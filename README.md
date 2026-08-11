@@ -20,13 +20,13 @@ everything into it, prompting for the handful of decisions that actually
 need a human (container ID, resources, auth):
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/LeTe0301/ai-dev-switchboard/main/ct/create.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/YOUR-GITHUB-USERNAME/ai-dev-switchboard/main/ct/create.sh)"
 ```
 
 **On any existing Debian/Ubuntu box or container** (no Proxmox needed):
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/LeTe0301/ai-dev-switchboard/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/YOUR-GITHUB-USERNAME/ai-dev-switchboard/main/install.sh)"
 ```
 
 Both scripts are plain, short, and meant to be read before you run them —
@@ -50,6 +50,36 @@ Either way you end up with:
 Log in as `RUN_USER` and run your engine's CLI once interactively (e.g.
 `claude`) to finish its own login before starting sessions from the web UI
 — the switchboard spawns the same CLI, it doesn't manage its credentials.
+It also doesn't install the CLIs themselves — pick whichever you want and
+install it as `RUN_USER` first:
+
+```bash
+npm install -g @anthropic-ai/claude-code   # Claude Code
+npm install -g @openai/codex               # Codex CLI
+pipx install aider-chat                    # aider
+```
+
+## Use cases
+
+- **Keep coding from your phone.** Start a session on the couch, close the
+  tab, pick it back up from a laptop an hour later — the tmux session (and,
+  for Claude Code, the hosted link) don't care which device opens them.
+- **A homelab with several projects and one machine to run them on.** Every
+  project folder under `PROJECTS_DIR` is its own row, its own on/off switch,
+  its own engine choice — no per-project systemd units or terminal
+  multiplexer muscle memory required.
+- **Give a non-technical collaborator a "go" button.** `AUTH_MODE=simple`
+  plus a TOTP code is a low-friction way to hand someone a working button
+  for "start Claude on the project we're building" without handing them a
+  terminal.
+- **Compare engines on the same project.** Stop Claude, start aider (or
+  Codex) on the same folder from the same switch — useful when one engine
+  is rate-limited, one needs LAN-only data handling, or you're just curious
+  which one handles a given task better.
+- **A private git-hosting box that also runs the agents.** With
+  `--with-git-hosting`, "push a new project" and "start an agent on it" are
+  two clicks total, including auto-sync back to disk on every future push
+  — see [`docs/GIT_HOSTING.md`](docs/GIT_HOSTING.md).
 
 ## What you get
 
@@ -58,11 +88,9 @@ Log in as `RUN_USER` and run your engine's CLI once interactively (e.g.
   tmux session.
 - **A picker for which engine** to start a project with, built from
   whatever's in `engines.d/` — see
-  [`docs/ADDING_AN_ENGINE.md`](docs/ADDING_AN_ENGINE.md). Claude Code and
-  aider ship working out of the box; a Codex template is included and
-  documented as unverified (Codex CLI's actual prompts weren't checked
-  against this — the ttyd fallback below means it still works even before
-  you tune that).
+  [`docs/ADDING_AN_ENGINE.md`](docs/ADDING_AN_ENGINE.md). Claude Code,
+  aider, and Codex CLI all ship working out of the box, each verified by
+  actually running it through this switchboard — not guessed.
 - **Either a hosted link or a built-in terminal, automatically.** An engine
   that prints its own remote-session URL (like Claude Code) gets that URL
   surfaced directly. Anything else gets a small ttyd web terminal sharing
@@ -139,9 +167,10 @@ docs/                    architecture notes, engine format, git-hosting detail
 ## Contributing
 
 Issues and PRs welcome, especially engine definitions for tools beyond
-Claude Code/aider — a working, verified `<tool>.engine` (or a corrected
-`codex.engine`) is a small, high-value contribution. See
-[`docs/ADDING_AN_ENGINE.md`](docs/ADDING_AN_ENGINE.md) for the format.
+Claude Code, aider, and Codex CLI — a working, *verified* `<tool>.engine`
+(actually run it through the switchboard, don't just guess at its prompts —
+see [`docs/ADDING_AN_ENGINE.md`](docs/ADDING_AN_ENGINE.md)) is a small,
+high-value contribution.
 
 ## License
 

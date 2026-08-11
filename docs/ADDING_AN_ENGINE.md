@@ -56,17 +56,43 @@ CLI tool — you get a working "open" link with zero extra config, whether or
 not the tool has (or even could have) a hosted remote-session feature of its
 own. `aider.engine` relies on exactly this fallback.
 
-## Adding Codex (or anything else)
+## Codex
 
-`engines.d/codex.engine.example` is a starting point — rename it to drop
-the `.example` suffix (files ending in `.example` are never loaded) once
-you've confirmed it matches your installed CLI's actual behavior. It ships
-with no `URL_REGEX`, so it works via the ttyd fallback out of the box even
-before you've verified anything else about it. If your version of Codex CLI
-(or any other tool) shows its own first-run prompts, add
-`STARTUP_MATCH_N`/`STARTUP_SEND_N` pairs the same way `claude.engine` does.
-If it turns out to have its own hosted session-link feature, add
-`URL_REGEX` to use that instead of the ttyd fallback.
+`engines.d/codex.engine` ships working, verified against codex-cli 0.147.0
+by actually running it through this switchboard end to end — not guessed.
+Worth knowing what that verification found, since it shapes how any new
+engine's file should look:
+
+- Codex's positional argument is an initial chat prompt, not a session
+  label — unlike `claude.engine`, `CMD` deliberately does **not** use
+  `{name}` here. Passing the project name there would feed it to the agent
+  as if you'd typed it as your first message.
+- Codex has its own one-time-per-directory "Do you trust the contents of
+  this directory?" prompt, functionally identical to Claude Code's — same
+  `STARTUP_MATCH_1`/`STARTUP_SEND_1` mechanism handles it.
+- Codex does have a `codex remote-control` subcommand, but it's an
+  `[experimental]` raw websocket/unix-socket protocol meant for a *custom*
+  TUI client, not a hosted browser link — there's nothing to point
+  `URL_REGEX` at, so it isn't set, and Codex runs via the ttyd fallback
+  instead. That fallback gives you a real interactive terminal, so any of
+  Codex's own per-command approval prompts still work exactly as they would
+  over SSH.
+- Signing in (ChatGPT / device code / API key) is a separate, one-time,
+  account-level step, deliberately left out of `STARTUP_MATCH`/`SEND` —
+  same as Claude Code's own login, that's a credential decision for a human
+  to make once, not something to script.
+
+## Adding another engine
+
+Follow the same process: run the CLI by hand first, in a scratch directory,
+and actually watch what it does on a truly first run — don't guess at
+prompt text or assume a tool has (or lacks) a hosted-link feature. If it
+turns out to have its own first-run prompts, add
+`STARTUP_MATCH_N`/`STARTUP_SEND_N` pairs the same way `claude.engine` and
+`codex.engine` do. If it turns out to have its own hosted session-link
+feature, add `URL_REGEX` to use that instead of the ttyd fallback — which
+remains the safe, correct default in the meantime, and forever for tools
+that simply don't have one.
 
 The same `.engine` file format is read by both `app/app.py` (per-project
 sessions) and `host-agent/lib/engine-lib.sh` (the optional single

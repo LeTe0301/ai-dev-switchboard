@@ -1,0 +1,36 @@
+# OpenAI Codex CLI (https://github.com/openai/codex, `npm install -g
+# @openai/codex`). Verified against codex-cli 0.147.0 by actually running
+# it through this switchboard's own startup-watch logic, not guessed:
+#
+#   - Bare `codex` launches straight into the interactive TUI in the
+#     current directory — no name/session-label argument like Claude Code's
+#     `--remote-control [name]`. Codex's own positional [PROMPT] argument
+#     is an initial chat message, not a label, so unlike claude.engine this
+#     CMD deliberately does NOT use {name} — passing the project name there
+#     would feed it to the agent as if you'd typed it as your first prompt.
+#   - First run in any given directory shows a one-time "Do you trust the
+#     contents of this directory?" prompt — functionally identical to
+#     Claude Code's "trust this folder" prompt, and, like Claude's, it's
+#     remembered per-directory afterwards (recorded in
+#     ~/.codex/config.toml under [projects."<path>"]) so this only fires
+#     once per project.
+#   - Signing in (ChatGPT login / device code / API key) is a separate,
+#     one-time, account-level step — same category as Claude Code's own
+#     login, and just as deliberately left OUT of STARTUP_MATCH/SEND below:
+#     that's a credential decision for a human, not something to script.
+#     Run `codex` once yourself as RUN_USER first to get that out of the
+#     way, same as you would for `claude`.
+#   - Codex does have its own `codex remote-control` subcommand, but it's
+#     explicitly labeled [experimental] and is a raw websocket/unix-socket
+#     protocol for a *custom* TUI client to connect to — not a hosted
+#     browser link the way Claude Code's `claude.ai/code/session_...` URL
+#     is. There's nothing to point URL_REGEX at, so no URL_REGEX is set
+#     here — same as aider.engine, this runs via the switchboard's
+#     built-in ttyd fallback instead, which needs no cooperation from
+#     Codex at all and gives you a real interactive terminal (Codex's own
+#     per-command approval prompts, if any, work in it exactly like they
+#     would over SSH).
+LABEL=Codex
+CMD=codex
+STARTUP_MATCH_1=Do you trust the contents of this directory
+STARTUP_SEND_1=1
