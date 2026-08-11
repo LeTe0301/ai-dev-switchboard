@@ -5,7 +5,7 @@
 #        sudo ./install.sh [flags]
 #
 #   2. Piped straight from GitHub, nothing cloned yet:
-#        bash -c "$(curl -fsSL https://raw.githubusercontent.com/YOUR-GITHUB-USERNAME/ai-dev-switchboard/main/install.sh)"
+#        bash -c "$(curl -fsSL https://raw.githubusercontent.com/LeTe0301/ai-dev-switchboard/main/install.sh)"
 #      (clones the repo to /opt/ai-dev-switchboard-src first, then re-execs
 #      itself from that real checkout — everything below assumes case 1)
 #
@@ -24,7 +24,7 @@
 # clobbers switchboard.env/git-hosting.env values that are already set.
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/YOUR-GITHUB-USERNAME/ai-dev-switchboard.git}"
+REPO_URL="${REPO_URL:-https://github.com/LeTe0301/ai-dev-switchboard.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
 SRC_DIR="${SRC_DIR:-/opt/ai-dev-switchboard-src}"
 

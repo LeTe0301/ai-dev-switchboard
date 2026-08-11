@@ -20,13 +20,13 @@ everything into it, prompting for the handful of decisions that actually
 need a human (container ID, resources, auth):
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/YOUR-GITHUB-USERNAME/ai-dev-switchboard/main/ct/create.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/LeTe0301/ai-dev-switchboard/main/ct/create.sh)"
 ```
 
 **On any existing Debian/Ubuntu box or container** (no Proxmox needed):
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/YOUR-GITHUB-USERNAME/ai-dev-switchboard/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/LeTe0301/ai-dev-switchboard/main/install.sh)"
 ```
 
 Both scripts are plain, short, and meant to be read before you run them —

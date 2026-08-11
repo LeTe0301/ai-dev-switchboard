@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-liner entry point — run ON a Proxmox VE host:
 #
-#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/YOUR-GITHUB-USERNAME/ai-dev-switchboard/main/ct/create.sh)"
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/LeTe0301/ai-dev-switchboard/main/ct/create.sh)"
 #
 # Walks you through creating a new Debian LXC container, clones this repo
 # into it, and runs install.sh inside — end to end, from a blank Proxmox
@@ -16,7 +16,7 @@
 # block near the bottom for exactly what gets read.
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/YOUR-GITHUB-USERNAME/ai-dev-switchboard.git}"
+REPO_URL="${REPO_URL:-https://github.com/LeTe0301/ai-dev-switchboard.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
 
 command -v pct >/dev/null 2>&1 || { echo "pct not found — this script must run on a Proxmox VE host." >&2; exit 1; }
