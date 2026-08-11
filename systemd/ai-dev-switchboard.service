@@ -1,0 +1,20 @@
+# Reference unit — install.sh generates this file itself with your actual
+# RUN_USER/SVC_USER substituted in; this copy is here for anyone installing
+# by hand instead. Adjust User=, EnvironmentFile=, and the app.py path
+# below to match your setup, then:
+#   cp systemd/ai-dev-switchboard.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now ai-dev-switchboard
+
+[Unit]
+Description=ai-dev-switchboard
+After=network.target
+
+[Service]
+Type=simple
+User=switchboard-svc
+EnvironmentFile=/etc/ai-dev-switchboard/switchboard.env
+ExecStart=/usr/bin/python3 /opt/ai-dev-switchboard/app.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

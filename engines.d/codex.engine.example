@@ -1,0 +1,16 @@
+# Template for OpenAI's Codex CLI, or any other CLI coding agent this
+# switchboard doesn't ship built-in support for. UNVERIFIED: Codex CLI's
+# actual first-run prompts (if any) and whether it has its own hosted
+# remote-session link haven't been checked against this switchboard — adjust
+# CMD and, if needed, add STARTUP_MATCH_N/STARTUP_SEND_N pairs (see
+# claude.engine for the pattern) to match whatever your installed version
+# actually shows on first run in a new directory. Then rename this file to
+# drop the ".example" suffix to enable it — files ending in .example are
+# never loaded.
+#
+# No URL_REGEX is set here, so until/unless you confirm Codex CLI prints its
+# own hosted link and add one, the switchboard falls back to its built-in
+# ttyd web terminal for this engine automatically — a working default for
+# any CLI tool, verified or not.
+LABEL=Codex
+CMD=codex {name}

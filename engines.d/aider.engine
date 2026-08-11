@@ -1,0 +1,13 @@
+# aider (https://aider.chat) — no hosted remote-control link of its own, so
+# no URL_REGEX is set below. That's the signal the switchboard uses to fall
+# back to its built-in ttyd web terminal automatically: any engine without
+# a URL_REGEX gets one for free, no extra config needed.
+LABEL=aider
+CMD=aider
+
+# To point aider at a local model instead of a hosted one (e.g. an
+# OpenAI-API-compatible endpoint like Ollama or LM Studio), change CMD to
+# something like:
+#   CMD=aider --openai-api-base http://YOUR-LLM-HOST:11434/v1 --model openai/YOUR-MODEL --openai-api-key none
+# or point it at a small wrapper script on RUN_USER's PATH that sets those
+# flags, and use that script's name as CMD instead.

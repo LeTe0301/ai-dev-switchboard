@@ -1,0 +1,21 @@
+# Claude Code, with its own hosted Remote Control link.
+#
+# CMD: {name} is replaced with the project name (or the host session's own
+# name — see config/switchboard.env's HOST_SESSION_NAME). --remote-control
+# both enables Remote Control and labels the session, in one step.
+LABEL=Claude
+CMD=claude --remote-control {name}
+
+# URL_REGEX: when set, the switchboard watches the session's terminal output
+# for a match and treats it as this engine's own hosted link — shown as the
+# "open" link in the UI instead of the built-in ttyd fallback terminal.
+URL_REGEX=https://claude\.ai/code/session_[A-Za-z0-9]+
+
+# STARTUP_MATCH_N / STARTUP_SEND_N: scripted one-time startup interactions,
+# tried in order while the switchboard watches the pane right after launch.
+# When the pane contains STARTUP_MATCH_N, STARTUP_SEND_N is sent as a
+# keystroke (followed by Enter) and the watcher moves on to N+1. Used here
+# to clear the one-time "do you trust this folder" prompt Claude Code shows
+# the first time it runs in a new directory.
+STARTUP_MATCH_1=trust this folder
+STARTUP_SEND_1=1
