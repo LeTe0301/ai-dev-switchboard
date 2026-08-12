@@ -18,6 +18,11 @@
 #   --with-host-control   also install host-agent/ on THIS machine (see
 #                         host-agent/README.md — usually installed on a
 #                         *different* machine than the web UI by hand instead)
+#   --with-taiga          also install Docker + Taiga's own official
+#                         taiga-docker Compose stack (self-hosted backlog
+#                         tracker), left OFF until toggled in the web UI —
+#                         see docs/spec.md and the "Optional: self-hosted
+#                         Taiga" section below
 #
 # Safe to re-run: every step here either checks for existing state first or
 # overwrites deterministically-generated files (units, sudoers), never
@@ -49,12 +54,14 @@ YES=0
 WITH_GIT_HOSTING=0
 WITH_CODE_SERVER=0
 WITH_HOST_CONTROL=0
+WITH_TAIGA=0
 for arg in "$@"; do
     case "$arg" in
         --yes) YES=1 ;;
         --with-git-hosting) WITH_GIT_HOSTING=1 ;;
         --with-code-server) WITH_CODE_SERVER=1 ;;
         --with-host-control) WITH_HOST_CONTROL=1 ;;
+        --with-taiga) WITH_TAIGA=1 ;;
         *) echo "Unknown flag: $arg (see the top of install.sh for the list)" >&2; exit 1 ;;
     esac
 done
@@ -218,6 +225,120 @@ if [ "$PUBLISH_MODE" = "tailscale" ]; then
     set_env "$ENV_FILE" BASE_URL "$BASE_URL"
 fi
 
+# ── Optional: self-hosted Taiga (--with-taiga) ───────────────────────────
+# Placed here (after Publishing, not right after the code-server block like
+# every other --with-* flag) because deriving TAIGA_DOMAIN below needs
+# PUBLISH_MODE/BASE_URL already resolved — see docs/spec.md's "Config" step,
+# which explicitly wants TAIGA_DOMAIN derived from values "already resolved
+# earlier in this same install run". Reuses set_env/get_env/random_token/
+# path_has_symlink exactly like every block above it.
+if [ "$WITH_TAIGA" -eq 1 ]; then
+    echo "-- Self-hosted Taiga (--with-taiga) --"
+
+    # 1. Docker itself — same curl-pipe-sh precedent code-server's own
+    # install already uses one block above, rather than the distro's often-
+    # stale docker.io apt package. Idempotent: never touch a pre-existing
+    # Docker install, however it got there.
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "Installing Docker (via Docker's own convenience script)..."
+        curl -fsSL https://get.docker.com | sh
+    fi
+    TAIGA_COMPOSE_OK=1
+    if ! docker compose version >/dev/null 2>&1; then
+        echo "WARNING: 'docker compose' (the Compose plugin, not the old standalone docker-compose v1 binary) isn't available. Taiga will be installed but not functional until you install the Compose plugin yourself (https://docs.docker.com/compose/install/). Continuing." >&2
+        TAIGA_COMPOSE_OK=0
+    fi
+
+    # 2. The taiga-docker checkout — pinned at whatever commit is first
+    # cloned; never `git pull`'d on re-run (docs/spec.md "Open questions").
+    TAIGA_DIR=/opt/ai-dev-switchboard-taiga
+    TAIGA_FRESH_CLONE=0
+    if [ ! -d "$TAIGA_DIR/.git" ]; then
+        git clone --branch stable --depth 1 https://github.com/taigaio/taiga-docker.git "$TAIGA_DIR"
+        TAIGA_FRESH_CLONE=1
+    fi
+
+    # 3. Config — taiga-docker ships a real (not .example) .env file with
+    # insecure placeholder defaults (SECRET_KEY="taiga-secret-key", etc.),
+    # so unlike switchboard.env's TOTP_SECRET there's no "empty means
+    # generate one" signal to key off of. Only randomize secrets right after
+    # a fresh clone — never re-randomize on re-run — same "preserved on
+    # re-run" behavior TOTP_SECRET/SIMPLE_PASSWORD already get elsewhere in
+    # this file. TAIGA_SCHEME/TAIGA_DOMAIN aren't one-time secrets, so they're
+    # re-derived every run to track whatever PUBLISH_MODE/BASE_URL currently
+    # resolve to.
+    TAIGA_PORT=9000
+    TAIGA_ENV="$TAIGA_DIR/.env"
+    if [ "$TAIGA_FRESH_CLONE" -eq 1 ]; then
+        set_env "$TAIGA_ENV" SECRET_KEY "$(random_token 32)"
+        set_env "$TAIGA_ENV" POSTGRES_PASSWORD "$(random_token 24)"
+        set_env "$TAIGA_ENV" RABBITMQ_PASS "$(random_token 24)"
+        set_env "$TAIGA_ENV" RABBITMQ_ERLANG_COOKIE "$(random_token 32)"
+    fi
+    set_env "$TAIGA_ENV" TAIGA_SCHEME "http"
+    if [ "$PUBLISH_MODE" = "tailscale" ] && [ -n "$BASE_URL" ]; then
+        TAIGA_DOMAIN_VALUE="${BASE_URL#https://}"
+        TAIGA_DOMAIN_VALUE="${TAIGA_DOMAIN_VALUE#http://}"
+    else
+        TAIGA_DOMAIN_VALUE="localhost:$TAIGA_PORT"
+    fi
+    set_env "$TAIGA_ENV" TAIGA_DOMAIN "$TAIGA_DOMAIN_VALUE"
+    # TAIGA_PORT also lives in taiga-docker's own .env (not just
+    # switchboard.env below) — Compose auto-loads .env from the project
+    # directory for variable substitution, which is what lets the
+    # docker-compose.override.yml below reference ${TAIGA_PORT} without the
+    # wrapper scripts needing to export anything themselves.
+    set_env "$TAIGA_ENV" TAIGA_PORT "$TAIGA_PORT"
+
+    # 4. Loopback-only binding — taiga-gateway's own docker-compose.yml
+    # binds "9000:80" on all interfaces, which conflicts with this project's
+    # "everything binds 127.0.0.1 only" rule. Compose auto-merges
+    # docker-compose.yml + docker-compose.override.yml in the same
+    # directory, so this override never conflicts with a future manual
+    # `git pull` in $TAIGA_DIR. Regenerated deterministically every run,
+    # like the systemd unit / sudoers file below. The single-quoted heredoc
+    # is deliberate: ${TAIGA_PORT} must stay literal here so Compose (not
+    # this shell) substitutes it from $TAIGA_DIR/.env at `docker compose`
+    # time.
+    cat > "$TAIGA_DIR/docker-compose.override.yml" <<'YAML'
+services:
+  taiga-gateway:
+    ports:
+      - "127.0.0.1:${TAIGA_PORT}:80"
+YAML
+
+    # 5. Pre-pull images at install time, not first toggle — otherwise the
+    # first UI toggle-on blocks on pulling 9 images over the network.
+    # Warn-and-continue (not fatal) if there's no network right now; the
+    # first toggle-on will simply be slow instead.
+    if [ "$TAIGA_COMPOSE_OK" -eq 1 ]; then
+        echo "Pre-pulling Taiga's images (9 images — this can take a while)..."
+        if ! ( cd "$TAIGA_DIR" && docker compose -f docker-compose.yml -f docker-compose.override.yml pull ); then
+            echo "WARNING: pre-pulling Taiga's images failed (no network at install time?) — Taiga stays installed, just with uncached images; the first toggle-on will pull them then instead. Continuing." >&2
+        fi
+    fi
+
+    # 6. Wrapper scripts (root-run, zero arguments — see docs/spec.md
+    # "Crossing the privilege boundary"). Sudoers entries for these are
+    # added below, alongside every other sudoers rule this installer
+    # generates.
+    install -m 755 "$REPO_DIR/scripts/taiga-up.sh" /usr/local/bin/ai-dev-switchboard-taiga-up.sh
+    install -m 755 "$REPO_DIR/scripts/taiga-down.sh" /usr/local/bin/ai-dev-switchboard-taiga-down.sh
+    install -m 755 "$REPO_DIR/scripts/taiga-status.sh" /usr/local/bin/ai-dev-switchboard-taiga-status.sh
+
+    # 7. switchboard.env — TAIGA_DIR is also recorded here (beyond what
+    # app.py itself reads) because the wrapper scripts above source this
+    # same file for it, exactly like new-project-from-upload.sh already
+    # sources RUN_USER/PROJECTS_DIR from it.
+    set_env "$ENV_FILE" TAIGA_ENABLED 1
+    set_env "$ENV_FILE" TAIGA_PORT "$TAIGA_PORT"
+    set_env "$ENV_FILE" TAIGA_LABEL "Taiga"
+    set_env "$ENV_FILE" TAIGA_DIR "$TAIGA_DIR"
+    set_env "$ENV_FILE" TAIGA_UP_SCRIPT "/usr/local/bin/ai-dev-switchboard-taiga-up.sh"
+    set_env "$ENV_FILE" TAIGA_DOWN_SCRIPT "/usr/local/bin/ai-dev-switchboard-taiga-down.sh"
+    set_env "$ENV_FILE" TAIGA_STATUS_SCRIPT "/usr/local/bin/ai-dev-switchboard-taiga-status.sh"
+fi
+
 if [ "$WITH_HOST_CONTROL" -eq 1 ]; then
     set_env "$ENV_FILE" HOST_CONTROL_ENABLED 1
 fi
@@ -246,6 +367,15 @@ SUDOERS=/etc/sudoers.d/ai-dev-switchboard
     echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-new-project-from-upload.sh *"
     if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
         echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-new-project.sh *"
+    fi
+    if [ "$WITH_TAIGA" -eq 1 ]; then
+        # Zero arguments (no trailing " *") — narrower than every other rule
+        # above, since Docker socket access is root-equivalent (see
+        # docs/spec.md "Crossing the privilege boundary"): these three fixed
+        # scripts are the entire narrowing, no passthrough arguments at all.
+        echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-taiga-up.sh"
+        echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-taiga-down.sh"
+        echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-taiga-status.sh"
     fi
 } > "$SUDOERS"
 chmod 440 "$SUDOERS"
@@ -313,6 +443,17 @@ if [ "$PUBLISH_MODE" = "tailscale" ]; then
 fi
 echo "TOTP secret (add to an authenticator app): $TOTP_SECRET"
 [ -n "$SIMPLE_PASSWORD_SHOWN" ] && echo "Generated web UI password: $SIMPLE_PASSWORD_SHOWN"
+if [ "$WITH_TAIGA" -eq 1 ]; then
+    echo ""
+    echo "Taiga: installed but left OFF — flip the 'Taiga' row's toggle in the"
+    echo "web UI to start it. Runs 9 containers and can use several GB of RAM"
+    echo "(and real disk, for Postgres/RabbitMQ data volumes) once turned on;"
+    echo "toggling it back off frees that RAM again right away."
+    echo "Before first use, create Taiga's own admin account (one-time,"
+    echo "interactive — not automated by this installer):"
+    echo "  cd $TAIGA_DIR && ./taiga-manage.sh createsuperuser"
+    echo "(run that after the Taiga toggle is on and the stack has finished starting)."
+fi
 echo ""
 echo "Next: log in as $RUN_USER and run your engine's CLI once interactively"
 echo "(e.g. \`claude\`) to finish ITS login, before starting sessions from the UI."

@@ -117,6 +117,16 @@ DESC_CACHE_FILE = os.environ.get("DESC_CACHE_FILE", "/var/lib/ai-dev-switchboard
 TTYD_BIN = os.environ.get("TTYD_BIN", "/usr/local/bin/ttyd")
 CODE_SERVER_BIN = os.environ.get("CODE_SERVER_BIN", "/usr/local/bin/code-server")
 
+# Self-hosted Taiga (backlog item 1a) — a singleton on/off toggle row like
+# host-control above, not a per-project row like ttyd/code-server. Off
+# unless install.sh --with-taiga was used AND the toggle is flipped on.
+TAIGA_ENABLED = os.environ.get("TAIGA_ENABLED", "0") == "1"
+TAIGA_LABEL = os.environ.get("TAIGA_LABEL", "Taiga")
+TAIGA_PORT = int(os.environ.get("TAIGA_PORT", "9000"))
+TAIGA_UP_SCRIPT = os.environ.get("TAIGA_UP_SCRIPT", "/usr/local/bin/ai-dev-switchboard-taiga-up.sh")
+TAIGA_DOWN_SCRIPT = os.environ.get("TAIGA_DOWN_SCRIPT", "/usr/local/bin/ai-dev-switchboard-taiga-down.sh")
+TAIGA_STATUS_SCRIPT = os.environ.get("TAIGA_STATUS_SCRIPT", "/usr/local/bin/ai-dev-switchboard-taiga-status.sh")
+
 STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT_SECONDS", "45"))
 
 # This service runs as its own unprivileged user — tmux sessions must run as
@@ -924,6 +934,31 @@ def host_run(action: str) -> str:
     return r.stdout.strip()
 
 
+# ─── self-hosted Taiga (backlog item 1a) ───────────────────────────────────
+# Singleton, like host-control above — but unlike host-control (a session on
+# a genuinely separate machine) and unlike ttyd/code-server (in-memory
+# subprocess.Popen handles that die with app.py's own process), Taiga's
+# containers are managed by dockerd, entirely outside app.py's process tree.
+# They survive an `ai-dev-switchboard` service restart, so state is never
+# trusted from memory here — every /status poll calls taiga_run("status")
+# fresh, exactly like host_run("status") already does for the host row.
+def taiga_run(action: str) -> str:
+    assert action in ("up", "down", "status")
+    script = {"up": TAIGA_UP_SCRIPT, "down": TAIGA_DOWN_SCRIPT,
+              "status": TAIGA_STATUS_SCRIPT}[action]
+    r = subprocess.run(["sudo", script], capture_output=True, text=True,
+                       timeout=(10 if action == "status" else 90))
+    return r.stdout.strip()
+
+
+TAIGA_URL_PATH = "/taiga"  # fixed, singleton — no per-name path like /term or /code
+
+
+def _taiga_display_url() -> str:
+    return f"{BASE_URL}{TAIGA_URL_PATH}" if PUBLISH_MODE == "tailscale" \
+        else f"http://127.0.0.1:{TAIGA_PORT}"
+
+
 PAGE_TEMPLATE = """<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -946,7 +981,21 @@ PAGE_TEMPLATE = """<!doctype html>
   .pill.active { background: #34c759; color: #111; font-weight: 600; border-color: #34c759; }
   .badge { display: inline-block; font-size: 12px; padding: 4px 11px; border-radius: 20px;
            background: #16324a; color: #4da6ff; margin-top: 6px; font-weight: 600; }
+  /* Taiga's resource-cost badge: brighter text than the plain .badge default
+     (#4da6ff) — #66d9ff on the same #16324a background clears the WCAG AA
+     4.5:1 text-contrast threshold (~8.1:1) with real headroom, see
+     docs/implementation.md for the contrast math. */
+  .badge.taiga-ram { color: #66d9ff; }
   .sub { font-size: 12px; color: #888; margin-top: 4px; word-break: break-all; }
+  .taiga-err { color: #ff6b6b; }
+  .taiga-starting-spinner { display: inline-block; width: 12px; height: 12px;
+                             margin-left: 4px; vertical-align: middle;
+                             animation: taiga-spin 1s linear infinite; }
+  @keyframes taiga-spin {
+    0% { transform: rotate(0deg); opacity: 0.6; }
+    50% { opacity: 1; }
+    100% { transform: rotate(360deg); opacity: 0.6; }
+  }
   .vscode-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
   .pill.code-pill { background: #2a2a2a; }
   .pill.code-pill.active { background: #4da6ff; color: #111; border-color: #4da6ff; }
@@ -1094,6 +1143,42 @@ document.getElementById('login-pass').addEventListener('keydown', e => { if (e.k
 let ENGINE_LABELS = {};
 let engineChoice = {};  // project name -> engine name, picked before starting
 
+// Taiga's row needs more visual states than the generic on/off rows above
+// (see docs/design.md "How starting→running detection works") — its Docker
+// stack can take 30-60s to come up, so a toggle-on doesn't mean "running"
+// yet the way it does for host-control's SSH-backed session. taigaPending
+// tracks an in-flight "waiting to see taiga:true" window (cleared once
+// /status confirms it, or after a 90s timeout — design.md's fallback so the
+// row never gets stuck showing "starting…" forever on a genuine failure).
+// taigaWasRunning lets a later poll tell "toggled off on purpose" apart from
+// "was running, suddenly isn't" (a transient container hiccup) — the latter
+// re-arms a fresh starting window instead of flashing "error" immediately.
+// taigaOffPendingCount covers the window between intentional toggle-off
+// request(s) being sent and them resolving — the backend blocks on `docker
+// compose down` for up to 90s, so a regular 4s /status poll can easily land
+// mid-flight and still (accurately) report taiga:true. Without tracking
+// this, that poll would re-set taigaWasRunning=true and clobber the
+// toggle-off's own reset, making refresh() misread the eventual real "off"
+// as an *unexpected* stop instead of the intentional one it actually is
+// (see docs/test-review.md Defect 1). While this count is > 0, refresh()
+// must not let a poll re-arm taigaWasRunning — only the toggle-off code
+// paths themselves increment/decrement it.
+//
+// This is a count, not a boolean, because the toggle checkbox is never
+// disabled while an action is in flight and the row keeps re-rendering as
+// "on" (accurately) for as long as any prior off request is still running —
+// an impatient user can realistically fire a second, independent off
+// dispatch before the first resolves. A plain boolean that either off
+// request's own completion unconditionally clears to false would let the
+// *first* to resolve declare the coast clear while the *second* off
+// request is still genuinely outstanding, reopening Defect 1's exact false
+// starting…/error outcome via a different trigger (docs/test-review.md
+// Defect 2). Only treat "no off request in flight" as true once the count
+// reaches zero, i.e. every dispatched off request has resolved.
+let taigaPending = null;      // {startTime} | null
+let taigaWasRunning = false;
+let taigaOffPendingCount = 0;
+
 async function refresh() {
   const r = await fetch('/status');
   if (r.status === 401) { showOverlay(); return; }
@@ -1106,6 +1191,35 @@ async function refresh() {
   }
   if (s.instances.length === 0) html += '<div class="empty">No project folders under the configured PROJECTS_DIR yet.</div>';
   if (s.host_enabled) html += row(s.host_label, s.host, s.host_url, 'host', null, '', null, false, null);
+  if (s.taiga_enabled) {
+    let taigaSub, showTaigaBadge = true;
+    if (s.taiga) {
+      taigaSub = 'running' + (s.taiga_url ? ' — <a href="' + s.taiga_url + '" target="_blank">open</a>' : '');
+      taigaPending = null;
+      // Don't let a poll landing mid-toggle-off re-arm taigaWasRunning — the
+      // toggle-off itself already reset it and owns that reset until every
+      // dispatched off request resolves (see taigaOffPendingCount's
+      // declaration comment).
+      if (taigaOffPendingCount === 0) taigaWasRunning = true;
+    } else {
+      if (taigaWasRunning && taigaOffPendingCount === 0) {
+        taigaPending = {startTime: Date.now()};
+        taigaWasRunning = false;
+      }
+      if (taigaPending) {
+        if (Date.now() - taigaPending.startTime > 90000) {
+          taigaSub = '<span class="taiga-err">error</span>';
+          showTaigaBadge = false;
+        } else {
+          taigaSub = 'starting… <span class="taiga-starting-spinner">◌</span>';
+        }
+      } else {
+        taigaSub = 'stopped';
+      }
+    }
+    html += row(s.taiga_label, s.taiga, s.taiga_url, 'taiga', null, '', null, false, null,
+               taigaSub, showTaigaBadge);
+  }
   document.getElementById('rows').innerHTML = html;
 }
 function esc(s) {
@@ -1140,11 +1254,17 @@ function codeRow(name, codeOn, codeUrl) {
     (codeOn && codeUrl ? '<a href="' + codeUrl + '" target="_blank">open</a>' : '') +
     '</div>';
 }
-function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl) {
-  const sub = on ? (url ? 'running — <a href="' + url + '" target="_blank">open</a>' : 'running') : 'stopped';
+function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverride, showTaigaBadge) {
+  // subOverride lets the Taiga row (see refresh()) supply its own
+  // starting/running/stopped/error text instead of this generic on/off
+  // computation — every other kind (inst/host/code) omits it and keeps the
+  // plain behavior unchanged.
+  const sub = subOverride != null ? subOverride :
+    (on ? (url ? 'running — <a href="' + url + '" target="_blank">open</a>' : 'running') : 'stopped');
   const arg = name ? "'" + kind + "','" + name + "'" : "'" + kind + "',null";
   return '<div class="row"><div><div class="label">' + esc(label) + '</div>' +
     (kind === 'inst' ? engineRow(name, on, engine) : '') +
+    (showTaigaBadge ? '<div class="badge taiga-ram">⚠ ~3–5 GB RAM when running</div>' : '') +
     (desc ? '<div class="desc">' + esc(desc) + '</div>' : '') +
     '<div class="sub">' + sub + '</div>' +
     (kind === 'inst' ? codeRow(name, codeOn, codeUrl) : '') +
@@ -1156,6 +1276,7 @@ let pendingToggle = null;  // {kind, name, on, checkboxEl} — only set while th
 
 function actionPath(kind, name, on) {
   if (kind === 'host') return '/host/' + (on ? 'on' : 'off');
+  if (kind === 'taiga') return '/taiga/' + (on ? 'on' : 'off');
   if (kind === 'code') return '/instance/' + encodeURIComponent(name) + '/code/' + (on ? 'on' : 'off');
   if (kind === 'newproject') return '/projects/new';
   return '/instance/' + encodeURIComponent(name) + '/' + (on ? 'on' : 'off');
@@ -1183,6 +1304,7 @@ async function handleActionResult(r, ctx) {
   if (r.status === 401) {
     hideCodeOverlay();
     if (checkboxEl) checkboxEl.checked = !on;
+    if (kind === 'taiga') { taigaPending = null; taigaWasRunning = false; }
     showOverlay();
     return;
   }
@@ -1212,9 +1334,33 @@ async function handleActionResult(r, ctx) {
   setTimeout(refresh, 1500);
 }
 async function toggle(kind, name, on, checkboxEl) {
+  if (kind === 'taiga') {
+    // Optimistic, ahead of the POST resolving (docs/design.md "Starting
+    // state is optimistic + poll-driven") — refresh() picks this up on its
+    // very next call, whether that's the setTimeout(refresh, 1500) below or
+    // the regular 4s poll.
+    if (on) { taigaPending = {startTime: Date.now()}; }
+    else {
+      taigaPending = null;
+      taigaWasRunning = false;
+      // Held until every dispatched off POST resolves — see
+      // taigaOffPendingCount's declaration comment for why this has to
+      // survive both concurrent polls and a second, overlapping off
+      // dispatch.
+      taigaOffPendingCount++;
+    }
+  }
   const ctx = {kind, name, on, checkboxEl};
-  const r = await performAction(kind, name, on, null);
-  handleActionResult(r, ctx);
+  try {
+    const r = await performAction(kind, name, on, null);
+    handleActionResult(r, ctx);
+  } finally {
+    // A network-level failure (performAction's fetch() rejects, not just a
+    // non-2xx status) must still release this — otherwise the counter leaks
+    // permanently and silently disables the "unexpected stop while running"
+    // detection for the rest of the page's life.
+    if (kind === 'taiga' && !on) { taigaOffPendingCount = Math.max(0, taigaOffPendingCount - 1); }
+  }
 }
 function toggleCode(name, currentlyOn) {
   toggle('code', name, !currentlyOn, null);
@@ -1248,6 +1394,12 @@ function cancelActionCode() {
   if (pendingToggle && pendingToggle.checkboxEl) {
     pendingToggle.checkboxEl.checked = !pendingToggle.on;
   }
+  if (pendingToggle && pendingToggle.kind === 'taiga') {
+    // Nothing actually started server-side — undo the optimistic marker
+    // toggle() set before the code overlay ever showed up.
+    taigaPending = null;
+    taigaWasRunning = false;
+  }
   hideCodeOverlay();
 }
 async function submitActionCode() {
@@ -1270,8 +1422,23 @@ async function submitActionCode() {
   if (!pendingToggle) return;
   const {kind, name, on} = pendingToggle;
   const code = document.getElementById('action-code').value;
-  const r = await performAction(kind, name, on, code);
-  handleActionResult(r, pendingToggle);
+  if (kind === 'taiga' && !on) {
+    // This retry (after a 428 asked for a TOTP code) is the request that
+    // actually triggers taiga_run("down") server-side — the first attempt
+    // never touched anything. Re-arm the same intentional-off guard toggle()
+    // uses, since polls may have run (and correctly set taigaWasRunning back
+    // to true) during however long the user took to type the code.
+    taigaWasRunning = false;
+    taigaOffPendingCount++;
+  }
+  try {
+    const r = await performAction(kind, name, on, code);
+    handleActionResult(r, pendingToggle);
+  } finally {
+    // See toggle()'s matching comment: must release on a network-level
+    // failure too, not just after a resolved response.
+    if (kind === 'taiga' && !on) { taigaOffPendingCount = Math.max(0, taigaOffPendingCount - 1); }
+  }
 }
 document.getElementById('action-code').addEventListener('keydown', e => { if (e.key === 'Enter') submitActionCode(); });
 
@@ -2112,6 +2279,11 @@ class Handler(BaseHTTPRequestHandler):
                 out = host_run("status").splitlines()
                 host_on = bool(out) and out[0] == "on"
                 host_url = out[1] if host_on and len(out) > 1 else None
+            taiga_on, taiga_url = False, None
+            if TAIGA_ENABLED:
+                out = taiga_run("status").splitlines()
+                taiga_on = bool(out) and out[0] == "on"
+                taiga_url = _taiga_display_url() if taiga_on else None
             instances = []
             for n in instance_names():
                 engine = active_engine(n)
@@ -2125,7 +2297,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"instances": instances,
                        "engines": {name: e.label for name, e in engines.items()},
                        "host_enabled": HOST_CONTROL_ENABLED, "host_label": HOST_LABEL,
-                       "host": host_on, "host_url": host_url})
+                       "host": host_on, "host_url": host_url,
+                       "taiga_enabled": TAIGA_ENABLED, "taiga_label": TAIGA_LABEL,
+                       "taiga": taiga_on, "taiga_url": taiga_url})
         else:
             self.send_response(404)
             self.end_headers()
@@ -2171,6 +2345,16 @@ class Handler(BaseHTTPRequestHandler):
             if not HOST_CONTROL_ENABLED:
                 return self._json({"error": "host control disabled"}, 404)
             host_run("start" if parts[1] == "on" else "stop")
+            self._json({"ok": True})
+        elif parts[0] == "taiga" and len(parts) == 2 and parts[1] in ("on", "off"):
+            if not TAIGA_ENABLED:
+                return self._json({"error": "taiga disabled"}, 404)
+            if parts[1] == "on":
+                taiga_run("up")
+                _publish(TAIGA_URL_PATH, TAIGA_PORT)
+            else:
+                _unpublish(TAIGA_URL_PATH)
+                taiga_run("down")
             self._json({"ok": True})
         elif parts[0] == "projects" and len(parts) == 2 and parts[1] == "new":
             ok, err = create_project((body.get("name") or "").strip())

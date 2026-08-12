@@ -17,6 +17,17 @@ before touching code.
 
 ## 1. Local backlog tracker (Taiga), tracked by Claude
 
+**Status: 1a shipped (2026-08-12)** — `install.sh --with-taiga` (Taiga via
+its official `taiga-docker` Docker Compose stack, this codebase's
+first-ever Docker dependency, off by default) plus a singleton toggle row
+in the web UI. Reviewer-approved after three review rounds that caught and
+fixed two real races in the frontend toggle-off state machine plus one
+follow-up leak fix. Full spec/design/implementation/test-review in
+`docs/spec.md` / `docs/design.md` / `docs/implementation.md` /
+`docs/test-review.md`. **1b (the "Claude should track it" MCP/API
+integration) is still open** — deliberately scoped out of 1a as a separate
+future cycle, see below.
+
 **Decision:** Taiga (agile/scrum, kanban + sprints), not Atlassian Jira —
 self-hosted Jira now requires a paid Data Center license, which doesn't fit
 this project's "small, self-hosted, free" model. Taiga is the closer match
