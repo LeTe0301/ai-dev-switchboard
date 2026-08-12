@@ -91,9 +91,10 @@ over to Gitea's own auth model.
 
 ## 3. Folder upload → auto-detect repo(s)
 
-**Status: built (2026-08-12), pending review.** Full spec/design/implementation
-in `docs/spec.md` / `docs/design.md` / `docs/implementation.md`. Small polish
-items deliberately deferred rather than blocking the reviewer pass — pick up
+**Status: shipped (2026-08-12), commit `893840c`.** Reviewer-approved with
+follow-ups. Full spec/design/implementation/test-review in `docs/spec.md` /
+`docs/design.md` / `docs/implementation.md` / `docs/test-review.md`. Small
+polish items deliberately deferred rather than blocking the ship — pick up
 whenever, none affect correctness or security:
 - `UPLOAD_MAX_ENTRIES` is documented in `config/switchboard.env.example` as a
   comment only, not a real settable line — it's currently a hardcoded Python
@@ -146,6 +147,11 @@ Low risk, no open questions — safe to pick up any time.
 ---
 
 ## 5. Tailscale vs. LAN-only as an explicit setup choice
+
+**Status: shipped (2026-08-12).** Reviewer-approved with follow-ups (one
+should-fix whiptail msgbox height fix, applied directly). Full
+spec/implementation/test-review in `docs/spec.md` / `docs/implementation.md`
+/ `docs/test-review.md`.
 
 **Shape of the work:** `PUBLISH_MODE` (tailscale vs. none, per
 `config/switchboard.env.example`) already exists as a config value read at

@@ -119,8 +119,11 @@ whichever fits how you already reach your machines:
 
 - **Tailscale**: `tailscale serve --bg https+insecure://127.0.0.1:8333` (or
   `--https=443` for a real cert) from the box itself, then open the tailnet
-  hostname it gives you. Also set `PUBLISH_MODE=tailscale` and `BASE_URL`
-  in `switchboard.env` so per-project terminals get published the same way.
+  hostname it gives you. `install.sh`/`ct/create.sh` already prompt for
+  `PUBLISH_MODE`/`BASE_URL` at setup time so per-project terminals get
+  published the same way — choose `tailscale` there and enter the tailnet
+  hostname (from `tailscale status`); edit `switchboard.env` and restart
+  only if you want to change that choice later.
 - **SSH tunnel**: `ssh -L 8333:127.0.0.1:8333 you@the-box`, then open
   `http://127.0.0.1:8333` locally. Fine for occasional use, not for the
   per-project terminals (those need `PUBLISH_MODE=tailscale` or your own

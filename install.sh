@@ -176,6 +176,14 @@ else
     set_env "$ENV_FILE" SIMPLE_PASSWORD "$SIMPLE_PASSWORD"
 fi
 
+echo "-- Publishing --"
+PUBLISH_MODE=$(prompt "Publish per-project terminals via tailscale serve, or keep them loopback-only? (tailscale/none)" "$(get_env "$ENV_FILE" PUBLISH_MODE)")
+set_env "$ENV_FILE" PUBLISH_MODE "$PUBLISH_MODE"
+if [ "$PUBLISH_MODE" = "tailscale" ]; then
+    BASE_URL=$(prompt "Tailnet hostname per-project terminals get published under (see 'tailscale status' to find it — leave blank to fill in later)" "$(get_env "$ENV_FILE" BASE_URL)")
+    set_env "$ENV_FILE" BASE_URL "$BASE_URL"
+fi
+
 if [ "$WITH_HOST_CONTROL" -eq 1 ]; then
     set_env "$ENV_FILE" HOST_CONTROL_ENABLED 1
 fi
@@ -266,6 +274,9 @@ fi
 echo ""
 echo "== Done =="
 echo "Web UI: http://127.0.0.1:$(get_env "$ENV_FILE" LISTEN_PORT):  put a reverse proxy / tailscale serve / SSH tunnel in front (see README.md)."
+if [ "$PUBLISH_MODE" = "tailscale" ]; then
+    echo "Publish mode: tailscale (per-project terminals will auto-publish via 'tailscale serve --set-path'). The main UI itself is NOT auto-published — still run 'tailscale serve --bg https+insecure://127.0.0.1:$(get_env "$ENV_FILE" LISTEN_PORT)' yourself (see README.md \"Reaching the UI\")."
+fi
 echo "TOTP secret (add to an authenticator app): $TOTP_SECRET"
 [ -n "$SIMPLE_PASSWORD_SHOWN" ] && echo "Generated web UI password: $SIMPLE_PASSWORD_SHOWN"
 echo ""
