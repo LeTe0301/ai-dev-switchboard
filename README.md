@@ -96,7 +96,7 @@ pipx install aider-chat                    # aider
   surfaced directly. Anything else gets a small ttyd web terminal sharing
   the exact tmux pane, no config needed.
 - **VS Code in the browser**, independent on/off per project
-  (`code-server`, `--with-code-server`).
+  (`code-server`, `--with-code-server`; opens in a dark theme by default).
 - **An "Upload folder / .zip" wizard** — pick a local folder (zipped
   client-side with a progress bar) or an already-made `.zip`, review the
   server-detected structure (single repo, a folder of independent repos, or

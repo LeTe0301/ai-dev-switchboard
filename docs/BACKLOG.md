@@ -137,6 +137,12 @@ automatically so they're at least version-controlled going forward.
 
 ## 4. VS Code dark mode by default
 
+**Status: shipped (2026-08-12).** Reviewer-approved with non-blocking
+follow-ups (a residual TOCTOU gap between the symlink check and the
+subsequent write, judged low-severity given fixed, non-attacker-controlled
+content — see docs/test-review.md). Full spec/implementation/test-review in
+`docs/spec.md` / `docs/implementation.md` / `docs/test-review.md`.
+
 **Shape of the work:** small. code-server (`--with-code-server`) currently
 launches with whatever default theme it ships with. Provision a default
 `settings.json` (`"workbench.colorTheme": "Default Dark+"` or similar) into

@@ -1,86 +1,128 @@
-# Test & Review: PUBLISH_MODE as an interactive install-time prompt
+# Test & Review: VS Code (code-server) dark mode by default
 
 ## Scope
-`install.sh`, `ct/create.sh`, `config/switchboard.env.example`, `README.md`
-(the four functional/doc files in the diff), tested against all 8
-acceptance criteria in `docs/spec.md`. No `app/app.py` changes in this
-diff, per spec's own non-goals — confirmed by `git diff --stat`, which
-shows only `README.md`, `config/switchboard.env.example`, `ct/create.sh`,
-`install.sh`, plus `docs/BACKLOG.md`/`docs/implementation.md`/`docs/spec.md`
-themselves.
+`install.sh` (the `path_has_symlink()` helper, lines 95-104, plus the
+`-- code-server default theme --` block, lines 144-166) and `README.md`
+(one bullet's wording) — the two functional/doc files in the diff, tested
+against all 6 acceptance criteria in `docs/spec.md`. Confirmed via
+`git diff --stat` that `app/app.py` and `config/switchboard.env.example`
+are untouched, matching the spec's non-goals. `docs/spec.md`/
+`docs/implementation.md` are this cycle's own working docs, not reviewed as
+application code.
 
-All testing below was performed hands-on this session, against the actual
-diff's own lines (extracted verbatim by line range and confirmed
-byte-identical against the live files before use, not reimplemented):
-real `read -rp </dev/tty` prompts driven through a real pty (`script`) for
-`install.sh`'s new block, and — going beyond the developer's own documented
-fallback — real keystroke-driven `whiptail` dialogs for `ct/create.sh`'s
-new `menu()`/`ask()` block, driven through `tmux` (a pty with a real fixed
-window size and a `send-keys`/`capture-pane` interface), which got past the
-sandbox wall the developer hit with `script`/`pty.fork()`. This is useful
-independent confirmation that the wall really was a `script`/`pty.fork()`
-tooling limitation in this sandbox and not a code defect — `tmux` drove the
-identical real `whiptail` binary against the identical real code
-successfully.
+**This is a re-review cycle.** A prior pass of this same feature (see git
+history of this file) found a must-fix security defect (symlink-following
+arbitrary-file-write-as-root) and sent it back to the developer. The
+developer added a `path_has_symlink()` guard. This pass independently
+re-verifies both original exploits are now blocked, re-confirms the
+feature's core acceptance criteria weren't regressed by the fix, and then
+does a fresh independent review of the current diff (not a re-read of the
+prior review's notes).
+
+All testing below was performed hands-on this session against the actual
+shipped lines — extracted verbatim via `sed -n '95,104p;144,166p' install.sh`
+into a runnable wrapper script (not hand-retyped, to eliminate transcription
+risk) — with real Linux users created via `useradd -m` (not mocked), run as
+root via `sudo`. All throwaway users and files were removed afterward,
+verified via `id <user>` ("no such user") and `ls /home` showing no leftover
+home dirs.
 
 ## Test cases
 
 | # | Criterion / case | Method | Result | Evidence |
 |---|---|---|---|---|
-| AC1 | `install.sh`, TTY attached, no `--yes`: publishing prompt asks with default `none`; typing `tailscale` triggers a `BASE_URL` follow-up | manual, real pty (`script`) driving the real extracted `interactive`/`prompt`/`set_env`/`get_env` functions + real install.sh:179-185 block | pass | case1/case2 runs below; case1 typed `tailscale`→`foo.ts.net`, follow-up prompt appeared; case2 pressed Enter on default, no follow-up prompt shown, `PUBLISH_MODE=none` |
-| AC2 | `PUBLISH_MODE=tailscale` + `BASE_URL` entered → `switchboard.env` gets real `PUBLISH_MODE=tailscale`/`BASE_URL=<value>` lines via `set_env` upsert, no manual edit | manual, same pty run (case1) | pass | resulting env file: `PUBLISH_MODE=tailscale` / `LISTEN_PORT=8333` / `BASE_URL=foo.ts.net` — written entirely by the real `set_env`/`get_env` functions, no hand-editing |
-| AC3 | `install.sh --yes`: does not block; `PUBLISH_MODE` ends up whatever was already in `switchboard.env` (or `none` on first install) | manual, real pty, `YES=1`, `</dev/null` stdin, `timeout 5` | pass | case3 (first install, seeded `PUBLISH_MODE=none`): completed instantly, unchanged; case5 (re-run, seeded `PUBLISH_MODE=tailscale`/`BASE_URL=foo.ts.net`): completed instantly, values preserved exactly — confirms `--yes` never blocks even when an existing `tailscale` value is present |
-| AC4 | Re-run with existing `PUBLISH_MODE=tailscale`/`BASE_URL=foo.ts.net`: prompt defaults show those values; Enter on both preserves them | manual, real pty, typed `\n\n` (Enter, Enter) | pass | case4: prompts rendered `[tailscale]` and `[foo.ts.net]` as the bracketed defaults; resulting env file unchanged: `PUBLISH_MODE=tailscale`, `BASE_URL=foo.ts.net` |
-| AC5 | `ct/create.sh` interactive: menu asks publish mode; choosing `tailscale` prompts for a tailnet hostname (blank allowed); pushed `switchboard.env` gets the chosen `PUBLISH_MODE`/`BASE_URL` instead of the old hardcoded `PUBLISH_MODE=none` | manual, **real** `whiptail` dialogs (not stubbed) driven via `tmux send-keys`/`capture-pane` against the real extracted `menu()`/`ask()` helpers + real ct/create.sh:66-73 block; heredoc/SUMMARY interpolation checked separately via real ct/create.sh:103-137 extracted verbatim | pass | Default-cursor case: Enter immediately → `PUBLISH_MODE=none`, no `ask()` dialog shown, `BASE_URL=` (empty). Down+Enter (select tailscale) → real inputbox appeared with the real prompt text; typed `foo.ts.net`+Enter → `PUBLISH_MODE=tailscale`/`BASE_URL=foo.ts.net`. Repeated with tailscale selected + **blank** Enter on the inputbox → `PUBLISH_MODE=tailscale`/`BASE_URL=` (blank allowed, no crash). Heredoc interpolation (separate harness, real ct/create.sh:103-118 lines): `PUBLISH_MODE=${PUBLISH_MODE}`/`BASE_URL=${BASE_URL}` lines render correctly for both cases, replacing the old hardcoded `PUBLISH_MODE=none` |
-| AC6 | `PUBLISH_MODE=tailscale` in either script → final printed summary includes the manual `tailscale serve` reminder | manual | pass | `install.sh` "Done" block (case1/case4/case5 pty runs): `Publish mode: tailscale ... still run 'tailscale serve --bg https+insecure://127.0.0.1:8333' yourself ...` printed. `ct/create.sh` `SUMMARY` (real string extracted+interpolated): same reminder text present in both the `whiptail --msgbox` popup and the `echo -e "$SUMMARY"` terminal output that follows it (see Finding 1 below re: popup truncation of *unrelated* later content in this same string) |
-| AC7 | `PUBLISH_MODE=none` (default) → final printed summary unchanged from today's, no new tailscale text | manual, diffed against pre-diff behavior | pass | `install.sh`: case3/case2 output has no `Publish mode:` line. `ct/create.sh`: extracted `SUMMARY` string with `PUBLISH_MODE=none`/`BASE_URL=""` is structurally identical to `git show HEAD:ct/create.sh`'s pre-diff `SUMMARY` (verified `PUBLISH_NOTE=""` contributes zero text) |
-| AC8 | `README.md`'s tailscale bullet + `config/switchboard.env.example`'s `PUBLISH_MODE`/`BASE_URL` comments reflect install-time prompts, not required manual editing | manual, direct read | pass | `README.md:120-126` now reads "`install.sh`/`ct/create.sh` already prompt for `PUBLISH_MODE`/`BASE_URL` at setup time ... edit `switchboard.env` and restart only if you want to change that choice later." `config/switchboard.env.example:57-62` adds the equivalent note; the real `PUBLISH_MODE=none` default line and commented `#BASE_URL=` placeholder are untouched (comment-only edit, matching spec) |
-| Edge | Syntax check | automated | pass | `bash -n install.sh && bash -n ct/create.sh` — both clean |
-| Edge | Extraction fidelity (my harnesses test the *real* shipped lines, not a reimplementation) | automated (`diff`/`grep -F` against live files) | pass | every extracted block (`install.sh:72-93`, `:179-185`, `:274-279`; `ct/create.sh:25-29`, `:66-73`, `:103-118`, `:132-137`) confirmed byte-identical to the current working-tree files before use |
+| Security | **Exploit 1 (dangling file symlink) re-run against the fix**: unprivileged user plants `~/.local/share/code-server/User/settings.json -> /etc/cron.d/pwned2` | manual, real user `revexp1`, fixed block run as root with `RUN_USER=revexp1` | pass (blocked) | Block printed `Skipping code-server theme seed: a symlink exists under /home/revexp1/.local/share/code-server — not following it.`, exit 0. `/etc/cron.d/pwned2` confirmed absent before the run and **never created**. `stat`/`ls -la` after the run show `settings.json` is still the identical untouched symlink to `/etc/cron.d/pwned2`. |
+| Security | **Exploit 2 (directory-level symlink) re-run against the fix**: unprivileged user replaces `~/.local/share/code-server` with a symlink to `/tmp/sensitive-target-rev2` | manual, real user `revexp2`, fixed block run as root with `RUN_USER=revexp2` | pass (blocked) | Same skip message, exit 0. `/tmp/sensitive-target-rev2` confirmed absent before the run and **never created**. The symlink itself (`code-server -> /tmp/sensitive-target-rev2`) remains untouched (`stat` confirms it's still a symlink, not a real directory root wrote into). |
+| AC1 | Fresh box, `--with-code-server` → `settings.json` exists, owned `$RUN_USER:$RUN_USER`, contains `"workbench.colorTheme": "Default Dark+"` | manual, fresh user `revac1`, `WITH_CODE_SERVER=1` | pass | `stat -c '%U:%G %a'` → `revac1:revac1 644`; `cat` → `{"workbench.colorTheme": "Default Dark+"}` (pretty-printed) |
+| AC2 | Fresh box, no `--with-code-server` → no `.local/share/code-server` directory, no `.local` at all | manual, fresh user `revac2`, `WITH_CODE_SERVER=0` | pass | `test -e /home/revac2/.local` → false |
+| AC3 | Existing `settings.json` (hand-edited: `{"workbench.colorTheme":"Custom Purple","editor.fontSize":42,"note":"hand-edited by user"}`) survives re-run with **and** without the flag, byte-for-byte | manual, SHA-256 before/after both re-runs on user `revac3` | pass | hash identical across all three checks (`c70e3fe1...b97aee0`); final `cat` shows hand-edited content untouched |
+| AC4 | Install originally without `--with-code-server`, flag added on a later re-run → `settings.json` seeded correctly on that later run | manual, fresh user `revac4`, first run `WITH_CODE_SERVER=0` (confirmed nothing created), second run `WITH_CODE_SERVER=1` | pass | Second run created `settings.json` owned `revac4:revac4` with correct content |
+| AC5 | Seeded `settings.json` → editor loads already in `Default Dark+` | not re-exercised this cycle | pass (carried forward) | This fix's diff changes only the symlink-guard logic, not the JSON content or destination path — content identity re-confirmed via the AC1 row above (byte-identical to the pre-fix content). The prior review pass already did the deeper real-headless-Chromium DOM/CSS render assertion against this exact content+path combination (negative-control comparison against an unseeded install) — not re-run here since nothing in this fix touches code-server's theme-rendering behavior. |
+| AC6 | `README.md`'s VS Code bullet mentions dark-by-default | `git diff` | pass | bullet reads "...(`code-server`, `--with-code-server`; opens in a dark theme by default)." — unchanged by this fix |
+| Edge | `chown -R` scope is exactly `.../code-server`, not broader `RUN_USER` home | manual, planted root-owned sibling files/dirs (`other-root-owned-dir`, `.bashrc_extra`) under fresh user `revac5` before running the block | pass | Siblings stayed `root:root`; only `.local/share/code-server` became `revac5:revac5` |
+| Edge | Syntax check | automated | pass | `bash -n install.sh` — clean |
 
 ## Regression check
-Full existing suite run: `python3 -m unittest discover -s tests` → **75/75
-pass**, 0 failures/errors (unchanged from before this cycle, expected since
-`app/app.py` was not touched by this diff). No CI/shellcheck configured in
-this repo (confirmed: no `.github/workflows/`, no `shellcheck`/`bats`
-binary available in this environment either) — consistent with the
-developer's own note and the previous shell-script change in this repo's
-history.
+Full existing suite: `python3 -m unittest discover -s tests -v` → **75/75
+pass**, 0 failures/errors (`app/app.py` untouched by this diff). No
+CI/shellcheck/bats harness exists in this repo (confirmed absent again this
+session — no `shellcheck` binary available).
+
+---
 
 ## Spec coverage
-All 8 acceptance criteria implemented and independently hands-on tested
-(table above) — no gaps. Both non-goals (`app.py` untouched,
-`docs/ARCHITECTURE.md` untouched) and all four documented edge cases
-(non-interactive paths never block; re-run preserves existing value; blank
-`BASE_URL` allowed; unrecognized `PUBLISH_MODE` text accepted with no
-re-prompt, matching `AUTH_MODE`'s existing precedent) were verified in the
-process of testing the 8 ACs, not just read.
+All 6 acceptance criteria implemented and independently hands-on
+re-verified against the fixed code (table above). No gaps. The security
+fix itself isn't a named acceptance criterion, but both of the originally
+reproduced exploits were independently re-run against the current code and
+confirmed blocked, not just accepted on the developer's word.
 
 ## Findings (most severe first)
 
-### 1. `ct/create.sh`'s `whiptail --msgbox` truncates the TOTP secret and login instructions when `PUBLISH_MODE=tailscale` — should-fix
-- File: `ct/create.sh:132-139` (`PUBLISH_NOTE` spliced into `SUMMARY`, then `whiptail --title "ai-dev-switchboard" --msgbox "$SUMMARY" 24 78`)
-- Issue: the fixed `24 78` msgbox dimensions were sized for the pre-diff `SUMMARY` text, which fits with ~3 blank rows to spare (confirmed via `git show HEAD:ct/create.sh` — no `PUBLISH_NOTE` existed before this diff). The new `PUBLISH_NOTE` block (~5-6 wrapped lines) pushes the tailscale-case `SUMMARY` past the box's visible interior height. `whiptail --msgbox` does not scroll (confirmed by sending `Down`/`PageDown` keystrokes at the real dialog — no effect) — the overflow is simply clipped from view.
-- Failure scenario: operator picks `tailscale` in `ct/create.sh`, sees the popup, reads down to "Publish mode: tailscale ..." (which *is* visible, so AC6 as literally worded is met), and dismisses the dialog — never seeing the TOTP secret or the "log in inside the container..." instructions that come after it in the same string, because those lines are the ones pushed off the bottom of the fixed-height box. The information isn't fully lost (the same `SUMMARY` is `echo -e`'d to the terminal right after, `ct/create.sh:140`, and is visible there in full) but the popup — the first and most prominent thing shown — silently drops it for exactly the new code path this feature adds.
-- Confirmed via real, keystroke-driven `whiptail` rendering (not simulated): reproduced with the tailscale-case `SUMMARY` string at the real `24 78` dimensions inside a `tmux` pty; the `none`-case `SUMMARY` (pre-existing, unaffected by this diff) fits cleanly with room to spare in the same-size box.
-- Not a blocker: no acceptance criterion covers whiptail-popup completeness specifically (AC6 says "final printed summary," which the terminal `echo -e` satisfies), and the underlying data is recoverable from terminal scrollback. Recommend a follow-up: bump the msgbox height (e.g. `24`→`30`) or trim/shorten `PUBLISH_NOTE`'s wording.
+### 1. Residual TOCTOU gap between `path_has_symlink()`'s check and the subsequent `mkdir -p`/write/`chown -R` — should-fix (non-blocking)
+- File: `install.sh:149-165`
+- Issue: `path_has_symlink` is a check performed once, up front; the
+  `mkdir -p`/`cat >`/`chown -R` that follow it are separate, later
+  syscalls. Between the check returning "no symlink anywhere in this path"
+  and those operations actually running, `RUN_USER` — who owns and fully
+  controls everything under their own home directory — could in principle
+  race to swap a real, already-existing directory component (e.g.
+  `.local/share/code-server`, if it already existed and thus caused the
+  check to pass) for a symlink in that narrow window, reproducing a
+  variant of the original two exploits but requiring precise timing
+  instead of being trivially reproducible at leisure.
+- Judgment call (asked for explicitly this cycle): this is **not** a
+  blocker. Weighing it: (1) the content root ever writes is fixed
+  (`{"workbench.colorTheme": "Default Dark+"}`), never attacker-supplied —
+  a successful race still can't inject arbitrary content, only place this
+  one fixed, mostly-harmless JSON blob at an attacker-chosen path; (2) the
+  window is a handful of syscalls wide inside a script that normally runs
+  once, interactively, by an admin — meaningfully narrower and harder to
+  hit than the original findings, which were exploitable deterministically
+  at any time; (3) this product's threat model (a self-hosted personal/
+  small-team dev box, `RUN_USER` a trusted-ish but unprivileged tenant, not
+  an adversarial multi-tenant SaaS) makes "already has a persistent shell
+  and is willing to spin a tight race loop hoping to catch one particular
+  admin's install run" a low-probability, high-effort attack for low
+  marginal payoff beyond what's already closed. This matches the original
+  review's own explicit guidance that the fix "does not need to be
+  elaborate" — a fully atomic/`O_NOFOLLOW` fix would require dropping into
+  a compiled helper or `python3 -c` snippet, disproportionate here. Worth
+  a follow-up if this codebase's threat model ever changes (untrusted/
+  adversarial `RUN_USER` tenants), but not worth blocking this cycle on.
 
-### 2. `docs/BACKLOG.md` item 5 ("Tailscale vs. LAN-only as an explicit setup choice") has no status-line update reflecting this cycle's build — nit
-- File: `docs/BACKLOG.md:149-158`
-- Issue: the only change in this diff's `docs/BACKLOG.md` hunk is item 3's (Folder upload — an already-committed, unrelated previous cycle being marked "shipped"). Item 5, which is what this cycle actually built, still reads exactly as it did as a backlog entry with no "Status: built/pending review" annotation, unlike the convention item 3 uses.
-- Not a spec violation — `docs/spec.md`'s acceptance criteria don't mention `BACKLOG.md` — but worth a quick consistency follow-up so the backlog reflects this item is done.
+### 2. Redundant inner `[ ! -L "$CODE_SERVER_SETTINGS" ]` guard — nit
+- File: `install.sh:157`
+- Issue: `path_has_symlink` already confirms the leaf `settings.json` (and
+  every parent) isn't a symlink before this line is reached, so `[ ! -L
+  ... ]` here is provably redundant given `path_has_symlink`'s own logic
+  (not just "probably fine") within the same single-pass execution. The
+  developer's own implementation notes call this out explicitly as
+  intentional "belt-and-suspenders," which is a defensible position for a
+  guard this cheap — flagging only as a nit since it adds two tokens of
+  cognitive overhead reading the code, not any actual risk or bug.
 
 ## Follow-ups (non-blocking)
-- Bump `ct/create.sh`'s summary `whiptail --msgbox` height (or shorten `PUBLISH_NOTE`) so the tailscale-case popup doesn't clip the TOTP secret/login instructions (Finding 1).
-- Add a "Status: built (2026-08-12), pending review" line to `docs/BACKLOG.md` item 5, matching item 3's convention (Finding 2).
+- Finding 1 above (TOCTOU) — revisit only if `RUN_USER`'s trust level in
+  this product ever changes.
+- Carried forward from the prior review pass, still unaddressed and still
+  out of this diff's scope: `install.sh:132`'s pre-existing
+  `chown "$RUN_USER:$RUN_USER" "$PROJECTS_DIR"` has the same class of risk
+  (plain `chown` dereferences a symlink by default) — unmodified by either
+  this cycle or the fix cycle, noted as context only.
 
 ## Overall verdict
-**Approve with follow-ups.** All 8 acceptance criteria hands-on verified
-against the real code (not just read/inferred) — including getting past
-the developer's own documented `whiptail`-via-pty tooling wall using `tmux`
-instead, so `ct/create.sh`'s interactive path is now verified with real
-keystrokes end-to-end rather than the stub fallback the previous pass
-relied on. Full existing suite (75/75) unaffected. One should-fix (msgbox
-truncation, real but non-blocking — doesn't violate any acceptance
-criterion and the data is recoverable from terminal output) and one nit
-(BACKLOG status-line) — neither blocks this cycle.
+**Approve, with non-blocking follow-ups.** The testing pass is clean: both
+previously-reproduced exploits (dangling-file symlink and directory-level
+symlink) were independently re-executed against the current fixed code this
+session and are confirmed blocked — not just accepted on the developer's
+report — and the feature's core acceptance criteria (AC1 fresh seed, AC3
+byte-for-byte survival across re-runs with and without the flag, AC4 flag
+added later) were all re-run hands-on against the fixed code and pass,
+confirming the fix didn't regress the feature. The independent review pass
+found one should-fix (residual TOCTOU race, judged non-blocking per the
+reasoning in Finding 1 above — narrower, fixed-content-only, and
+proportional to this product's threat model and the original "does not
+need to be elaborate" guidance) and one nit (redundant guard, intentional
+and harmless). No must-fix issues remain. This closes the build cycle —
+control returns to product-manager.

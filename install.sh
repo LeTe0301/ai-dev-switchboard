@@ -92,6 +92,16 @@ get_env() {  # get_env <file> <KEY> -> value or empty
     grep "^${2}=" "$1" 2>/dev/null | tail -1 | cut -d= -f2- || true
 }
 random_token() { head -c "${1:-16}" /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c "${1:-16}"; }
+path_has_symlink() {  # path_has_symlink <abs path> -> true if any component is a symlink
+    local p="$1" check="" part
+    local IFS=/
+    for part in $p; do
+        [ -n "$part" ] || continue
+        check="$check/$part"
+        [ -L "$check" ] && return 0
+    done
+    return 1
+}
 
 echo "== ai-dev-switchboard install =="
 echo "Repo: $REPO_DIR"
@@ -130,6 +140,30 @@ id "$SVC_USER" &>/dev/null || { useradd -r -m -d "/home/$SVC_USER" -s /usr/sbin/
 PROJECTS_DIR="/home/$RUN_USER/projects"
 mkdir -p "$PROJECTS_DIR"
 chown "$RUN_USER:$RUN_USER" "$PROJECTS_DIR"
+
+if [ "$WITH_CODE_SERVER" -eq 1 ]; then
+    echo "-- code-server default theme --"
+    CODE_SERVER_DIR="/home/$RUN_USER/.local/share/code-server"
+    CODE_SERVER_USER_DIR="$CODE_SERVER_DIR/User"
+    CODE_SERVER_SETTINGS="$CODE_SERVER_USER_DIR/settings.json"
+    if path_has_symlink "$CODE_SERVER_SETTINGS"; then
+        # RUN_USER controls everything under their own home directory, so
+        # refuse to mkdir/write through a symlink planted anywhere in this
+        # path (dangling or not) — never follow it as root, same as we'd
+        # never clobber a real pre-existing settings.json.
+        echo "Skipping code-server theme seed: a symlink exists under $CODE_SERVER_DIR — not following it." >&2
+    else
+        mkdir -p "$CODE_SERVER_USER_DIR"
+        if [ ! -f "$CODE_SERVER_SETTINGS" ] && [ ! -L "$CODE_SERVER_SETTINGS" ]; then
+            cat > "$CODE_SERVER_SETTINGS" <<'JSON'
+{
+  "workbench.colorTheme": "Default Dark+"
+}
+JSON
+        fi
+        chown -R "$RUN_USER:$RUN_USER" "$CODE_SERVER_DIR"
+    fi
+fi
 
 echo "-- App + engines --"
 cp "$REPO_DIR/app/app.py" "$INSTALL_DIR/app.py"
