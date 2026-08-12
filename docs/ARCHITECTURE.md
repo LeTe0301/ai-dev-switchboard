@@ -3,11 +3,26 @@
 ## Processes and privilege boundaries
 
 - **`app/app.py`** runs as `SVC_USER` (default `switchboard-svc`), an
-  unprivileged system account with no login shell of its own. It can do
-  exactly three privileged things, all via a narrow `/etc/sudoers.d` rule:
-  run `tmux` as `RUN_USER`, run `ttyd` as `RUN_USER`, run `code-server` as
-  `RUN_USER`. Nothing else. A bug in this ~900-line stdlib-only app is not
-  an instant path to `RUN_USER`'s account.
+  unprivileged system account with no login shell of its own. Via narrow
+  `/etc/sudoers.d` rules it can run `tmux`/`ttyd`/`code-server` as
+  `RUN_USER`, and run the folder-upload wizard's privileged hand-off script
+  (`ai-dev-switchboard-new-project-from-upload.sh` — see below) — plus,
+  only when `--with-git-hosting` is installed, the git-hosting "+ New
+  project" script. Nothing else. A bug in this stdlib-only app is not an
+  instant path to `RUN_USER`'s account.
+- **The folder-upload wizard's privileged hand-off**
+  (`scripts/new-project-from-upload.sh`, see `docs/spec.md` "Crossing the
+  privilege boundary") follows the same shape `new-project.sh` already
+  established: runs as root via a whitelisted sudoers entry, does the
+  minimum mechanical work (atomic `mkdir`, `cp -a`, `chown`, an optional
+  `git init`), nothing else. Unlike the git-hosting script, its sudoers
+  entry lives in the **base, always-installed** block of `install.sh`, not
+  behind `--with-git-hosting` — this feature is explicitly the
+  project-registration path for people *without* git hosting. Everything
+  before that hand-off (receiving the upload, staging, detecting structure,
+  naming, collision-checking) runs entirely unprivileged as `SVC_USER`,
+  inside `UPLOAD_STAGING_DIR` — only the final registration step needs the
+  privileged script.
 - **`RUN_USER`** (default `dev`) is where the actual work happens: project
   files, engine credentials (e.g. `claude`'s own login), and the tmux
   sessions the engines run in all live here. This account needs whatever
@@ -55,6 +70,24 @@ they're either cheap to regenerate or genuinely tied to a live process:
   whether the cached URL predates the session it's attached to, and drops
   it if so, rather than risk serving a link to an engine incarnation that
   no longer exists.
+
+- **Upload staging** (`UPLOAD_STAGING_DIR/<token>/`, folder-upload wizard)
+  is a deliberate exception to "a request either finishes clean or its
+  state is gone": a staged-but-not-yet-confirmed upload genuinely outlives
+  a single request, spanning phase 1 (`POST /projects/upload` — detect) and
+  phase 2 (`POST /projects/upload/confirm` — register), however long the
+  user takes on the review step in between. There's no
+  always-cleanup-in-`finally` here on purpose — instead, confirm removes
+  its own staging directory only once it **succeeds**; a failed confirm
+  (e.g. a name collision) leaves staging in place so the UI's "Back to
+  review" button can retry the same token, evaluated fresh, instead of
+  hitting a spurious "upload expired." `_reap_dead_state()` (already called
+  on every `/status` poll) is the backstop either way — it sweeps any
+  staging directory older than `UPLOAD_STAGING_TTL_SECONDS` that was never
+  confirmed successfully, whether it was never attempted or was attempted
+  and failed. A future reader finding a `UPLOAD_STAGING_DIR/<token>/`
+  directory that outlived its originating request should read this as the
+  intended retry-then-TTL-cleanup story, not a leak.
 
 ## Why engines are config, not code
 

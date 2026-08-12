@@ -180,6 +180,15 @@ if [ "$WITH_HOST_CONTROL" -eq 1 ]; then
     set_env "$ENV_FILE" HOST_CONTROL_ENABLED 1
 fi
 
+echo "-- Folder-upload wizard (works standalone, no --with-git-hosting needed) --"
+install -m 755 "$REPO_DIR/scripts/new-project-from-upload.sh" \
+    /usr/local/bin/ai-dev-switchboard-new-project-from-upload.sh
+mkdir -p "$STATE_DIR/uploads"
+chown "$SVC_USER:$SVC_USER" "$STATE_DIR/uploads"
+set_env "$ENV_FILE" NEW_PROJECT_FROM_UPLOAD_SCRIPT \
+    "/usr/local/bin/ai-dev-switchboard-new-project-from-upload.sh"
+set_env "$ENV_FILE" UPLOAD_STAGING_TTL_SECONDS "1800"
+
 chown "$SVC_USER:$SVC_USER" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
@@ -189,6 +198,10 @@ SUDOERS=/etc/sudoers.d/ai-dev-switchboard
     echo "$SVC_USER ALL=($RUN_USER) NOPASSWD: /usr/bin/tmux *"
     echo "$SVC_USER ALL=($RUN_USER) NOPASSWD: /usr/local/bin/ttyd *"
     echo "$SVC_USER ALL=($RUN_USER) NOPASSWD: /usr/local/bin/code-server *"
+    # Unconditional (not gated behind --with-git-hosting) — the folder-upload
+    # wizard is explicitly the project-registration path for people WITHOUT
+    # git hosting installed.
+    echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-new-project-from-upload.sh *"
     if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
         echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-new-project.sh *"
     fi

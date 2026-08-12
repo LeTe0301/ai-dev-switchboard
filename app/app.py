@@ -35,12 +35,15 @@ directly.
 import base64
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
 import secrets
 import shlex
+import shutil
 import ssl
+import stat
 import struct
 import subprocess
 import threading
@@ -48,6 +51,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote
 
@@ -66,6 +70,33 @@ PROJECTS_DIR = os.environ.get("PROJECTS_DIR", f"/home/{RUN_USER}/projects")
 ENGINES_DIR = os.environ.get("ENGINES_DIR", "/etc/ai-dev-switchboard/engines.d")
 NEW_PROJECT_SCRIPT = os.environ.get(
     "NEW_PROJECT_SCRIPT", "/usr/local/bin/ai-dev-switchboard-new-project.sh")
+
+# Folder-upload wizard (see docs/spec.md "Folder upload → auto-detect
+# repo(s)") — phase 1 (POST /projects/upload) stages an uploaded zip and
+# detects structure only, entirely unprivileged, under UPLOAD_STAGING_DIR
+# (owned by this process's own unprivileged user, no sudo involved). Phase 2
+# (POST /projects/upload/confirm) re-walks that staged tree, derives/
+# collision-checks names, and only then crosses the privilege boundary via
+# NEW_PROJECT_FROM_UPLOAD_SCRIPT to actually register under PROJECTS_DIR.
+UPLOAD_STAGING_DIR = os.environ.get(
+    "UPLOAD_STAGING_DIR", "/var/lib/ai-dev-switchboard/uploads")
+UPLOAD_MAX_BYTES = int(os.environ.get("UPLOAD_MAX_BYTES", "104857600"))  # 100 MiB
+# Cheap guard against a many-tiny-files DoS shape (see docs/spec.md "Size
+# limits") — not exposed as its own switchboard.env knob, same reasoning as
+# the known-heavy-directory exclusion list being a hardcoded JS constant.
+UPLOAD_MAX_ENTRIES = 20000
+# How long an unconfirmed staged upload is kept before _reap_dead_state()
+# sweeps it as abandoned (docs/spec.md "Two-phase protocol") — a confirmed
+# upload's staging directory is removed immediately regardless of this.
+UPLOAD_STAGING_TTL_SECONDS = int(os.environ.get("UPLOAD_STAGING_TTL_SECONDS", "1800"))
+# The privileged hand-off script (docs/spec.md "Crossing the privilege
+# boundary") that actually moves a validated, already-named staged directory
+# into PROJECTS_DIR/<name> as RUN_USER. Installed unconditionally by
+# install.sh, unlike NEW_PROJECT_SCRIPT above — this feature is explicitly
+# the path for people WITHOUT git hosting installed.
+NEW_PROJECT_FROM_UPLOAD_SCRIPT = os.environ.get(
+    "NEW_PROJECT_FROM_UPLOAD_SCRIPT",
+    "/usr/local/bin/ai-dev-switchboard-new-project-from-upload.sh")
 
 PUBLISH_MODE = os.environ.get("PUBLISH_MODE", "none")  # "tailscale" | "none"
 BASE_URL = os.environ.get("BASE_URL", "")
@@ -491,6 +522,274 @@ def create_project(name: str) -> tuple[bool, str]:
     return True, ""
 
 
+# ─── folder upload → auto-detect repo(s), phase 1 (detect only) ───────────
+# See docs/spec.md "Zip-slip protection" / "Detection and the two-phase
+# protocol". Everything in this phase-1 section only ever reads/writes
+# under UPLOAD_STAGING_DIR, never PROJECTS_DIR — see the phase-2 section
+# further down (create_projects_from_selection / confirm_upload) for the
+# naming/collision-checking/privileged-registration half.
+class UploadRejected(Exception):
+    """A whole upload is rejected (zip-slip-shaped entry, corrupt/oversized
+    zip, etc.) — always aborts the entire upload, never a partial one."""
+
+
+def _zip_entry_target(staging_root_real: str, info: zipfile.ZipInfo) -> str:
+    """
+    Validates one zip entry against zip-slip-shaped attacks and returns the
+    on-disk path it would extract to. Raises UploadRejected on any
+    violation — see docs/spec.md "Zip-slip protection" for the exact
+    mechanics this mirrors. Doesn't touch disk itself; extraction only
+    happens after every entry in the archive has passed this check (see
+    _extract_zip_safely below), so a single bad entry anywhere aborts the
+    whole upload before anything is written.
+    """
+    name = info.filename
+    if "\x00" in name:
+        raise UploadRejected(f"zip entry contains a NUL byte: {name!r}")
+    normalized = name.replace("\\", "/")
+    if normalized.startswith("/"):
+        raise UploadRejected(f"zip entry has an absolute path: {name!r}")
+    if ".." in normalized.split("/"):
+        raise UploadRejected(f"zip entry contains a '..' path component: {name!r}")
+    target = os.path.realpath(os.path.join(staging_root_real, normalized))
+    if target != staging_root_real and \
+            os.path.commonpath([target, staging_root_real]) != staging_root_real:
+        raise UploadRejected(f"zip entry resolves outside the staging directory: {name!r}")
+    mode = (info.external_attr >> 16) & 0xFFFF
+    if stat.S_ISLNK(mode):
+        raise UploadRejected(f"zip entry is a symlink, not allowed: {name!r}")
+    return target
+
+
+def _extract_zip_safely(zf: zipfile.ZipFile, staging_subdir: str) -> None:
+    """
+    Validates every entry first (see _zip_entry_target), then extracts only
+    if the whole archive passes — "any rejection aborts the entire upload,
+    nothing partial is left staged" (docs/spec.md). staging_subdir must not
+    already exist; created here once validation has passed.
+    """
+    staging_root_real = os.path.realpath(staging_subdir)
+    targets = {info.filename: _zip_entry_target(staging_root_real, info)
+              for info in zf.infolist()}
+    os.makedirs(staging_subdir)
+    for info in zf.infolist():
+        target = targets[info.filename]
+        if info.filename.endswith("/"):
+            os.makedirs(target, exist_ok=True)
+            continue
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with zf.open(info) as src, open(target, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+
+
+def _unwrap_single_wrapper_folder(staged_root: str) -> str:
+    """
+    If the staged root contains exactly one non-hidden top-level entry and
+    it's a directory, treat that subdirectory as the effective root for
+    detection — the exact shape GitHub/GitLab/Bitbucket's own "Download
+    ZIP" always produces (e.g. myrepo-main/), and also what a client-built
+    zip from a picked *folder* naturally has (webkitdirectory paths are all
+    prefixed with the picked folder's own name). Applied once, not
+    recursively; hidden top-level entries (e.g. a stray .DS_Store) don't
+    prevent the unwrap.
+    """
+    non_hidden = [e for e in os.listdir(staged_root) if not e.startswith(".")]
+    if len(non_hidden) == 1:
+        candidate = os.path.join(staged_root, non_hidden[0])
+        if os.path.isdir(candidate) and not os.path.islink(candidate):
+            return candidate
+    return staged_root
+
+
+def detect_structure(effective_root: str) -> dict:
+    """
+    Phase 1's read-only detection walk (docs/spec.md "Detection and the
+    two-phase protocol", step 1). Registers nothing — just describes what
+    was found so the (future) review step can offer a real choice. Root
+    name here is purely informational for that review step; phase 2 is
+    what actually derives/sanitizes a project name from it.
+    """
+    root_name = os.path.basename(effective_root.rstrip(os.sep)) or effective_root
+    root_git_dir = os.path.join(effective_root, ".git")
+    root_has_git = os.path.isdir(root_git_dir) and not os.path.islink(root_git_dir)
+
+    nested_git_paths = []
+    for dirpath, dirnames, _filenames in os.walk(effective_root):
+        git_dir = os.path.join(dirpath, ".git")
+        if ".git" in dirnames and os.path.isdir(git_dir) and not os.path.islink(git_dir):
+            if dirpath != effective_root:
+                rel = os.path.relpath(dirpath, effective_root).replace(os.sep, "/")
+                nested_git_paths.append(rel)
+            dirnames.remove(".git")  # never descend into a .git dir itself
+
+    top_level_subdirs = []
+    loose_top_level_files = 0
+    if not root_has_git:
+        for entry in sorted(os.listdir(effective_root)):
+            full = os.path.join(effective_root, entry)
+            if os.path.isdir(full):
+                if not entry.startswith("."):
+                    top_level_subdirs.append(entry)
+            else:
+                loose_top_level_files += 1
+
+    ambiguous = ((root_has_git and len(nested_git_paths) >= 1) or
+                (not root_has_git and len(top_level_subdirs) >= 2))
+
+    return {
+        "root_name": root_name,
+        "root_has_git": root_has_git,
+        "nested_git_paths": sorted(nested_git_paths),
+        "top_level_subdirs": top_level_subdirs,
+        "loose_top_level_files": loose_top_level_files,
+        "ambiguous": ambiguous,
+    }
+
+
+# ─── folder upload → auto-detect repo(s), phase 2 (confirm + register) ────
+# See docs/spec.md "Detection and the two-phase protocol" (phase 2) and
+# "Partial-failure semantics for a multi-project confirm call". Naming/
+# collision-checking here still runs entirely unprivileged; only the final
+# per-project registration step crosses into RUN_USER's territory, via
+# NEW_PROJECT_FROM_UPLOAD_SCRIPT (see "Crossing the privilege boundary").
+def _derive_project_name(raw: str) -> str:
+    """
+    Sanitizes a raw folder name (from the uploaded zip's own contents —
+    fully attacker-controlled) into a NAME_RE-valid project name
+    (docs/spec.md step 5): strip disallowed characters, strip any leading
+    non-alnum run (NAME_RE requires starting with a letter/number), cap at
+    60 chars. Falls back to "upload-<8 hex chars>" if nothing usable
+    survives.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9 _-]+", "", raw or "")
+    cleaned = re.sub(r"^[^A-Za-z0-9]+", "", cleaned)[:60]
+    if NAME_RE.match(cleaned):
+        return cleaned
+    return f"upload-{secrets.token_hex(4)}"
+
+
+def _register_via_privileged_script(source: str, name: str) -> subprocess.CompletedProcess:
+    """
+    The one line that actually crosses the privilege boundary — split out
+    from create_projects_from_selection() so tests can substitute a fake
+    without needing a real sudoers rule / installed script / RUN_USER on the
+    test box.
+    """
+    return subprocess.run(["sudo", NEW_PROJECT_FROM_UPLOAD_SCRIPT, source, name],
+                          capture_output=True, text=True, timeout=60)
+
+
+def create_projects_from_selection(staging_root: str, mode: str, selected: list):
+    """
+    Phase 2's core logic (docs/spec.md "Detection and the two-phase
+    protocol" phase 2). Re-walks the staging tree fresh via
+    detect_structure() rather than trusting the client's `selected` list
+    blindly — any path that doesn't match a currently-valid candidate from
+    that fresh walk is rejected, nothing registered. Every resulting
+    project's name is derived/sanitized and collision-checked (against
+    existing PROJECTS_DIR entries and against each other) up front, before
+    any privileged script runs — a collision rejects the whole call.
+
+    Returns (ok: bool, error: str, registered: list[str], skipped: int).
+    On a genuine TOCTOU race defeating one specific project's registration
+    after sibling projects in the same call already succeeded, that one
+    fails (named in the error, `registered` still lists the siblings that
+    already succeeded) — those siblings are NOT rolled back, see
+    docs/spec.md "Partial-failure semantics" for why that's intentional.
+    """
+    effective_root = _unwrap_single_wrapper_folder(staging_root)
+    detection = detect_structure(effective_root)
+
+    if mode not in ("single", "split"):
+        return False, "mode must be 'single' or 'split'", [], 0
+    if not isinstance(selected, list) or not all(isinstance(s, str) for s in selected):
+        return False, "selected must be a list of strings", [], 0
+
+    to_register = []  # [(source_dir, raw_name_for_sanitizing), ...]
+    skipped = 0
+
+    if mode == "single":
+        # `selected` is ignored in single mode (docs/spec.md "Wire format
+        # and endpoints": "ignored/must be empty when mode == 'single'").
+        to_register.append((effective_root, detection["root_name"]))
+    else:
+        candidates = (detection["nested_git_paths"] if detection["root_has_git"]
+                     else detection["top_level_subdirs"])
+        valid = set(candidates)
+        invalid = sorted(set(selected) - valid)
+        if invalid:
+            return False, ("selection contains a path that is no longer a valid "
+                           f"candidate (stale or tampered): {', '.join(invalid)}"), [], 0
+        chosen = list(dict.fromkeys(p for p in selected if p in valid))  # de-dupe, keep order
+        skipped = len(valid) - len(chosen)
+
+        if detection["root_has_git"]:
+            # Root is ALSO always registered in this shape (docs/spec.md
+            # "Root-has-.git + split") — selecting zero nested paths is
+            # equivalent to "single", not an error.
+            to_register.append((effective_root, detection["root_name"]))
+            for p in chosen:
+                to_register.append((os.path.join(effective_root, p), os.path.basename(p)))
+        else:
+            if not chosen:
+                return False, "select at least one project", [], 0
+            for p in chosen:
+                to_register.append((os.path.join(effective_root, p), p))
+
+    names = [_derive_project_name(raw) for _source, raw in to_register]
+
+    existing = set(instance_names())
+    seen = set()
+    collisions = set()
+    for n in names:
+        if n in existing or n in seen:
+            collisions.add(n)
+        seen.add(n)
+    if collisions:
+        return False, f"name collision: {', '.join(sorted(collisions))}", [], 0
+
+    registered = []
+    for (source, _raw), name in zip(to_register, names):
+        r = _register_via_privileged_script(source, name)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "registration failed").strip()[:300]
+            return False, f"'{name}' failed to register: {err}", registered, 0
+        registered.append(name)
+
+    return True, "", registered, skipped
+
+
+_UPLOAD_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def confirm_upload(token: str, mode: str, selected: list):
+    """
+    Route logic for POST /projects/upload/confirm. Validates the token
+    shape (it's used directly in a filesystem path, so only the exact
+    secrets.token_hex(16) shape is accepted — anything else is rejected
+    before ever touching the filesystem), delegates to
+    create_projects_from_selection(), and performs confirm-triggered
+    cleanup: UPLOAD_STAGING_DIR/<token>/ is removed (best-effort) only once
+    this call *succeeds* — a failed confirm (e.g. a name collision) leaves
+    staging in place so the UI's "Back to review" button can retry the same
+    token with a tweaked selection, evaluated fresh against the still-staged
+    tree (docs/spec.md "Two-phase protocol"). Abandoned staging from a
+    failed confirm that's never retried is still cleaned up eventually by
+    the existing UPLOAD_STAGING_TTL_SECONDS sweep in _reap_dead_state().
+    Returns (http_status, response_dict).
+    """
+    if not token or not _UPLOAD_TOKEN_RE.match(token):
+        return 404, {"error": "upload expired or not found — start over"}
+    staging_root = os.path.join(UPLOAD_STAGING_DIR, token)
+    if not os.path.isdir(staging_root):
+        return 404, {"error": "upload expired or not found — start over"}
+    ok, err, registered, skipped = create_projects_from_selection(staging_root, mode, selected)
+    if not ok:
+        return 400, {"error": err, "registered": registered}
+    shutil.rmtree(staging_root, ignore_errors=True)
+    return 200, {"ok": True, "registered": registered, "skipped": skipped}
+
+
 def tmux_has(session: str) -> bool:
     r = subprocess.run(TMUX + ["has-session", "-t", session], capture_output=True)
     return r.returncode == 0
@@ -581,6 +880,11 @@ def _reap_dead_state():
     every /status so the UI self-heals even when a session ends on its own
     (crash, quit, `tmux kill-session` from inside) rather than only when the
     user explicitly flips the switch off.
+
+    Also sweeps abandoned upload-wizard staging directories (docs/spec.md
+    "Two-phase protocol" — TTL/idle cleanup for abandoned uploads), reusing
+    this same "opportunistic cleanup on a request that already happens
+    often" precedent rather than a dedicated background thread/timer.
     """
     engines = load_engines()
     for name in list(_session_urls):
@@ -598,6 +902,15 @@ def _reap_dead_state():
         proc = _code_procs.get(name)
         if proc is not None and proc.poll() is not None:
             _code_stop(name)
+    if os.path.isdir(UPLOAD_STAGING_DIR):
+        cutoff = time.time() - UPLOAD_STAGING_TTL_SECONDS
+        for entry in os.listdir(UPLOAD_STAGING_DIR):
+            full = os.path.join(UPLOAD_STAGING_DIR, entry)
+            try:
+                if os.path.isdir(full) and os.path.getmtime(full) < cutoff:
+                    shutil.rmtree(full, ignore_errors=True)
+            except OSError:
+                continue
 
 
 def host_run(action: str) -> str:
@@ -670,6 +983,42 @@ PAGE_TEMPLATE = """<!doctype html>
   .card .err { color: #ff6b6b; font-size: 14px; margin-bottom: 12px; min-height: 18px; }
   .card .back { display: block; text-align: center; margin-top: 12px; font-size: 13px;
                 color: #888; cursor: pointer; }
+
+  .upload-wizard-btn { display: block; width: 100%; box-sizing: border-box; font-size: 14px;
+                        padding: 13px 16px; border-radius: 10px; border: 1px solid #333;
+                        background: #1c1c1c; color: #4da6ff; font-weight: 600; cursor: pointer;
+                        margin: 0 0 16px; text-align: center; }
+  .wizard-card { max-width: 420px; max-height: 85vh; overflow-y: auto; }
+  .wizard-step-indicator { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 16px; }
+  .wizard-step { font-size: 11px; padding: 4px 9px; border-radius: 12px; background: #2a2a2a; color: #666; }
+  .wizard-step.active { background: #16324a; color: #4da6ff; font-weight: 600; }
+  .wizard-step.done { color: #34c759; }
+  .wizard-step.disabled { opacity: 0.4; }
+  .wizard-body p { font-size: 13px; color: #aaa; margin: 0 0 10px; }
+  .wizard-body p.err { color: #ff6b6b; }
+  .wizard-pick-row button { width: 100%; padding: 13px; border-radius: 10px; border: 1px solid #333;
+                             background: #2a2a2a; color: #eee; font-size: 14px; font-weight: 600;
+                             cursor: pointer; margin-bottom: 8px; min-height: 44px; }
+  .wizard-or { text-align: center; color: #666; font-size: 12px; margin: 10px 0; }
+  .wizard-check-row { display: flex; align-items: center; min-height: 44px; gap: 10px;
+                       padding: 4px 0; cursor: pointer; }
+  .wizard-check-row input { accent-color: #34c759; width: 18px; height: 18px; flex-shrink: 0; }
+  .wizard-check-row .info { font-size: 13px; }
+  .wizard-check-row .info .sub { font-size: 12px; color: #888; }
+  .wizard-progress-bg { background: #2a2a2a; height: 6px; border-radius: 3px; margin: 10px 0 6px; overflow: hidden; }
+  .wizard-progress-fill { height: 6px; border-radius: 3px; transition: none; }
+  .wizard-progress-fill.zip { background: #34c759; }
+  .wizard-progress-fill.upload { background: #4da6ff; }
+  .wizard-progress-label { font-size: 12px; color: #888; }
+  .wizard-warn { background: rgba(255, 193, 7, 0.1); border-left: 4px solid #ffc107; padding: 10px 12px;
+                 border-radius: 6px; font-size: 13px; color: #eee; margin: 10px 0; }
+  .wizard-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
+  .wizard-actions button { padding: 13px 18px; border-radius: 10px; border: none; font-size: 14px;
+                            font-weight: 600; cursor: pointer; min-height: 44px; }
+  .wizard-actions .primary { background: #34c759; color: #111; }
+  .wizard-actions .secondary { background: #2a2a2a; color: #aaa; }
+  .wizard-json { background: #111; border: 1px solid #333; border-radius: 8px; padding: 10px;
+                 font-size: 11px; color: #aaa; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
 </style></head>
 <body>
 <h1>ai-dev-switchboard</h1>
@@ -678,7 +1027,21 @@ PAGE_TEMPLATE = """<!doctype html>
   <button onclick="startNewProject()">+ New project</button>
 </div>
 <div class="new-project-err" id="new-project-err"></div>
+<button class="upload-wizard-btn" onclick="openUploadWizard()">Upload folder / .zip</button>
 <div id="rows"></div>
+
+<div id="upload-overlay" class="overlay">
+  <div class="card wizard-card">
+    <h2>Upload local folder or .zip</h2>
+    <div id="wizard-steps" class="wizard-step-indicator"></div>
+    <div class="wizard-body" id="wizard-body"></div>
+    <div class="err" id="wizard-err"></div>
+    <div class="wizard-actions" id="wizard-actions"></div>
+    <span class="back" onclick="closeUploadWizard()">&lsaquo; close</span>
+  </div>
+</div>
+<input type="file" id="wizard-folder-input" webkitdirectory style="display:none">
+<input type="file" id="wizard-zip-input" accept=".zip" style="display:none">
 
 <div id="code-overlay" class="overlay">
   <div class="card">
@@ -868,8 +1231,17 @@ function startNewProject() {
 function hideCodeOverlay() {
   document.getElementById('code-overlay').classList.remove('show');
   pendingToggle = null;
+  wizardAwaitingCode = false;
+  wizardConfirmAwaitingCode = false;
 }
 function cancelActionCode() {
+  // Neither of the upload wizard's own TOTP retries (phase 1's startUpload,
+  // phase 2's runConfirm) touch any checkbox — just close the overlay and
+  // let the user retry from wherever the wizard already is.
+  if (wizardAwaitingCode || wizardConfirmAwaitingCode) {
+    hideCodeOverlay();
+    return;
+  }
   // The checkbox already flipped visually the instant it was clicked (that's
   // how the change event works) — revert it since nothing actually happened
   // (the server returns 428, before touching anything, when a code is due).
@@ -879,6 +1251,22 @@ function cancelActionCode() {
   hideCodeOverlay();
 }
 async function submitActionCode() {
+  // The upload wizard's phase-1 request carries its code via ?code= on a
+  // raw XHR, not through performAction's JSON-body path (see
+  // docs/spec.md's phase-1 deviation) — reusing this same code overlay and
+  // its Enter-to-submit wiring, just routed differently on submit. Phase 2
+  // (confirm) uses the standard JSON-body code field like every other
+  // action, so it's routed to runConfirm(code) instead.
+  if (wizardConfirmAwaitingCode) {
+    const code = document.getElementById('action-code').value;
+    runConfirm(code);
+    return;
+  }
+  if (wizardAwaitingCode) {
+    const code = document.getElementById('action-code').value;
+    startUpload(code);
+    return;
+  }
   if (!pendingToggle) return;
   const {kind, name, on} = pendingToggle;
   const code = document.getElementById('action-code').value;
@@ -886,6 +1274,695 @@ async function submitActionCode() {
   handleActionResult(r, pendingToggle);
 }
 document.getElementById('action-code').addEventListener('keydown', e => { if (e.key === 'Enter') submitActionCode(); });
+
+// ─── folder upload → auto-detect repo(s): client-side zip writer + wizard ──
+// See docs/spec.md "Folder upload → auto-detect repo(s)" and docs/design.md.
+// All six wizard steps (Pick/Exclude/Zip/Upload/Review/Confirm) are wired
+// end to end here: steps 1-4 drive POST /projects/upload (phase 1 —
+// detect only), steps 5-6 drive POST /projects/upload/confirm (phase 2 —
+// register).
+
+// === ZIP WRITER START (store mode, no compression — see docs/spec.md "Client-side zip writer") ===
+const ZIP_CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes) {
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) {
+    crc = (ZIP_CRC_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8)) >>> 0;
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+function zipDosDateTime(date) {
+  const year = Math.max(0, date.getFullYear() - 1980);
+  const dosTime = (date.getHours() << 11) | (date.getMinutes() << 5) | (date.getSeconds() >> 1);
+  const dosDate = (year << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
+  return {dosTime, dosDate};
+}
+
+function makeZipByteWriter() {
+  const chunks = [];
+  let offset = 0;
+  return {
+    push(u8) { chunks.push(u8); offset += u8.length; },
+    get offset() { return offset; },
+    concat() {
+      const out = new Uint8Array(offset);
+      let pos = 0;
+      for (const c of chunks) { out.set(c, pos); pos += c.length; }
+      return out;
+    },
+  };
+}
+
+// entries: [{path: 'relative/path.txt', file: File}, ...] (forward slashes,
+// no leading slash). onProgress(filesDone, filesTotal, bytesDone, bytesTotal)
+// is called once per file, after that file's bytes are written into the
+// archive buffer — used to drive step 3's progress bar.
+async function buildZipStore(entries, onProgress) {
+  const encoder = new TextEncoder();
+  const writer = makeZipByteWriter();
+  const central = [];
+  const bytesTotal = entries.reduce((sum, e) => sum + e.file.size, 0);
+  let bytesDone = 0;
+
+  for (let i = 0; i < entries.length; i++) {
+    const {path, file} = entries[i];
+    const nameBytes = encoder.encode(path);
+    const buf = new Uint8Array(await file.arrayBuffer());
+    const crc = crc32(buf);
+    const {dosTime, dosDate} = zipDosDateTime(new Date(file.lastModified || Date.now()));
+    const localOffset = writer.offset;
+
+    const header = new DataView(new ArrayBuffer(30));
+    header.setUint32(0, 0x04034b50, true);
+    header.setUint16(4, 20, true);       // version needed to extract
+    header.setUint16(6, 0x0800, true);   // general purpose flag: UTF-8 filename (bit 11)
+    header.setUint16(8, 0, true);        // compression method: 0 = stored
+    header.setUint16(10, dosTime, true);
+    header.setUint16(12, dosDate, true);
+    header.setUint32(14, crc, true);
+    header.setUint32(18, buf.length, true);  // compressed size == uncompressed (store mode)
+    header.setUint32(22, buf.length, true);  // uncompressed size
+    header.setUint16(26, nameBytes.length, true);
+    header.setUint16(28, 0, true);       // extra field length
+
+    writer.push(new Uint8Array(header.buffer));
+    writer.push(nameBytes);
+    writer.push(buf);
+
+    central.push({nameBytes, crc, size: buf.length, offset: localOffset, dosTime, dosDate});
+
+    bytesDone += buf.length;
+    if (onProgress) onProgress(i + 1, entries.length, bytesDone, bytesTotal);
+  }
+
+  const centralStart = writer.offset;
+  for (const c of central) {
+    const header = new DataView(new ArrayBuffer(46));
+    header.setUint32(0, 0x02014b50, true);
+    header.setUint16(4, 20, true);       // version made by
+    header.setUint16(6, 20, true);       // version needed to extract
+    header.setUint16(8, 0x0800, true);   // UTF-8 filename flag
+    header.setUint16(10, 0, true);       // compression method: stored
+    header.setUint16(12, c.dosTime, true);
+    header.setUint16(14, c.dosDate, true);
+    header.setUint32(16, c.crc, true);
+    header.setUint32(20, c.size, true);
+    header.setUint32(24, c.size, true);
+    header.setUint16(28, c.nameBytes.length, true);
+    header.setUint16(30, 0, true);       // extra field length
+    header.setUint16(32, 0, true);       // file comment length
+    header.setUint16(34, 0, true);       // disk number start
+    header.setUint16(36, 0, true);       // internal file attributes
+    header.setUint32(38, 0, true);       // external file attributes
+    header.setUint32(42, c.offset, true);
+
+    writer.push(new Uint8Array(header.buffer));
+    writer.push(c.nameBytes);
+  }
+  const centralSize = writer.offset - centralStart;
+
+  const eocd = new DataView(new ArrayBuffer(22));
+  eocd.setUint32(0, 0x06054b50, true);
+  eocd.setUint16(4, 0, true);
+  eocd.setUint16(6, 0, true);
+  eocd.setUint16(8, central.length, true);
+  eocd.setUint16(10, central.length, true);
+  eocd.setUint32(12, centralSize, true);
+  eocd.setUint32(16, centralStart, true);
+  eocd.setUint16(20, 0, true);
+  writer.push(new Uint8Array(eocd.buffer));
+
+  return writer.concat();
+}
+// === ZIP WRITER END ===
+
+// Known-heavy-directory exclusion list (docs/spec.md "Known-heavy-directory
+// exclusion") — hardcoded here, not a switchboard.env knob. .git is never
+// offered, enforced by simply never being in this list.
+const HEAVY_DIR_NAMES = ['node_modules', '.venv', 'venv', 'env', '__pycache__', '.pytest_cache',
+  'target', 'dist', 'build', 'vendor', '.tox', '.next', '.nuxt', '.gradle', 'Pods', '.cache'];
+
+// Mirrors the server's UPLOAD_MAX_BYTES default — used only for the
+// client-side pre-flight warning (a nicety, not a hard requirement; the
+// server enforces its own configured cap regardless of what this constant
+// says). A custom-configured UPLOAD_MAX_BYTES on the server won't be
+// reflected here without editing this file — see docs/implementation.md.
+const CLIENT_UPLOAD_MAX_BYTES = 104857600;
+
+const WEBKITDIRECTORY_SUPPORTED = 'webkitdirectory' in document.createElement('input');
+const WIZARD_STEP_LABELS = ['Pick', 'Exclude', 'Zip', 'Upload', 'Review', 'Confirm'];
+
+let wizardState = null;
+let wizardAwaitingCode = false;
+let wizardConfirmAwaitingCode = false;
+
+function resetWizardState() {
+  wizardState = {
+    step: 1,
+    files: [],           // File[] from webkitdirectory picking (folder case)
+    zipFile: null,        // File, when a .zip was picked directly
+    exclusionGroups: [],  // [{name, folderCount, fileCount, size, files, excluded}]
+    zipBytes: null,       // Uint8Array built by buildZipStore
+    zipError: null,       // 'no-files' | 'too-large' | null
+    zipProgress: {done: 0, total: 0},
+    uploadProgress: {loaded: 0, total: 0},
+    detectResult: null,
+    error: '',
+    // Review step (5) state — see initReviewState().
+    mode: 'single',        // 'single' | 'split'
+    splitCandidates: [],   // detectResult.nested_git_paths or .top_level_subdirs, fixed per detectResult
+    splitSelected: [],     // booleans, indexed the same as splitCandidates
+    // Confirm step (6) state — see runConfirm().
+    confirmMode: 'single',
+    confirmSelected: [],
+    confirmStatus: null,    // null | 'pending' | 'success' | 'error'
+    confirmRegistered: [],
+    confirmSkipped: 0,
+    confirmErrorMsg: '',
+  };
+}
+
+function openUploadWizard() {
+  resetWizardState();
+  document.getElementById('upload-overlay').classList.add('show');
+  renderWizard();
+}
+function closeUploadWizard() {
+  document.getElementById('upload-overlay').classList.remove('show');
+  wizardAwaitingCode = false;
+  wizardConfirmAwaitingCode = false;
+}
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && document.getElementById('upload-overlay').classList.contains('show')) {
+    closeUploadWizard();
+  }
+});
+
+function formatBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return Math.round(n / 1024) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function getIncludedFiles() {
+  const excluded = new Set();
+  for (const g of wizardState.exclusionGroups) {
+    if (g.excluded) for (const f of g.files) excluded.add(f);
+  }
+  return wizardState.files.filter(f => !excluded.has(f));
+}
+
+// Groups matched files by heavy-directory basename across every depth (one
+// checklist row per name, e.g. "node_modules" whether it appears once or at
+// ten different depths) — see docs/spec.md "Known-heavy-directory exclusion".
+function computeExclusionGroups(files) {
+  const groups = {};
+  for (const f of files) {
+    const relPath = (f.webkitRelativePath || f.name).replace(/\\\\/g, '/');
+    const parts = relPath.split('/');
+    for (let i = 1; i < parts.length - 1; i++) {
+      const dirName = parts[i];
+      if (dirName === '.git') continue; // never offered as excludable, no exceptions
+      if (HEAVY_DIR_NAMES.includes(dirName)) {
+        if (!groups[dirName]) groups[dirName] = {name: dirName, dirPaths: new Set(), files: [], size: 0};
+        groups[dirName].dirPaths.add(parts.slice(0, i + 1).join('/'));
+        groups[dirName].files.push(f);
+        groups[dirName].size += f.size;
+        break; // stop at the first (shallowest) heavy-dir match for this file
+      }
+    }
+  }
+  return Object.keys(groups).sort().map(name => {
+    const g = groups[name];
+    return {name: g.name, folderCount: g.dirPaths.size, fileCount: g.files.length,
+           size: g.size, files: g.files, excluded: true};
+  });
+}
+function toggleExclusionGroup(i, checked) {
+  wizardState.exclusionGroups[i].excluded = checked;
+}
+
+function initWizardInputs() {
+  document.getElementById('wizard-folder-input').addEventListener('change', onWizardFolderPicked);
+  document.getElementById('wizard-zip-input').addEventListener('change', onWizardZipPicked);
+}
+
+function onWizardFolderPicked(e) {
+  const fileList = Array.from(e.target.files || []);
+  e.target.value = '';
+  if (fileList.length === 0) return;
+  wizardState.files = fileList;
+  wizardState.exclusionGroups = computeExclusionGroups(fileList);
+  if (wizardState.exclusionGroups.length === 0) {
+    // Nothing matched the heavy-directory list — skip straight to zipping.
+    enterStep3();
+  } else {
+    wizardState.step = 2;
+    renderWizard();
+  }
+}
+function onWizardZipPicked(e) {
+  const files = e.target.files;
+  e.target.value = '';
+  if (!files || files.length === 0) return;
+  wizardState.zipFile = files[0];
+  wizardState.step = 4;
+  renderWizard();
+  startUpload();
+}
+
+function enterStep3() {
+  const included = getIncludedFiles();
+  wizardState.step = 3;
+  if (included.length === 0) {
+    wizardState.zipError = 'no-files';
+    renderWizard();
+    return;
+  }
+  const totalSize = included.reduce((s, f) => s + f.size, 0);
+  if (totalSize > CLIENT_UPLOAD_MAX_BYTES) {
+    wizardState.zipError = 'too-large';
+    renderWizard();
+    return;
+  }
+  wizardState.zipError = null;
+  renderWizard();
+  runZipping(included);
+}
+
+async function runZipping(included) {
+  const entries = included.map(f => ({path: (f.webkitRelativePath || f.name).replace(/\\\\/g, '/'), file: f}));
+  wizardState.zipProgress = {done: 0, total: entries.length};
+  let bytes;
+  try {
+    bytes = await buildZipStore(entries, (done, total) => {
+      wizardState.zipProgress = {done, total};
+      updateZipProgressUI();
+    });
+  } catch (ex) {
+    wizardState.error = 'Failed to build zip: ' + (ex && ex.message ? ex.message : ex);
+    renderWizard();
+    return;
+  }
+  wizardState.zipBytes = bytes;
+  wizardState.uploadProgress = {loaded: 0, total: bytes.length};
+  wizardState.step = 4;
+  renderWizard();
+  startUpload();
+}
+
+function startUpload(code) {
+  wizardState.error = '';
+  const blob = wizardState.zipFile ? wizardState.zipFile : new Blob([wizardState.zipBytes], {type: 'application/zip'});
+  wizardState.uploadProgress = {loaded: 0, total: blob.size};
+  renderWizard();
+  const xhr = new XMLHttpRequest();
+  // TOTP for this one endpoint is carried via ?code=, not a JSON body — see
+  // docs/spec.md's phase-1 deviation (Content-Type here is the raw zip
+  // bytes, so there's no JSON body to put a code field in).
+  let url = '/projects/upload';
+  if (code) url += '?code=' + encodeURIComponent(code);
+  xhr.open('POST', url);
+  xhr.setRequestHeader('Content-Type', 'application/zip');
+  xhr.upload.onprogress = function(e) {
+    if (e.lengthComputable) {
+      wizardState.uploadProgress = {loaded: e.loaded, total: e.total};
+      updateUploadProgressUI();
+    }
+  };
+  xhr.onload = function() {
+    if (xhr.status === 401) {
+      wizardState.error = 'Session expired — refresh the page and sign in again.';
+      renderWizard();
+      return;
+    }
+    if (xhr.status === 428) {
+      showWizardCodeOverlay();
+      return;
+    }
+    if (xhr.status === 403) {
+      showWizardCodeError('Wrong code — try again.');
+      return;
+    }
+    let payload = {};
+    try { payload = JSON.parse(xhr.responseText); } catch (ex) {}
+    if (xhr.status === 200) {
+      hideCodeOverlay();
+      wizardState.detectResult = payload;
+      initReviewState();
+      setTimeout(function() { wizardState.step = 5; renderWizard(); }, 250);
+      return;
+    }
+    wizardState.error = describeUploadError(xhr.status, payload);
+    renderWizard();
+  };
+  xhr.onerror = function() {
+    wizardState.error = 'Connection lost — your upload is still in progress on the server. ' +
+      'Refresh the page to check status, or start over.';
+    renderWizard();
+  };
+  xhr.send(blob);
+}
+
+function describeUploadError(status, err) {
+  if (status === 413) return 'Uploaded file is too large. Go back and exclude more directories.';
+  if (status === 400) return 'Upload failed: ' + (err.error || 'invalid upload.');
+  return 'Upload failed (' + status + '): ' + (err.error || 'unknown error.');
+}
+
+function showWizardCodeOverlay() {
+  wizardAwaitingCode = true;
+  document.getElementById('code-overlay-label').textContent = 'Confirm this upload.';
+  document.getElementById('action-code').value = '';
+  document.getElementById('err-code').textContent = '';
+  document.getElementById('code-overlay').classList.add('show');
+  document.getElementById('action-code').focus();
+}
+function showWizardCodeError(msg) {
+  document.getElementById('err-code').textContent = msg;
+}
+
+function updateZipProgressUI() {
+  const p = wizardState.zipProgress;
+  const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
+  const fill = document.getElementById('wizard-zip-fill');
+  const label = document.getElementById('wizard-zip-label');
+  if (fill) fill.style.width = pct + '%';
+  if (label) label.textContent = pct + '% (' + p.done + ' of ' + p.total + ' files)';
+}
+function updateUploadProgressUI() {
+  const p = wizardState.uploadProgress;
+  const pct = p.total ? Math.round((p.loaded / p.total) * 100) : 0;
+  const fill = document.getElementById('wizard-upload-fill');
+  const label = document.getElementById('wizard-upload-label');
+  if (fill) fill.style.width = pct + '%';
+  if (label) label.textContent = pct + '% (' + formatBytes(p.loaded) + ' of ' + formatBytes(p.total) + ')';
+}
+
+function renderStepIndicator() {
+  return WIZARD_STEP_LABELS.map((label, i) => {
+    const n = i + 1;
+    let cls = 'wizard-step';
+    if (n < wizardState.step) cls += ' done';
+    else if (n === wizardState.step) cls += ' active';
+    else cls += ' disabled';
+    return '<span class="' + cls + '">' + n + '. ' + esc(label) + '</span>';
+  }).join('');
+}
+
+function clickWizardFolderInput() { document.getElementById('wizard-folder-input').click(); }
+function clickWizardZipInput() { document.getElementById('wizard-zip-input').click(); }
+
+function renderStep1() {
+  let html = '<div class="wizard-pick-row">';
+  if (WEBKITDIRECTORY_SUPPORTED) {
+    html += '<button onclick="clickWizardFolderInput()">Pick a folder&hellip;</button>';
+  } else {
+    html += '<p>This browser does not support picking a whole folder here — pick a .zip instead.</p>';
+  }
+  html += '<div class="wizard-or">&ndash; or &ndash;</div>';
+  html += '<button onclick="clickWizardZipInput()">Pick a .zip&hellip;</button>';
+  html += '<p>Picking a .zip skips client-side zipping and uploads it as-is.</p>';
+  html += '</div>';
+  return html;
+}
+
+function renderStep2() {
+  let html = '<p>Directories to exclude from the zip (checked = excluded):</p>';
+  wizardState.exclusionGroups.forEach((g, i) => {
+    html += '<label class="wizard-check-row">' +
+      '<input type="checkbox" ' + (g.excluded ? 'checked' : '') +
+      ' onchange="toggleExclusionGroup(' + i + ', this.checked)">' +
+      '<span class="info"><div>' + esc(g.name) + '</div>' +
+      '<div class="sub">' + g.folderCount + ' folder' + (g.folderCount === 1 ? '' : 's') + ', ' +
+      g.fileCount + ' file' + (g.fileCount === 1 ? '' : 's') + ', ~' + formatBytes(g.size) +
+      '</div></span></label>';
+  });
+  return html;
+}
+function renderStep2Actions() {
+  return '<button class="secondary" onclick="wizardState.step = 1; renderWizard();">&lsaquo; Back</button>' +
+         '<button class="primary" onclick="enterStep3()">Next &rsaquo;</button>';
+}
+
+function renderStep3() {
+  if (wizardState.zipError === 'no-files') {
+    return '<p class="err">No files to upload after exclusions.</p>';
+  }
+  if (wizardState.zipError === 'too-large') {
+    const total = getIncludedFiles().reduce((s, f) => s + f.size, 0);
+    return '<div class="wizard-warn">Total size (' + formatBytes(total) + ') exceeds the ' +
+      formatBytes(CLIENT_UPLOAD_MAX_BYTES) + ' upload limit. Remove more directories to proceed.</div>';
+  }
+  const p = wizardState.zipProgress;
+  const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
+  return '<p>Building archive&hellip;</p>' +
+    '<div class="wizard-progress-bg"><div class="wizard-progress-fill zip" id="wizard-zip-fill" ' +
+    'style="width:' + pct + '%"></div></div>' +
+    '<div class="wizard-progress-label" id="wizard-zip-label">' + pct + '% (' + p.done + ' of ' + p.total + ' files)</div>';
+}
+function renderStep3Actions() {
+  if (wizardState.zipError) {
+    return '<button class="secondary" onclick="wizardState.step = 2; wizardState.zipError = null; renderWizard();">' +
+      '&lsaquo; Back to exclude</button>';
+  }
+  return '';
+}
+
+function renderStep4() {
+  const p = wizardState.uploadProgress;
+  const pct = p.total ? Math.round((p.loaded / p.total) * 100) : 0;
+  return '<p>Uploading archive&hellip;</p>' +
+    '<div class="wizard-progress-bg"><div class="wizard-progress-fill upload" id="wizard-upload-fill" ' +
+    'style="width:' + pct + '%"></div></div>' +
+    '<div class="wizard-progress-label" id="wizard-upload-label">' + pct + '% (' +
+    formatBytes(p.loaded) + ' of ' + formatBytes(p.total) + ')</div>';
+}
+
+// ─── Step 5: Review — docs/design.md "Step 5: Review" ──────────────────────
+// Shows phase 1's detected structure and lets the user choose single-vs-
+// split (see docs/spec.md "Detection and the two-phase protocol"). Called
+// once, right after a successful phase-1 upload (see startUpload's
+// xhr.onload 200 branch above) — NOT re-derived on every render, since the
+// user's checkbox choices need to persist across re-renders of this step.
+function initReviewState() {
+  const d = wizardState.detectResult;
+  wizardState.mode = 'single';
+  wizardState.splitCandidates = d.root_has_git ? d.nested_git_paths : d.top_level_subdirs;
+  // Defaults per docs/spec.md "Detection and the two-phase protocol":
+  // monorepo nested paths default UNCHECKED (safer — most nested .git dirs
+  // are vendored content nobody meant to surface); no-root-.git subfolders
+  // default CHECKED (matches the old auto-register-every-subfolder default).
+  const defaultChecked = !d.root_has_git;
+  wizardState.splitSelected = wizardState.splitCandidates.map(() => defaultChecked);
+}
+function setWizardMode(mode) { wizardState.mode = mode; renderWizard(); }
+// Indexed by position in wizardState.splitCandidates, never by the
+// candidate's own path string — those path strings come straight out of an
+// untrusted uploaded zip's own entry names, so they're never interpolated
+// into an inline onXXX="..." HTML attribute (same defensive pattern
+// toggleExclusionGroup(i, ...) above already uses for the same reason).
+function toggleSplitPath(i, checked) { wizardState.splitSelected[i] = checked; }
+
+function renderStep5() {
+  const d = wizardState.detectResult;
+  let html = '<p><strong>Detected structure:</strong></p>';
+  html += '<p>&#128193; ' + esc(d.root_name) + ' (root)<br>' +
+    (d.root_has_git ? 'has .git' : 'no .git') + '</p>';
+  if (d.root_has_git) {
+    html += '<p>' + (d.nested_git_paths.length
+      ? d.nested_git_paths.length + ' nested repo' + (d.nested_git_paths.length === 1 ? '' : 's') + ' inside'
+      : 'no nested repos detected') + '</p>';
+  } else {
+    html += '<p>' + d.top_level_subdirs.length + ' subfolder' +
+      (d.top_level_subdirs.length === 1 ? '' : 's') +
+      (d.loose_top_level_files
+        ? ', ' + d.loose_top_level_files + ' loose top-level file' + (d.loose_top_level_files === 1 ? '' : 's')
+        : '') + '</p>';
+  }
+
+  if (!d.ambiguous) {
+    html += '<p>&#10003; One project to register: "' + esc(d.root_name) + '"</p>';
+    return html;
+  }
+
+  html += '<fieldset style="border:none;padding:0;margin:10px 0;">' +
+    '<legend style="font-size:13px;color:#aaa;padding:0 0 4px;">How would you like to register it?</legend>';
+  html += '<label class="wizard-check-row"><input type="radio" name="wizard-mode" ' +
+    (wizardState.mode === 'single' ? 'checked' : '') + ' onchange="setWizardMode(\\'single\\')">' +
+    '<span class="info">Single project (keep all together as "' + esc(d.root_name) + '")</span></label>';
+  const splitLabel = d.root_has_git ? 'Split out nested repos:' : 'Each subfolder as its own project:';
+  html += '<label class="wizard-check-row"><input type="radio" name="wizard-mode" ' +
+    (wizardState.mode === 'split' ? 'checked' : '') + ' onchange="setWizardMode(\\'split\\')">' +
+    '<span class="info">' + esc(splitLabel) + '</span></label>';
+  html += '</fieldset>';
+
+  if (wizardState.mode === 'split') {
+    wizardState.splitCandidates.forEach((p, i) => {
+      html += '<label class="wizard-check-row"><input type="checkbox" ' +
+        (wizardState.splitSelected[i] ? 'checked' : '') +
+        ' onchange="toggleSplitPath(' + i + ', this.checked)">' +
+        '<span class="info">' + esc(p) + '</span></label>';
+    });
+    if (d.root_has_git) {
+      html += '<div class="wizard-warn">Splitting creates duplicate copies of selected folders ' +
+        'on disk. Choose carefully.</div>';
+    }
+  }
+  return html;
+}
+function renderStep5Actions() {
+  return '<button class="secondary" onclick="resetWizardState(); renderWizard();">&lsaquo; Back</button>' +
+         '<button class="primary" onclick="proceedToConfirm()">Confirm &rsaquo;</button>';
+}
+
+function proceedToConfirm() {
+  const d = wizardState.detectResult;
+  wizardState.error = '';
+  let mode = 'single', selected = [];
+  if (d.ambiguous && wizardState.mode === 'split') {
+    mode = 'split';
+    selected = wizardState.splitCandidates.filter((p, i) => wizardState.splitSelected[i]);
+    if (!d.root_has_git && selected.length === 0) {
+      wizardState.error = 'Select at least one folder to register.';
+      renderWizard();
+      return;
+    }
+  }
+  wizardState.confirmMode = mode;
+  wizardState.confirmSelected = selected;
+  wizardState.confirmStatus = 'pending';
+  wizardState.confirmRegistered = [];
+  wizardState.confirmSkipped = 0;
+  wizardState.confirmErrorMsg = '';
+  wizardState.step = 6;
+  renderWizard();
+  runConfirm();
+}
+
+// ─── Step 6: Confirm — docs/design.md "Step 6: Confirm" ────────────────────
+// POST /projects/upload/confirm — an ordinary JSON body like every other
+// mutating endpoint (docs/spec.md "Wire format and endpoints": phase 2 has
+// no ?code= deviation, unlike phase 1), so its own TOTP retry goes through
+// the standard code overlay too, just gated on wizardConfirmAwaitingCode
+// instead of wizardAwaitingCode (see submitActionCode/cancelActionCode
+// above).
+function showWizardConfirmCodeOverlay() {
+  wizardConfirmAwaitingCode = true;
+  document.getElementById('code-overlay-label').textContent = 'Confirm registering these project(s).';
+  document.getElementById('action-code').value = '';
+  document.getElementById('err-code').textContent = '';
+  document.getElementById('code-overlay').classList.add('show');
+  document.getElementById('action-code').focus();
+}
+
+async function runConfirm(code) {
+  wizardState.confirmStatus = 'pending';
+  renderWizard();
+  const body = {token: wizardState.detectResult.token, mode: wizardState.confirmMode,
+                selected: wizardState.confirmSelected};
+  if (code) body.code = code;
+  let r;
+  try {
+    r = await fetch('/projects/upload/confirm', {method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  } catch (ex) {
+    wizardState.confirmStatus = 'error';
+    wizardState.confirmErrorMsg = 'Connection lost — try again.';
+    renderWizard();
+    return;
+  }
+  if (r.status === 401) {
+    wizardState.confirmStatus = 'error';
+    wizardState.confirmErrorMsg = 'Session expired — refresh the page and sign in again.';
+    renderWizard();
+    return;
+  }
+  if (r.status === 428) {
+    showWizardConfirmCodeOverlay();
+    return;
+  }
+  if (r.status === 403) {
+    showWizardCodeError('Wrong code — try again.');
+    return;
+  }
+  const payload = await r.json().catch(() => ({}));
+  hideCodeOverlay();
+  if (r.ok) {
+    wizardState.confirmStatus = 'success';
+    wizardState.confirmRegistered = payload.registered || [];
+    wizardState.confirmSkipped = payload.skipped || 0;
+    renderWizard();
+    setTimeout(refresh, 1500);
+    return;
+  }
+  wizardState.confirmStatus = 'error';
+  wizardState.confirmErrorMsg = payload.error || 'Registration failed.';
+  wizardState.confirmRegistered = payload.registered || [];
+  renderWizard();
+}
+
+function renderStep6() {
+  if (wizardState.confirmStatus === 'success') {
+    let html = '<p style="color:#34c759">&#10003; Success!</p><p>Registered projects:</p><ul>';
+    wizardState.confirmRegistered.forEach(n => { html += '<li>' + esc(n) + '</li>'; });
+    html += '</ul>';
+    if (wizardState.confirmSkipped) {
+      html += '<p class="sub">(' + wizardState.confirmSkipped + ' skipped as unselected)</p>';
+    }
+    html += '<p>They&rsquo;ll show up in the dashboard shortly.</p>';
+    return html;
+  }
+  if (wizardState.confirmStatus === 'error') {
+    let html = '<p class="err" style="color:#ff6b6b">&#10007; Registration failed</p>' +
+      '<p class="err">Error: ' + esc(wizardState.confirmErrorMsg) + '</p>';
+    if (wizardState.confirmRegistered.length) {
+      html += '<p class="sub">Already registered before the failure: ' +
+        wizardState.confirmRegistered.map(esc).join(', ') + '</p>';
+    }
+    return html;
+  }
+  return '<p>Registering projects&hellip;</p>';
+}
+function renderStep6Actions() {
+  if (wizardState.confirmStatus === 'success') {
+    return '<button class="primary" onclick="closeUploadWizard(); refresh();">Done, close wizard</button>';
+  }
+  if (wizardState.confirmStatus === 'error') {
+    return '<button class="secondary" onclick="wizardState.step = 5; wizardState.confirmStatus = null; ' +
+      'renderWizard();">&lsaquo; Back to review</button>' +
+      '<button class="primary" onclick="resetWizardState(); renderWizard();">Start over</button>';
+  }
+  return '';
+}
+
+function renderWizard() {
+  document.getElementById('wizard-steps').innerHTML = renderStepIndicator();
+  document.getElementById('wizard-err').textContent = wizardState.error || '';
+  let body = '', actions = '';
+  if (wizardState.step === 1) { body = renderStep1(); }
+  else if (wizardState.step === 2) { body = renderStep2(); actions = renderStep2Actions(); }
+  else if (wizardState.step === 3) { body = renderStep3(); actions = renderStep3Actions(); }
+  else if (wizardState.step === 4) { body = renderStep4(); }
+  else if (wizardState.step === 5) { body = renderStep5(); actions = renderStep5Actions(); }
+  else if (wizardState.step === 6) { body = renderStep6(); actions = renderStep6Actions(); }
+  document.getElementById('wizard-body').innerHTML = body;
+  document.getElementById('wizard-actions').innerHTML = actions;
+}
+
+initWizardInputs();
 
 refresh(); setInterval(refresh, 4000);
 </script>
@@ -947,6 +2024,77 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def _handle_upload(self, query: str):
+        """
+        Phase 1 of the folder-upload wizard (POST /projects/upload — see
+        docs/spec.md "Wire format and endpoints"). Called from do_POST's
+        early branch, BEFORE the shared _read_json_body() call, since that
+        call reads exactly Content-Length bytes and json.loads()s them —
+        run unmodified against a raw zip body it would silently consume and
+        discard those bytes before this handler ever saw them. TOTP is
+        checked here too (via ?code=, not the JSON body — the one
+        deliberate deviation from every other mutating endpoint), staging
+        does consume real server resources. Stages + detects structure
+        only; registers nothing under PROJECTS_DIR — that's phase 2
+        (POST /projects/upload/confirm), a later build cycle.
+        """
+        sid = self._session_id()
+        if sid is None or not session_valid(sid):
+            return self._json({"error": "not authenticated"}, 401)
+        if not session_totp_ok(sid):
+            code = urllib.parse.parse_qs(query).get("code", [""])[0]
+            if not code:
+                return self._json({"error": "totp_required"}, 428)
+            if not totp_verify(TOTP_SECRET, code):
+                return self._json({"error": "invalid or missing 2FA code"}, 403)
+            mark_session_totp_ok(sid)
+
+        # Size limit check 1 of 2 (docs/spec.md "Size limits"): reject
+        # before reading any of the body at all if Content-Length is
+        # missing, zero, or oversized. No chunked-transfer support.
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        if length <= 0 or length > UPLOAD_MAX_BYTES:
+            return self._json(
+                {"error": "missing, zero, or oversized Content-Length"}, 413)
+
+        raw = self.rfile.read(length)
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(raw))
+        except zipfile.BadZipFile:
+            return self._json({"error": "not a valid zip file"}, 400)
+
+        infolist = zf.infolist()
+        if not infolist:
+            return self._json({"error": "empty zip file"}, 400)
+        if len(infolist) > UPLOAD_MAX_ENTRIES:
+            return self._json({"error": "too many entries in zip file"}, 400)
+
+        # Size limit check 2 of 2: the uncompressed total, before extracting
+        # anything — catches a zip-bomb-shaped mismatch (small compressed
+        # upload, huge decompressed size). Can't happen for a client-built
+        # (store-mode) zip, but still matters for the pick-a-pre-made-.zip
+        # fallback path.
+        total_uncompressed = sum(i.file_size for i in infolist)
+        if total_uncompressed > UPLOAD_MAX_BYTES:
+            return self._json(
+                {"error": "uncompressed contents exceed the size limit"}, 413)
+
+        token = secrets.token_hex(16)
+        staging_subdir = os.path.join(UPLOAD_STAGING_DIR, token)
+        try:
+            _extract_zip_safely(zf, staging_subdir)
+        except UploadRejected as e:
+            shutil.rmtree(staging_subdir, ignore_errors=True)
+            return self._json({"error": str(e)}, 400)
+
+        effective_root = _unwrap_single_wrapper_folder(staging_subdir)
+        detection = detect_structure(effective_root)
+        detection["token"] = token
+        self._json(detection)
+
     def do_GET(self):
         # The page itself is a static shell (no session data in it) — the login
         # overlay and the dashboard rows are both populated client-side, gated
@@ -991,6 +2139,15 @@ class Handler(BaseHTTPRequestHandler):
             cookie = f"session={sid}; HttpOnly; Secure; SameSite=Lax; Max-Age={SESSION_TTL}; Path=/"
             return self._json({"ok": True}, extra_headers={"Set-Cookie": cookie})
 
+        # Raw-bytes upload route needs its own early branch, before the
+        # shared _read_json_body() call below — see _handle_upload's
+        # docstring / docs/spec.md "Background" for why. Routed on
+        # split.path (not self.path) since this is the one POST route that
+        # carries a query string (?code=).
+        split = urllib.parse.urlsplit(self.path)
+        if split.path == "/projects/upload":
+            return self._handle_upload(split.query)
+
         sid = self._session_id()
         if sid is None or not session_valid(sid):
             return self._json({"error": "not authenticated"}, 401)
@@ -1020,6 +2177,14 @@ class Handler(BaseHTTPRequestHandler):
             if not ok:
                 return self._json({"error": err}, 400)
             self._json({"ok": True})
+        elif parts[0] == "projects" and len(parts) == 3 and parts[1] == "upload" and parts[2] == "confirm":
+            # Phase 2 of the upload wizard — ordinary JSON body, code (if
+            # needed) already handled by the shared TOTP gate above, unlike
+            # phase 1's ?code= deviation (docs/spec.md "Wire format and
+            # endpoints").
+            status, payload = confirm_upload(
+                body.get("token", ""), body.get("mode", ""), body.get("selected") or [])
+            self._json(payload, status)
         elif parts[0] == "instance" and len(parts) == 3 and parts[2] in ("on", "off"):
             name = parts[1]
             if name not in instance_names():
@@ -1051,5 +2216,6 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     os.makedirs(PROJECTS_DIR, exist_ok=True)
+    os.makedirs(UPLOAD_STAGING_DIR, exist_ok=True)
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     server.serve_forever()

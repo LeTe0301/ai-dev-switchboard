@@ -97,6 +97,12 @@ pipx install aider-chat                    # aider
   the exact tmux pane, no config needed.
 - **VS Code in the browser**, independent on/off per project
   (`code-server`, `--with-code-server`).
+- **An "Upload folder / .zip" wizard** — pick a local folder (zipped
+  client-side with a progress bar) or an already-made `.zip`, review the
+  server-detected structure (single repo, a folder of independent repos, or
+  a monorepo with nested/vendored repos), choose which pieces become their
+  own projects, and confirm. Works standalone — unlike "+ New project"
+  below, it does **not** need `--with-git-hosting`.
 - **A "+ New project" button** — optional, needs
   [`--with-git-hosting`](docs/GIT_HOSTING.md): creates a private bare repo
   + a working copy in one step, kept in sync automatically on every future
