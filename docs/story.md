@@ -429,6 +429,33 @@ no UI.
 - A tier-1 model that ignores the `tools` array and replies in prose is
   detected and falls back to tier-3 parsing rather than silently doing nothing.
 
+**Status: done** (reviewer-approved round 3). All 17 acceptance criteria have
+real implementation and test coverage; 588 tests green. Carried forward, none
+blocking:
+
+- **`codex` tier 2 is unverified end to end.** `codex` is unauthenticated in
+  the build environment (confirmed: a real 401 from `api.openai.com`), so
+  `--output-schema {schema_file}` is correct per `codex exec --help` but has
+  never been exercised against the live binary. Deliberately *not* faked by
+  any test. First thing to verify wherever an authenticated `codex` exists.
+- **Repeated delegation is mitigated, not fixed.** `qwen3:8b` was observed
+  delegating one task twice before finishing. Round-history summaries now
+  state agent/task/SUCCEEDED-or-FAILED explicitly; it did not recur in 3/3
+  live runs. That is a probabilistic small-model behaviour, and no test
+  asserts non-recurrence — such a test would be flaky by construction.
+- **`re.sub()` maps a `None` replacement to `""` silently.** After the
+  single-pass substitution fix, calling `_build_headless_argv()` on a
+  file-mode engine with `prompt_path=None` now silently drops `{prompt_file}`
+  where the old chained-`str.replace()` code raised `TypeError`. Unreachable
+  from the only real caller (`agent_run()` always supplies a path), so it is
+  a latent sharp edge rather than a live bug — but it trades a loud failure
+  for a quiet one, which is against this codebase's grain.
+- **One timing-sensitive test flakes.** A real-tmux/real-thread `sleep(5)`
+  test in `tests/test_teams_headless.py` failed once in ~8 full-suite runs
+  and passed in isolation and on rerun. Not attributable to 6c (that file's
+  diff is empty), but it is a real flake and should not be rediscovered from
+  scratch later.
+
 ### 6d — Team session lifecycle
 
 **Deliverable.** `team-<project>` tmux session, one window per agent. One git

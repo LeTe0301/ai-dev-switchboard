@@ -30,7 +30,26 @@ STARTUP_SEND_1=1
 # turn, or with HEADLESS_RESUME (itself {session_id}-substituted first) when
 # resuming -- `claude -p --resume <id> ...` was confirmed to genuinely
 # continue the prior turn, not just accept the flag.
-HEADLESS_CMD=claude -p {resume} --output-format stream-json --verbose
+HEADLESS_CMD=claude -p {resume} {schema} --output-format stream-json --verbose
 HEADLESS_FORMAT=claude-stream-json
 HEADLESS_PROMPT=arg
 HEADLESS_RESUME=--resume {session_id}
+
+# HEADLESS_SCHEMA_FLAG (backlog item 6c, docs/spec.md "Engine-file
+# extension"): presence of this key is what makes _lead_tier_for_engine()
+# auto-detect this engine as tier 2 (schema-constrained lead output) rather
+# than tier 3 (prose-parse). {schema} (NOT {schema_file} -- see
+# docs/spec.md "Correction: {schema} is inline for Claude, a file for
+# Codex") is substituted with the schema's own JSON TEXT, shlex.quote()'d
+# as a single argv element -- `claude -p --help` documents `--json-schema
+# <schema>`'s own example value as literal inline JSON
+# ({"type":"object",...}), NOT a file path the way Codex's own
+# --output-schema <FILE> is (see codex.engine's own HEADLESS_SCHEMA_FLAG).
+# This was originally shipped as a path substitution (mirroring
+# {prompt_file}) and confirmed WRONG by actually running a real, logged-in
+# `claude` CLI during this sub-spec's own build -- it failed with `Error:
+# --json-schema is not valid JSON: JSON Parse error: Unrecognized token
+# '/'` (a file path isn't valid JSON) -- corrected to the inline form
+# above, then reverified end to end against the same real `claude` CLI.
+# See docs/implementation.md for the full writeup, both attempts.
+HEADLESS_SCHEMA_FLAG=--json-schema {schema}

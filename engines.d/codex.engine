@@ -48,7 +48,26 @@ STARTUP_SEND_1=1
 # `resume <SESSION_ID>` subcommand-swap syntax specifically are NOT yet
 # confirmed end to end -- see docs/implementation.md's verification table
 # before trusting this beyond "the plumbing runs a real process".
-HEADLESS_CMD=codex exec {resume} --json --skip-git-repo-check
+HEADLESS_CMD=codex exec {resume} {schema} --json --skip-git-repo-check
 HEADLESS_FORMAT=codex-jsonl
 HEADLESS_PROMPT=arg
 HEADLESS_RESUME=resume {session_id}
+
+# HEADLESS_SCHEMA_FLAG (backlog item 6c, docs/spec.md "Engine-file
+# extension"): presence of this key is what makes _lead_tier_for_engine()
+# auto-detect this engine as tier 2 (schema-constrained lead output) rather
+# than tier 3 (prose-parse). {schema_file} (NOT {schema} -- see
+# docs/spec.md "Correction: {schema} is inline for Claude, a file for
+# Codex", found by actually running the real claude CLI during this
+# sub-spec's build) is substituted with the path of a schema.json file
+# agent_run(..., schema=...) writes under the run's own throwaway rundir.
+# `codex exec --help` documents `--output-schema <FILE>` as "Path to a JSON
+# Schema file describing the model's final response shape" -- a real file
+# path, unlike Claude Code's own --json-schema, which wants the schema's
+# JSON text inline (see claude.engine's own HEADLESS_SCHEMA_FLAG). See
+# docs/implementation.md for this sub-spec's own verification status
+# (codex.engine's headless plumbing was already only partially verified as
+# of 6a -- see the HEADLESS_CMD note above; codex remains unauthenticated
+# in the environment 6c was built in, so a real tier-2 run against it is
+# also not yet confirmed end to end).
+HEADLESS_SCHEMA_FLAG=--output-schema {schema_file}

@@ -290,11 +290,12 @@ _HEADLESS_PROMPT_MODES = {"arg", "stdin", "file"}
 
 class Engine:
     __slots__ = ("name", "label", "cmd", "url_regex", "startup",
-                 "headless_cmd", "headless_format", "headless_prompt", "headless_resume")
+                 "headless_cmd", "headless_format", "headless_prompt", "headless_resume",
+                 "headless_lead_format", "headless_schema_flag")
 
     def __init__(self, name, label, cmd, url_regex, startup,
                  headless_cmd=None, headless_format=None, headless_prompt=None,
-                 headless_resume=None):
+                 headless_resume=None, headless_lead_format=None, headless_schema_flag=None):
         self.name = name
         self.label = label
         self.cmd = cmd
@@ -310,6 +311,19 @@ class Engine:
         self.headless_format = headless_format
         self.headless_prompt = headless_prompt
         self.headless_resume = headless_resume
+        # Lead-adapter tier hints (backlog item 6c, docs/spec.md "Engine-file
+        # extension") -- both optional, additive, None-default, and parsed
+        # independently of the headless_enabled nullification above (an
+        # engine without them is simply tier-3 by auto-detection, same as
+        # "an engine without them is teammate-ineligible" for the four
+        # HEADLESS_* keys, here it's "doesn't appear at tier 2" instead).
+        # HEADLESS_LEAD_FORMAT has no fixed enum to validate against here --
+        # _lead_tier_for_engine() (app/teams.py) only ever compares it
+        # against the literal strings "schema"/"prose"; any other value
+        # simply falls through to auto-detection, same effect as leaving it
+        # unset, so there is nothing to reject at parse time.
+        self.headless_lead_format = headless_lead_format
+        self.headless_schema_flag = headless_schema_flag
 
     @property
     def headless_enabled(self) -> bool:
@@ -358,8 +372,14 @@ def _parse_engine_file(path: str):
     if headless_cmd and (headless_format not in _HEADLESS_FORMATS or
                           headless_prompt not in _HEADLESS_PROMPT_MODES):
         headless_cmd = headless_format = headless_prompt = headless_resume = None
+    # Lead-adapter hints (backlog item 6c) -- read/defaulted independently of
+    # the headless_enabled nullification above; see Engine.__init__'s own
+    # docstring comment for why no enum check applies here.
+    headless_lead_format = kv.get("HEADLESS_LEAD_FORMAT") or None
+    headless_schema_flag = kv.get("HEADLESS_SCHEMA_FLAG") or None
     return Engine(name, kv.get("LABEL", name), cmd, kv.get("URL_REGEX") or None, startup,
-                  headless_cmd, headless_format, headless_prompt, headless_resume)
+                  headless_cmd, headless_format, headless_prompt, headless_resume,
+                  headless_lead_format, headless_schema_flag)
 
 
 def load_engines() -> dict:

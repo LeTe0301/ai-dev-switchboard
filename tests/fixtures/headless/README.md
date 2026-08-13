@@ -32,3 +32,20 @@ Provenance of each fixture, per `docs/ADDING_AN_ENGINE.md`'s standing rule
   was not installed in the environment this sub-spec was built in. Plausible
   plain-stdout shape for `--message-file ... --yes-always`; not a real
   capture.
+
+- **`tier3_stub_two_step.sh`**, **`tier3_stub_no_fence.sh`**,
+  **`tier3_stub_malformed_fence.sh`** — backlog item 6c (`docs/spec.md` §8).
+  Executable shell-script stand-ins for a real tier-3 (prose-parse) lead,
+  since `aider` is not installed here either. Each reads the round's own
+  assembled prompt (arg mode, `$1`) and replies deterministically: the
+  two-step fixture emits a well-formed `fact_check` call on "Round 1 of..."
+  and a well-formed `finish` call on any later round (drives a real,
+  complete `team_run()` end to end); the other two always reply with no
+  fence at all, or a fence whose contents don't parse as JSON, respectively
+  — both exercise the shared malformed-retry-then-`ask_user`-escalation
+  path. Wired through a scratch `.engine` file in
+  `tests/test_teams_lead.py`, same real-tmux/no-real-engine-CLI technique
+  `tests/test_teams_headless.py`'s own `RealTmuxHeadlessTests` already
+  established. `aider.engine`'s own real-CLI tier-3 status remains
+  UNVERIFIED (see `docs/implementation.md`) — these fixtures verify the
+  lead LOOP's tier-3 code paths, not `aider` itself.
