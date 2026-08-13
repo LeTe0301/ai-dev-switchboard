@@ -25,6 +25,9 @@
 #   --with-host-control   also install host-agent/ on THIS machine (see
 #                         host-agent/README.md — usually installed on a
 #                         *different* machine than the web UI by hand instead)
+#   --with-deploy-target  provision THIS machine as a deploy receiver (see
+#                         deploy-target/README.md) — run on a *separate*
+#                         target machine, never the switchboard box itself
 #   --with-taiga          also install Docker + Taiga's own official
 #                         taiga-docker Compose stack (self-hosted backlog
 #                         tracker), left OFF until toggled in the web UI —
@@ -61,6 +64,7 @@ YES=0
 WITH_GIT_HOSTING=0
 WITH_CODE_SERVER=0
 WITH_HOST_CONTROL=0
+WITH_DEPLOY_TARGET=0
 WITH_TAIGA=0
 for arg in "$@"; do
     case "$arg" in
@@ -68,6 +72,7 @@ for arg in "$@"; do
         --with-git-hosting) WITH_GIT_HOSTING=1 ;;
         --with-code-server) WITH_CODE_SERVER=1 ;;
         --with-host-control) WITH_HOST_CONTROL=1 ;;
+        --with-deploy-target) WITH_DEPLOY_TARGET=1 ;;
         --with-taiga) WITH_TAIGA=1 ;;
         *) echo "Unknown flag: $arg (see the top of install.sh for the list)" >&2; exit 1 ;;
     esac
@@ -594,6 +599,87 @@ if [ "$WITH_HOST_CONTROL" -eq 1 ]; then
     done
     [ -f "$CONFIG_DIR/host.env" ] || cp "$REPO_DIR/host-agent/host.env.example" "$CONFIG_DIR/host.env"
     set_env "$CONFIG_DIR/host.env" ENGINES_DIR "$CONFIG_DIR/engines.d"
+fi
+
+# ── Optional: deploy-target receiver (--with-deploy-target). Fully
+# independent of --with-host-control above (different user, different
+# config file, different sudoers file, no shared state) — safe to use
+# either or both on the same box. Run on the SEPARATE machine that will
+# receive deploys, never on the switchboard box itself (docs/spec.md
+# part 2c-2a — see deploy-target/README.md).
+if [ "$WITH_DEPLOY_TARGET" -eq 1 ]; then
+    echo "-- Deploy-target receiver (this machine) --"
+    echo "Run this on the SEPARATE machine that will receive deploys — never"
+    echo "on the switchboard box itself. See deploy-target/README.md."
+
+    DEPLOY_PATH_INPUT=$(prompt "Destination path this target will receive deploys into" "")
+    DEPLOY_SERVICE_NAME_INPUT=$(prompt "Systemd service name to restart after each deploy" "")
+    DEPLOY_PUBKEY=$(prompt "Public key to authorize for this target (paste the contents of e.g. deploy_ed25519.pub — leave blank to add by hand later)" "")
+
+    if [ ! -x /usr/bin/rrsync ]; then
+        # Skip only this block, not the whole install.sh run over one
+        # optional flag — same "continue"-equivalent precedent the
+        # ttyd-arch-not-found check above already uses.
+        echo "ERROR: /usr/bin/rrsync not found. 'apt-get install rsync' should already have provided it on Debian 12+ (rsync itself is already installed unconditionally above) — if this target is on an older or non-Debian OS, install rrsync yourself before re-running --with-deploy-target. Skipping deploy-target provisioning." >&2
+    else
+        id deploy &>/dev/null || useradd -m -d /home/deploy -s /bin/sh deploy
+
+        # Additive, never wipes pre-existing content — same idiom as
+        # PROJECTS_DIR's own mkdir -p + chown earlier in this script.
+        if [ -n "$DEPLOY_PATH_INPUT" ]; then
+            mkdir -p "$DEPLOY_PATH_INPUT"
+            chown deploy:deploy "$DEPLOY_PATH_INPUT"
+        fi
+
+        mkdir -p /home/deploy/.ssh
+        chmod 700 /home/deploy/.ssh
+
+        DEPLOY_ENV="$CONFIG_DIR/deploy-target.env"
+        [ -f "$DEPLOY_ENV" ] || cp "$REPO_DIR/deploy-target/deploy-target.env.example" "$DEPLOY_ENV"
+        # Only overwrite the keys actually supplied this run — same
+        # idempotent-upsert idiom as every other set_env call in this file,
+        # so a blank re-run answer leaves the previous value untouched
+        # rather than clearing it (docs/spec.md "Edge cases").
+        [ -n "$DEPLOY_PATH_INPUT" ] && set_env "$DEPLOY_ENV" DEPLOY_PATH "$DEPLOY_PATH_INPUT"
+        [ -n "$DEPLOY_SERVICE_NAME_INPUT" ] && set_env "$DEPLOY_ENV" DEPLOY_SERVICE_NAME "$DEPLOY_SERVICE_NAME_INPUT"
+
+        install -m 755 "$REPO_DIR/deploy-target/deploy-wrapper.sh" /usr/local/bin/ai-dev-switchboard-deploy-wrapper.sh
+        install -m 755 "$REPO_DIR/deploy-target/deploy-restart.sh" /usr/local/bin/ai-dev-switchboard-deploy-restart.sh
+
+        if [ -n "$DEPLOY_PUBKEY" ]; then
+            # Deterministically overwritten (like the sudoers file below) —
+            # this cycle supports exactly one authorized key per target.
+            printf 'command="/usr/local/bin/ai-dev-switchboard-deploy-wrapper.sh",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty %s\n' \
+                "$DEPLOY_PUBKEY" > /home/deploy/.ssh/authorized_keys
+            chown -R deploy:deploy /home/deploy/.ssh
+            chmod 600 /home/deploy/.ssh/authorized_keys
+        else
+            echo "No public key supplied — deploy-target is provisioned but not yet"
+            echo "reachable over SSH. Add one by hand later:"
+            echo "  echo 'command=\"/usr/local/bin/ai-dev-switchboard-deploy-wrapper.sh\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty <pubkey>' | sudo tee /home/deploy/.ssh/authorized_keys"
+            echo "  sudo chown deploy:deploy /home/deploy/.ssh/authorized_keys && sudo chmod 600 /home/deploy/.ssh/authorized_keys"
+        fi
+
+        DEPLOY_SUDOERS=/etc/sudoers.d/ai-dev-switchboard-deploy-target
+        # Zero arguments — same "narrower than every other rule" idiom this
+        # script already uses for gitea-{up,down,status}.sh and
+        # taiga-{up,down,status}.sh: root-restart-equivalent access here, no
+        # passthrough arguments accepted.
+        echo "deploy ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-deploy-restart.sh" > "$DEPLOY_SUDOERS"
+        chmod 440 "$DEPLOY_SUDOERS"
+        visudo -cf "$DEPLOY_SUDOERS" || { echo "Generated sudoers file failed validation — see $DEPLOY_SUDOERS" >&2; exit 1; }
+
+        echo ""
+        echo "Deploy-target receiver provisioned on this machine (target-side only —"
+        echo "no switchboard/app.py wiring exists yet to drive it; see"
+        echo "deploy-target/README.md). The PRIVATE half of the SSH keypair belongs"
+        echo "on whatever machine will eventually push here (a future switchboard-side"
+        echo "caller, or you, for manual verification), never on this target machine."
+        echo "Manual test sequence, once a key is authorized (see"
+        echo "deploy-target/README.md for why the destination is left bare):"
+        echo "  rsync -e \"ssh -i <key>\" -a <source>/ deploy@<this-host>:"
+        echo "  ssh -i <key> deploy@<this-host> deploy-restart"
+    fi
 fi
 
 echo ""

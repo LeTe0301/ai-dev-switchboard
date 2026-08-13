@@ -161,6 +161,7 @@ ct/create.sh             Proxmox-host wrapper: creates a container, then runs in
 scripts/                 optional git-hosting + project-scaffolding (docs/GIT_HOSTING.md);
                           also scripts/taiga_push_spec.py + taiga-configure-push.sh (docs/spec.md)
 host-agent/               optional persistent session on a separate machine (host-agent/README.md)
+deploy-target/           optional deploy receiver on a separate machine (deploy-target/README.md)
 systemd/                 reference systemd unit for manual installs
 docs/                    architecture notes, engine format, git-hosting detail
 ```
@@ -181,6 +182,12 @@ docs/                    architecture notes, engine format, git-hosting detail
 - The optional host-control SSH channel is scoped to exactly three
   whitelisted scripts via `sudoers.d` — see
   [`host-agent/README.md`](host-agent/README.md).
+- The optional deploy-target SSH channel (`--with-deploy-target`, run on a
+  *separate* target machine) is restricted to write-only `rrsync` into one
+  configured path or one exact, sudoers-scoped restart script — no shell,
+  no port/X11/agent forwarding, no pty. This is receiver-only
+  infrastructure with no switchboard UI consumer yet — see
+  [`deploy-target/README.md`](deploy-target/README.md).
 - `scripts/taiga_push_spec.py` stores its password in plain text in
   `~/.config/ai-dev-switchboard/taiga-push.env` (file mode `600`, owned by
   `RUN_USER`).

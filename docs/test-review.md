@@ -1,247 +1,75 @@
-# Test & Review: Local git hosting UI + CI/CD (Gitea) — part 2c, part 1: poll-based sync-on-push
+# Test & Review: Local git hosting UI + CI/CD (Gitea) — part 2c, part 2a: deploy-target receiver
 
 ## Scope
-Covers all 10 acceptance criteria in `docs/spec.md` for the poll-based
-sync-on-push feature: the repo-map write in `create_project()`, the
-throttled `/status`-piggybacked poll (`_gitea_poll_if_due`/`_gitea_poll_one`),
-the SHA-diff gate, the sync dispatch (`_gitea_sync_bg`/`_gitea_sync_run`),
-and the low-privilege `scripts/gitea-sync-project.sh` safety logic (dirty
-check, fast-forward-safety check, `git merge --ff-only`). Given this cycle's
-explicit "safety, not features" framing, most of the added scrutiny went
-into adversarially attacking `scripts/gitea-sync-project.sh`'s safety
-guarantees with constructed repo states and real concurrency, beyond what
-the developer's own test suite covers.
+Covers all 9 acceptance-criteria bullets in `docs/spec.md` for the
+`deploy-target/` receiver and `install.sh --with-deploy-target`: the
+`deploy-wrapper.sh` forced-command SSH branching, `deploy-restart.sh`'s
+validated sudoers-scoped restart, and `install.sh`'s provisioning of the
+`deploy` user / `DEPLOY_PATH` / config / scripts / `authorized_keys` /
+sudoers. This is new privileged SSH surface (a low-priv account with a
+root-restart capability, reachable from any machine holding the matching
+private key), so the review pass weighted security scrutiny heaviest:
+independently re-deriving the two documented spec deviations from
+`/usr/bin/rrsync`'s actual source rather than trusting the write-up, and
+re-reading the wrapper for injection/bypass paths.
 
 ## Test cases
 
 | # | Criterion / case | Method | Result | Evidence |
 |---|---|---|---|---|
-| 1 | `create_project()` success writes repo-map entry with null sync fields | Automated (`tests/test_gitea.py::test_happy_path_writes_repo_map_entry_with_null_sync_fields`) | pass | Ran `python3 -m unittest tests.test_gitea -v`, all pass |
-| 2 | Repo-map write failure doesn't fail `create_project()` | Automated + direct read of `app/app.py:772-783` (`try/except OSError: pass`) | pass | Test passes; code confirms `return True, ""` is unconditional after the try/except |
-| 3 | `_gitea_api` called once per repo-map entry when poll is due | Automated (`test_gitea_poll.py::GiteaPollIfDueTests`) + own real-concurrency stress test (30 threads calling `_gitea_poll_if_due` simultaneously) | pass | Existing tests pass; my own script: 30 concurrent `/status`-style calls → exactly 1 `_gitea_api` call total |
-| 4 | Throttle holds across repeated `/status` calls before interval elapses | Automated + real-concurrency stress test (above) | pass | Same run as #3 — throttle is genuinely race-safe under real threading, not just sequential mock timestamps |
-| 5 | No polling when `GITEA_ENABLED=False` or Gitea not running | Automated (`GiteaPollIfDueTests.test_gitea_disabled_*`, `test_gitea_on_false_*`) | pass | `python3 -m unittest tests.test_gitea_poll -v` |
-| 6 | SHA-match skips sync attempt (no subprocess) | Automated + own direct check with a `subprocess.run` spy | pass | My own script: real `subprocess.run` never invoked when polled SHA equals stored `remote_sha` |
-| 7 | SHA-diff → fast-forward when clean+ancestor; repo-map updated after | Automated (mocked in `test_gitea_poll.py`) + real git ops (`test_gitea_sync_project.py::test_clean_fast_forwardable_syncs_and_updates_working_tree`) | pass | Both suites pass; `HEAD` in dest matches origin exactly after sync |
-| 8 | Dirty working copy → skip, uncommitted changes byte-for-byte intact, `remote_sha` still updated | Automated (`test_dirty_working_tree_is_skipped_and_left_byte_for_byte_intact`) + adversarial: staged-but-uncommitted change, untracked-only file, concurrent uncommitted edit mid-race-window | pass | See "Adversarial safety testing" below — all variants correctly caught as dirty, nothing touched |
-| 9 | Diverged/ahead local HEAD → skip, no destructive op, commit still reachable | Automated (`test_diverged_local_commit_is_skipped_and_not_lost`, `test_local_ahead_only_...`) + adversarial: local merge commit, concurrent local commit landing mid-fetch | pass | See "Adversarial safety testing" below |
-| 10 | Non-200 branch lookup → skipped without raising, repo-map untouched | Automated (`GiteaPollOneTests.test_non_200_status_skipped_without_raising`) + own repro of a related but uncovered case (malformed 200 body) | pass (AC) / **gap found**, see Findings #1 | AC itself passes; adjacent edge case (200 with non-dict body) raises uncaught `AttributeError` — see Findings |
-| 11 (edge, not separately numbered in AC but spec-relevant) | Full suite passes, no real Docker/network calls in new test files, `test_gitea_sync_project.py` needs no root | Automated + direct verification | pass | `python3 -m unittest discover -s tests -v` → 213/213 pass; `grep` for docker/http/urllib in both new test files found only comments; ran as uid 1001 (`dev`, non-root) directly, all 10 script tests pass |
-| 12 | `/status` includes `gitea_sync` when repo-map entry exists, omits (not null) otherwise | Automated (`test_status_includes_gitea_sync_...`, `test_status_omits_gitea_sync_...`) | pass | `python3 -m unittest tests.test_gitea -v` |
-| 13 | Frontend `.sub` suffix appears only for skip states, other rows unaffected | Manual, via `render_page()`'s actual rendered `<script>` executed in a Node `vm` sandbox (not a hand-copied snippet) | pass | See "Frontend verification" below |
-
-## Adversarial safety testing (scripts/gitea-sync-project.sh)
-
-Per the explicit instruction to try to break the dirty-check and
-fast-forward-safety check, I ran the real script (not mocked) against
-constructed repo states beyond the developer's own test file:
-
-1. **Staged-but-uncommitted change** (`git add` without commit) — correctly
-   caught by `git status --porcelain` → `skipped-dirty`, file left as staged.
-2. **Untracked-only file** (no modified tracked files at all) — also
-   correctly caught as dirty (porcelain output is non-empty for untracked
-   files too) → `skipped-dirty`, nothing merged.
-3. **Detached HEAD, clean, ancestor of new remote** — `git merge --ff-only`
-   succeeds and moves the detached `HEAD` forward. Not destructive (old
-   position stays in reflog, no commits lost) but worth noting: this is a
-   real behavior the spec doesn't explicitly discuss. See Findings (nit).
-4. **Local merge commit that is "ancestor-adjacent" but not actually an
-   ancestor** (a real `git merge --no-ff` of a local feature branch into
-   `main`) — `git merge-base --is-ancestor` correctly reports false →
-   `skipped-diverged`; the merge commit and the feature branch's file both
-   remain untouched.
-5. **Concurrent commit landing between `git fetch` and the dirty/ancestor
-   checks** (simulated with a real background process racing a real `sleep`
-   window inserted into a copy of the script) — the new local commit is
-   picked up by the checks that run after it lands, correctly producing
-   `skipped-diverged`; no data lost.
-6. **Concurrent uncommitted edit landing between the ancestor check and the
-   `git merge --ff-only` call, on a file the incoming commit also touches**
-   — `git merge --ff-only` itself refuses at apply time ("Your local changes
-   ... would be overwritten by merge... Aborting"), exits 1, and the
-   uncommitted edit is left completely intact. This confirms the safety
-   doesn't just rely on the earlier point-in-time checks — git's own merge
-   machinery re-validates the actual working tree at apply time, closing
-   the race window genuinely, not just probabilistically.
-7. **Concurrent uncommitted edit to an *unrelated* file in the same race
-   window** — `git merge --ff-only` succeeds (the incoming commit doesn't
-   touch that file), and the uncommitted edit survives untouched alongside
-   the newly-merged content. Confirms ff-only doesn't clobber anything
-   outside its own diff.
-8. **True concurrent-thread race on the per-project lock** — 20 real
-   Python threads simultaneously calling `_gitea_sync_bg` for the same
-   `owner_repo` (not the developer's own pre-acquire-then-assert-dropped
-   test, but genuine concurrent dispatch) resulted in exactly 1
-   `subprocess.run` call. Lock is genuinely race-safe.
-9. **True concurrent-thread race on the repo-map file** — 100 threads
-   writing 100 different entries concurrently via `_save_gitea_repo_map_entry`
-   produced all 100 entries with zero lost updates (the single
-   `_gitea_map_lock` around the whole read-modify-write cycle prevents the
-   lost-update race a per-key lock scheme would have been vulnerable to).
-
-None of these adversarial cases produced data loss, a silent history
-rewrite, or a double-apply. `git merge --ff-only` (never `git reset --hard`,
-never a bare `git merge` that could fabricate a merge commit) is confirmed
-as the actual operation used, and it is confirmed to be a genuine loud
-no-op/refusal — not just by reading the script, but by constructing states
-that specifically try to defeat it.
-
-## Frontend verification (no docs/design.md — developer judgment call)
-
-Confirmed the developer's judgment that this didn't need a full design
-pass. Extracted the *actual* rendered `<script>` block via
-`appmod.render_page()` (not a hand-copied excerpt — this catches any
-Python-level string-escaping mismatch a naive regex-on-raw-source
-extraction would miss, which I hit and worked around) and ran it in a
-Node `vm` sandbox with stubbed DOM. Calling the real `row()` function:
-- `gitSync.state === 'skipped-dirty'` → `...sub">stopped · sync skipped: local changes</div>`
-- `gitSync.state === 'skipped-diverged'` → `...sub">stopped · sync skipped: local commits ahead</div>`
-- `gitSync.state === 'synced'` or `gitSync` omitted → plain `running`/`stopped`, unchanged
-- The `host` row (called with no `gitSync` argument at all, matching the
-  real call site) renders identically to its pre-existing behavior.
-
-This is genuinely minimal: one suffix appended to an existing `.sub` text
-node, reusing the existing render path, no new CSS/DOM/badge system, and
-every other `row()` call site is unaffected because the new parameter is
-purely additive and trailing. The orchestrator's call to skip a
-`docs/design.md` pass for this holds up.
+| 1 | Full provision: `deploy` user (`/bin/sh`), `DEPLOY_PATH` owned `deploy:deploy`, `authorized_keys` exactly one restricted line, sudoers exact zero-arg `NOPASSWD` grant, `visudo -cf` passes | Automated (`InstallScriptDeployTargetBlockTests.test_full_run_provisions_user_path_env_keys_sudoers`), real pty-driven run of `install.sh`'s literal block as root | pass | `python3 -m unittest tests.test_deploy_target -v` — ok |
+| 2 | Push lands under `DEPLOY_PATH`, owned by receiver user, no shell/tty | Automated, real `rsync`/`ssh` against local sshd (`PrivilegedEndToEndTests.test_push_lands_under_deploy_path_owned_by_receiver_user`) | pass | same run |
+| 3 | Escape attempt outside `DEPLOY_PATH` never writes outside it | Automated, real rrsync (`test_path_escape_attempt_rejected_no_file_written_outside`) | pass | same run; independently re-verified against `/usr/bin/rrsync`'s own `validated_arg()` source (see Findings) |
+| 4 | Arbitrary command / bare interactive attempt rejected, no shell/output/pty | Automated, real ssh (`test_arbitrary_command_rejected_no_shell`, `test_bare_interactive_attempt_rejected_no_shell`) | pass | same run |
+| 5 | `deploy-restart` genuinely restarts the named service, no sudo password prompt | Automated, real systemd unit + real ssh (`test_deploy_restart_actually_restarts_service_no_password_prompt`) | pass | same run |
+| 6 | Nonexistent service → non-zero exit over SSH, not swallowed | Automated (`test_restart_of_nonexistent_service_fails_loudly`) | pass | same run |
+| 7 | Re-run with different path/service/pubkey → `deploy-target.env`/`authorized_keys` reflect only new values, no accumulation | Automated (`test_rerun_with_different_values_overwrites_not_accumulates`) | pass | same run |
+| 8 | Blank pubkey at install time → user/path/scripts/sudoers still provisioned, hand-add instructions printed | Automated (`test_blank_pubkey_leaves_authorized_keys_untouched_prints_instructions`) | pass | same run |
+| 9 | `--with-host-control` + `--with-deploy-target` together → no conflicting state | Automated (`test_combined_with_host_control_no_conflicting_state`) | pass | same run |
+| 10 | Unset/malformed (relative) `DEPLOY_PATH` fails closed, never falls through to unrestricted rrsync | Automated, real ssh (`test_unset_deploy_path_fails_closed_over_real_ssh`, `test_malformed_relative_deploy_path_fails_closed_over_real_ssh`) | pass | same run |
+| 11 | Sudoers grant unusable for anything but the exact restart script | Automated (`test_sudoers_grant_scoped_to_exactly_one_zero_arg_script`, `test_sudo_cannot_be_used_to_run_arbitrary_root_command`) | pass | same run |
+| 12 | Wrapper never `eval`s/re-interprets `$SSH_ORIGINAL_COMMAND` (injection probe) | Automated (`WrapperBranchingTests.test_never_evals_original_command`) | pass | same run |
+| 13 | `rrsync` missing on target → this block only is skipped (not a full `install.sh` `exit 1`) | Manual code read only (see Findings — no automated test, and I could not safely fake `/usr/bin/rrsync`'s absence in this sandbox) | pass (by inspection) | `install.sh:619-623`: `if [ ! -x /usr/bin/rrsync ]; then echo ... >&2; else <rest of block>; fi` — no `exit` in the missing-binary branch, and a bare `[ ]` test inside an `if` condition is exempt from `set -e`, so the rest of `install.sh` continues |
 
 ## Regression check
-Full existing suite: `python3 -m unittest discover -s tests -v` — **213/213
-pass** (matches the implementation doc's claimed count: 173 pre-existing +
-40 new/extended this cycle). Frontend regression suite:
-`node tests/test_singleton_toggle_frontend.js` — **15/15 pass**, unmodified.
-`bash -n scripts/gitea-sync-project.sh`, `bash -n install.sh`,
-`python3 -m py_compile app/app.py` — all clean.
+Full existing suite: `python3 -m unittest discover -s tests -v` — **245 tests, all pass** (10 pre-existing test modules unaffected by this change).
+`bash -n install.sh` — syntax OK.
+Post-run cleanup verified: `id deploy` → no such user, `/etc/ai-dev-switchboard` absent, no `ai-dev-switchboard-deploy-*` files under `/usr/local/bin`, no matching `sudoers.d` entries, no lingering systemd units — the suite's own tearDown/tearDownClass leave the box clean.
+
+(Also found and removed one piece of pre-existing sandbox debris unrelated to this test run — a leftover `aidswbreview` system user and `/etc/sudoers.d/ai-dev-switchboard-deploy-target-review` file from an earlier manual session, using a different username than this suite's own `aidswbtest`/`aidswbreview`-agnostic tearDown. Not caused by this cycle's code or test run; cleaned up for hygiene, noted here for the record.)
 
 ## Defects found
-None blocking. Testing pass is clean — proceeding to review.
+None — testing pass is clean.
 
 ---
 
 ## Spec coverage
-All 10 acceptance criteria in `docs/spec.md` are implemented and covered by
-tests (automated where possible, plus my own adversarial extensions for the
-sync-safety logic specifically called out as needing extra scrutiny). No
-criterion was found unimplemented or untested.
-
-- Repo-map write on `create_project()` success, null sync fields — ✅ implemented, tested (#1).
-- Repo-map write failure non-fatal — ✅ implemented, tested (#2).
-- One `_gitea_api` call per repo-map entry per due poll — ✅ implemented, tested, and independently stress-tested under real concurrency (#3).
-- Throttle holds across repeated calls — ✅ implemented, tested, stress-tested (#4).
-- No polling when disabled/off — ✅ implemented, tested (#5).
-- SHA-match skips sync (no subprocess) — ✅ implemented, tested, independently verified with a real subprocess spy (#6).
-- SHA-diff → correct fast-forward + repo-map update — ✅ implemented, tested with both mocked and real git (#7).
-- Dirty → skip, byte-for-byte intact, `remote_sha` still updated — ✅ implemented, tested, and adversarially extended (staged, untracked-only, race-window cases) (#8).
-- Diverged/ahead → skip, no destructive op — ✅ implemented, tested, and adversarially extended (local merge commit, race-window concurrent commit) (#9).
-- Non-200 → skipped without raising, repo-map untouched — ✅ implemented, tested for the literal AC. **Adjacent gap found** for a malformed-but-200 response — see Findings #1 (does not invalidate this AC, which only concerns status codes).
-- Full suite passes, no real Docker/network in new tests, no root needed — ✅ verified directly.
-- `/status` includes/omits `gitea_sync` correctly — ✅ implemented, tested (#12).
-
-The developer's flagged deviation (`_gitea_sync_run` factored out of
-`_gitea_sync_bg`) was independently verified, not just read: my own 20-thread
-concurrent-dispatch test against the real (unmocked) locking/threading code
-confirms the factoring has no behavioral difference from the spec's stated
-intent (per-project non-blocking lock, background thread, fast return) —
-exactly 1 real sync attempt out of 20 concurrent dispatches for the same
-project.
+All 9 checkbox bullets in `docs/spec.md`'s "Acceptance criteria" section are implemented and covered by a passing automated test that exercises the real behavior (real `ssh`/`rsync`/`sudo`/`systemctl`, not mocks), per the table above. The "Edge cases" section's items are also implemented; all but one ("`rrsync` missing → skip this block only") have automated coverage; that one was verified by direct code reading only (see Findings #1 below — not a blocker).
 
 ## Findings (most severe first)
 
-### 1. Unhandled exception when a Gitea branch-lookup response is 200 but not a JSON object — should-fix
-- File: `app/app.py:721` (`_gitea_poll_one`), called from `app/app.py:2640`
-  (`_gitea_poll_if_due(gitea_on)` inside `do_GET`'s `/status` handler, no
-  surrounding `try/except`)
-- Issue: `remote_sha = (resp.get("commit") or {}).get("id", "")` assumes
-  `resp` is always a dict. `_gitea_api` only converts network-level errors,
-  HTTP error statuses, and JSON-parse failures into `ConnectionError`
-  (caught by `_gitea_poll_one`) — a **200** response whose body parses as
-  valid JSON but isn't an object (e.g. literal `null`, or an array) passes
-  straight through as `resp`, and `resp.get(...)` then raises
-  `AttributeError`. Reproduced directly: monkeypatching `_gitea_api` to
-  return `(200, None)` and calling `_gitea_poll_one` raises
-  `AttributeError: 'NoneType' object has no attribute 'get'` uncaught.
-  `_gitea_poll_if_due`'s `try/finally` only releases the poll lock in
-  `finally` — it does not catch the exception, so it propagates into
-  `do_GET`, which has no generic exception handler either (confirmed by
-  reading the `Handler` class and `do_GET`/`do_POST`; only
-  `_read_json_body` has a narrow local `try/except`). The default
-  `ThreadingHTTPServer` behavior for an unhandled exception in a handler
-  thread is to print a traceback and reset that connection — it does not
-  crash the whole server, but that specific `/status` request fails for
-  the client.
-- Failure scenario: a Gitea instance (or a reverse proxy/misconfiguration
-  in front of it) that returns a 200 with an unexpected body shape for one
-  registered project's branch-lookup endpoint. Because the `for` loop in
-  `_gitea_poll_if_due` (`app/app.py:665-666`-ish, iterating
-  `_load_gitea_repo_map().items()`) has no per-entry exception handling,
-  the exception aborts the *entire* poll pass partway through — every other
-  registered project after the malformed one in iteration order is also
-  skipped for that interval, not just the offending one. This recurs every
-  `GITEA_POLL_INTERVAL_SECONDS` for as long as the malformed-response
-  condition persists, degrading (but not destroying) sync availability for
-  every Gitea-backed project, not only the misbehaving one. Not data loss,
-  not a literal acceptance-criterion violation (the spec's own "Edge cases"
-  and AC #10 only specify non-200 status handling), and consistent with the
-  spec's own stated risk tolerance ("worst case: sync doesn't happen when
-  it safely could have") — but the blast radius (all projects, not just the
-  one with the bad response) is broader than what the spec's edge-case
-  analysis anticipated, and a bare `except Exception` (or narrowing to
-  `except (AttributeError, TypeError, KeyError)`) around the body inside
-  `_gitea_poll_one`, or around each iteration of the loop in
-  `_gitea_poll_if_due`, would close this cleanly without changing any
-  currently-tested behavior.
+### 1. `rrsync`-missing skip path has no automated (or, this session, hands-on) test coverage — nit
+- File: `install.sh:619-623`
+- Issue: the spec's "Edge cases" section requires that a target missing `/usr/bin/rrsync` prints an error and skips *only* the `--with-deploy-target` block, not the whole `install.sh` run. No test in `tests/test_deploy_target.py` exercises this path (confirmed via `grep` — only comments/an unrelated `skipUnless` guard mention `rrsync`). I verified it's correct by reading the code directly (the `if [ ! -x ... ]; then echo ...; else ...; fi` has no `exit` in the true branch, and a failing test inside an `if` condition doesn't trigger `set -e`), and I attempted to verify it hands-on by temporarily moving `/usr/bin/rrsync` aside and re-running the extracted block, but the sandbox's own auto-mode classifier blocked that action as too risky (moving a real system binary). This exact gap — no test for the analogous "tool missing → skip this optional block" precedent — already exists for `install.sh`'s pre-existing `ttyd`-arch-not-found check (`grep -rn ttyd tests/*.py` → no hits), so this isn't a new departure from the project's own testing convention, just an inherited one.
+- Failure scenario if this were actually broken: a target running an older/non-Debian OS without `rrsync` would see `install.sh --with-deploy-target` (or a combined multi-flag run) `exit 1` and abort every other requested flag instead of just skipping this one — annoying but not a security issue, and the static code shape makes this very unlikely.
+- Suggested follow-up (non-blocking): a cheap way to close this without touching the real system binary would be a small refactor to make the rrsync path a variable the test can override (e.g. `RRSYNC_BIN="${RRSYNC_BIN:-/usr/bin/rrsync}"`), or a test that stubs a fake `PATH`-shadowing `/usr/bin/rrsync` doesn't help here since the check is `-x /usr/bin/rrsync` on the literal absolute path — the override-variable approach is the practical fix if this is ever prioritized.
 
-### 2. Detached HEAD is silently fast-forwarded — nit
-- File: `scripts/gitea-sync-project.sh:99-103` (the ancestor check / `git
-  merge --ff-only`)
-- Issue: if `PROJECTS_DIR/<name>` happens to be in a detached-HEAD state
-  (e.g. an agent session intentionally checked out an older commit to
-  inspect/test something) and that detached HEAD is a clean ancestor of the
-  newly fetched ref, `git merge --ff-only` succeeds and moves the detached
-  HEAD forward — verified directly (test 3 in my adversarial run). Not
-  destructive (the old position remains in the reflog, no commit is lost,
-  and this satisfies the spec's literal "clean + ancestor → fast-forward"
-  rule exactly as written), but it's a case the spec's prose doesn't
-  explicitly call out, and it means an agent session that deliberately
-  detached HEAD to look at history could have that state silently moved
-  out from under it. Not a blocker — no data loss, and arguably correct
-  per the letter of the spec — but worth a documentation note or an
-  explicit decision in a follow-up if it turns out to surprise anyone in
-  practice.
+### 2. README.md repo-layout tree: `deploy-target/` line's column alignment is a few spaces short of its neighbors — nit
+- File: `README.md:164`
+- Issue: `deploy-target/           optional deploy receiver...` starts its description one column earlier than `host-agent/               optional persistent session...` above it, in a block that (loosely) tries to align descriptions into a column. Purely cosmetic; the tree already has pre-existing minor inconsistency (e.g. `app/app.py` vs `engines.d/`), so this isn't a new departure from a firm convention, just imperfect monospace alignment.
+- Failure scenario: none — purely visual.
+
+## Verified independently (review pass, not just re-reading the developer's write-up)
+- **Deviation 1 (bare `deploy@target:` destination, not `deploy@target:<DEPLOY_PATH>/`)**: confirmed correct by the fact that `PrivilegedEndToEndTests.test_push_lands_under_deploy_path_owned_by_receiver_user` uses the bare form and passes; `deploy-target/README.md` and `install.sh`'s printed summary were both checked and consistently show the corrected bare-destination form.
+- **Deviation 2 (`rrsync` silently re-roots an absolute destination under `DEPLOY_PATH` rather than erroring)**: independently confirmed by reading `/usr/bin/rrsync`'s own `validated_arg()` (lines 295-337) directly on this machine — for a non-`.`/`..`-containing absolute arg, when `args.dir != '/'`, the code does `arg = args.dir + arg` (re-rooting), and only `die()`s on a literal `..` traversal attempt (`HAS_DOT_DOT_RE`) or on `os.path.realpath()` resolving outside `args.dir_slash` for an existing path. This matches `docs/implementation.md`'s "Deviations from spec" write-up exactly, and the load-bearing security property (nothing lands outside `DEPLOY_PATH`) is what `test_path_escape_attempt_rejected_no_file_written_outside` actually asserts, which I ran and confirmed passing.
+- **Wrapper injection surface**: `deploy-wrapper.sh` does a literal `case` string match only, never `eval`s `$SSH_ORIGINAL_COMMAND`; confirmed by direct read and by `test_never_evals_original_command` passing. The `rsync --server*` branch execs a hardcoded absolute path (`/usr/bin/rrsync`, not PATH-resolved) with a fixed `-wo "$DEPLOY_PATH"` argument list — the client's own `$SSH_ORIGINAL_COMMAND` content past the case-match is never passed as shell-interpreted argv to anything; `rrsync` itself independently re-reads and validates `$SSH_ORIGINAL_COMMAND` for the actual rsync protocol arguments, which is exactly rrsync's documented purpose.
+- **Sudoers scoping**: `deploy ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-deploy-restart.sh` — zero arguments, no wildcard, confirmed via `visudo -cf` and via `sudo -l` output in `test_sudoers_grant_scoped_to_exactly_one_zero_arg_script`.
+- **No secrets in code/logs**: no credentials are logged or hardcoded; the only "secret" involved (the SSH private key) never touches this repo or the target machine per spec design, and the pasted-in `DEPLOY_PUBKEY` is, by definition, public.
+- **Scope discipline**: diff matches `docs/spec.md`'s "Affected areas" exactly — no changes to `app/app.py`, `config/switchboard.env.example`, or switchboard-side sudoers/systemd assets. No unnecessary abstractions found; the wrapper/restart scripts are as minimal as the spec calls for (no speculative multi-target or generic-command-runner machinery was added, matching "Non-goals").
 
 ## Follow-ups (non-blocking)
-- Consider a bare-minimum `except Exception` guard around the per-entry
-  body of `_gitea_poll_one` (or around each iteration in
-  `_gitea_poll_if_due`'s loop) so one malformed response can't suppress
-  polling for every other registered project in the same pass (Finding #1).
-- Consider explicitly deciding (and documenting) whether a detached-HEAD
-  working copy should be fast-forwarded like any other clean+ancestor case,
-  or treated as an additional skip condition (Finding #2) — current
-  behavior is safe but undiscussed.
-- The `at` (`sync_at`) timestamp is sent in `/status`'s `gitea_sync` field
-  but not currently surfaced anywhere in the UI (only `state` drives the
-  `.sub` suffix). Consistent with the spec explicitly leaving exact UI
-  treatment to developer discretion — not a defect, just noting in case a
-  future design pass wants to use it (e.g. a tooltip with "skipped 3m ago").
+- Consider closing Finding #1's coverage gap (`rrsync`-missing skip path) with a `RRSYNC_BIN`-style override variable + test, if/when this area gets touched again — not urgent given the low-risk, easily-inspected code shape and the matching pre-existing untested `ttyd` precedent.
+- Optional cosmetic fix to `README.md:164`'s column alignment (Finding #2).
 
 ## Overall verdict
-**Approve with follow-ups.** All 10 acceptance criteria are implemented and
-verified — most of them with hands-on adversarial testing beyond the
-developer's own suite, specifically targeting the sync-safety logic this
-cycle's core value proposition depends on (dirty-check, fast-forward-safety
-check, per-project lock, poll throttle). I was unable to break the
-data-loss/history-rewrite guarantees despite deliberately constructing
-staged-only, untracked-only, detached-HEAD, local-merge-commit, and
-genuine-concurrent-race scenarios against the real script and real threads
-— `git merge --ff-only` held up as a true loud-refusal-or-clean-no-op in
-every case, including races that landed inside the gap between the
-Python-level checks and the actual merge. The one real bug found (Finding
-#1, an uncovered exception path on a malformed-but-200 Gitea response) is
-should-fix, not must-fix: it doesn't violate any literal acceptance
-criterion, doesn't risk data loss, and degrades gracefully in the direction
-the spec already accepts ("sync doesn't happen when it safely could have")
-— it just has a wider blast radius (all registered projects' polling for
-that interval, not only the malformed one) than the spec's edge-case
-analysis anticipated. The frontend judgment call to skip a `docs/design.md`
-pass held up under direct verification of the actual rendered script.
+**Approve with follow-ups.** All 30 new tests pass (including every privileged real-SSH/rsync/systemd end-to-end test), the full 245-test repo suite has zero regressions, every one of `docs/spec.md`'s 9 acceptance-criteria bullets is implemented and covered by a real (non-mocked) passing test, and the two documented spec deviations were independently re-verified against `/usr/bin/rrsync`'s actual source rather than taken on trust. The two findings above are both nits (an inherited, pre-existing test-coverage gap on an unlikely/low-risk path, and a cosmetic whitespace nit) — neither blocks this cycle.

@@ -1,285 +1,188 @@
-# Implementation: Local git hosting UI + CI/CD (Gitea) — part 2c, part 1: poll-based sync-on-push
-
-(2a/2b's own implementation notes are preserved in git history and in this
-project's `docs/BACKLOG.md` — `git show dcc582b:docs/implementation.md` for
-2a, the previous commit's `docs/implementation.md` for 2b. This file now
-documents 2c part 1 only, per this cycle's `docs/spec.md` — the *revised*,
-polling-based version, not the earlier webhook design the user rejected.)
+# Implementation: deploy-target receiver (backlog item 2c, part 2, cycle 2a)
 
 ## Summary
+Added a new `deploy-target/` directory and an `install.sh --with-deploy-target`
+flag that together provision a receiver-only deploy target on a *separate*
+machine from the switchboard: a low-priv `deploy` system user whose SSH key
+can only write-only-rsync into one configured path (via `rrsync`) or trigger
+one fixed, sudoers-scoped `systemctl restart` of one named service — nothing
+else, no shell, ever. No switchboard-side wiring exists yet (that's a future
+cycle, 2c-2b); this cycle is standalone-testable with nothing but a manually
+generated SSH keypair and the `ssh`/`rsync` CLIs, and was exercised for real
+end-to-end (real sshd, real throwaway system users, real sudo, real systemd
+units) rather than only unit-tested.
 
-Added a throttled Gitea-API poll (`_gitea_poll_if_due`/`_gitea_poll_one`,
-piggybacked on the existing `/status` handler, independently throttled to
-`GITEA_POLL_INTERVAL_SECONDS`, default 45s) that detects when a push has
-landed on a Gitea-backed project's repo from somewhere else, plus a new
-low-privilege script (`scripts/gitea-sync-project.sh`, run as `RUN_USER`,
-never root) that safely fast-forwards `PROJECTS_DIR/<name>` — fetch, then
-`git merge --ff-only` only if the working copy is clean *and* local `HEAD`
-is an ancestor of the new remote ref, otherwise skip and record why. No new
-listener, no new secret, no Docker networking changes — everything reuses
-2b's existing `_gitea_api()` helper and the existing loopback
-`127.0.0.1:$GITEA_PORT` path. A new `GITEA_REPO_MAP_FILE` (JSON,
-`SVC_USER`-owned, same directory as `DESC_CACHE_FILE`) resolves
-`owner/repo` -> local project name/branch/sync-state, written by
-`create_project()` (best-effort, non-fatal) and read/updated by the poll
-machinery.
-
-Followed the spec's "Proposed approach" code shapes essentially verbatim —
-`_gitea_poll_if_due`/`_gitea_poll_one` match the spec's own pseudocode
-almost line for line. The one structural addition beyond what the spec's
-pseudocode literally showed is `_gitea_sync_run` (a synchronous, directly
-testable function that does the actual `subprocess.run` + repo-map update),
-factored out from `_gitea_sync_bg` (which now just acquires the per-project
-lock and spawns `_gitea_sync_run` on a background thread) — see "Key
-decisions / tradeoffs" for why.
+## Root cause
+N/A — new feature, not a bugfix.
 
 ## Changes by file
-
-- **`app/app.py`**:
-  - New config: `GITEA_SYNC_SCRIPT`, `GITEA_REPO_MAP_FILE`,
-    `GITEA_POLL_INTERVAL_SECONDS` (env-overridable constant, default `45`,
-    not written by `install.sh` — see "Deviations from spec", Open
-    Question #5 resolved as specced).
-  - New `_load_gitea_repo_map()` / `_save_gitea_repo_map_entry()` — same
-    tmp-file-then-`os.replace()` idiom as `_save_desc_cache`, guarded by a
-    new `_gitea_map_lock` (needed here, unlike `_save_desc_cache`, because
-    multiple threads — `create_project()` and every in-flight sync attempt —
-    can call this concurrently for *different* projects).
-  - New `_gitea_sync_lock_for(owner_repo)` — a per-project non-blocking
-    lock dict (`_gitea_sync_locks`/`_gitea_sync_locks_guard`), mirroring the
-    `_desc_pending` per-name-set idiom.
-  - New `_gitea_sync_run(name, branch, owner_repo, observed_sha)` — runs
-    `GITEA_SYNC_SCRIPT` via `sudo -u $RUN_USER`, records the outcome
-    (`synced`/`skipped-dirty`/`skipped-diverged`/`no-such-project`) plus
-    `sync_at`/`remote_sha` into the repo-map on success (exit 0); a
-    non-zero exit or a subprocess-level exception leaves the repo-map
-    untouched entirely (see "Key decisions").
-  - New `_gitea_sync_bg(name, branch, owner_repo, observed_sha)` — the
-    exact call site `_gitea_poll_one` uses (matches the spec's pseudocode
-    verbatim); acquires the per-project lock non-blocking, and if acquired,
-    spawns `_gitea_sync_run` on a daemon thread and returns immediately
-    (mirrors `_generate_description_bg`'s "return fast" idiom).
-  - New `_gitea_poll_lock`/`_gitea_poll_last_at`, `_gitea_poll_if_due`,
-    `_gitea_poll_one` — verbatim to the spec's own pseudocode.
-  - `create_project()`: one new best-effort call
-    (`_save_gitea_repo_map_entry(f"{owner}/{repo_name}", name, "main")`)
-    right after the existing successful-clone path, before `return True,
-    ""` — wrapped in `try/except OSError: pass`.
-  - `do_GET`'s `/status` handler: calls `_gitea_poll_if_due(gitea_on)`
-    right after `gitea_on` is computed; loads the repo-map once per
-    request and reverse-indexes it by `name` to attach an optional
-    `gitea_sync: {"state": ..., "at": ...}` field to each instance row
-    when a repo-map entry exists for that project (absent, not
-    present-but-null, otherwise).
-  - Frontend `<script>` (`render_page()`): new `gitSyncSuffix(gitSync)`
-    helper and a new `gitSync` parameter on `row()` (appended as the last
-    positional arg, so every existing call site except the instance-row one
-    is unaffected) — appends a small suffix to the row's existing `.sub`
-    text (` · sync skipped: local changes` / ` · sync skipped: local
-    commits ahead`) only for the two skip states; `synced`/absent add
-    nothing. No new badge/icon system, per the spec's own UI note.
-- **`scripts/gitea-sync-project.sh`** (new) — the low-privilege (`RUN_USER`,
-  not root) sync script: re-validates `<name>`/`<branch>`, `git fetch
-  origin "$branch"`, dirty-check (`git status --porcelain`), fast-forward-
-  safety check (`git merge-base --is-ancestor HEAD "origin/$branch"`),
-  otherwise `git merge --ff-only`. Prints exactly one of `synced` /
-  `skipped-dirty` / `skipped-diverged` / `no-such-project` and always exits
-  0 on a defined outcome; exits 1 (argv/config validation failure) or lets
-  `git fetch` itself fail loudly (`set -e`) on an undefined one.
-- **`install.sh`**:
-  - New `ALL=($RUN_USER)` sudoers line for
-    `ai-dev-switchboard-gitea-sync-project.sh` (gated on
-    `WITH_GIT_HOSTING`), grouped with the other `ALL=($RUN_USER)` rules —
-    not `ALL=(root)`, since this script never needs root.
-  - `install -m 755 .../gitea-sync-project.sh
-    /usr/local/bin/ai-dev-switchboard-gitea-sync-project.sh` inside the
-    `WITH_GIT_HOSTING` block.
-  - Two new `set_env` calls: `GITEA_SYNC_SCRIPT`, `GITEA_REPO_MAP_FILE`
-    (`$STATE_DIR/gitea-repo-map.json`, same directory `DESC_CACHE_FILE`
-    already uses). `GITEA_POLL_INTERVAL_SECONDS` deliberately **not**
-    written (see "Open questions" #5 in `docs/spec.md`) — it has a
-    built-in default in `app.py` and is documented as an optional
-    commented-out override in `config/switchboard.env.example` instead.
-  - No changes to `config/gitea-docker-compose.yml` or any Docker
-    networking — none needed under the revised (polling) design.
-- **`config/switchboard.env.example`** — new commented block documenting
-  `GITEA_SYNC_SCRIPT`, `GITEA_REPO_MAP_FILE`, `GITEA_POLL_INTERVAL_SECONDS`,
-  matching the existing `GITEA_*` block's style.
-- **`docs/GIT_HOSTING.md`** — replaced the old "Auto-sync... [not
-  included]" bullet under "What's NOT included (yet)" with a new "Auto-sync
-  of `PROJECTS_DIR/<name>` when someone pushes from elsewhere" section
-  describing the polling mechanism, the exact safety steps, and both honest
-  caveats (latency up to `GITEA_POLL_INTERVAL_SECONDS`; the two skip cases
-  still need a manual `git pull`). Also added a "Projects not created
-  through the '+ New project' flow" bullet to "What's NOT included (yet)"
-  (repo-map has no retroactive-linking mechanism — matches the spec's
-  Non-goals) and a forward pointer to 2c part 2 (CI/CD auto-deploy).
-- **`README.md`** — **not changed**. Its existing Gitea mention doesn't
-  reference the old "no auto-sync" gap at all (checked directly), so
-  there's nothing there to update per the spec's own conditional ("if it
-  references the old gap, updated to match").
-- **Tests** (no real Docker/network/Gitea-server calls anywhere):
-  - `tests/test_gitea_poll.py` (new, 26 tests) —
-    `GiteaRepoMapTests` (load/save round-trip, tmp-file idiom, corrupt-file
-    handling), `GiteaPollIfDueTests` (throttling via a mocked
-    `_gitea_poll_last_at`, `GITEA_ENABLED`/`gitea_on` gating, one
-    `_gitea_api` call per repo-map entry when due), `GiteaPollOneTests`
-    (SHA-match skip, SHA-diff dispatch with exact args, non-200/
-    `ConnectionError`/missing-`commit.id` all skipped without raising),
-    `GiteaSyncRunTests` (mocked `subprocess.run` — `synced`/
-    `skipped-dirty`/`skipped-diverged` all update the repo-map including
-    `remote_sha`; a non-zero exit or a raised exception leaves the
-    repo-map untouched), `GiteaSyncBgConcurrencyTests` (a second dispatch
-    while the per-project lock is held is dropped; the lock is released
-    after a completed run so the next dispatch can proceed).
-  - `tests/test_gitea_sync_project.py` (new, 10 tests) — exercises the
-    *real* `gitea-sync-project.sh` against real temporary local git repos
-    (a plain local-path "origin" stands in for Gitea): clean
-    fast-forwardable -> `synced` (file lands, HEAD matches origin exactly),
-    already-up-to-date -> `synced` as a no-op, dirty working tree ->
-    `skipped-dirty` (byte-for-byte-intact uncommitted edit verified),
-    diverged local commit -> `skipped-diverged` (commit still reachable
-    from `HEAD` afterward, verified two ways — a genuinely diverged history
-    and a local-ahead-only case), missing/non-git destination ->
-    `no-such-project`, plus arg-validation cases (wrong count, invalid
-    name, invalid branch). No `sudo`/root needed, as the spec predicted —
-    the script never crosses a privilege boundary internally.
-  - `tests/test_gitea.py` (extended) — two new tests in
-    `CreateProjectGiteaTests` (`test_happy_path_writes_repo_map_entry_with_null_sync_fields`,
-    `test_repo_map_write_failure_does_not_fail_create_project`) plus two new
-    tests in `GiteaEndpointTests`
-    (`test_status_includes_gitea_sync_for_a_project_with_a_repo_map_entry`,
-    `test_status_omits_gitea_sync_for_a_project_without_a_repo_map_entry`)
-    covering the exact presence/absence JSON-shape acceptance criterion.
-    `setUp`/`tearDown` in `CreateProjectGiteaTests` now also redirect
-    `GITEA_REPO_MAP_FILE` to a per-test temp path.
+- `deploy-target/deploy-target.env.example` (new) — documents `DEPLOY_PATH`
+  and `DEPLOY_SERVICE_NAME`, mirrors `host-agent/host.env.example`'s shape.
+- `deploy-target/deploy-wrapper.sh` (new) — the `authorized_keys` forced
+  command. Branches on `$SSH_ORIGINAL_COMMAND` via a literal `case` match
+  only (never `eval`s it): `rsync --server*` → validates `DEPLOY_PATH` is
+  set and absolute, then `exec /usr/bin/rrsync -wo "$DEPLOY_PATH"` (hardcoded
+  absolute path, not PATH-resolved); the literal string `deploy-restart` →
+  `exec sudo -n /usr/local/bin/ai-dev-switchboard-deploy-restart.sh`;
+  anything else (including no command) → error to stderr, exit 1.
+- `deploy-target/deploy-restart.sh` (new) — the one script `deploy` may run
+  as root. Re-validates `DEPLOY_SERVICE_NAME` against
+  `^[A-Za-z0-9@_.-]+$` (defense in depth against a hand-edited config), then
+  `systemctl restart -- "$DEPLOY_SERVICE_NAME"` under `set -euo pipefail` —
+  a restart failure propagates as a non-zero SSH exit, never swallowed.
+- `deploy-target/README.md` (new) — setup steps, the `/bin/sh`-not-`nologin`
+  rationale, a manual verification walkthrough, the protocol contract for a
+  future 2c-2b caller, and removal/rollback steps.
+- `install.sh` — new `--with-deploy-target` flag (flag-list comment,
+  `WITH_DEPLOY_TARGET` variable, parsing case arm) and a new provisioning
+  block placed immediately after the existing `WITH_HOST_CONTROL` block:
+  prompts for `DEPLOY_PATH`/`DEPLOY_SERVICE_NAME`/`DEPLOY_PUBKEY`, verifies
+  `/usr/bin/rrsync` exists (skips only this block, not the whole run, if
+  missing), idempotently creates the `deploy` user (`/bin/sh` shell),
+  creates/chowns `DEPLOY_PATH` if supplied, installs
+  `/etc/ai-dev-switchboard/deploy-target.env` (copy-once-then-`set_env`,
+  only overwriting keys actually supplied this run), installs the two
+  scripts to `/usr/local/bin/ai-dev-switchboard-deploy-{wrapper,restart}.sh`,
+  writes `authorized_keys` deterministically if a pubkey was supplied (else
+  prints hand-add instructions), writes and `visudo -cf`-validates
+  `/etc/sudoers.d/ai-dev-switchboard-deploy-target` (zero-argument
+  `NOPASSWD` grant), and prints a summary.
+- `README.md` (top-level) — added `deploy-target/` to the repo-layout tree
+  and one new security-notes bullet describing the SSH-key restriction,
+  explicitly noting this is receiver-only infrastructure with no
+  switchboard UI consumer yet.
+- `tests/test_deploy_target.py` (new) — see "How to verify locally".
 
 ## Key decisions / tradeoffs
-
-- **`_gitea_sync_run` factored out of `_gitea_sync_bg`, beyond what the
-  spec's pseudocode literally showed.** The spec's own "Proposed approach"
-  code block calls `_gitea_sync_bg(...)` directly from `_gitea_poll_one`
-  with no visible `Thread(...)` wrapper, while its prose says `_gitea_sync_bg`
-  is itself "spawned from `_gitea_poll_one`, off the request thread." Read
-  literally together, this means the *call site* stays exactly as specced
-  (a plain call, easy to mock and assert-called-with in
-  `GiteaPollOneTests`), while `_gitea_sync_bg` internally owns spawning the
-  actual background thread. To keep the acceptance criterion "verified via
-  a mocked subprocess call in `tests/test_gitea_poll.py`" testable
-  *synchronously* (no thread-join races in test code), the part that
-  actually calls `subprocess.run` and updates the repo-map is its own
-  function, `_gitea_sync_run`, which `_gitea_sync_bg` spawns on a thread
-  after acquiring the per-project lock. This is an implementation-detail
-  addition, not a deviation from the spec's actual behavior — every
-  acceptance criterion and every piece of the spec's own prose ("per-project
-  non-blocking lock", "spawned... off the request thread", "returns fast")
-  is satisfied exactly as described.
-- **A non-zero exit / raised exception from `gitea-sync-project.sh` leaves
-  the repo-map's `remote_sha` untouched**, rather than recording some
-  generic "error" state with the observed SHA. The spec's own script steps
-  only define three "touched the repo-map" outcomes (`synced`,
-  `skipped-dirty`, `skipped-diverged`) plus `no-such-project`, all normal
-  exit-0 outcomes; a script-level failure (bad args, or `git fetch` itself
-  failing — e.g. Gitea restarting mid-poll) isn't one of those. Recording
-  `remote_sha` on a failure would have silently suppressed all future retry
-  attempts for that push (since `_gitea_poll_one`'s SHA-compare would then
-  see no diff); leaving it untouched means the next poll interval still
-  sees the same diff and retries automatically — the same "safe to rerun,
-  self-healing" framing the spec applies everywhere else (the SHA-snapshot
-  race in "Open questions" #2, the lock-busy-drop case).
-- **`gitea_sync_by_name` reverse-index rebuilt on every `/status` call**
-  (one JSON file read, small N) rather than cached in memory — matches the
-  spec's own "just iterate it" framing for `instance_names()`'s own
-  filesystem scan, and keeps `/status` simple (no cache-invalidation logic
-  needed when `_gitea_sync_run` updates the file from a different thread).
+- **Followed `host-agent`'s shape, not the deleted `target-setup.sh`'s**, per
+  the spec: dedicated low-priv user, forced-command/no-shell SSH
+  restriction, a fixed zero-argument sudoers rule — no systemd `.path`-unit
+  inotify trigger.
+- **`/bin/sh`, not `nologin`, for `deploy`'s shell** — `nologin` ignores its
+  `-c` argument and never runs the forced command at all; carried forward
+  from the deleted `target-setup.sh`'s own documented reasoning.
+- **No hand-parsing of the rsync wire protocol** — the wrapper only ever
+  does a literal string `case` match on `$SSH_ORIGINAL_COMMAND`; all actual
+  path-restriction enforcement is delegated to `rrsync` itself.
+- **Real end-to-end testing over unit testing wherever possible** — this is
+  security-sensitive surface (SSH forced commands, sudoers scoping,
+  `rrsync` path restriction), so `tests/test_deploy_target.py` provisions
+  real throwaway system users, a real sudoers rule, and a real systemd unit,
+  and drives them over real `ssh`/`rsync` against this machine's own
+  already-running sshd, rather than mocking any of that away. See "How to
+  verify locally" for the three test tiers.
+- **`install.sh`'s own `--with-deploy-target` block is tested by extracting
+  and running its literal source**, not by re-implementing equivalent logic
+  in Python and not by running the *entire* `install.sh` (which would also
+  do apt-get installs, create `RUN_USER`/`SVC_USER`, and start a second real
+  switchboard systemd service — too invasive for a test and inconsistent
+  with the fact that no other `--with-*` flag has an `install.sh`-level
+  test in this repo either). The extraction includes `install.sh`'s own
+  `prompt()`/`set_env()`/`get_env()` helpers verbatim, so a future edit to
+  the block's logic is exercised for real, not against a stale copy.
+- **Discovered `prompt()` reads from `/dev/tty`, not stdin** (deliberate, so
+  a `curl | bash` install still prompts interactively) — a plain
+  stdin-piped `subprocess.run()` therefore always sees `prompt()`'s
+  non-interactive branch and returns only the empty default, regardless of
+  what's piped in. `tests/test_deploy_target.py` drives `install.sh`'s block
+  through a real pty (`pty.fork()`) instead, exactly like a human typing at
+  a terminal — this actually caught the harness silently not exercising
+  the values I intended in an early draft of these tests (see below).
 
 ## Deviations from spec
-
-None. Every piece of the spec's "Proposed approach" (poll mechanism,
-throttle, repo-map file shape and write/read points, the sync script's
-5-step safety logic, per-project lock, `install.sh` diff shape) was
-implemented as specified; the one addition (`_gitea_sync_run`) is an
-internal factoring, not a behavioral or interface deviation — see "Key
-decisions" above. All 10 acceptance criteria were implemented and are
-covered by the tests listed above. `docs/BACKLOG.md` was intentionally left
-unchanged — the spec's own "Affected areas" list doesn't include it, and
-tracking backlog-item status across cycles is product-manager's file to
-update, not developer's.
-
-## Post-review fix: per-entry poll isolation (should-fix from docs/test-review.md)
-
-The reviewer found that `_gitea_poll_one` raised an uncaught `AttributeError`
-when Gitea returned a 200 whose body wasn't a JSON object (`resp.get("commit")`
-on a non-dict `resp`), and that the calling loop in `_gitea_poll_if_due` had
-no per-entry exception handling — so one malformed response silently killed
-polling for every other registered project in that pass, not just the
-malformed one. Fixed two ways: `_gitea_poll_one` now checks
-`isinstance(resp, dict)` before touching `resp.get(...)` (closes the specific
-reported cause), and `_gitea_poll_if_due`'s loop now wraps each
-`_gitea_poll_one` call in its own `try/except Exception: pass` (closes the
-class of bug generally, not just this one instance of it) — matching this
-feature's own accepted "availability nit, never a correctness/safety issue"
-risk tolerance from `docs/spec.md`'s Risk notes.
-
-Two new regression tests in `tests/test_gitea_poll.py`:
-`test_non_dict_200_response_skipped_without_raising` (direct repro) and
-`test_one_malformed_entry_does_not_stop_the_rest_of_the_pass` (asserts a
-second, healthy repo-map entry still gets polled in the same pass despite the
-first one's malformed response). Verified load-bearing: reverted both fix
-edits, confirmed both new tests fail with the exact reported
-`AttributeError`, restored the fix, confirmed the full suite (215/215) passes
-clean.
+- **The spec's own "Protocol contract" / acceptance-criteria example command
+  (`rsync -e "ssh -i <key>" -a ./somefile deploy@target:<DEPLOY_PATH>/`) does
+  not work as literally written against real `rrsync`.** Verified directly:
+  `rrsync` treats any destination arg starting with `/` as relative to its
+  own restricted root and prepends that root to it (see `/usr/bin/rrsync`'s
+  `validated_arg()`), so repeating the absolute `DEPLOY_PATH` in the client
+  command causes rsync to try to `mkdir` a doubled/nested path that doesn't
+  exist, and the push fails (`rsync: [Receiver] mkdir "...deploydest/tmp/
+  .../deploydest" failed`). The **correct**, verified-working form leaves
+  the destination bare (`deploy@target:`, no path at all) — the server has
+  already fixed the destination via `command="... rrsync -wo $DEPLOY_PATH"`.
+  I corrected the example commands in `deploy-target/README.md` and
+  `install.sh`'s own printed summary to the verified-working bare form, and
+  left a note in the README explaining why. `docs/spec.md` itself still has
+  the original (non-working-as-written) example; flagging it here since I
+  can't edit the spec, but the *design intent* (push lands under
+  `DEPLOY_PATH`) is unaffected — only the exact command syntax needed
+  correcting.
+- **The spec's path-escape acceptance criterion says "rrsync refuses"**
+  (implying an error) for an escape attempt like `deploy@target:/etc/`.
+  In practice `rrsync` doesn't error on this — it silently re-roots the
+  absolute path underneath `DEPLOY_PATH` (so `/etc/` becomes
+  `DEPLOY_PATH/etc/`), and the rsync call reports success (exit 0). The
+  actual, load-bearing security property — **nothing is ever written
+  outside `DEPLOY_PATH`** — holds regardless, and that's what
+  `tests/test_deploy_target.py`'s
+  `test_path_escape_attempt_rejected_no_file_written_outside` asserts
+  directly (plus confirming the file landed re-rooted at
+  `DEPLOY_PATH/etc/escapefile`, proving this was `rrsync`'s remapping and
+  not some unrelated failure). No code changed because of this — it's a
+  property of `rrsync` itself, working as upstream-designed — but it's
+  worth the reviewer knowing the exit-code framing in `docs/spec.md`
+  doesn't match `rrsync`'s actual behavior.
+- Everything else in the spec's "Proposed approach" (file layout, script
+  responsibilities, `install.sh` step-by-step provisioning, sudoers/
+  `authorized_keys` exact line shapes, edge cases) was implemented as
+  written; no other deviations.
 
 ## Known limitations
-
-- Same latency/skip-case tradeoffs the spec explicitly accepts as
-  non-goals: sync latency is bounded by `GITEA_POLL_INTERVAL_SECONDS` (up
-  to ~45s), not instant; a dirty or diverged working copy still needs a
-  manual `git pull`; there's no manual "check now" UI action this cycle.
-- A repo-map entry for a project later removed by hand (`PROJECTS_DIR/<name>`
-  deleted outside this app) is never cleaned up — the sync script's own
-  `no-such-project` no-op makes this harmless, just a small steady-state
-  extra GET per poll interval forever, exactly as the spec's "Edge cases"
-  section accepts.
-- `install.sh`'s pre-existing `STATE_DIR` (`/var/lib/ai-dev-switchboard`)
-  ownership pattern is unchanged by this cycle (matches `DESC_CACHE_FILE`'s
-  own existing treatment exactly, per the spec's explicit instruction) — not
-  a new issue introduced here, and out of this cycle's scope to fix.
+- Matches the spec's own "Open questions": one `deploy` user / one path /
+  one service per target machine (no multiplexing multiple projects onto
+  one target machine yet); no locking between overlapping push+restart
+  pairs (a future caller must serialize); `deploy-restart` is a fixed
+  protocol keyword, not a secret; restart is `systemctl restart` only, not
+  a general command-runner. None of these are addressed here — they're
+  explicitly out of scope for this cycle per the spec.
+- No switchboard-side wiring exists yet (by design — that's 2c-2b). Nothing
+  in `app/app.py`, `config/switchboard.env.example`, or the switchboard's
+  own sudoers/systemd assets changed.
+- `install.sh`'s interactive prompts for `DEPLOY_PATH`/`DEPLOY_SERVICE_NAME`/
+  `DEPLOY_PUBKEY` have no non-interactive (`--yes`/env-var) override — same
+  as every other prompt-driven value already in `install.sh` (e.g.
+  `RUN_USER`, `PVE_HOST`); not a gap introduced by this cycle.
 
 ## How to verify locally
-
-```bash
-# Full suite (Python)
-python3 -m unittest discover -s tests -v
-
-# Just this cycle's new/changed test files
-python3 -m unittest tests.test_gitea_poll tests.test_gitea_sync_project tests.test_gitea -v
-
-# Frontend (existing regression suite — verifies row()/refresh() changes
-# didn't break the singleton-toggle state machine)
-node tests/test_singleton_toggle_frontend.js
-
-# Script syntax
-bash -n scripts/gitea-sync-project.sh
-bash -n install.sh
 ```
+cd /home/dev/projects/ai-dev-switchboard
+python3 -m unittest tests.test_deploy_target -v      # this cycle's suite (30 tests)
+python3 -m unittest discover -s tests -v              # full repo suite (245 tests)
+bash -n install.sh                                     # syntax check
+```
+`tests/test_deploy_target.py` has three tiers (see its own module
+docstring for the reasoning behind each):
+1. `WrapperBranchingTests` / `RestartValidationTests` / `InstallShTemplateTests`
+   — no root needed; branching/validation logic exercised directly, with
+   fake `rrsync`/`sudo` stand-ins on `PATH` recording their own argv where
+   that's meaningful (the wrapper's `rrsync` call uses a hardcoded absolute
+   path deliberately, so that branch is instead verified against the real
+   `/usr/bin/rrsync`).
+2. `PrivilegedEndToEndTests` — gated on passwordless `sudo` and a reachable
+   local sshd (both present in this dev sandbox); provisions a real
+   throwaway system user (not literally `deploy`, to avoid colliding with a
+   genuine `deploy` account on whatever box runs this suite), a real
+   sudoers rule, and a real systemd unit, then drives all of it over real
+   `ssh`/`rsync` against `127.0.0.1` — covers every "Acceptance criteria"
+   bullet in `docs/spec.md` directly (push lands correctly; path-escape
+   attempt never lands outside `DEPLOY_PATH`; arbitrary command / bare
+   interactive attempt rejected with no shell; `deploy-restart` genuinely
+   restarts the service with no password prompt; a nonexistent service
+   fails loudly; unset/malformed `DEPLOY_PATH` fails closed; the sudoers
+   grant can't be used for anything else).
+3. `InstallScriptDeployTargetBlockTests` — gated on passwordless `sudo`;
+   extracts and runs `install.sh`'s actual `--with-deploy-target` block
+   verbatim (plus its own `prompt()`/`set_env()`/`get_env()` helpers) via a
+   real pty, using the literal `deploy` username — covers the
+   install-flow-specific acceptance criteria (full provisioning shape,
+   blank-pubkey handling, re-run-with-different-values not accumulating,
+   and running alongside `--with-host-control` with no conflicting state).
 
-All of the above were run in this implementation session: 213/213 Python
-tests pass (173 pre-existing + 40 new/extended in this cycle),
-15/15 existing frontend tests still pass unmodified, both scripts parse
-cleanly, and `python3 -m py_compile app/app.py` succeeds.
+All tests clean up their own throwaway state (`useradd -r`/`rm -f`/
+`systemctl stop` + unit-file removal); verified clean after a full run via
+`id deploy`, `ls /etc/ai-dev-switchboard`, `ls /usr/local/bin/
+ai-dev-switchboard-*`, `ls /etc/sudoers.d/`.
 
-To see the new UI treatment without a live Gitea instance, the rendered
-`<script>` was extracted from `render_page()` and exercised directly (Node
-`vm`, no DOM): `row('proj', false, null, 'inst', 'proj', '', null, false,
-null, undefined, undefined, {state:'skipped-dirty', at: 123})` renders
-`<div class="sub">stopped · sync skipped: local changes</div>`; the same
-call with `state:'synced'` or `gitSync` omitted renders the plain
-`running`/`stopped` text unchanged.
-
-For a full live round trip (not done in this session — would need a real
-Gitea instance): create a project via "+ New project", push a commit to
-its repo from a second clone or Gitea's own web UI, wait up to
-`GITEA_POLL_INTERVAL_SECONDS`, and confirm `PROJECTS_DIR/<name>` picks up
-the change and the project's `/status` row's small `sync skipped: ...`
-suffix appears/disappears correctly across dirty/diverged/clean scenarios.
+Manual walkthrough (what the tests above automate) is documented in
+`deploy-target/README.md`'s "Verifying the restriction" section.
