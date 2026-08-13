@@ -1,774 +1,598 @@
-# Spec: Headless engine invocation (backlog item 6, sub-spec 6a)
+# Spec: Grounding — discovery, digest, and `fact_check` (backlog item 6, sub-spec 6b)
 
 ## Summary
-Give the switchboard a way to run any capable engine (`claude`, `codex`,
-`aider`) **headlessly** — one bounded, non-interactive turn, structured
-output, no `capture-pane` — via a new `agent_run()` library function in a
-new `app/teams.py`, plus a small CLI so it's runnable and testable with zero
-UI. This is the foundation every later multi-agent-team sub-spec (6b–6f, see
-`docs/story.md`) builds on; nothing above the process layer (grounding, lead
-loop, per-teammate git worktrees, any web UI) is built here.
-
-**Revision note (this version):** §2–§4 were reworked after review. The
-headless process is now spawned **inside a tmux session**, via the
-*already-existing* `TMUX` sudoers rule (`app/app.py:191`), instead of adding
-a new `bash -lc` sudoers line. Zero new privilege surface. Everything else —
-the four `HEADLESS_*` keys, `{resume}`/`{prompt_file}` placeholder
-mechanics, the extended `agent_run()` return shape, signal-generic
-cancellation classification, and the three-tier test plan — is unchanged
-from the prior version. See "Why tmux-hosted" below.
+Give the (not-yet-built) team lead something real to plan and verify claims
+against: a new grounding section in `app/teams.py` that auto-discovers a
+project's own documentation, builds a hard-byte-capped digest for a system
+prompt, and answers `fact_check(claim, grounding)` with matching passages
+(`file:line`) or an explicit "no supporting passage found". Pure functions
+over files — no LLM, no process spawning, no tmux, no UI, no write path.
+This is a hard dependency of 6c's lead loop; splitting it out keeps 6c from
+carrying both grounding logic and tool-calling adapters in one pass.
 
 ## Goals
-- Extend `engines.d/*.engine` with optional `HEADLESS_CMD`, `HEADLESS_FORMAT`,
-  `HEADLESS_PROMPT`, `HEADLESS_RESUME` keys, parsed by `_parse_engine_file()`
-  in `app/app.py`.
-- Ship working headless config for `claude.engine`, `codex.engine`, and
-  `aider.engine`, each verified by actually running it.
-- `app/teams.py`: `agent_run(engine, workdir, prompt, session_id=None,
-  timeout=...)` — spawns the headless process **inside a tmux session, as
-  `RUN_USER`, via the existing `TMUX` sudoers rule**, translates its native
-  stream into the normalized envelope (`docs/story.md` §4.1), appends it to
-  a `.jsonl` log, and returns a normalized result dict.
-- A CLI entry point (`python3 app/teams.py run ...`) that exercises the same
-  code path with no server, no UI, no team concept involved.
-- Zero behavioral change to the existing single-session toggle for any engine
-  (present or future) that doesn't define `HEADLESS_CMD`.
-- Zero new sudoers surface.
+- `discover_grounding_files(workdir)` — finds `docs/ARCHITECTURE.md`,
+  `docs/BACKLOG.md`, `CLAUDE.md`/`AGENTS.md` (one, first found), `README.md`
+  (mirroring `_gather_project_context()`'s casing variants) under a project
+  directory. Each optional; missing/unusable files are skipped silently. A
+  project with none of them still produces a usable, non-empty result — the
+  caller (and eventually the lead) can tell grounding is empty rather than
+  silently getting nothing.
+- `load_grounding(workdir)` — reads each discovered file once, bounded, and
+  returns one immutable-in-spirit snapshot dict holding per-file content,
+  extracted headings, and a pre-built digest string.
+- `build_digest(files, max_bytes)` — pure function assembling headings +
+  per-file snippets into one text blob, **hard-truncated** to `max_bytes` of
+  UTF-8-encoded output, regardless of how large the source files are.
+- `fact_check(claim, grounding)` — deterministic, precision-biased textual
+  match against the *full* per-file content (not the truncated digest).
+  Returns matching passages with `file:line`, or an explicit
+  `found: False` — never a best-effort/nearest-weak-match fallback, and
+  never an exception for any claim or grounding shape.
+- Read-only by construction, and provably so: no function in this module's
+  new grounding section calls `open()` in a write/append mode or any
+  mutating `os`/`shutil` function, verified by both a monkeypatch-based
+  runtime test and a static AST scan of the source.
+- Survive adversarial file *shape*, not just size: malformed UTF-8, a
+  200 MB file, a symlink loop, a symlink pointing outside the project
+  directory, a file that's actually a directory, a binary file named
+  `README.md`. None of these may raise; each has a defined, tested outcome.
 
 ## Non-goals
-Explicitly deferred to later sub-specs in `docs/story.md`:
-- The lead loop, roster assembly, or any LLM tool-calling (**6c**). `agent_run()`
-  runs exactly one bounded turn for exactly one named engine; nothing here
-  chooses an engine, plans, or retries at a semantic level.
-- `HEADLESS_ROLE_FLAG`, `HEADLESS_SCHEMA_FLAG`, `HEADLESS_LEAD_FORMAT` — these
-  three `.engine` keys from `docs/story.md` §4.2 are **not** parsed or used by
-  this sub-spec. They only matter once something is choosing a *lead* and
-  constraining its output (6c). Adding them now would be unused code. See
-  "Open questions" for the (additive, non-breaking) follow-up this implies for
-  `_parse_engine_file()` in 6c.
-- Grounding / `fact_check` (**6b**).
-- Per-teammate git worktrees, multi-window **team** tmux sessions (one
-  window per agent, human-attachable, named per project), `install.sh
-  --with-ollama` (**6d**). This sub-spec's tmux session is a single-purpose,
-  invisible, self-cleaning implementation detail of `agent_run()` — it is
-  **not** the "team session" concept 6d builds; see "Why tmux-hosted" for how
-  the two relate.
-- Any web UI, page, or button (**6e**, **6f**). The CLI entry point is the
-  only human-facing surface this sub-spec ships.
-- Multi-turn conversational state held in a long-lived process
-  (`--input-format stream-json`) — deliberately out of scope per
-  `docs/story.md` §4.2's own reasoning; every call is one process, resumed
-  by session ID, never a persistent bidirectional pipe.
-- `install.sh` / `docs/ARCHITECTURE.md` privilege-boundary changes — moot
-  now that no new sudoers line is needed (see "Why tmux-hosted").
-- `README.md` changes. Nothing here is an end-user-visible feature yet.
+- The lead loop, its tools, and exposing `fact_check` as an LLM-callable
+  tool (JSON schema, tool-call wiring) — **6c**. Here it is a plain Python
+  function; 6c decides how/when the lead calls it.
+- The roster, tmux team sessions, per-teammate worktrees, `install.sh
+  --with-ollama` — **6d**.
+- Any web UI, page, or button — **6e**, **6f**. A CLI entry point (see
+  "Proposed approach" §5) is the only human-facing surface, matching 6a's
+  own precedent that a CLI is not a UI.
+- Semantic/LLM-assisted matching in `fact_check`. It is deliberately a
+  dumb, deterministic, single-line substring matcher — see "Precision over
+  recall" below for why, and "Open questions" for the follow-up this implies
+  if 6c's real usage shows it's too conservative.
+- Fact-checking against the project's *code* (grep the worktree), per
+  `docs/story.md` §7's own resolution of that open question — teammates
+  already read code directly; this module only ever looks at the four
+  discovered doc files.
+- Any caching/staleness/file-watching policy across multiple
+  `load_grounding()` calls, or any notion of "the team's grounding" as a
+  long-lived object — 6b only provides the single-snapshot primitive; when
+  and how often to reload it across a team's lifetime is 6c's/6d's decision.
+- Any change to `app/app.py`. `_read_head()` (already there) is reused
+  as-is; nothing about engines, sessions, or privilege boundaries changes.
+- Any new sudoers surface or privilege boundary. Grounding files are read
+  by `SVC_USER` directly, exactly as `_gather_project_context()` already
+  does today for the same `PROJECTS_DIR/<name>/` tree — no `RUN_USER`
+  involvement at all.
+- Multi-line/paragraph-spanning matches in `fact_check` — single-line
+  granularity only (see "Precision over recall").
 
 ## Background / current state
-- Engines are config, not code (`docs/ARCHITECTURE.md` "Why engines are
-  config, not code"): `engines.d/*.engine` is `KEY=value` text, parsed by
-  `_parse_engine_file()` (`app/app.py:294`) into an `Engine`
-  (`app/app.py:283`, `__slots__`), collected by `load_engines()`
-  (`app/app.py:315`), which **deliberately re-reads `ENGINES_DIR` on every
-  call** — no caching, so files can be edited live. This sub-spec must not
-  break that property.
-- The existing single-session path (`instance_start()`, `app/app.py:1230`)
-  runs an engine **interactively**: `TMUX + ["new-session", "-d", "-s",
-  session, "-c", workdir, "bash", "-lc", cmd]` (`app/app.py:1248`), i.e. the
-  engine's own CLI process becomes the tmux pane's command, running as
-  `RUN_USER` via a narrowly-scoped sudoers rule (`app/app.py:191`,
-  `TMUX = ["sudo", "-u", RUN_USER, "/usr/bin/tmux"]`). `run_startup_watch()`
-  (`app/app.py:1201`) then polls `tmux capture-pane` to clear one-time
-  trust prompts and to capture a hosted URL if `URL_REGEX` matches.
-  **This sub-spec's headless path must never call `capture-pane`** — the
-  whole point of headless mode is a real completion signal (an exit code
-  written to a file, once the process is actually done) instead of
-  screen-scraping.
-- `RUN_USER` (not the switchboard's own `SVC_USER`) is where engine
-  credentials live (`claude`'s own login, `aider`'s config, `codex`'s auth —
-  `docs/ARCHITECTURE.md` "Processes and privilege boundaries") and where
-  `RUN_USER`'s shell profile (nvm/pipx/etc. `PATH` extensions) makes the CLI
-  binaries findable at all. `SVC_USER` cannot write into `PROJECTS_DIR/<name>`
-  directly (it's `chown RUN_USER:RUN_USER`, `install.sh:177`).
-- No third-party dependencies anywhere in this project; `app/teams.py` is
-  stdlib-only, matching `app/app.py` and `scripts/taiga_push_spec.py` (the
-  existing precedent for a standalone stdlib CLI script in this repo —
-  `argparse`, `_parse_args()`/`_run()`/`main()` shape, `if __name__ ==
-  "__main__":` at the bottom, one clear exception type main() catches).
-
-## Why tmux-hosted (superseding the prior version's §2)
-
-The prior version of this spec ran the headless process via a direct
-`subprocess.Popen(["sudo", "-u", RUN_USER, "bash", "-lc", ...])`, needing one
-new sudoers line. Rejected — not because the trust-boundary reasoning was
-wrong (it wasn't: `SVC_USER` can already run arbitrary commands as
-`RUN_USER` today, via `TMUX`'s existing wildcard), but because it's not the
-*cheapest* correct option once `docs/story.md` §2.2's already-settled
-architecture ("tmux hosts, NDJSON carries") is taken seriously:
-
-1. **§2.2 already settled this.** A direct `bash -lc` subprocess quietly
-   opts 6a out of half the settled architecture.
-2. **The `.jsonl` log is already the transport (§4).** Tailing a file isn't
-   extra machinery here — it *is* the machinery, and 6f's overwatch feed
-   tails these same files.
-3. **6d needs one tmux window per agent regardless.** Building 6a this way
-   means 6d *generalizes* this sub-spec's plumbing (a named, attachable team
-   window instead of an invisible throwaway session) rather than replacing
-   it outright.
-4. **Attach-to-watch comes free** — a stated 6d acceptance criterion — for
-   the exact same reason.
-5. **Zero new privilege.** No new sudoers line, no new `docs/ARCHITECTURE.md`
-   paragraph justifying a second standing path into `RUN_USER`.
-
-**This sub-spec's tmux session is not the "team session" 6d builds.** It's
-one throwaway, unlabeled, single-purpose session per `agent_run()` call —
-created, used purely as a `RUN_USER`-privileged host for one background
-process plus its completion signal, and torn down within the same call.
-Nothing about it is human-facing, named per project, or long-lived. 6d's job
-is to make a **visible, multi-window, per-team** tmux session where a human
-can attach to watch — a materially different lifecycle built on top of the
-same primitive.
+- `app/app.py:419` `_gather_project_context(workdir)` is the existing
+  discovery precedent: checks `README.md`/`Readme.md`/`readme.md`/`README`
+  (first found wins), then `CLAUDE.md`/`AGENTS.md` (first found wins),
+  including the one-line `@`-indirection case (`app/app.py:436`: if the
+  file's stripped content is a single line starting with `@`, the *target*
+  file's content is used instead). It also reads `package.json`/
+  `requirements.txt`/`pyproject.toml`, none of which are part of 6b's
+  grounding set — that function is a different concern (a one-shot LLM
+  project description, capped at 6000 combined bytes) and is **not** called
+  by this module; 6b mirrors its *matching rules* for the four docs it
+  cares about, not its output shape or its unrelated file types.
+- `app/app.py:411` `_read_head(path, limit) -> str` is the existing
+  bounded-read helper: opens in text mode with `errors="ignore"`, reads at
+  most `limit` bytes, and returns `""` on **any** `OSError` (missing file,
+  permission denied, is-a-directory, too-many-symlink-levels — all `OSError`
+  subclasses). This module reuses it directly rather than duplicating a
+  bounded-read helper — `from app import TMUX, tmux_has, load_engines,
+  _read_head` (extending `app/teams.py`'s existing import line at line 48;
+  `app/app.py` itself is untouched).
+- `app/teams.py` (6a, `e7deade`) already establishes the conventions this
+  spec follows: a `# ─── config ──` block of `TEAM_*` env vars read once at
+  module level with `os.environ.get(...)` defaults (`app/teams.py:51-60`);
+  section-marker comments (`# ─── ... ──`) separating pure-function groups
+  from I/O-performing ones; pure builder functions that take explicit
+  parameters rather than reading module globals internally, so tests can
+  override them directly (`_validate_prompt_size`, `_build_headless_argv`,
+  `_build_script`); a CLI dispatch table in `_parse_args()`/`main()`
+  (`app/teams.py:813,:837`) reusing `argparse` subcommands
+  (`run`/`list-engines`), matching `scripts/taiga_push_spec.py`'s shape.
+- `docs/story.md` §6 already reserves `TEAM_GROUNDING_MAX_BYTES` as the
+  config name for the digest's hard cap.
+- **This repo is itself the primary test fixture.** `docs/ARCHITECTURE.md`
+  (7,013 bytes, headings only, no fenced code blocks), `docs/BACKLOG.md`
+  (20,088 bytes — a genuine oversize case against any reasonable digest cap,
+  headings only, no fenced code blocks), `README.md` (11,263 bytes, 4
+  fenced code blocks — none currently containing a `#`-prefixed line, so the
+  fenced-code-block-aware heading extraction below is exercised by a
+  synthetic fixture, not live by this repo's current content), and **no**
+  `CLAUDE.md`/`AGENTS.md` (exercises the skip path for real).
 
 ## Proposed approach
 
-### 1. `Engine` and `_parse_engine_file()` — four new keys, additive only
-
-`app/app.py`'s `Engine.__slots__` gains four fields, all optional, all
-defaulting to values that make the engine **headless-ineligible** if any
-required piece is missing or unrecognized:
-
-```
-HEADLESS_CMD=claude -p {resume} --output-format stream-json --verbose
-HEADLESS_FORMAT=claude-stream-json      # claude-stream-json | codex-jsonl | plain — required if HEADLESS_CMD set
-HEADLESS_PROMPT=arg                     # arg | stdin | file — required if HEADLESS_CMD set
-HEADLESS_RESUME=--resume {session_id}   # optional — omit entirely if the engine has no resume concept (aider)
-```
-
-Parsing rule in `_parse_engine_file()`: if `HEADLESS_CMD` is present but
-`HEADLESS_FORMAT` is missing/not one of the three known values, or
-`HEADLESS_PROMPT` is missing/not one of `arg|stdin|file`, the engine is
-parsed exactly as it is today (`LABEL`/`CMD`/`URL_REGEX`/`STARTUP_*` all
-still work) but its headless fields are left unset/`None` and
-`Engine.headless_enabled` is `False` — **never** an exception, never a
-`load_engines()` failure, consistent with the function's existing
-best-effort philosophy (`app/app.py:328`'s `except OSError: continue`). An
-engine with no `HEADLESS_CMD` line at all behaves **byte-for-byte** as it
-does today.
-
-`Engine` gains a read-only `headless_enabled` property
-(`bool(self.headless_cmd and self.headless_format and self.headless_prompt)`).
-
-**One reserved engine-name prefix.** `_parse_engine_file()` treats a `.engine`
-file whose derived name (filename stem) **starts with** `switchboard` as
-invalid/ignored — the same "intentionally inert" treatment `.engine.example`
-templates already get (`app/app.py:327`). This is what makes the tmux
-session-naming scheme in §2 below *structurally* collision-proof rather than
-merely improbable — see "Session naming" for why. Worth exactly one line in
-`docs/ADDING_AN_ENGINE.md` so a future engine author isn't surprised by it.
-
-Note it must be a **prefix** rule, not an exact-name rule. Reserving only the
-exact name `switchboard-headless` leaves a real collision open: an engine
-named `switchboard` combined with a project directory named
-`headless-<run_id>` also renders `f"{e}-{name}"` as
-`switchboard-headless-<run_id>`. Reserving the whole `switchboard` prefix
-makes that unconstructible, because no loaded engine's name can begin the
-string at all.
-
-**Placeholder tokens are substituted with plain `str.replace()`, never
-`str.format()`** — `HEADLESS_SCHEMA_FLAG` (6c) will carry a literal JSON
-Schema, which is full of `{`/`}`; using `.format()` anywhere in this
-substitution chain would break the moment that key is added.
-
-### 2. Crossing into `RUN_USER` — the existing `TMUX` sudoers rule, nothing new
-
-`app/teams.py` spawns every headless run via the same constant
-`instance_start()` already uses:
-
+### 1. Config — one new operator-facing knob, two deliberately-not-tunable ones
 ```python
-from app import TMUX, tmux_has, load_engines  # app/app.py:191, :1187, :315
+# ─── grounding (docs/story.md §4.3; docs/spec.md 6b) ─────────────────────
+TEAM_GROUNDING_MAX_BYTES = int(os.environ.get("TEAM_GROUNDING_MAX_BYTES", "8000"))
 ```
+This measures **the UTF-8-encoded byte length of `build_digest()`'s
+returned string** — the text actually seeded into the lead's system prompt
+— after headings and per-file snippets are assembled and joined, not the
+size of any input file. Default 8000 (~2000 tokens): enough room for
+headings + a meaningful snippet from up to four files while leaving most of
+a small local model's context window for the actual task and tool schemas.
 
-No new module-level constant, no new sudoers line. The shape (concretely
-resolving the coordinator's sketch, with one addition — capturing the real
-child PID — explained below):
-
+Two more constants exist but are **deliberately not environment-configurable**
+— a lesson carried over from 6a's own review history, where a tuned magic
+number was the wrong fix twice before the third fix made the bad case
+structurally unreachable instead:
 ```python
-RUNDIR = os.path.join(TEAM_STATE_DIR, "_headless", run_id)   # SVC_USER-owned
-os.makedirs(RUNDIR, exist_ok=True)
-os.chmod(RUNDIR, 0o711)   # traversable by anyone, listable by no one but the owner
+_GROUNDING_READ_CAP_BYTES = 2 * 1024 * 1024   # hard backstop, see below
+_GROUNDING_MAX_HEADINGS_PER_FILE = 20         # defensive, see §3
+_GROUNDING_FACT_CHECK_MAX_MATCHES = 5
+```
+`_GROUNDING_READ_CAP_BYTES` measures **bytes read from a single grounding
+file off disk, before any digest transformation** — the largest chunk any
+one `_read_head()` call for this module will ever request, independent of
+`TEAM_GROUNDING_MAX_BYTES`. This is what makes the 200 MB-file case safe
+regardless of how `TEAM_GROUNDING_MAX_BYTES` is configured: even if an
+operator sets the digest cap absurdly high, no single file read is ever
+larger than 2 MiB (comfortably larger than this repo's own 20 KB
+`BACKLOG.md`, small enough to bound memory for an adversarial input). Making
+this a fixed constant rather than another env var is the point — it is not
+a behavior an operator should be tuning, it is a safety ceiling that must
+hold regardless of what they configure elsewhere.
 
-argv = _headless_argv(engine, prompt, session_id)   # list, see §3 — shlex.join()'d once, at the end
-script = (
-    f"{shlex.join(argv)}"
-    f"{' < ' + shlex.quote(promptf) if headless_prompt == 'stdin' else ''}"
-    f" >{shlex.quote(out_path)} 2>{shlex.quote(err_path)}"
-    f" & echo $! >{shlex.quote(pid_path)}; wait $!; echo $? >{shlex.quote(rc_path)}"
+`_GROUNDING_NO_FILES_DIGEST` is the literal string used when nothing was
+discovered (see §2/§3) — a specific, greppable sentence, not an empty
+string a caller could mistake for "not yet loaded":
+```python
+_GROUNDING_NO_FILES_DIGEST = (
+    "No grounding files were found for this project (checked "
+    "docs/ARCHITECTURE.md, docs/BACKLOG.md, CLAUDE.md/AGENTS.md, README.md)."
 )
-session = f"switchboard-headless-{run_id}"     # see "Session naming" below
-subprocess.run(TMUX + ["new-session", "-d", "-s", session, "-c", workdir,
-                       "bash", "-lc", script])
 ```
 
-Every dynamic value (paths, the engine's own argv) is either passed as its
-own `subprocess.run()` list element (no shell involved, hence no quoting
-needed for `-c workdir`/`-s session`) or individually `shlex.quote()`'d
-before being spliced into the one string that *is* interpreted as shell
-syntax (`script`, handed to `bash -lc`) — the same argv-list-then-
-`shlex.join()` discipline the prior version used, now applied to the small
-set of shell operators (`<`, `>`, `&`, `;`) this shape genuinely needs.
-This exactly mirrors `instance_start()`'s own `cmd = engine.cmd.format(
-name=shlex.quote(name))` (`app/app.py:1240`).
+`config/switchboard.env.example` gains one new commented-out line,
+`TEAM_GROUNDING_MAX_BYTES`, in the same documented-but-commented-out style
+as the existing `TEAM_HEADLESS_*` block — with a one-line comment stating
+exactly what it measures (the assembled digest's own byte length, not any
+source file's size).
 
-**Why capture `$!` into `pid_path`, beyond the coordinator's sketch.** The
-sketch's shape (`<cmd> > out.jsonl 2> out.err; echo $? > out.rc`) has no way
-to target *just the engine process* for a clean `SIGTERM` later — the only
-things `tmux` itself exposes are the whole session (`kill-session`, too
-blunt: it tears down the pane before the trailing `echo $? >out.rc` can
-ever run, permanently losing the exit code) or the pane's *leaf* process
-(`#{pane_pid}`, which is `bash` itself here, not the engine, since `bash`
-doesn't `exec`-replace itself — it can't, because it still has the trailing
-`echo` to run after). Backgrounding the command (`&`) and capturing `$!`
-immediately gives a real, targetable PID for the engine process specifically,
-while leaving the wrapping shell alive to still write `out.rc` normally
-after that process exits for any reason, including a `SIGTERM` we sent it.
-This is what makes "clean stop" (§4) actually possible with this transport.
-
-**`TEAM_STATE_DIR`** (new env var, default `/var/lib/ai-dev-switchboard/teams`)
-holds both the durable `.jsonl` translated logs and each run's throwaway
-`_headless/<run_id>/` directory. Created lazily
-(`os.makedirs(TEAM_STATE_DIR, exist_ok=True)`), the same way
-`_save_desc_cache()` creates `DESC_CACHE_FILE`'s parent directory
-(`app/app.py:351`) — no `install.sh` change needed. `/var/lib/
-ai-dev-switchboard` itself already has default (`mkdir -p`, root, typical
-`022` umask → `0755`) traverse-for-others permissions from `install.sh:89`,
-so `RUN_USER` can already reach anything SVC_USER creates underneath it
-without any group/ACL setup — the `0711` on each run's own subdirectory
-(§ above) is what actually matters, and is set directly by `agent_run()`
-itself, an ordinary unprivileged `chmod` on a directory it just created and
-owns. **The `RUN_USER`-run child process never needs elevated access to
-write there** — it's writing into a directory `SVC_USER` (the directory's
-owner) deliberately made traversable+writable by everyone; conversely
-`SVC_USER` reads files `RUN_USER`'s shell created inside it by exact path
-(needs no `r`/list permission on the directory at all, only `x`/traverse,
-which `0711` grants) — and `SVC_USER`, as the directory's owner, can delete
-everything inside it during cleanup regardless of who created each file,
-since no sticky bit is set. This is the same "drop box" permission pattern
-`/tmp` itself uses, just narrower (`0711` instead of `01777` — no listing,
-no cross-run visibility, no deletion by anyone but the owning process).
-
-### 3. Building the command: `{resume}` and `{prompt_file}` placeholders
-
-Unchanged from the engine-file-author's point of view — only *how*
-`agent_run()` delivers the prompt for `stdin`/`file` modes got simpler
-(§2's shared run directory means it can just write a file directly, no
-mid-shell `mktemp`/`cat`/`trap` dance is needed anymore).
-
-`HEADLESS_CMD` is a template string, substituted (via `.replace()`, per
-above) before `shlex.split()`:
-
-- **`{resume}`** — replaced with the empty string on a first turn
-  (`session_id=None`), or with `HEADLESS_RESUME`'s own template (with
-  `{session_id}` substituted into *it* first) when resuming. Sits *inline*
-  inside `HEADLESS_CMD` because Claude Code's resume is a flag
-  (`claude -p --resume abc123 ...`) but Codex's is a **subcommand swap**
-  (`codex exec resume abc123 ...`, not `codex exec ... --resume abc123`):
-  ```
-  # claude.engine
-  HEADLESS_CMD=claude -p {resume} --output-format stream-json --verbose
-  HEADLESS_RESUME=--resume {session_id}
-
-  # codex.engine
-  HEADLESS_CMD=codex exec {resume} --json --skip-git-repo-check
-  HEADLESS_RESUME=resume {session_id}
-  ```
-  (Exact final flags confirmed during Tier 3 verification — the shapes above
-  are the resolved *mechanism*, not a claim these are the final byte-for-byte
-  flags.) If `session_id` is passed to `agent_run()` for an engine whose
-  `HEADLESS_CMD` has no `{resume}` token (or no `HEADLESS_RESUME` key at all
-  — `aider.engine`), `agent_run()` raises `ValueError` **before creating any
-  tmux session**.
-
-- **`{prompt_file}`** — only meaningful when `HEADLESS_PROMPT=file`
-  (`aider`, via `--message-file`). Substituted with the literal path of a
-  file `agent_run()` writes **directly** (`open(promptf, "wb").write(...)`)
-  into the same `0711` run directory §2 already sets up, *before* the tmux
-  session is created — no shell-side `mktemp`/`cat` prelude needed, since
-  `SVC_USER` already owns that directory and can write into it freely; the
-  only thing that has to happen inside `RUN_USER`'s shell is reading a path
-  it was handed, exactly as `--message-file` already expects.
-
-`HEADLESS_PROMPT` modes, concretely:
-- **`arg`** — prompt appended as one extra Python list element *after*
-  splitting the substituted `HEADLESS_CMD`, never string-interpolated
-  (Claude Code: `-p` is a boolean "print mode" flag; the query itself is a
-  positional argument).
-- **`stdin`** — same file-write as `file` mode, but the file is fed to the
-  engine as its actual stdin via a plain shell redirect (`< promptf`, added
-  in §2's `script` construction) rather than a named-file flag —
-  functionally equivalent to a live pipe for the engine's own purposes, and
-  considerably simpler than one (no writer-thread/pipe-deadlock concern
-  exists at all now, since it's an ordinary file the child opens and reads
-  at its own pace).
-- **`file`** — as above, path substituted into `{prompt_file}`.
-
-Two byte caps, not one, because `arg` mode has a materially tighter ceiling
-than `stdin`/`file` do: the *entire* `script` string (redirects, `wait`,
-the engine's own argv with the prompt inlined) becomes a single argv
-element to the outer `bash -lc` invocation, and Linux caps any *single*
-argv element at `MAX_ARG_STRLEN` (~128 KiB) regardless of the much larger
-overall `ARG_MAX`. `TEAM_HEADLESS_ARG_PROMPT_MAX_BYTES` (default 65536,
-comfortably under that ceiling) applies specifically to `arg` mode;
-`TEAM_HEADLESS_PROMPT_MAX_BYTES` (default 1 MiB, well under Claude's own
-documented 10 MB piped-stdin cap) applies to `stdin`/`file` modes, which
-have no such constraint since the prompt never appears in any argv at all.
-Both raise `ValueError` before anything is spawned. This is also a concrete,
-practical reason (beyond the shell-escaping one already given) to prefer
-`stdin`/`file` mode for any engine expected to receive long delegation
-prompts.
-
-### 4. `agent_run()` — signature, execution, return shape
-
+### 2. `discover_grounding_files(workdir) -> list[dict]`
+Returns entries (in this fixed order) for whichever of the four sources are
+present *and usable*:
 ```python
-def agent_run(engine: str, workdir: str, prompt: str, *,
-              session_id: str | None = None,
-              timeout: float = TEAM_HEADLESS_TIMEOUT_SECONDS,
-              log_path: str | None = None) -> dict:
+[{"label": "docs/ARCHITECTURE.md", "path": "<resolved path>"},
+ {"label": "docs/BACKLOG.md",      "path": "<resolved path>"},
+ {"label": "CLAUDE.md",            "path": "<resolved path>"},  # or "AGENTS.md"
+ {"label": "README.md",            "path": "<resolved path>"}]
 ```
+Matching rules, mirroring `_gather_project_context()`'s in full (not just
+the `@`-indirection case) for consistency between the two discovery
+functions living in the same codebase:
+- `README.md`/`Readme.md`/`readme.md`/`README` — first found wins.
+- `CLAUDE.md`/`AGENTS.md` — first found wins. If its stripped content is a
+  single line starting with `@`, the path after `@` (resolved relative to
+  `workdir`, exactly as `app/app.py:437` does) is treated as the real
+  source — **the returned `path` is the resolved target**, not the literal
+  `CLAUDE.md`/`AGENTS.md` path, because that target is what's actually read
+  and what any `fact_check` `file:line` must point a human at. The `label`
+  stays `"CLAUDE.md"`/`"AGENTS.md"` (what the project author wrote), so the
+  digest still reads naturally even though `path` differs.
+- `docs/ARCHITECTURE.md`, `docs/BACKLOG.md` — exact names only, no casing
+  variants (matching `docs/story.md`'s literal naming).
 
-- `engine` is a **name** (`.engine` filename stem), resolved via
-  `load_engines()` on every call — preserving that function's documented
-  no-caching contract (`app/app.py:317`'s docstring).
-- Validates, in order, before creating any tmux session: engine known and
-  `headless_enabled`; `workdir` exists and is a directory; `session_id`
-  compatible with the engine's resume support; prompt within the
-  mode-appropriate byte cap. Any failure here is a `ValueError` with a
-  specific message.
-- Opportunistically sweeps stale runs first (see "Cleanup" below) — cheap,
-  mirrors `_reap_dead_state()`'s own "cleanup on a request that already
-  happens often" precedent, without being wired into that function (a
-  different module, a different concern; `app.py` never needs to know
-  headless runs exist in this sub-spec).
-- `log_path` defaults to `TEAM_STATE_DIR/_adhoc/<engine>-<ts>-<rand>.jsonl`
-  when not given. 6d will pass its own `<agent>.jsonl` path once team
-  sessions exist; `agent_run()` itself has no notion of a team.
-- **Startup confirmation**: immediately after `tmux new-session -d`
-  returns, poll (bounded, ~5s) for `pid_path` to appear and contain a valid
-  integer. If it never does even though the session exists, that means
-  `bash -lc` itself failed before backgrounding anything (a bug in our own
-  generated `script`, a missing `cwd`, `bash` itself unavailable for
-  `RUN_USER`) — a `agent_run()`-side failure, not an engine failure:
-  `ok=False`, `error="headless session failed to start"`, session torn
-  down, return immediately without entering the tailing loop below.
-- **Tailing**: incremental read of `out_path` by byte offset (`seek()` to
-  the last-read position each poll, never re-reading from the start), a
-  partial trailing line held across polls until its newline arrives.
-  Malformed-line and stream-volume-cap handling are **unchanged** from the
-  prior version: a `json.loads()` failure (including an unterminated final
-  line once the file stops growing) produces one `kind="error"` envelope
-  and parsing continues; `TEAM_HEADLESS_MAX_EVENTS`/`TEAM_HEADLESS_MAX_LINE_BYTES`
-  stop further per-line translation past their caps (with one
-  truncation-notice event) without affecting `ok`/`exit_code`.
-- **Completion detection — exact ordering.** Each poll (`TEAM_HEADLESS_POLL_SECONDS`,
-  default 0.5s, between iterations — same "poll on an interval" shape as
-  `run_startup_watch()`'s own loop, `app/app.py:1213`): tail whatever's new
-  in `out_path`, then check `rc_path` **before** checking whether the
-  session still exists. This ordering isn't arbitrary — the wrapping shell
-  always writes `rc_path` (via `wait $!; echo $? >rc_path`) strictly
-  *before* it finishes and the pane's command exits, so **`rc_path`
-  becoming valid always happens no later than the session disappearing,
-  never after.** Concretely:
-  - `rc_path` exists and parses as an int → the real command genuinely
-    finished; `exit_code` is that value. (If it exists but is empty/
-    unparseable — the `echo`'s write hasn't fully landed yet — treat as
-    "not ready", keep polling; this is bounded by the same overall timeout
-    and grace-period budget below, not an unbounded wait.)
-  - `rc_path` still absent **and** `tmux_has(session)` is now `False` → the
-    session ended without ever recording an exit code (the whole tmux
-    server was killed, `kill-session` was called externally bypassing this
-    module's own cancellation path below, disk failure mid-write, etc.).
-    **Treated as `cancelled=True`, `ok=False`, `exit_code=None`** — never
-    as success. This is deliberately the one case this design cannot fully
-    explain after the fact, so it is never optimistically assumed clean.
-  - Neither yet, and `timeout` hasn't elapsed → keep polling.
-- **Cancellation — targeted `SIGTERM`, never `capture-pane`, never a blunt
-  `kill-session` first.** Signaling a `RUN_USER`-owned PID from `SVC_USER`
-  directly (`os.kill()`) would fail with `EPERM` — cross-UID signals need
-  root or the same UID, and the only standing privilege this module has is
-  `TMUX`. So cancellation reuses **exactly that**, nothing more: a second,
-  throwaway, self-cleaning tmux session whose entire job is one line —
-  ```python
-  subprocess.run(TMUX + ["new-session", "-d", "-s", f"{session}-kill",
-                         "bash", "-lc", f"kill -{sig_name} {pid}"])
-  ```
-  — run as `RUN_USER` (so the signal permission check passes: same UID as
-  the target), self-terminating the instant `kill` returns, exactly the
-  same auto-cleanup property `instance_start()`'s own doc comment already
-  establishes for any tmux pane whose command exits (`app/app.py:1244-1247`).
-  No new sudoers surface at all — this is `tmux new-session` running a
-  different one-line script, nothing `tmux` itself wasn't already whitelisted
-  for. Escalation, once `timeout` elapses:
-  1. `kill -TERM <pid>` via the helper above; `cancel_reason="timeout"`.
-  2. Keep polling for `rc_path` (should appear promptly — the wrapping
-     shell's remaining work after the child dies is trivial). If it hasn't
-     within `TEAM_HEADLESS_KILL_GRACE_SECONDS` (default 10), escalate:
-     `kill -KILL <pid>` via the same helper shape.
-  3. If `rc_path` *still* never appears within one more grace window, the
-     wrapping shell itself is wedged — last resort, `tmux kill-session -t
-     <session>` (idempotent; harmless if it's already gone, same
-     `capture_output=True`-swallowed-errors style `instance_stop()` already
-     uses at `app/app.py:1263`). `exit_code=None`, classified per the
-     "missing rc" rule above.
-  An externally-sent `SIGTERM` (not initiated by `agent_run()`'s own
-  `timeout` — e.g. a future 6d "stop team" action, an operator's own `kill`
-  against the PID) is classified identically once observed in `rc_path`
-  (`cancel_reason="external"`) — cancellation classification doesn't care
-  who sent the signal, only what the exit code says.
-- **`ok`/`exit_code`/cancellation classification are otherwise exactly as
-  the prior version specified — unchanged**: `ok = (exit_code == 0)`;
-  `cancelled = exit_code is not None and exit_code >= 128 and
-  (exit_code - 128) in {SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGKILL}` — a
-  general Unix signal-exit convention, not a Claude-only "143" special
-  case, since Codex's/aider's own signal-exit codes are unconfirmed pending
-  Tier 3 verification. Bash's `$?` capturing `128+N` for a foreground child
-  killed by signal `N` is standard POSIX shell behavior (confirmed, not an
-  assumption specific to this design) — it applies here because the
-  engine process is `wait`ed on directly by PID, not backgrounded further
-  or wrapped in anything that would mask its wait status.
-- **Cleanup**: once a result is determined (success, cancelled, or missing-
-  rc), `agent_run()` does one final unconditional tail pass (closes a small
-  window where the last bytes of `out_path` were flushed between the last
-  poll and the process actually exiting), reads `err_path` bounded by
-  `TEAM_HEADLESS_STDERR_TAIL_BYTES` into `stderr_tail`, then
-  `shutil.rmtree(RUNDIR, ignore_errors=True)` — safe and needing no special
-  privilege, since `SVC_USER` owns `RUNDIR` regardless of which user wrote
-  the individual files inside it (no sticky bit set). The **durable**
-  artifact is `log_path` (this module's own translated `.jsonl`), not the
-  raw `out_path`/`err_path`/`pid_path`/`rc_path`/prompt-file plumbing, which
-  is deleted along with the rest of `RUNDIR`. If the session somehow still
-  exists at this point, one final defensive `tmux kill-session` (same
-  swallowed-error style as above).
-- **Stale-run sweep** (opportunistic, at the top of every `agent_run()`
-  call, not a background thread/timer): any `TEAM_STATE_DIR/_headless/<id>/`
-  directory older than `TEAM_HEADLESS_STALE_RUN_TTL_SECONDS` (default 7200)
-  **and** whose corresponding session name no longer exists is removed, with
-  a defensive `tmux kill-session` attempt on the matching name regardless.
-  Covers `app.py`'s/`teams.py`'s own process being restarted mid-run — the
-  fuller "service restart while a team runs" story (state reconstruction,
-  UI self-healing) is 6d's job; this sub-spec only guarantees it doesn't
-  leak directories forever.
-- **PID reuse** (the target PID having already exited and been recycled by
-  the OS before a signal reaches it) is a generic, low-probability Unix race
-  every process-management tool accepts; not specially defended against
-  here beyond the ordinary short poll cadence keeping the exposure window
-  small. Noted, not treated as a hard requirement to eliminate.
+**"Usable" is one unifying rule, not five special-cased branches**: a
+candidate path is included only if, after the checks below, reading it
+yields non-empty content. A missing file, an empty file, a permission-denied
+file, a directory-instead-of-a-file, and a symlink-loop file all reduce to
+the same outcome (`_read_head()` already returns `""` for every one of
+these — all are `OSError` subclasses it already catches) and are therefore
+*indistinguishable from "not present"* by design — simpler than tracking
+five different skip reasons, and product-wise correct: an empty `CLAUDE.md`
+is exactly as useless as a missing one.
 
-**Return shape** (unchanged from the prior version):
+Two checks run **before** any read is attempted, because relying on
+"empty content ⇒ skip" is not sufficient for these two — a readable file in
+the wrong place must never be read at all, not read-then-discarded:
+- **Symlink containment.** `os.path.realpath()` the candidate path (and,
+  for the `@`-indirection case, the resolved target path too — the second,
+  in-band pointer mechanism is exactly as much of an information-disclosure
+  risk as a filesystem symlink and gets the identical check). If the real
+  path does not stay under `os.path.realpath(workdir)`, the candidate is
+  skipped **without being opened at all**. This exists so a project
+  containing `README.md -> /etc/hostname` (or a `CLAUDE.md` whose one line
+  is `@../../../etc/hostname`) can never leak arbitrary host filesystem
+  content into a digest or a `fact_check` response, independent of whatever
+  file permissions happen to allow — belt-and-suspenders, not a
+  currently-exploitable hole, but a real disclosure path worth closing
+  before it exists, per the brief.
+- **Binary sniff.** Read the first 512 bytes in `"rb"` mode; if a `NUL`
+  byte is present, skip — a `.png` renamed to `README.md` decodes "fine"
+  under `errors="ignore"` (bytes are silently dropped, not replaced) but
+  produces useless-to-garbage text that pollutes the digest and wastes
+  `fact_check`'s scan; catching it structurally here is cheaper than trying
+  to make the digest/heading logic robust to arbitrary garbage later.
 
+Genuinely malformed UTF-8 (not a binary file — real text with a few invalid
+byte sequences) is **not** a skip condition — `_read_head()`'s own
+`errors="ignore"` already handles it (drops the invalid bytes, keeps the
+rest, never raises), matching `_gather_project_context()`'s existing
+tolerance for the same case.
+
+### 3. `load_grounding(workdir, *, max_bytes=TEAM_GROUNDING_MAX_BYTES, read_cap=_GROUNDING_READ_CAP_BYTES) -> dict`
 ```python
 {
-  "ok": bool,
-  "text": str,
-  "session_id": str | None,
-  "exit_code": int | None,
-  "cancelled": bool,
-  "cancel_reason": "timeout" | "external" | None,
-  "event_count": int,
-  "truncated": bool,
-  "log_path": str,
-  "stderr_tail": str,
-  "error": str | None,
+  "workdir": workdir,
+  "loaded_at": _now_iso(),
+  "files": [
+    {"label": "docs/ARCHITECTURE.md", "path": "...", "relpath": "docs/ARCHITECTURE.md",
+     "headings": [...], "content": "<up to read_cap bytes, text>", "byte_count": N},
+    ...
+  ],
+  "digest": "<build_digest(files, max_bytes)>",
+  "empty": bool,   # True iff files == []
 }
 ```
+For each discovered entry, reads `content = _read_head(path, read_cap)`
+**once** — this single read is both the source for headings/digest
+*and* the corpus `fact_check` searches; nothing re-reads the file for a
+later `fact_check` call against this same `grounding` object (see
+"Snapshot semantics" below).
 
-`text` extraction per format is unchanged: **claude-stream-json** — the
-final `result` line's `result` field, else the concatenation of `assistant`
-text blocks seen so far. **codex-jsonl** — the completed turn's final
-message item text, same fallback. **plain** (aider) — the full captured
-`out_path` content, bounded by the same general size discipline.
+**Heading extraction** (`_extract_headings(content) -> list[str]`, pure,
+independently testable): scans lines matching `^#{1,6}\s+.+` (ATX
+headings), **skipping any line while inside a fenced code block** — toggled
+by a line starting with ` ``` ` or `~~~` — so a shell comment or a Python
+shebang inside a fenced example is never mistaken for a heading. Capped at
+`_GROUNDING_MAX_HEADINGS_PER_FILE` (20) per file — a defensive bound on the
+intermediate heading list itself, independent of the final byte truncation
+below, so a pathological file with thousands of `#`-prefixed lines can't
+blow up an intermediate list before truncation ever gets a chance to run.
 
-### 5. Session naming — why it can't collide with a project session
+**Snapshot semantics.** `load_grounding()` reads every file exactly once,
+at call time. The returned dict is a snapshot: if `docs/BACKLOG.md` changes
+on disk a second after `load_grounding()` returns, that snapshot's
+`content`/`digest`/subsequent `fact_check()` calls against it do **not**
+see the change — only a fresh `load_grounding()` call does. This is
+deliberate, not an oversight: within one round, the lead's digest and its
+own `fact_check` calls should agree with each other (a claim `fact_check`
+confirms should match what the digest already told the lead), which
+requires them to read the same snapshot; picking up a concurrent edit
+mid-round would let the two disagree with no way for the lead to tell why.
+6c/6d own the decision of *when* to call `load_grounding()` again across a
+team's lifetime (a new round, a restart, a fixed interval) — this module
+only guarantees that one snapshot is internally consistent for as long as
+it's held.
 
-`instance_start()` names project sessions `f"{engine_name}-{name}"`
-(`app/app.py:1239`); `active_engine()` (`app/app.py:1192`) and
-`_reap_dead_state()` (`app/app.py:1266`) both key off that exact shape —
-`active_engine()` does a **targeted** `tmux_has(f"{e}-{name}")` check per
-real engine `e` (from `load_engines()`) and real project `name` (from
-`instance_names()`); neither function scans `tmux list-sessions` blindly.
+### 4. `build_digest(files, max_bytes=TEAM_GROUNDING_MAX_BYTES) -> str`
+Pure function, no disk I/O — takes the `files` list `load_grounding()`
+already built (or a synthetic one a test constructs directly, with no
+project directory needed at all).
 
-Headless sessions are named `f"switchboard-headless-{run_id}"` (§2) and
-their throwaway kill-helper `f"switchboard-headless-{run_id}-kill"` (§4).
-For either to be mistaken for a project session, `active_engine()` would have
-to find some loaded engine `e` and project `name` where
-`f"{e}-{name}"` equals a live headless session name. Two ways that could
-happen, and both must be closed:
+- `files == []` → returns `_GROUNDING_NO_FILES_DIGEST` verbatim (already
+  well under any reasonable `max_bytes`; no truncation logic needed for
+  this branch).
+- Otherwise: for each file, emit a section — its `label`, its heading list,
+  and a body snippet — sized against a fair per-file share of the budget
+  (`per_file_budget = max(200, max_bytes // len(files))`, so 1–4 files each
+  get a reasonable slice rather than the first file starving the rest), then
+  join all sections in discovery order.
+- **The per-file share is a fairness heuristic, not the safety mechanism.**
+  The actual guarantee — the thing the acceptance criteria hold it to — is
+  a final, unconditional step: encode the assembled text to UTF-8, slice to
+  the first `max_bytes` bytes, decode with `errors="ignore"` (cleanly drops
+  a trailing partial multi-byte sequence, same discipline `_read_head()`
+  already uses). This runs **every time**, regardless of file count or
+  size, so the cap holds even if the per-file math above is wrong, changed
+  later, or fed something unexpected — a structural backstop, not a tuned
+  number trusted to always be sufficient by itself — the safety property
+  doesn't depend on the fairness heuristic being correct.
+- `max_bytes <= 0` → returns `""` (no exception; an operator misconfiguring
+  this to zero gets an empty-but-valid digest, not a crash).
 
-- `e == "switchboard-headless"`, any `name` — the obvious case.
-- `e == "switchboard"`, `name == f"headless-{run_id}"` — the non-obvious one.
-  `active_engine()` would then report that project as running engine
-  `switchboard` for as long as the headless run lives, i.e. an existing
-  project row showing the wrong state. Improbable (the directory name would
-  have to match a live run's random token) but constructible, so an
-  exact-name reservation is not sufficient.
+### 5. `fact_check(claim, grounding, *, max_matches=_GROUNDING_FACT_CHECK_MAX_MATCHES) -> dict`
+```python
+{"claim": claim, "found": bool,
+ "matches": [{"label": "...", "path": "...", "relpath": "...",
+              "line": 42, "file_line": "docs/ARCHITECTURE.md:42",
+              "text": "<the matching line, stripped>"}, ...]}
+```
+Searches `grounding["files"][*]["content"]` — the **full** per-file
+content read by `load_grounding()` (bounded at `read_cap`, i.e. up to
+2 MiB), **not** `grounding["digest"]` (bounded much smaller, at
+`max_bytes`, i.e. 8 KB by default). A passage that got truncated out of the
+digest but is still present in the full content must still be found — the
+digest is a *summary for the prompt*; `fact_check` is a *lookup against the
+real source*, and conflating the two would silently cripple recall for
+exactly the oversized-file case this module exists to handle gracefully.
 
-Reserving the entire `switchboard` **prefix** in `_parse_engine_file()` (§1)
-closes both: no loaded engine's name can begin the string, so no
-`f"{e}-{name}"` can ever equal `switchboard-headless-*`. This closes the gap
-**structurally**, not probabilistically: no live cross-referencing against
-`load_engines()`/`instance_names()` is needed at session-creation time, and
-none is added, keeping `agent_run()`'s hot path simple.
+**Precision over recall — the whole point of the feature.** Per
+`docs/story.md` §4.3, a claim `fact_check` wrongly confirms is worse than
+one it wrongly rejects, because the lead treats a returned match as
+confirmation. The matcher is therefore deliberately conservative, with no
+scoring/ranking of "close enough" candidates at all — the absence of any
+such fallback is what makes "return the nearest weak match" structurally
+impossible, not a rule the algorithm has to remember to apply:
 
-`run_id` itself (`f"{int(time.time())}-{secrets.token_hex(6)}"`, matching
-`new_session()`'s own use of `secrets` at `app/app.py:252`) also guarantees
-no two concurrent headless runs collide with each other.
+1. Normalize `claim`: lowercase, tokenize on `[A-Za-z0-9_']+`, drop a small
+   built-in stopword list (`a, an, the, is, are, was, were, be, to, of, in,
+   on, and, or, that, this, it, for, with, as, ...`), drop single-character
+   tokens. Call the result `terms`.
+2. `terms == []` (empty/whitespace-only claim, or a claim built entirely
+   from stopwords) → `found=False`, `matches=[]` immediately. Nothing
+   meaningful to search for; not an error.
+3. Otherwise, scan every file's content line by line (1-indexed). A line is
+   a match **iff every term in `terms` appears as a case-insensitive
+   substring of that line** — a strict conjunctive match, no partial
+   credit, no edit-distance/fuzzy scoring, no minimum-fraction-of-terms
+   threshold. A claim whose terms are scattered across two lines of a
+   wrapped paragraph will not match even if the claim is true — an
+   intentional recall loss in exchange for the precision guarantee; see
+   "Open questions" for the possible follow-up if 6c's real usage shows
+   this is too conservative.
+4. Collect matches in file-discovery-then-line order, capped at
+   `max_matches` (default 5). `found = bool(matches)`.
 
-### 6. Normalized event envelope, CLI entry point
+Claim text is only ever matched with plain `str.lower()` substring
+containment against document lines — never compiled as a regex or used to
+build one — so an adversarial claim full of regex metacharacters carries no
+ReDoS or injection risk. (The `re.findall()` call in step 1 uses a
+fixed pattern *we* wrote to tokenize the claim; it never treats claim text
+as a pattern itself.)
 
-**Unchanged from the prior version** — the §4.1 translation table (native
-event → `kind`/`text`/`meta`, per engine and format), and the CLI's shape
-(`python3 app/teams.py run/list-engines`, `argparse`, stderr-streams-events/
-stdout-prints-final-JSON, matching `scripts/taiga_push_spec.py`'s
-`_parse_args()`/`_run()`/`main()` shape) — neither depends on the transport
-mechanism reworked above.
+`grounding["empty"] is True` needs no special case: `terms` scanned against
+zero files' worth of lines naturally yields `matches=[]` either way.
+
+### 6. Read-only guarantee — asserted, not just intended
+Every function above only ever calls `open()` in a default/`"r"`/`"rb"`
+mode and never calls any of `os.remove`/`os.rename`/`os.replace`/
+`os.unlink`/`os.truncate`/`os.mkdir`/`os.makedirs`/`os.chmod`/
+`shutil.rmtree`/`shutil.move`/`shutil.copy*` — no function in this section
+accepts a "content to write" parameter at all, so there is structurally
+nothing *to* write even if a bug tried. Verified two ways in the test plan:
+a runtime monkeypatch test (each mutating call raises `AssertionError` if
+hit, then the full public surface is exercised against a real fixture
+project including edge cases) and a static `ast`-based scan of the
+module's grounding section (catches a call in a branch the runtime test
+didn't happen to exercise — the stronger, literal reading of "the module
+exposes no write path at all").
+
+### 7. CLI additions (not a UI — matches 6a's own precedent)
+Two new `argparse` subcommands in the existing `_parse_args()`/`main()`
+dispatch (`app/teams.py:813,:837`), for manual verification without
+writing a throwaway script:
+```
+python3 app/teams.py grounding <workdir>              # prints load_grounding() as JSON
+python3 app/teams.py fact-check <workdir> "<claim>"    # prints fact_check() as JSON
+```
 
 ## Affected areas
-- `app/app.py` — `Engine.__slots__` + `_parse_engine_file()`: four new
-  optional keys, plus the reserved-name check (§1). **No other change** —
-  `TMUX`, `tmux_has()`, `instance_start()`/`instance_stop()`/
-  `_reap_dead_state()` are all read-only imports for `teams.py`, untouched
-  themselves.
-- `app/teams.py` — **new**. `agent_run()`, the envelope translator, the
-  tmux-hosted spawn/tail/cancel/cleanup machinery, the CLI.
-- `engines.d/claude.engine`, `engines.d/codex.engine`, `engines.d/aider.engine`
-  — new `HEADLESS_*` keys, each verified per "Test plan" below.
-- `config/switchboard.env.example` — new section: `TEAM_STATE_DIR` plus
-  `TEAM_HEADLESS_TIMEOUT_SECONDS`, `TEAM_HEADLESS_KILL_GRACE_SECONDS`,
-  `TEAM_HEADLESS_POLL_SECONDS`, `TEAM_HEADLESS_MAX_EVENTS`,
-  `TEAM_HEADLESS_MAX_LINE_BYTES`, `TEAM_HEADLESS_PROMPT_MAX_BYTES`,
-  `TEAM_HEADLESS_ARG_PROMPT_MAX_BYTES`, `TEAM_HEADLESS_STDERR_TAIL_BYTES`,
-  `TEAM_HEADLESS_STALE_RUN_TTL_SECONDS` — all optional, arbitrary-but-
-  reasonable built-in defaults, same documented-but-commented-out style as
-  `GITEA_POLL_INTERVAL_SECONDS`. **Not** included: `TEAM_LLM_BASE_URL`/
-  `TEAM_LLM_MODEL`/`TEAM_MAX_ROUNDS` (6c), `TEAM_GROUNDING_MAX_BYTES` (6b).
-- `docs/ADDING_AN_ENGINE.md` — documents the four new keys, the
-  `{resume}`/`{prompt_file}` placeholder mechanics, the no-`HEADLESS_CMD`-
-  means-unaffected rule, and the one-line note about the reserved
-  `switchboard-headless` engine name.
-- `tests/test_teams_headless.py` — **new**, following
-  `tests/test_gitea_poll.py`'s conventions (`sys.path.insert(0, APP_DIR)`,
-  env vars via `os.environ.setdefault` before import, `unittest`).
-
-No `install.sh` change. No `docs/ARCHITECTURE.md` change. No schema/data-model
-changes. No HTTP API changes — `app/teams.py` is not wired into `app.py`'s
-`Handler` in this sub-spec (that first happens in 6d).
+- `app/teams.py` — extended (new grounding section, new import
+  `_read_head` from `app`; no existing function in this file changed). No
+  `app/app.py` change.
+- `config/switchboard.env.example` — one new commented-out line,
+  `TEAM_GROUNDING_MAX_BYTES`.
+- `tests/test_teams_grounding.py` — new.
+- No schema/data-model changes, no HTTP API changes, no `install.sh`
+  change, no `docs/ARCHITECTURE.md` change (no new privilege boundary —
+  same `SVC_USER`-reads-`PROJECTS_DIR`-directly pattern
+  `_gather_project_context()` already uses), no `docs/ADDING_AN_ENGINE.md`
+  change (that doc is about `HEADLESS_*` engine keys, not grounding).
 
 ## Edge cases
-- Engine name not found, or found but not `headless_enabled` → `ValueError`,
-  no tmux session created.
-- `workdir` missing or not a directory → `ValueError`, no tmux session
-  created.
-- `session_id` given for an engine with no `{resume}` support → `ValueError`.
-- Prompt exceeds the mode-appropriate byte cap (§3) → `ValueError`.
-- Engine binary not on `RUN_USER`'s `PATH`, or not logged in → a normal
-  nonzero `exit_code` path (`bash -lc` itself starts fine, backgrounds a
-  command that immediately fails) — `ok=False`, `error` derived from
-  `stderr_tail`, not a Python exception. Distinct from every `ValueError`
-  case above (those are "never spawned anything"; this is "spawned, and the
-  engine itself failed fast").
-- `bash -lc` fails before even backgrounding anything (missing `bash` for
-  `RUN_USER`, a bug in the generated `script`) → the "startup confirmation"
-  timeout path in §4 (`pid_path` never appears) — `ok=False`,
-  `error="headless session failed to start"`.
-- `rc_path` present but empty/unparseable at the moment it's first observed
-  → treated as "not yet flushed", retried on the next poll, bounded by the
-  overall timeout/grace budget — never immediately misreported as a
-  malformed result.
-- Session ends with `rc_path` still absent (§4's "missing rc" case) →
-  `cancelled=True`, `ok=False`, `exit_code=None`. Never treated as success.
-- Two concurrent `agent_run()` calls against the **same** `workdir` — not
-  prevented or detected at this layer; worktree-per-teammate isolation is
-  explicitly 6d's job. Each gets its own `run_id`-namespaced tmux session
-  and run directory regardless, so they don't collide with *each other* —
-  only shared-directory semantics (both editing the same files) are
-  unmanaged here, exactly as running two interactive engine sessions in the
-  same directory already is today.
-- `RUN_USER`'s shell umask is unusually strict (e.g. `077`), making
-  `out.jsonl`/`out.rc`/etc. unreadable by `SVC_USER` despite the `0711`
-  directory permission being correct → surfaces as a `PermissionError` when
-  `agent_run()` tries to read a file it can traverse to but not open; caught
-  and reported as a clear, specific error (not a silent hang, not a crash)
-  rather than assumed away. Documented as an environmental precondition
-  (default umask) in `docs/ADDING_AN_ENGINE.md`'s headless section.
-- Empty prompt string (`""`) → allowed through as-is, no special-casing.
-- `log_path`'s parent directory missing → created
-  (`os.makedirs(..., exist_ok=True)`).
-- A truly empty stdout (process ran, produced nothing, exited 0) →
-  `text=""`, `ok=True`. Not an error.
-- PID reuse (§4) — accepted low-probability race, not specially defended.
-- Platform: already Linux-only (`sudo`, `tmux`, `systemd`); no new
-  cross-platform concern.
+- No grounding files at all → `files=[]`, `empty=True`,
+  `digest=_GROUNDING_NO_FILES_DIGEST`, `fact_check()` always `found=False`.
+- `CLAUDE.md` and `AGENTS.md` both present → `CLAUDE.md` wins, `AGENTS.md`
+  ignored (matches `_gather_project_context()`'s `break` semantics).
+- `CLAUDE.md`'s one-line `@target` resolves outside `workdir` → skipped,
+  never opened.
+- Symlinked grounding file resolving outside `workdir` → skipped, never
+  opened.
+- Symlink loop → `_read_head()`'s `OSError` catch returns `""` → skipped
+  via the unified "empty content ⇒ not present" rule.
+- File replaced by a directory of the same name → `IsADirectoryError` (an
+  `OSError`) → same unified skip.
+- Binary file (NUL byte in first 512 bytes) named like a grounding file →
+  skipped before any content is read for digest/heading purposes.
+- Malformed UTF-8 mixed with valid text → not a skip condition; valid
+  portions still usable, no exception.
+- 200 MB grounding file → only `_GROUNDING_READ_CAP_BYTES` (2 MiB) is ever
+  read into memory, regardless of the file's real size on disk; a passage
+  past that boundary is a documented, accepted recall limitation for
+  adversarially huge files, not a crash.
+- `docs/BACKLOG.md`-sized (20 KB, real) or larger input vs. a small/default
+  `TEAM_GROUNDING_MAX_BYTES` → digest still hard-truncated to the cap; full
+  content still fully searchable by `fact_check()` regardless of the
+  digest's own truncation.
+- Heading line inside a fenced code block → not extracted as a heading.
+- Empty claim / all-stopword claim → `found=False`, no exception.
+- Claim with partial (not full) term overlap on every line → `found=False`
+  — no nearest-weak-match fallback.
+- `TEAM_GROUNDING_MAX_BYTES` configured to `0` or negative →
+  `build_digest()` returns `""`, no exception.
+- Two concurrent `load_grounding()`/`fact_check()` calls for different (or
+  the same) project — pure reads against no shared mutable state beyond
+  module-level config constants; safe by construction, no locking needed.
+- Mid-run edit to a grounding file between two `load_grounding()` calls —
+  the earlier snapshot does not see it (§3 "Snapshot semantics"); a new
+  `load_grounding()` call does.
+- `docs/` subdirectory missing entirely → `os.path.join` on a nonexistent
+  intermediate directory still raises the same `FileNotFoundError`
+  `_read_head()` already catches; no special-case needed.
+- Platform: already Linux-only (matches the rest of `app/teams.py`); no new
+  cross-platform concern (no shell/tmux involvement at all in this module).
 
 ## Acceptance criteria
-- [ ] Given `claude.engine` with valid `HEADLESS_*` keys, when
-      `agent_run("claude", <scratch workdir>, "<short prompt>")` runs
-      against the real `claude` CLI logged in as `RUN_USER`, then it returns
-      `ok=True`, non-empty `text`, a non-`None` `session_id`, `exit_code=0`
-      — verified by actually running it, not guessed. No new sudoers entry
-      required for this to work.
-- [ ] Same for `codex.engine` and `aider.engine` (aider without
-      `session_id`) — each verified by actually running it.
-- [ ] Given `session_id` from a prior `claude`/`codex` run, when
-      `agent_run()` is called again with it, then the constructed command
-      uses each engine's own resume syntax correctly (`--resume <id>` for
-      Claude; `exec resume <id>` for Codex) and the turn is genuinely
-      continued (verified with a turn-2 question that only makes sense with
-      turn-1 context).
-- [ ] Given an engine `.engine` file with no `HEADLESS_CMD` (or malformed
-      `HEADLESS_FORMAT`/`HEADLESS_PROMPT`), when `load_engines()` parses it,
-      then `Engine.headless_enabled` is `False`, and every pre-existing
-      engine-loading/instance-toggle test in `tests/` still passes
-      unmodified.
-- [ ] Given an `.engine` file named `switchboard-headless.engine`, when
-      `load_engines()` parses it, then it is ignored (not returned in the
-      engines dict), same as an `.engine.example` file.
-- [ ] Given an `.engine` file named `switchboard.engine` — the non-obvious
-      collision case from §2 "Session naming" — when `load_engines()` parses
-      it, then it is likewise ignored. An implementation that reserves only
-      the exact name `switchboard-headless` passes the test above and fails
-      this one; both must pass.
-- [ ] Given a loaded engine named `switchboard` is impossible per the rule
-      above, when a headless run is live for `run_id = R` and a project
-      directory named `headless-R` exists, then `active_engine("headless-R")`
-      returns `None` — the headless session is never reported as that
-      project's running engine.
-- [ ] Given a fixture stream containing one line that fails `json.loads()`,
-      when `agent_run()` processes it (Tier 1/2 test, no real engine
-      needed), then exactly one `kind="error"` envelope is appended and the
-      run completes normally; no exception escapes `agent_run()`.
-- [ ] Given a running headless process, when `agent_run()`'s own `timeout`
-      elapses, then it sends a targeted `SIGTERM` to the engine process
-      specifically (not the tmux session), the session's own `rc_path`
-      still gets written normally, and `cancelled=True`/`cancel_reason=
-      "timeout"` is reported. Claude Code's specific 143-on-`SIGTERM`
-      behavior is confirmed via Tier 3 verification; Codex's/aider's own
-      signal-exit codes are recorded (whatever they turn out to be), not
-      assumed.
-- [ ] Given `agent_run()` called with `session_id` set against an engine
-      with no resume support (aider), then it raises `ValueError`
-      immediately, before any tmux session is created.
-- [ ] Given a process that never exits on its own, when `timeout` elapses,
-      then `agent_run()` escalates `SIGTERM` → (grace period) → `SIGKILL` →
-      (grace period) → last-resort `kill-session`, and still returns a
-      well-formed result dict in every branch of that escalation, never
-      hanging indefinitely.
-- [ ] Given a tmux session that disappears with `rc_path` never written
-      (simulated via a Tier 2 test that force-kills the whole session out
-      from under `agent_run()`), then the result is `cancelled=True`,
-      `ok=False`, `exit_code=None` — never reported as success.
-- [ ] Given a fixture stream exceeding `TEAM_HEADLESS_MAX_EVENTS` or a
-      single line exceeding `TEAM_HEADLESS_MAX_LINE_BYTES`, then further
-      per-line events stop being appended, one truncation-notice event is
-      appended, `truncated=True`, and `ok`/`exit_code` still reflect the
-      real process outcome.
-- [ ] After any `agent_run()` call (success, cancelled, or errored), the
-      per-run directory under `TEAM_STATE_DIR/_headless/` is gone and no
-      tmux session matching `switchboard-headless-*` remains — verified
-      directly (`tmux list-sessions`, directory listing), not just inferred
-      from the return value.
-- [ ] `docs/ADDING_AN_ENGINE.md` documents `HEADLESS_CMD`, `HEADLESS_FORMAT`,
-      `HEADLESS_PROMPT`, `HEADLESS_RESUME`, the `{resume}`/`{prompt_file}`
-      placeholder mechanics, the reserved `switchboard-headless` name, and
-      states that `HEADLESS_ROLE_FLAG`/`HEADLESS_SCHEMA_FLAG`/
-      `HEADLESS_LEAD_FORMAT` are reserved for 6c and not yet consumed.
-- [ ] `python3 app/teams.py list-engines` and `python3 app/teams.py run ...`
-      both work against a real `ENGINES_DIR`/`PROJECTS_DIR` with no server
-      running, no other part of the app touched, and no `install.sh`
-      changes applied.
+- [ ] Given this repo's own project directory (real `docs/ARCHITECTURE.md`,
+      `docs/BACKLOG.md`, `README.md`; no `CLAUDE.md`/`AGENTS.md`), when
+      `discover_grounding_files(workdir)` runs, then it returns exactly
+      those three entries, correctly labeled, with no error for the two
+      absent sources.
+- [ ] Given a project directory with none of the four sources, when
+      `load_grounding(workdir)` runs, then `files == []`, `empty is True`,
+      and `digest == _GROUNDING_NO_FILES_DIGEST` (not `""`, not `None`) —
+      the team still "starts" (in the sense that this call succeeds) with
+      grounding the caller can tell is empty.
+- [ ] Given a `CLAUDE.md` whose one-line content is `@docs/OTHER.md`
+      pointing at a real file inside the project, when discovery runs, then
+      the returned entry's `path` is the resolved target (not the literal
+      `CLAUDE.md` path), matching `_gather_project_context()`'s behavior at
+      `app/app.py:436`.
+- [ ] Given that same `@`-pointer resolves **outside** the project
+      directory, when discovery runs, then the entry is skipped entirely —
+      never opened (verified via a monkeypatched/wrapped `open()` that
+      fails the test if called on the out-of-bounds path).
+- [ ] Given a real filesystem symlink for one of the four candidate paths
+      that resolves outside the project directory, when discovery runs,
+      then it is skipped and never appears in `files` or the digest —
+      verified against an actual symlink, not just path-string reasoning.
+- [ ] Given a symlink loop at one of the four candidate paths, when
+      discovery runs, then no exception propagates and the entry is
+      skipped.
+- [ ] Given one of the four candidate paths is actually a directory, when
+      discovery runs, then no exception propagates and the entry is
+      skipped.
+- [ ] Given a binary file (containing a NUL byte in its first 512 bytes)
+      named `README.md`, when discovery runs, then it is skipped and never
+      contributes to `files`, `digest`, or a `fact_check` match.
+- [ ] Given a grounding file with a genuinely invalid UTF-8 byte sequence
+      mixed into otherwise-valid text, when it is loaded, then no exception
+      propagates and the valid surrounding text is still present in
+      `content`/headings/digest.
+- [ ] Given this repo's real 20,088-byte `docs/BACKLOG.md`, when
+      `build_digest()` runs with `TEAM_GROUNDING_MAX_BYTES` at its default
+      **and** at a deliberately tiny override (e.g. 500), then in both
+      cases the returned digest's UTF-8-encoded length is `<= max_bytes` —
+      proven at more than one cap size against a real oversized file, not
+      just the default.
+- [ ] Given a synthetic sparse file well over 100 MB as a grounding
+      candidate, when `load_grounding()` reads it, then the returned
+      `content`'s length never exceeds `_GROUNDING_READ_CAP_BYTES`, and the
+      call completes quickly (bounded read, not a full-file read).
+- [ ] Given a claim built from an exact sentence fragment that genuinely
+      appears in one of this repo's own discovered grounding files, when
+      `fact_check(claim, grounding)` runs, then `found is True` and at
+      least one match's `file_line` correctly names the real file and the
+      real 1-indexed line number of that text (independently verified by
+      reading that line from the source file).
+- [ ] Given a claim whose significant terms are only *partially* present on
+      any single line of the grounding set (a genuine weak/partial overlap,
+      not a full match), when `fact_check()` runs, then `found is False`
+      and `matches == []` — proving there is no nearest-weak-match
+      fallback.
+- [ ] Given an empty, whitespace-only, or all-stopword claim, when
+      `fact_check()` runs, then `found is False` with no exception.
+- [ ] Given `grounding["empty"] is True`, when `fact_check()` runs for any
+      claim, then `found is False` with no exception.
+- [ ] Given a passage that is present in a file's full content but falls
+      outside where `build_digest()` truncated that file's snippet, when
+      `fact_check()` runs against it, then it is still found — proving
+      `fact_check` searches full content, not the truncated digest.
+- [ ] Given a markdown file with a fenced code block containing a
+      `#`-prefixed line, when headings are extracted, then that line is not
+      included in the heading list (synthetic fixture; this repo's own
+      files don't currently exercise this, so the fixture is required).
+- [ ] Given the full grounding public surface (`discover_grounding_files`,
+      `load_grounding`, `build_digest`, `fact_check`) run against a real
+      fixture project including at least one edge case above, when
+      `builtins.open` and every listed mutating `os`/`shutil` function are
+      monkeypatched to raise if called, then none of them fire.
+- [ ] Given a static `ast` scan of the grounding section of
+      `app/teams.py`, then no `open()` call uses a write/append/create
+      mode and no call targets any of the mutating functions listed in §6
+      — independent of runtime test coverage.
+- [ ] Given `load_grounding()` called twice for the same project with a
+      grounding file modified on disk between the two calls, then the
+      first call's own snapshot does not reflect the change; a fresh
+      `load_grounding()` call does.
+- [ ] `python3 app/teams.py grounding <workdir>` and
+      `python3 app/teams.py fact-check <workdir> "<claim>"` both work
+      against a real project directory with no server running and no other
+      part of the app touched.
+- [ ] All 372 pre-existing tests continue to pass unmodified; no
+      pre-existing test file is touched.
 
 ## Test plan
+**Tier 1 — pure unit, no disk I/O at all** (`tests/test_teams_grounding.py`):
+`build_digest()` fed synthetic `files` lists (empty, one file, four files,
+a file whose content is longer than its per-file share) asserting the exact
+truncation guarantee at multiple `max_bytes` values; `_extract_headings()`
+fed synthetic markdown strings including a fenced-code-block case and a
+`_GROUNDING_MAX_HEADINGS_PER_FILE`-exceeding case; `_significant_terms()`
+fed empty/whitespace/all-stopword/mixed-case/punctuation-heavy claims;
+`fact_check()` fed a synthetic `grounding` dict (no project directory
+needed) covering full-match, partial-match, empty-claim, and
+`empty=True` cases.
 
-**Tier 1 — pure unit, no subprocess, no tmux, no real CLI**
-(`tests/test_teams_headless.py`, bulk of the file): `_parse_engine_file()`'s
-four new keys and the reserved-name rule; the pure argv/`script`-template
-construction function (`{resume}`/`{prompt_file}` rendering, per-mode
-branching, both byte caps) tested as pure input-in/string-or-`ValueError`-out
-functions, no process involved; the envelope translator fed the recorded
-fixture files below, asserting the exact `kind`/`meta` mapping table; the
-malformed-line and stream-cap behaviors fed synthetic fixtures built to be
-malformed/oversized on purpose; every "Edge cases" validation failure
-asserted as `ValueError` with `subprocess.run`/`tmux_has` monkeypatched to
-fail the test if either is ever called (proves nothing was spawned).
+**Tier 2 — real filesystem, real fixture projects** (same file): this
+repo's own working tree used directly as the primary realistic fixture
+(exercises the real 20 KB `BACKLOG.md` oversize case and the real
+no-`CLAUDE.md` skip path with zero synthesized content); a `tempfile`-based
+scratch project tree for every edge case that needs constructing on
+purpose — real symlink pointing outside the tree, a real symlink loop
+(`os.symlink(a, b); os.symlink(b, a)`-style), a directory named like a
+grounding file, a binary fixture (a few KB of non-UTF-8/NUL-containing
+bytes) named `README.md`, a file with deliberately invalid UTF-8 bytes
+spliced into valid text, a `CLAUDE.md` with an in-bounds and an
+out-of-bounds `@`-pointer, and a sparse multi-hundred-MB file
+(`os.ftruncate`/seek-based creation, not actually written byte-by-byte, so
+the test stays fast) for the read-cap proof.
 
-**Tier 2 — real tmux, real (test-authored) process, no real engine CLI, no
-sudo**: `TMUX` monkeypatched from `["sudo", "-u", RUN_USER, "/usr/bin/tmux"]`
-down to `["tmux"]` (same category of substitution `test_gitea_poll.py`
-already applies to `subprocess.run`/`_gitea_api`) — real `tmux`, running as
-whichever user runs the test suite, no `RUN_USER` account or passwordless
-sudo needed in CI. A tiny Python helper script (written via `tempfile` by
-the test itself) stands in for "the engine": one variant prints fixture
-NDJSON to stdout and exits 0; one hangs, to exercise real
-`SIGTERM`→grace→`SIGKILL` escalation end to end (including confirming
-`$?` really does land as `128+15` in `rc_path` for a plain `SIGTERM`,
-closing that "confirm, don't assume" item from the coordinator's ask); one
-is killed by the test forcing `tmux kill-session` on it directly mid-run, to
-exercise the missing-`rc_path` classification; one reads its actual stdin,
-to exercise `stdin`-mode prompt delivery. This tier is what actually proves
-the tailing-by-offset, completion-ordering, and cleanup logic in §4, without
-needing a real `RUN_USER`/engine CLI at all.
+**Read-only assertions**: one test monkeypatches `builtins.open` to raise
+`AssertionError` on any non-read mode and runs the full public surface
+against the Tier 2 fixtures; a second monkeypatches each mutating
+`os`/`shutil` function to raise if called, same run; a third does a static
+`ast.parse()` of `app/teams.py`, walks the grounding section's function
+defs, and asserts no `Call` node targets `open()` with a write-mode literal
+or any of the mutating functions — independent of what the runtime tests
+happened to exercise.
 
-**Tier 3 — real CLI verification (manual, developer stage, per
-`docs/ADDING_AN_ENGINE.md`'s standing rule)**: run each of `claude`, `codex`,
-`aider` for real, headless, through the actual tmux-hosted path, against a
-scratch project. Confirm the binary is on `RUN_USER`'s `PATH` and logged in;
-run `python3 app/teams.py run <engine> <scratch dir> --prompt "..."` for a
-first turn and again with `--session-id` to confirm resume; capture the
-real output into `tests/fixtures/headless/<engine>_stream.jsonl` (`.txt` for
-aider) for Tier 1 to replay deterministically; send a real `SIGTERM`
-mid-run (`kill -TERM <pid>`, or via the CLI's own future interrupt handling)
-to confirm/record the actual signal-exit code per engine, replacing the
-"143 confirmed for Claude, unconfirmed for the other two" note above with
-real findings. **If a given CLI is not installed on the box doing this
-pass**, that engine's `HEADLESS_*` keys ship marked explicitly **"unverified
-— believed correct per vendor docs as of 2026-08-13, not yet run
-end-to-end"** in both the commit message and `docs/ADDING_AN_ENGINE.md`,
-mirroring this repo's own existing verified/documented distinction — never
-silently marked done. `docs/implementation.md` records which of the three
-actually got a real run.
+**CLI**: both new subcommands run directly against a real scratch project
+and against this repo's own tree, output inspected as JSON.
+
+Run with: `python3 -m unittest discover -s tests -v` (existing convention;
+new file follows `tests/test_teams_headless.py`'s `sys.path.insert`/
+`os.environ.setdefault`-before-import shape).
 
 ## Open questions
-- **`HEADLESS_ROLE_FLAG`/`HEADLESS_SCHEMA_FLAG`/`HEADLESS_LEAD_FORMAT`**
-  remain deliberately unparsed in 6a (see "Non-goals") — 6c will need one
-  more small, additive touch to `_parse_engine_file()`/`Engine.__slots__`.
-- **Exact final `HEADLESS_CMD`/`HEADLESS_RESUME` flag text for Codex** is
-  the resolved *mechanism* (§3), confirmed byte-for-byte in Tier 3. If
-  Codex's actual `exec resume` syntax doesn't accept trailing flags the way
-  assumed, the fix is confined to `codex.engine`'s own two lines.
-- **`TEAM_HEADLESS_POLL_SECONDS` default (0.5s)** trades latency
-  (how quickly a new stream event or a completed run is noticed) against
-  overhead (a `tmux has-session`/file-`stat` pair per tick per in-flight
-  run). Fine for 6a's single-run CLI use; 6c's lead loop or 6f's overwatch
-  feed may want this tuned per-context once there are many concurrent runs
-  — flagging now so a future sub-spec doesn't treat the current default as
-  load-bearing.
-- **Whether the opportunistic stale-run sweep (§4) should eventually fold
-  into `_reap_dead_state()`** rather than staying `teams.py`-local, once 6d
-  gives headless runs an actual team/session concept `app.py` needs to know
-  about for its own "self-heal on restart" story. Leaning: keep it local
-  through 6a–6c, revisit in 6d when there's a real reason to unify the two
-  sweeps.
-- **`--include-partial-messages`/`stream_event`** remains deliberately
-  unrequested by default (unchanged from the prior version).
+- **`TEAM_GROUNDING_MAX_BYTES` default (8000)** — a reasonable-sounding
+  starting point (~2000 tokens), not measured against a real local model's
+  actual context budget yet. Proceeding under this assumption; worth
+  revisiting once 6c has a real Ollama model's context window and tool-
+  schema overhead to size it against.
+- **README casing-variant matching** — `docs/story.md` §4.3 literally says
+  `README.md`; this spec extends discovery to also match
+  `Readme.md`/`readme.md`/`README`, mirroring `_gather_project_context()`
+  in full for consistency between the two sibling discovery functions.
+  Flagging this as a deliberate, low-risk extension beyond the story's
+  literal wording rather than a silent deviation — easy to narrow back to
+  the literal name only if that consistency isn't wanted.
+- **Single-line-only `fact_check` matching** — deliberately conservative
+  (see "Precision over recall"). If 6c's real usage against a real lead
+  shows too many true claims coming back `found=False` because their
+  support spans two adjacent lines of a wrapped paragraph, a follow-up
+  could join adjacent non-blank lines into one matchable "paragraph" unit
+  without changing the underlying precision rule (still no fuzzy/nearest
+  matching, just a wider matching unit). Not built now — no evidence yet
+  that it's needed, and the brief explicitly asks for precision bias.
+- **`_GROUNDING_READ_CAP_BYTES` (2 MiB, not configurable)** — sized to
+  comfortably exceed every real file in this repo's own grounding set
+  (largest is 20 KB) while bounding memory for an adversarial input.
+  Proceeding under this value as a reasonable structural ceiling; open to
+  adjustment if a real project's genuine `BACKLOG.md` turns out to need
+  more.
 
 ## Risk / rollback notes
-Every change here is additive to existing files (`Engine`,
-`_parse_engine_file()`, `switchboard.env.example`) plus wholly new files
-(`app/teams.py`, `tests/test_teams_headless.py`, three new fixture files).
-`install.sh` and `docs/ARCHITECTURE.md` are untouched. Nothing in `app.py`'s
-HTTP handler, `instance_start()`/`instance_stop()`, or any existing route is
-touched — the regression risk to today's single-session toggle is exactly
-what the "zero behavioral change" acceptance criterion tests for directly.
-The only operationally live surface this sub-spec introduces at all is a
-new, empty-by-default directory (`TEAM_STATE_DIR`) and, transiently, tmux
-sessions matching `switchboard-headless-*` that are torn down within the
-same `agent_run()` call that creates them — nothing persists past a single
-invocation except the translated `.jsonl` log files. Rollback is reverting
-the commit; there is no sudoers file, install-time state, or privilege
-change to separately undo.
+Purely additive: a new self-contained section in `app/teams.py` with no
+call site anywhere else in the codebase yet (6c is what will import and
+call it from the lead loop) and no change to `app/app.py`. Nothing in this
+sub-spec is wired into any HTTP route, the CLI's existing `run`/
+`list-engines` subcommands, or the existing single-engine session path.
+Rollback is reverting the commit; no migration, no state, no privilege
+surface to unwind. The only shared surface touched is `app/teams.py`'s
+import line (`_read_head` added) and `config/switchboard.env.example`
+(one new commented-out line) — both trivially revertible and inert until
+6c actually calls into this module.
