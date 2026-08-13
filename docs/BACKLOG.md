@@ -87,10 +87,26 @@ instance caught one must-fix defect (a same-second token-name collision in
 approved on re-review (verified live across 35 runs with zero collisions,
 including runs that genuinely shared the same Unix second). Full
 spec/implementation/test-review for **2a specifically**
-preserved in git history at commit `dcc582b`; **2b specifically** in the
+preserved in git history at commit `dcc582b`; **2b specifically** at commit
+`5a59d21`.
+
+**2c part 1 shipped (2026-08-13)** — `app.py` now polls Gitea's REST API
+(piggybacked on `/status`, throttled to its own `GITEA_POLL_INTERVAL_SECONDS`
+interval, default 45s — no webhook, no new listener, no Docker networking
+changes; an earlier webhook-based design was rejected by the user for
+introducing exactly that kind of new attack surface) and, when a
+Gitea-backed project's default branch moves, safely fast-forwards
+`PROJECTS_DIR/<name>` — never destructive: skips (and records why) on a
+dirty working copy or diverged local history, never `git reset --hard`.
+Reviewer approved with one should-fix follow-up (a malformed API response
+could silently kill polling for every other project in that pass) — fixed
+directly, verified load-bearing, 215/215 tests pass. Full
+spec/implementation/test-review for **2c part 1 specifically** in the
 current `docs/spec.md` / `docs/implementation.md` / `docs/test-review.md`.
-**2c (CI/CD auto-deploy) is still open** — deliberately scoped out as a
-separate future cycle.
+**2c part 2 (CI/CD auto-deploy to a separate target machine) is still
+open** — deliberately scoped out as a separate future cycle that reuses
+part 1's poll-detected-a-change dispatch point rather than building its own
+detection mechanism.
 
 **Decision:** Gitea, not full GitLab CE. GitLab's resource footprint (own
 Postgres, Redis, multiple worker processes, several GB RAM minimum) cuts

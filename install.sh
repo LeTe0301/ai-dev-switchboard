@@ -380,6 +380,14 @@ SUDOERS=/etc/sudoers.d/ai-dev-switchboard
     echo "$SVC_USER ALL=($RUN_USER) NOPASSWD: /usr/bin/tmux *"
     echo "$SVC_USER ALL=($RUN_USER) NOPASSWD: /usr/local/bin/ttyd *"
     echo "$SVC_USER ALL=($RUN_USER) NOPASSWD: /usr/local/bin/code-server *"
+    if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
+        # Poll-triggered sync-on-push (backlog item 2c, part 1 —
+        # docs/spec.md "The sync decision") — grouped with the other
+        # ALL=($RUN_USER) rules above, NOT the ALL=(root) ones below: this
+        # script never needs root (the working copy and its ownership
+        # already exist; see scripts/gitea-sync-project.sh's own header).
+        echo "$SVC_USER ALL=($RUN_USER) NOPASSWD: /usr/local/bin/ai-dev-switchboard-gitea-sync-project.sh *"
+    fi
     # Unconditional (not gated behind --with-git-hosting) — the folder-upload
     # wizard is explicitly the project-registration path for people WITHOUT
     # git hosting installed.
@@ -539,6 +547,13 @@ if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
     install -m 755 "$REPO_DIR/scripts/new-project-from-gitea.sh" \
         /usr/local/bin/ai-dev-switchboard-new-project-from-gitea.sh
 
+    # 5c. Poll-triggered sync-on-push (backlog item 2c, part 1 —
+    # docs/spec.md). Run via `sudo -u $RUN_USER` (its sudoers entry is added
+    # above, alongside the other ALL=($RUN_USER) rules — NOT grouped with
+    # the ALL=(root) Gitea rules above, since this script never needs root).
+    install -m 755 "$REPO_DIR/scripts/gitea-sync-project.sh" \
+        /usr/local/bin/ai-dev-switchboard-gitea-sync-project.sh
+
     # 6. switchboard.env — GITEA_DIR is also recorded here (beyond what
     # app.py itself reads) because the wrapper scripts above source this
     # same file for it, exactly like TAIGA_DIR's usage above.
@@ -554,6 +569,15 @@ if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
     set_env "$ENV_FILE" GITEA_STATUS_SCRIPT "/usr/local/bin/ai-dev-switchboard-gitea-status.sh"
     set_env "$ENV_FILE" NEW_PROJECT_FROM_GITEA_SCRIPT \
         "/usr/local/bin/ai-dev-switchboard-new-project-from-gitea.sh"
+    # GITEA_SYNC_SCRIPT/GITEA_REPO_MAP_FILE (docs/spec.md part 2c part 1) —
+    # same $STATE_DIR DESC_CACHE_FILE already uses.
+    # GITEA_POLL_INTERVAL_SECONDS is deliberately NOT written here — it has
+    # a built-in default (45) in app.py itself and is documented as an
+    # optional override in config/switchboard.env.example instead (docs/
+    # spec.md "Open questions" #5), same style as GITEA_PORT/GITEA_LABEL.
+    set_env "$ENV_FILE" GITEA_SYNC_SCRIPT \
+        "/usr/local/bin/ai-dev-switchboard-gitea-sync-project.sh"
+    set_env "$ENV_FILE" GITEA_REPO_MAP_FILE "$STATE_DIR/gitea-repo-map.json"
 fi
 
 if [ "$WITH_HOST_CONTROL" -eq 1 ]; then

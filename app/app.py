@@ -149,6 +149,27 @@ NEW_PROJECT_FROM_GITEA_SCRIPT = os.environ.get(
     "NEW_PROJECT_FROM_GITEA_SCRIPT",
     "/usr/local/bin/ai-dev-switchboard-new-project-from-gitea.sh")
 
+# Poll-based sync-on-push (backlog item 2c, part 1 -- docs/spec.md) -- keeps
+# PROJECTS_DIR/<name> in sync when a push lands on its Gitea repo from
+# somewhere else (another contributor via Gitea's own web UI, a merged PR, a
+# second agent session elsewhere). GITEA_SYNC_SCRIPT is run via
+# `sudo -u RUN_USER` (never root -- see scripts/gitea-sync-project.sh's own
+# header). GITEA_REPO_MAP_FILE is the owner/repo -> local name/branch/
+# sync-state mapping create_project() writes and the poll loop reads/updates
+# -- SVC_USER-owned, same directory DESC_CACHE_FILE already lives in (see
+# docs/spec.md "Repo-map + sync-state file" for why this can't just be an
+# ambient read of each project's own .git/config).
+GITEA_SYNC_SCRIPT = os.environ.get(
+    "GITEA_SYNC_SCRIPT", "/usr/local/bin/ai-dev-switchboard-gitea-sync-project.sh")
+GITEA_REPO_MAP_FILE = os.environ.get(
+    "GITEA_REPO_MAP_FILE", "/var/lib/ai-dev-switchboard/gitea-repo-map.json")
+# Independent of the frontend's fast 4-second /status poll -- polling
+# Gitea's API is a real network call per registered project, not the cheap
+# in-memory bookkeeping _reap_dead_state() itself redoes on every tick. Not
+# written by install.sh (docs/spec.md "Open questions" #5) -- an
+# env-overridable constant, same style as UPLOAD_STAGING_TTL_SECONDS.
+GITEA_POLL_INTERVAL_SECONDS = int(os.environ.get("GITEA_POLL_INTERVAL_SECONDS", "45"))
+
 STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT_SECONDS", "45"))
 
 # This service runs as its own unprivileged user — tmux sessions must run as
@@ -573,6 +594,145 @@ def _gitea_api(method: str, path: str, body: dict = None) -> tuple:
         raise ConnectionError("gitea unreachable")
 
 
+# ─── poll-based sync-on-push (backlog item 2c, part 1) ─────────────────────
+# See docs/spec.md "Repo-map + sync-state file" -- resolves owner/repo ->
+# PROJECTS_DIR/<name> without app.py (running as SVC_USER) ever needing an
+# ambient filesystem read into RUN_USER's home directory.
+_gitea_map_lock = threading.Lock()
+
+
+def _load_gitea_repo_map() -> dict:
+    try:
+        with open(GITEA_REPO_MAP_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_gitea_repo_map_entry(owner_repo: str, name: str, branch: str,
+                               sync_state=None, sync_at=None, remote_sha=None) -> None:
+    """Read-modify-write, tmp-file-then-os.replace() -- same idiom
+    _save_desc_cache already uses, plus a lock around the read-modify-write
+    itself since (unlike the description cache) multiple threads can call
+    this concurrently for different projects (create_project() and every
+    in-flight _gitea_sync_run() call)."""
+    with _gitea_map_lock:
+        m = _load_gitea_repo_map()
+        m[owner_repo] = {"name": name, "branch": branch, "sync_state": sync_state,
+                         "sync_at": sync_at, "remote_sha": remote_sha}
+        os.makedirs(os.path.dirname(GITEA_REPO_MAP_FILE), exist_ok=True)
+        tmp = GITEA_REPO_MAP_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(m, f, indent=2, sort_keys=True)
+        os.replace(tmp, GITEA_REPO_MAP_FILE)
+
+
+# Per-project (keyed by owner/repo) non-blocking lock for sync concurrency --
+# mirrors the _desc_pending per-name-set idiom above: a poll-triggered sync
+# attempt that finds the lock already held for this project is simply
+# dropped, not queued (docs/spec.md "Concurrency" -- the next poll interval
+# converges to the same end state regardless).
+_gitea_sync_locks_guard = threading.Lock()
+_gitea_sync_locks = {}
+
+
+def _gitea_sync_lock_for(owner_repo: str) -> threading.Lock:
+    with _gitea_sync_locks_guard:
+        lock = _gitea_sync_locks.get(owner_repo)
+        if lock is None:
+            lock = threading.Lock()
+            _gitea_sync_locks[owner_repo] = lock
+        return lock
+
+
+def _gitea_sync_run(name: str, branch: str, owner_repo: str, observed_sha: str) -> None:
+    """The actual sync attempt: runs GITEA_SYNC_SCRIPT as RUN_USER and
+    records the outcome in the repo-map, keyed by owner_repo. Only ever
+    called off the /status request thread (see _gitea_sync_bg). A non-zero
+    exit (argv/config problem, or the script's own `git fetch` failing) is
+    NOT recorded -- remote_sha is deliberately left untouched so the next
+    poll interval still sees a diff and retries, rather than silently
+    giving up on a transient failure."""
+    try:
+        r = subprocess.run(["sudo", "-u", RUN_USER, GITEA_SYNC_SCRIPT, name, branch],
+                           capture_output=True, text=True, timeout=60)
+    except (subprocess.SubprocessError, OSError):
+        return
+    if r.returncode != 0:
+        return
+    lines = (r.stdout or "").strip().splitlines()
+    state = lines[-1] if lines else "error"
+    _save_gitea_repo_map_entry(owner_repo, name, branch, sync_state=state,
+                               sync_at=time.time(), remote_sha=observed_sha)
+
+
+def _gitea_sync_bg(name: str, branch: str, owner_repo: str, observed_sha: str) -> None:
+    """Spawned by _gitea_poll_one whenever a polled branch's SHA has moved
+    since it was last checked. Returns immediately -- the real fetch/sync
+    work (a potentially slow `sudo -u RUN_USER` subprocess call) runs on its
+    own thread, mirroring _generate_description_bg's own "return fast, do
+    the real work off the request thread" idiom, since a git fetch
+    shouldn't run synchronously inside a /status request."""
+    lock = _gitea_sync_lock_for(owner_repo)
+    if not lock.acquire(blocking=False):
+        return  # a sync for this project is already in flight
+
+    def _run():
+        try:
+            _gitea_sync_run(name, branch, owner_repo, observed_sha)
+        finally:
+            lock.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+_gitea_poll_lock = threading.Lock()
+_gitea_poll_last_at = 0.0
+
+
+def _gitea_poll_if_due(gitea_on: bool) -> None:
+    global _gitea_poll_last_at
+    if not GITEA_ENABLED or not gitea_on:
+        return  # feature off, or Gitea itself isn't currently running --
+                 # don't hammer _gitea_api with ConnectionErrors
+    if time.time() - _gitea_poll_last_at < GITEA_POLL_INTERVAL_SECONDS:
+        return
+    if not _gitea_poll_lock.acquire(blocking=False):
+        return  # another /status request is already mid-poll-pass
+    try:
+        if time.time() - _gitea_poll_last_at < GITEA_POLL_INTERVAL_SECONDS:
+            return  # lost the race -- someone else just finished a pass
+        _gitea_poll_last_at = time.time()
+        for owner_repo, entry in _load_gitea_repo_map().items():
+            try:
+                _gitea_poll_one(owner_repo, entry)
+            except Exception:
+                # One malformed/unexpected response must not silently kill
+                # polling for every other registered project in this pass --
+                # skip and retry this entry next interval, same "availability
+                # nit, never a correctness/safety issue" tolerance the rest
+                # of this feature already accepts.
+                pass
+    finally:
+        _gitea_poll_lock.release()
+
+
+def _gitea_poll_one(owner_repo: str, entry: dict) -> None:
+    branch = entry.get("branch", "main")
+    try:
+        status, resp = _gitea_api("GET", f"/repos/{owner_repo}/branches/{branch}")
+    except ConnectionError:
+        return  # transient; retried next interval
+    if status != 200 or not isinstance(resp, dict):
+        return  # repo/branch renamed/deleted, or an unexpected response
+                 # shape -- retried next interval either way (e.g. Gitea
+                 # mid-restart)
+    remote_sha = (resp.get("commit") or {}).get("id", "")
+    if not remote_sha or remote_sha == entry.get("remote_sha"):
+        return  # nothing new since the last time this was checked
+    _gitea_sync_bg(entry["name"], branch, owner_repo, remote_sha)
+
+
 def create_project(name: str) -> tuple[bool, str]:
     if not NAME_RE.match(name or ""):
         return False, "Use letters, numbers, spaces, - or _ (must start with a letter/number)."
@@ -618,6 +778,18 @@ def create_project(name: str) -> tuple[bool, str]:
         except ConnectionError:
             pass
         return False, (r.stderr or r.stdout or "registration script failed").strip()[:300]
+
+    # Best-effort, non-fatal (docs/spec.md "Repo-map write in
+    # create_project()") -- a pure local JSON file write, not a Gitea API
+    # call, so it can really only fail on a disk/permission problem. A
+    # failure here doesn't fail create_project()'s own return value: the
+    # primary outcome (a real repo, cloned and working) already succeeded;
+    # losing only the auto-sync nicety is the same degrade-gracefully
+    # tradeoff already accepted for the cleanup-on-clone-failure path above.
+    try:
+        _save_gitea_repo_map_entry(f"{owner}/{repo_name}", name, "main")
+    except OSError:
+        pass
     return True, ""
 
 
@@ -1368,7 +1540,7 @@ async function refresh() {
   let html = '';
   for (const inst of s.instances) {
     html += row(inst.name, inst.on, inst.url, 'inst', inst.name, inst.desc, inst.engine,
-               inst.code_on, inst.code_url);
+               inst.code_on, inst.code_url, undefined, undefined, inst.gitea_sync);
   }
   if (s.instances.length === 0) html += '<div class="empty">No project folders under the configured PROJECTS_DIR yet.</div>';
   if (s.host_enabled) html += row(s.host_label, s.host, s.host_url, 'host', null, '', null, false, null);
@@ -1414,14 +1586,25 @@ function codeRow(name, codeOn, codeUrl) {
     (codeOn && codeUrl ? '<a href="' + codeUrl + '" target="_blank">open</a>' : '') +
     '</div>';
 }
-function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverride, showBadge) {
+// A poll-triggered sync's skip states get one small suffix on the row's
+// existing .sub text (docs/spec.md "Not surfaced as a 'notification'..."
+// — an informational addition to text that's already there, not a new
+// badge/icon system). "synced", absent, or in-flight states add nothing.
+function gitSyncSuffix(gitSync) {
+  if (!gitSync || !gitSync.state) return '';
+  if (gitSync.state === 'skipped-dirty') return ' · sync skipped: local changes';
+  if (gitSync.state === 'skipped-diverged') return ' · sync skipped: local commits ahead';
+  return '';
+}
+function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverride, showBadge, gitSync) {
   // subOverride lets a singleton-toggle row (Taiga/Gitea — see refresh())
   // supply its own starting/running/stopped/error text instead of this
   // generic on/off computation — every other kind (inst/host/code) omits it
   // and keeps the plain behavior unchanged. showBadge + SINGLETON_TOGGLE_CONFIG
   // (keyed by kind) supply that row's own resource-cost badge text/class.
-  const sub = subOverride != null ? subOverride :
-    (on ? (url ? 'running — <a href="' + url + '" target="_blank">open</a>' : 'running') : 'stopped');
+  const sub = (subOverride != null ? subOverride :
+    (on ? (url ? 'running — <a href="' + url + '" target="_blank">open</a>' : 'running') : 'stopped')) +
+    gitSyncSuffix(gitSync);
   const cfg = SINGLETON_TOGGLE_CONFIG[kind];
   const arg = name ? "'" + kind + "','" + name + "'" : "'" + kind + "',null";
   return '<div class="row"><div><div class="label">' + esc(label) + '</div>' +
@@ -2458,16 +2641,31 @@ class Handler(BaseHTTPRequestHandler):
                 out = gitea_run("status").splitlines()
                 gitea_on = bool(out) and out[0] == "on"
                 gitea_url = _gitea_display_url() if gitea_on else None
+            # Opportunistic work on this already-frequent request, same
+            # precedent _reap_dead_state() itself established -- internally
+            # throttled to its own GITEA_POLL_INTERVAL_SECONDS interval, so
+            # this is a cheap no-op on every tick that isn't due yet (see
+            # docs/spec.md "The poll mechanism").
+            _gitea_poll_if_due(gitea_on)
+            # Reverse-indexed by name, small N -- same "just iterate it"
+            # style instance_names() itself already uses -- to attach an
+            # optional gitea_sync field to each row below, when present.
+            gitea_sync_by_name = {e.get("name"): e for e in _load_gitea_repo_map().values()}
             instances = []
             for n in instance_names():
                 engine = active_engine(n)
                 e = engines.get(engine) if engine else None
                 url = (_session_urls.get(n) if (e and e.url_regex) else
                        _ttyd_urls.get(n) if engine else None)
-                instances.append({"name": n, "on": engine is not None, "engine": engine,
-                                  "url": url,
-                                  "desc": get_description(n, os.path.join(PROJECTS_DIR, n)),
-                                  "code_on": code_running(n), "code_url": _code_urls.get(n)})
+                inst = {"name": n, "on": engine is not None, "engine": engine,
+                       "url": url,
+                       "desc": get_description(n, os.path.join(PROJECTS_DIR, n)),
+                       "code_on": code_running(n), "code_url": _code_urls.get(n)}
+                sync_entry = gitea_sync_by_name.get(n)
+                if sync_entry is not None:
+                    inst["gitea_sync"] = {"state": sync_entry.get("sync_state"),
+                                          "at": sync_entry.get("sync_at")}
+                instances.append(inst)
             self._json({"instances": instances,
                        "engines": {name: e.label for name, e in engines.items()},
                        "host_enabled": HOST_CONTROL_ENABLED, "host_label": HOST_LABEL,

@@ -105,24 +105,60 @@ git client reaching in from elsewhere, which needs no extra code on this
 project's side; it falls out of the Gitea toggle's existing `_publish()`
 call.
 
+## Auto-sync of `PROJECTS_DIR/<name>` when someone pushes from elsewhere
+
+If another contributor pushes to the same repo from somewhere else (Gitea's
+own web UI, a merged PR, a second agent session elsewhere), `app.py`
+notices and, when it's safe, catches your local working copy up
+automatically — no webhook, no extra listener, no extra secret. It works by
+**polling**, not by Gitea pushing a notification: every
+`GITEA_POLL_INTERVAL_SECONDS` (45s by default), `app.py` asks Gitea's own
+REST API whether each Gitea-backed project's default branch has moved since
+the last check, and only fetches when it actually has.
+
+**What "safe" means, exactly** — this never overwrites or discards local
+work:
+
+1. `git fetch origin main` (never touches your working tree or `HEAD` by
+   itself).
+2. If the working copy has uncommitted changes, sync is skipped entirely
+   (recorded as `skipped-dirty` — visible as a small note next to that
+   project's row in the web UI). Nothing is touched.
+3. If local `HEAD` isn't a strict/equal ancestor of the newly fetched
+   ref — a genuinely diverged history, or local commits of your own not yet
+   pushed — sync is also skipped (`skipped-diverged`). Nothing is touched,
+   no history is rewritten, no commit is ever lost.
+4. Otherwise: a guaranteed no-op-or-clean `git merge --ff-only` — never
+   `git reset --hard`.
+
+**Two things this is honest about, on purpose:**
+
+- **Latency, not instant.** A push landing elsewhere shows up in your local
+  working copy within `GITEA_POLL_INTERVAL_SECONDS` (up to ~45s by
+  default), not immediately. If you know a push just happened and don't
+  want to wait, `git pull` manually — that always works regardless.
+- **The two skip cases above still need a manual `git pull`/resolve.** If
+  you have uncommitted changes or unpushed local commits when someone else
+  pushes, auto-sync steps back and leaves it to you rather than guessing.
+
 ## What's NOT included (yet)
 
-- **Auto-sync of `PROJECTS_DIR/<name>` when someone pushes to the same repo
-  from somewhere else** (another contributor via Gitea's own web UI, a
-  merged PR, a second agent session elsewhere). The old flow's
-  `post-receive` hook gave this "for free" because it expected the *bare
-  repo* to be the primary target of pushes; under the new model
-  `PROJECTS_DIR/<name>` is itself the primary working copy, so this is a
-  narrower, less common need than it used to be. For now: `git pull`
-  manually in the working copy if you know something else pushed to it.
-  Revisit if this turns out to matter more in practice — see `docs/BACKLOG.md`.
 - **CI/CD auto-deploy** (Gitea Actions or webhooks replacing the old
   `project-sync.sh` + `post-receive` deploy-to-a-target-machine flow) — a
-  future cycle, not built yet.
+  future cycle, not built yet. (Backlog item 2c, part 2 — reuses this
+  cycle's poll-detected-a-push dispatch point rather than building its own
+  detection mechanism.)
+- **A manual "check now" button** — auto-sync always waits for the next due
+  poll interval; there's no on-demand trigger in the web UI (yet).
 - **Multiple Gitea orgs, or a separate Gitea account per developer.** Every
   repo is created under the single admin account from step 1 above
   (`POST /user/repos`, not `/orgs/{org}/repos`) — same single-shared-identity
   model the old `git` system user had, just under Gitea's terms.
+- **Projects not created through the "+ New project" flow.** Auto-sync only
+  covers projects `create_project()` itself registered (it's the only thing
+  that records the `owner/repo` -> local-project mapping this relies on) —
+  a manually `git init`'d project, or one registered via the folder-upload
+  wizard with a hand-added Gitea remote, isn't polled.
 
 ## Troubleshooting
 

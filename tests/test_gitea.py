@@ -216,6 +216,52 @@ class GiteaEndpointTests(unittest.TestCase):
         self.assertTrue(s["gitea"])
         self.assertEqual(s["gitea_url"], f"http://127.0.0.1:{appmod.GITEA_PORT}")
 
+    def test_status_includes_gitea_sync_for_a_project_with_a_repo_map_entry(self):
+        # docs/spec.md part 2c part 1, acceptance criteria: sync_state/
+        # sync_at present when a repo-map entry exists for that project.
+        # gitea_state stays "off" here deliberately (default from setUp) so
+        # _gitea_poll_if_due(gitea_on=False) never fires a real network call.
+        self._fake_gitea_run()
+        tmp = tempfile.mkdtemp(prefix="switchboard-status-sync-")
+        orig_projects_dir = appmod.PROJECTS_DIR
+        orig_map_file = appmod.GITEA_REPO_MAP_FILE
+        try:
+            appmod.PROJECTS_DIR = os.path.join(tmp, "projects")
+            os.makedirs(os.path.join(appmod.PROJECTS_DIR, "proj"))
+            appmod.GITEA_REPO_MAP_FILE = os.path.join(tmp, "gitea-repo-map.json")
+            appmod._save_gitea_repo_map_entry("admin/proj", "proj", "main",
+                                              sync_state="skipped-dirty", sync_at=123.0,
+                                              remote_sha="abc123")
+            cookie = self._login()
+            s = self._get_status(cookie)
+            by_name = {i["name"]: i for i in s["instances"]}
+            self.assertIn("proj", by_name)
+            self.assertEqual(by_name["proj"]["gitea_sync"],
+                             {"state": "skipped-dirty", "at": 123.0})
+        finally:
+            appmod.PROJECTS_DIR = orig_projects_dir
+            appmod.GITEA_REPO_MAP_FILE = orig_map_file
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_status_omits_gitea_sync_for_a_project_without_a_repo_map_entry(self):
+        self._fake_gitea_run()
+        tmp = tempfile.mkdtemp(prefix="switchboard-status-nosync-")
+        orig_projects_dir = appmod.PROJECTS_DIR
+        orig_map_file = appmod.GITEA_REPO_MAP_FILE
+        try:
+            appmod.PROJECTS_DIR = os.path.join(tmp, "projects")
+            os.makedirs(os.path.join(appmod.PROJECTS_DIR, "plain"))
+            appmod.GITEA_REPO_MAP_FILE = os.path.join(tmp, "gitea-repo-map.json")  # never written
+            cookie = self._login()
+            s = self._get_status(cookie)
+            by_name = {i["name"]: i for i in s["instances"]}
+            self.assertIn("plain", by_name)
+            self.assertNotIn("gitea_sync", by_name["plain"])
+        finally:
+            appmod.PROJECTS_DIR = orig_projects_dir
+            appmod.GITEA_REPO_MAP_FILE = orig_map_file
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_toggle_on_without_code_returns_428(self):
         self._fake_gitea_run()
         cookie = self._login()
@@ -415,6 +461,8 @@ class CreateProjectGiteaTests(unittest.TestCase):
         self._orig_gitea_run = appmod.gitea_run
         self._orig_gitea_api = appmod._gitea_api
         self._orig_subprocess_run = subprocess.run
+        self._orig_map_file = appmod.GITEA_REPO_MAP_FILE
+        appmod.GITEA_REPO_MAP_FILE = os.path.join(self.tmp, "gitea-repo-map.json")
 
         appmod.GITEA_ENABLED = True
         appmod.GITEA_API_TOKEN = "test-token"
@@ -430,6 +478,7 @@ class CreateProjectGiteaTests(unittest.TestCase):
         appmod.gitea_run = self._orig_gitea_run
         appmod._gitea_api = self._orig_gitea_api
         subprocess.run = self._orig_subprocess_run
+        appmod.GITEA_REPO_MAP_FILE = self._orig_map_file
 
     def _fake_gitea_api(self, responses):
         """responses: list of (status, body) tuples, one per call in order."""
@@ -535,6 +584,40 @@ class CreateProjectGiteaTests(unittest.TestCase):
         self.assertEqual(cmd, ["sudo", appmod.NEW_PROJECT_FROM_GITEA_SCRIPT,
                                "admin", "newproj", "newproj"])
         self.assertEqual(kwargs.get("timeout"), 30)
+
+    def test_happy_path_writes_repo_map_entry_with_null_sync_fields(self):
+        # docs/spec.md part 2c part 1, acceptance criteria: a successful
+        # create_project() (Gitea flow) leaves a GITEA_REPO_MAP_FILE entry
+        # mapping owner/repo -> the local name/branch, with
+        # sync_state/sync_at/remote_sha all null -- verified without a live
+        # Gitea instance (subprocess/API are already mocked above).
+        self._fake_gitea_api([(201, {"name": "newproj", "owner": {"login": "admin"}})])
+        self._fake_subprocess_ok()
+        ok, msg = appmod.create_project("newproj")
+        self.assertTrue(ok)
+        m = appmod._load_gitea_repo_map()
+        self.assertEqual(m, {"admin/newproj": {"name": "newproj", "branch": "main",
+                                               "sync_state": None, "sync_at": None,
+                                               "remote_sha": None}})
+
+    def test_repo_map_write_failure_does_not_fail_create_project(self):
+        # Best-effort/non-fatal (docs/spec.md "Repo-map write in
+        # create_project()"): the real repo+clone already succeeded, so a
+        # pure local JSON-file-write failure must not turn that into an
+        # overall failure -- no regression to 2b's existing behavior.
+        self._fake_gitea_api([(201, {"name": "newproj", "owner": {"login": "admin"}})])
+        self._fake_subprocess_ok()
+
+        def _raise(*a, **kw):
+            raise OSError("disk full")
+        orig = appmod._save_gitea_repo_map_entry
+        appmod._save_gitea_repo_map_entry = _raise
+        try:
+            ok, msg = appmod.create_project("newproj")
+        finally:
+            appmod._save_gitea_repo_map_entry = orig
+        self.assertTrue(ok)
+        self.assertEqual(msg, "")
 
     def test_name_with_spaces_uses_slug_for_gitea_but_original_name_for_script(self):
         self._fake_gitea_api([(201, {"name": "my-project", "owner": {"login": "admin"}})])
