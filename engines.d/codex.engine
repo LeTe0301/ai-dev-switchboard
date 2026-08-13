@@ -34,3 +34,21 @@ LABEL=Codex
 CMD=codex
 STARTUP_MATCH_1=Do you trust the contents of this directory
 STARTUP_SEND_1=1
+
+# HEADLESS_*: one bounded, non-interactive turn (backlog item 6a,
+# docs/spec.md), used by app/teams.py's agent_run() -- unrelated to the
+# interactive session above, never read by instance_start(). Partially
+# verified by actually running it (docs/implementation.md): `codex exec
+# {resume} --json --skip-git-repo-check "<prompt>"` really does start,
+# stream NDJSON (`thread.started` carries `thread_id`, the session id used
+# for {resume}; `turn.started`/`turn.failed`/`error` all confirmed live),
+# and exit with a real nonzero code -- but the account codex was run under
+# in that environment was not logged in (401 from api.openai.com), so a
+# *successful* (exit 0) turn, `item.completed` message events, and the
+# `resume <SESSION_ID>` subcommand-swap syntax specifically are NOT yet
+# confirmed end to end -- see docs/implementation.md's verification table
+# before trusting this beyond "the plumbing runs a real process".
+HEADLESS_CMD=codex exec {resume} --json --skip-git-repo-check
+HEADLESS_FORMAT=codex-jsonl
+HEADLESS_PROMPT=arg
+HEADLESS_RESUME=resume {session_id}

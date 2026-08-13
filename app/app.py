@@ -280,15 +280,40 @@ def mark_session_totp_ok(sid: str) -> None:
 
 
 # ─── engines: config, not code (engines.d/*.engine) ────────────────────────
-class Engine:
-    __slots__ = ("name", "label", "cmd", "url_regex", "startup")
+# HEADLESS_FORMAT/HEADLESS_PROMPT known values (backlog item 6a, docs/spec.md
+# "Engine and _parse_engine_file() -- four new keys, additive only"). Kept
+# here rather than inside _parse_engine_file() so app/teams.py can reference
+# the same sets without re-declaring them.
+_HEADLESS_FORMATS = {"claude-stream-json", "codex-jsonl", "plain"}
+_HEADLESS_PROMPT_MODES = {"arg", "stdin", "file"}
 
-    def __init__(self, name, label, cmd, url_regex, startup):
+
+class Engine:
+    __slots__ = ("name", "label", "cmd", "url_regex", "startup",
+                 "headless_cmd", "headless_format", "headless_prompt", "headless_resume")
+
+    def __init__(self, name, label, cmd, url_regex, startup,
+                 headless_cmd=None, headless_format=None, headless_prompt=None,
+                 headless_resume=None):
         self.name = name
         self.label = label
         self.cmd = cmd
         self.url_regex = re.compile(url_regex) if url_regex else None
         self.startup = startup  # list of (match_str, keys_to_send)
+        # Headless invocation (backlog item 6a, docs/spec.md) -- all four
+        # optional, all None unless HEADLESS_CMD plus a recognized
+        # HEADLESS_FORMAT/HEADLESS_PROMPT are all present (see
+        # _parse_engine_file()). HEADLESS_RESUME may legitimately stay None
+        # even when the other three are set (an engine with no resume
+        # concept at all, e.g. aider).
+        self.headless_cmd = headless_cmd
+        self.headless_format = headless_format
+        self.headless_prompt = headless_prompt
+        self.headless_resume = headless_resume
+
+    @property
+    def headless_enabled(self) -> bool:
+        return bool(self.headless_cmd and self.headless_format and self.headless_prompt)
 
 
 def _parse_engine_file(path: str):
@@ -304,12 +329,37 @@ def _parse_engine_file(path: str):
     if not cmd:
         return None
     name = os.path.splitext(os.path.basename(path))[0]
+    # Reserved engine-name prefix (docs/spec.md "Session naming"): headless
+    # tmux sessions are named f"switchboard-headless-{run_id}" (app/teams.py)
+    # via the *same* TMUX rule instance_start() uses, and active_engine()
+    # keys purely off f"{engine_name}-{project_name}" with no other
+    # cross-check. Reserving only the exact name "switchboard-headless"
+    # would still leave a constructible collision open (engine "switchboard"
+    # + a project directory literally named "headless-<run_id>"), so the
+    # *whole* "switchboard" prefix is reserved -- any .engine file whose
+    # derived name starts with it is ignored, same "intentionally inert"
+    # treatment .engine.example templates already get below.
+    if name.startswith("switchboard"):
+        return None
     startup = []
     i = 1
     while f"STARTUP_MATCH_{i}" in kv and f"STARTUP_SEND_{i}" in kv:
         startup.append((kv[f"STARTUP_MATCH_{i}"], kv[f"STARTUP_SEND_{i}"]))
         i += 1
-    return Engine(name, kv.get("LABEL", name), cmd, kv.get("URL_REGEX") or None, startup)
+    # HEADLESS_CMD present but HEADLESS_FORMAT/HEADLESS_PROMPT missing or
+    # unrecognized -> parse the rest of the file normally, leave headless
+    # fields unset (Engine.headless_enabled == False). Never an exception,
+    # never a load_engines() failure -- same best-effort philosophy as the
+    # `except OSError: continue` in load_engines() itself.
+    headless_cmd = kv.get("HEADLESS_CMD") or None
+    headless_format = kv.get("HEADLESS_FORMAT") or None
+    headless_prompt = kv.get("HEADLESS_PROMPT") or None
+    headless_resume = kv.get("HEADLESS_RESUME") or None
+    if headless_cmd and (headless_format not in _HEADLESS_FORMATS or
+                          headless_prompt not in _HEADLESS_PROMPT_MODES):
+        headless_cmd = headless_format = headless_prompt = headless_resume = None
+    return Engine(name, kv.get("LABEL", name), cmd, kv.get("URL_REGEX") or None, startup,
+                  headless_cmd, headless_format, headless_prompt, headless_resume)
 
 
 def load_engines() -> dict:

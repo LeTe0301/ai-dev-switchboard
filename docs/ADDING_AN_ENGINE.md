@@ -97,3 +97,83 @@ that simply don't have one.
 The same `.engine` file format is read by both `app/app.py` (per-project
 sessions) and `host-agent/lib/engine-lib.sh` (the optional single
 persistent host session) — write it once, both use it.
+
+## Headless invocation (`HEADLESS_*`, backlog item 6a)
+
+Four more optional `KEY=value` lines, read by `app/teams.py`'s
+`agent_run()` — a *separate* code path from everything above. They're about
+one bounded, non-interactive turn with structured output (for a future
+multi-agent team to delegate to), not the interactive tmux session the rest
+of this doc covers. An engine file with none of these four keys is
+completely unaffected — parses and runs exactly as it does today.
+
+```
+HEADLESS_CMD=claude -p {resume} --output-format stream-json --verbose
+HEADLESS_FORMAT=claude-stream-json      # claude-stream-json | codex-jsonl | plain
+HEADLESS_PROMPT=arg                     # arg | stdin | file
+HEADLESS_RESUME=--resume {session_id}   # optional -- omit entirely if the engine has no resume concept
+```
+
+- **`HEADLESS_CMD`** — the non-interactive command template. Two
+  placeholders, substituted with plain string replacement (never
+  `str.format()`, so a literal `{`/`}` elsewhere in the command — e.g. a
+  future JSON Schema flag — can't break it):
+  - **`{resume}`** — the empty string on a first turn, or `HEADLESS_RESUME`
+    (with `{session_id}` substituted into *that* first) when resuming.
+    Sits inline because some engines take resume as a flag (Claude Code:
+    `--resume <id>`) and others as a subcommand swap (Codex:
+    `exec resume <id>`, not `exec ... --resume <id>`).
+  - **`{prompt_file}`** — only meaningful when `HEADLESS_PROMPT=file`;
+    substituted with the path of a file `agent_run()` already wrote the
+    prompt into.
+- **`HEADLESS_FORMAT`** *(required if `HEADLESS_CMD` is set)* — one of
+  `claude-stream-json`, `codex-jsonl`, `plain`. Tells `agent_run()` how to
+  translate the engine's native stdout into the normalized event envelope
+  (`docs/story.md` §4.1). `plain` means "no structured stream at all" (e.g.
+  aider) — the whole captured stdout becomes one `message` event.
+- **`HEADLESS_PROMPT`** *(required if `HEADLESS_CMD` is set)* — how the
+  prompt is delivered: `arg` (appended as its own argv element, e.g. Claude
+  Code's positional query), `stdin` (piped in as the process's actual
+  stdin), or `file` (written to `{prompt_file}`, e.g. aider's
+  `--message-file`). `arg` mode has a materially tighter byte cap than
+  `stdin`/`file` — see `TEAM_HEADLESS_ARG_PROMPT_MAX_BYTES` in
+  `config/switchboard.env.example` — since the prompt ends up as its own
+  argv element when the engine binary itself is exec'd, capped by Linux's
+  own per-argv-element `MAX_ARG_STRLEN`. `stdin`/`file` mode has no such
+  constraint — the prompt never appears in any argv at all.
+- **`HEADLESS_RESUME`** *(optional)* — omit entirely for an engine with no
+  resume/session concept at all (aider). If a `session_id` is ever passed to
+  `agent_run()` for such an engine, it raises `ValueError` before spawning
+  anything, rather than silently ignoring it.
+
+If `HEADLESS_CMD` is present but `HEADLESS_FORMAT`/`HEADLESS_PROMPT` are
+missing or not one of the recognized values above, the rest of the file
+still parses normally (`LABEL`/`CMD`/`URL_REGEX`/`STARTUP_*` all still
+work) — the engine is just left headless-ineligible
+(`Engine.headless_enabled == False`), never a `load_engines()` failure.
+
+**Reserved name: the whole `switchboard` prefix.** Any `.engine` file whose
+filename stem (with `.engine` stripped) *starts with* `switchboard` is
+ignored by `load_engines()` — same "intentionally inert" treatment
+`.engine.example` templates get. This is what keeps a headless run's own
+throwaway tmux session (`switchboard-headless-<run_id>`) structurally unable
+to collide with any real project's own `<engine>-<project>` session name,
+including the non-obvious case of an engine literally named `switchboard`
+combined with a project directory named `headless-<run_id>`. Don't name your
+own engine file starting with `switchboard`.
+
+**`HEADLESS_ROLE_FLAG`, `HEADLESS_SCHEMA_FLAG`, `HEADLESS_LEAD_FORMAT`**
+(mentioned in `docs/story.md` §4.2) are reserved for a later sub-spec (6c —
+choosing and constraining a *lead*) and are not yet parsed or consumed by
+anything in this codebase. Don't rely on them yet.
+
+**Verification status of the three shipped engines' `HEADLESS_*` keys** (see
+`docs/implementation.md` for the full writeup): `claude.engine` is verified
+end to end, including `--resume`, against a real logged-in `claude` CLI.
+`codex.engine`'s plumbing (process spawn, NDJSON capture, real exit code) is
+confirmed against a real `codex` CLI, but that CLI was not logged in during
+verification, so a *successful* turn and the `resume <SESSION_ID>` syntax
+specifically remain unconfirmed. `aider.engine` is **unverified** — `aider`
+was not installed in the environment this sub-spec was built in; believed
+correct per aider's own documented CLI flags as of 2026-08-13, not yet run
+end-to-end.

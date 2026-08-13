@@ -19,3 +19,18 @@ URL_REGEX=https://claude\.ai/code/session_[A-Za-z0-9]+
 # the first time it runs in a new directory.
 STARTUP_MATCH_1=trust this folder
 STARTUP_SEND_1=1
+
+# HEADLESS_*: one bounded, non-interactive turn (backlog item 6a,
+# docs/spec.md), used by app/teams.py's agent_run() -- unrelated to the
+# interactive session above, never read by instance_start(). Verified by
+# actually running it (docs/implementation.md): `claude -p --output-format
+# stream-json --verbose "<prompt>"` exits 0, prints one NDJSON event per
+# line, and the final `result` line carries both the answer (`result` field)
+# and `session_id`. {resume} is substituted with the empty string on a first
+# turn, or with HEADLESS_RESUME (itself {session_id}-substituted first) when
+# resuming -- `claude -p --resume <id> ...` was confirmed to genuinely
+# continue the prior turn, not just accept the flag.
+HEADLESS_CMD=claude -p {resume} --output-format stream-json --verbose
+HEADLESS_FORMAT=claude-stream-json
+HEADLESS_PROMPT=arg
+HEADLESS_RESUME=--resume {session_id}

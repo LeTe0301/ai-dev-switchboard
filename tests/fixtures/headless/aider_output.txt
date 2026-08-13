@@ -1,0 +1,8 @@
+Aider v0.86.0
+Model: gpt-4o-mini with whole edit format
+Git repo: .git with 3 files
+Repo-map: using 1024 tokens
+
+Applied edit to app/example.py
+
+Done. 1 file changed.

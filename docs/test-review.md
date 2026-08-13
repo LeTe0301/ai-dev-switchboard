@@ -1,94 +1,89 @@
-# Test & Review: Upload wizard polish (backlog item 3's deferred follow-ups)
+# Test & Review: Headless engine invocation (backlog item 6, sub-spec 6a)
 
 ## Scope
-Covers `docs/spec.md`'s 6 acceptance criteria: `UPLOAD_MAX_ENTRIES` becoming
-a real `switchboard.env` knob (fail-fast, matching sibling vars), step 5's
-single/split mode choice rendering as pill-styled labels with native
-`<input type="radio">` preserved, and `renderStep5Actions(d)`'s conditional
-"Back" button. This is a fresh review for this cycle — the prior
-`docs/test-review.md` on disk (2c part 2b, deploy dispatch) was stale and is
-superseded by this file.
+Covers `docs/spec.md`'s full acceptance-criteria list for `app/teams.py`'s
+`agent_run()` + CLI, `Engine`/`_parse_engine_file()`'s four new `HEADLESS_*`
+keys and the reserved `switchboard` name prefix, the tmux-hosted spawn/
+tail/cancel/cleanup machinery, and the `engines.d/*.engine` verification
+status. This is the fourth and final testing/review round. Round 1 found
+and fixed Defect 1 (uncaught `OSError` + rundir leak). Round 2 found and
+fixed Defect 2 (wrong ceiling modeled for the `arg`-mode byte cap; fixed by
+writing the script to a file). Round 3's review pass found Finding 1
+(uncaught exception on malformed-shape translator input), Finding 2 (stale
+mechanism docs), and Finding 3 (missing explicit `chmod` on `SVC_USER`-
+written files `RUN_USER` must read), plus a Q2 consolidation ask (trim
+incident-narrative source comments). **All four are now independently
+verified fixed.** No new blocking issue found this round despite deliberate
+adversarial re-testing beyond what was asked. **Verdict: approved.**
 
-## Test cases
+## Re-verification of round-3 fixes
 
-| # | Criterion / case | Method | Result | Evidence |
+| # | Item | Method | Result | Evidence |
 |---|---|---|---|---|
-| 1 | `UPLOAD_MAX_ENTRIES=5` set → app starts, effective limit is 5 | automated (`UploadMaxEntriesEnvVarTests.test_env_var_set_overrides_default`) + **live E2E** | pass | subprocess reads back `5`; live HTTP server with `UPLOAD_MAX_ENTRIES=5` rejected a 6-entry zip (400 "too many entries in zip file") and accepted a 5-entry zip (200), boundary-tested at exactly the limit |
-| 2 | No `UPLOAD_MAX_ENTRIES` set → default stays 20000 | automated (`test_env_var_unset_keeps_default_20000`) | pass | subprocess reads back `20000` |
-| 3 | Ambiguous step 5: mode choice renders as 2 pill-styled elements, checked state follows `wizardState.mode`, `setWizardMode()` unchanged | automated (3 JS tests) + live server HTML check | pass | `node tests/test_upload_frontend.js`; live `curl` of a real running server's `/` response contains identical `pill-choice` CSS/HTML at the same lines as the diff |
-| 4 | Ambiguous step 5, keyboard: focus lands on the native radio, not a bare span | automated (JS test) | pass | asserts 2 real `<input type="radio">`, no `<span class="pill">` |
-| 5 | Unambiguous step 5: no Back button, only Confirm | automated (JS test) | pass | `actionsHtml` has no `Back`/`class="secondary"` |
-| 6 | Ambiguous step 5: Back rendered exactly as before (`resetWizardState(); renderWizard();`) | automated (JS test) | pass | onclick string asserted verbatim |
-| edge | `UPLOAD_MAX_ENTRIES` non-numeric → fails fast at import time, same as siblings | manual code exercise | pass | `UPLOAD_MAX_ENTRIES=notanumber` and `GITEA_POLL_INTERVAL_SECONDS=notanumber` both raise the identical `ValueError` at the identical `import app` line pattern, exit code 1 |
-| edge | Unambiguous case still lets user abandon the wizard with Back hidden | code read | pass | `<span class="back" onclick="closeUploadWizard()">‹ close</span>` at `app/app.py:1529` is modal-level, independent of `wizard-actions`, unaffected by this diff |
-| edge | Split-candidate checkboxes stay unstyled (only the 2 mode-choice labels get `pill-choice`) | automated (JS test) | pass | `2 plain wizard-check-row checkbox rows` asserted separately from the 2 `pill-choice` labels |
+| 1 | Regression suite | `uv run --with pytest python -m pytest tests/ -q`, repeated | pass (see flake note below) | `372 passed` in 5 of 6 full-suite attempts (one flake, investigated — see below; one run cut off by an unrelated tool-harness timeout with zero leftover processes, not a hang) |
+| 2 | No pre-existing test modified | `git status --porcelain tests/`, `git diff --stat -- tests/*.py`, `git diff -- app/app.py` re-read in full | pass | only `tests/test_teams_headless.py`/`tests/fixtures/` new/untracked; `app/app.py`'s diff is byte-identical to round 1 (unchanged this round) |
+| 3 | **Finding 1 closed at the class level**, not just the 4 original shapes | wrote and ran a 47-case fuzz set against both `_translate_claude`/`_translate_codex` through `_translate_safely()`: deeply nested wrong types (dict-in-list-in-dict with `None`s), wrong scalar types (`int`/`float`/`bool`/`None` where a dict/list was expected), absent keys entirely, empty dicts/lists, unexpected top-level `type` values (`None`, int, list, dict, a made-up string), and the codex-side equivalents (`item`/`error`/`message` fields each tried as `None`/string/list/int) | pass | **0/94** boundary-wrapper calls raised (47 cases × 2 translators); the *raw* `_translate_claude`/`_translate_codex` are still allowed to raise (confirmed several do, by design — the guarantee lives at the boundary, not per-branch) |
+| 4 | Finding 1's fix is genuinely load-bearing (revert-and-watch-it-fail) | temporarily reverted `_translate_safely()` to a bare passthrough (no try/except), re-ran the developer's own `test_shape_crash_line_through_the_real_agent_run_path_does_not_raise` (the real-`agent_run()`-path regression test) | fails cleanly without the fix, passes with it restored | reverted version raised the exact `AttributeError` at `app/teams.py:212` through the full real-tmux path, confirming the test isn't vacuous; restored code confirmed byte-identical to pre-revert (`diff` clean) and full suite re-passed (372) afterward |
+| 5 | Judge the blanket `except Exception` at the boundary | read `_translate_safely()`'s full contract; checked (a) whether it can swallow a signal that should propagate, (b) whether it can mask *our own* bug vs. the engine's output, (c) whether it affects `ok`/`exit_code` | sound, no changes needed | (a) `except Exception` does not catch `SystemExit`/`KeyboardInterrupt`/`GeneratorExit` (all `BaseException`-only in Python) — real interrupts still propagate correctly; (b) the caught exception's `type(e).__name__: {e}` is preserved verbatim in `error_message` and durably appended to the `.jsonl` log as an `error` event (`docs/story.md`'s own "nothing lost" principle) — a bug in *our* code (e.g. a stray `NameError`) would still show up in the log with a recognizably different signature (`NameError: name 'x' is not defined`) than a shape-mismatch (`AttributeError: 'str' object has no attribute 'get'`), so diagnosability survives the broad catch even though the two aren't type-distinguished in code; (c) `ok`/`exit_code` are sourced entirely from `rc_path` (the wrapping shell's real exit code), never from translation success — a swallowed translation failure degrades event/text quality for that one line only, never silently misreports whether the run itself succeeded |
+| 6 | Findings 2/3 verified fixed | (Finding 2) `grep`-confirmed `docs/ADDING_AN_ENGINE.md`/`config/switchboard.env.example` no longer describe the "whole script as one argv element to `bash -lc`" mechanism, now correctly describe the engine's own final `exec()`; `docs/implementation.md`'s "Deviations from spec" section now explicitly names the file-based invocation as a deliberate deviation from spec §2's literal shape. (Finding 3) confirmed `os.chmod(prompt_path, 0o644)`/`os.chmod(script_path, 0o644)` present at the two write sites | pass | both fixed as described |
+| 7 | **The strict-umask test genuinely exercises the failure it claims to** | revert-and-watch-it-fail: temporarily removed both new `os.chmod()` calls, re-ran `test_run_sh_and_prompt_file_are_world_readable_under_a_strict_umask` in isolation | fails cleanly without the fix (`AssertionError: 0 is not true : run.sh not world-readable: 0o600`), passes with it restored | confirmed non-vacuous; restored code verified byte-identical to the pre-revert file via `diff` |
+| 8 | Q2 — is the consolidation sufficient? | re-read `_MAX_ARG_STRLEN`/`_ARG_SCRIPT_OVERHEAD_BYTES`'s comments, `_validate_prompt_size()`'s docstring, `_build_script()`'s docstring, and `agent_run()`'s script-writing block in full | sufficient | all now state current rationale concisely (what's modeled, why it's per-argv-element, why the check is a sound proxy) with no "round 1 did X, round 2 did Y" narrative left in the hot-path code; one single-line pointer remains in `_translate_claude()`'s `user`-branch comment (`docs/test-review.md Finding A`) as a deliberate, cheap breadcrumb to the fuller writeup, not narrative — reasonable to keep. No other patch-on-patch structure found: no dead code, no orphaned parameters, no duplicate/parallel logic paths from earlier rounds. |
+| 9 | Verification labels still accurate | independently re-ran `python3 app/teams.py run claude ...` against the **current** code (after Finding 1/3's changes) | pass | `claude` still runs end-to-end cleanly (`ok=True`, real event stream, no error) — Finding 1/3's changes (translation-boundary robustness, explicit chmod) don't touch engine invocation commands or the happy path, as expected; no label needs updating |
 
-## Regression check
-- `python3 -m unittest discover -s tests -v` → **289/289 pass** (matches developer's report).
-- `node tests/test_upload_frontend.js` → **8/8 pass**.
-- `node tests/test_deploy_frontend.js` → **9/9 pass** (no regression).
-- `node tests/test_singleton_toggle_frontend.js` → **15/15 pass** (no regression).
+### The one flake, investigated further
+One of the 6 full-suite attempts this round failed
+`test_run_sh_and_prompt_file_are_world_readable_under_a_strict_umask` on its
+final `results["r"]["ok"]` assertion (the file-permission assertions
+earlier in the same test passed even in that run — the fix itself wasn't
+in question). I did not accept the developer's "transient contention,
+not reproduced" characterization at face value and instead: (a) ran the
+same test in isolation 5× via pytest — clean every time; (b) extracted the
+test's exact logic into a standalone script and ran it in a tight loop 25×
+outside the full suite — **0/25 failures**; (c) re-ran the full suite 3
+more times afterward — clean every time (372 passed each). This pattern
+(never reproducible in isolation, only ever seen once amid a full ~34s,
+80+ real-tmux-session suite) is consistent with genuine environmental
+contention, not a logic defect — and this sandbox specifically has other,
+unrelated `tmux`/Claude sessions from other projects visibly running
+concurrently on the same box (`claude-birdiely`, `claude-ai-dev-switchboard`
+sessions, confirmed via `tmux list-sessions` and `ps aux` during this
+review), which is a plausible independent source of scheduling contention
+this module has no control over. **Non-blocking finding for the writeup**:
+`docs/implementation.md`'s "Known limitations" entry attributes the
+*original* round-2 flake specifically to "manual, ad-hoc tmux probing... in
+this same shell session" — my own observation of the same *symptom class*
+happened without any such manual probing on my end, so the note's causal
+attribution is narrower than the evidence now supports. Worth broadening
+the wording to "environmental/shared-resource contention" generally rather
+than the one specific cause identified during round 2's diagnosis — a
+wording nit, not something that changes the accepted, non-blocking
+disposition of the flake itself.
 
-All four numbers independently re-run and confirmed this session, matching the developer's reported figures exactly.
-
-## Live exercise (beyond the Node-`vm` harness)
-Started a real `ThreadingHTTPServer` instance of `app.Handler` (both via the
-module's own `__main__` entrypoint and, for the entry-count check, via an
-in-process server matching `tests/test_upload.py`'s own HTTP-test technique):
-- Fetched `/` with `curl` and confirmed the served page's CSS/HTML for
-  `pill-choice` and `renderStep5Actions(d)` are byte-identical to the diff
-  (not just what the JS test's subprocess extraction produced).
-- Did a full login → TOTP → `POST /projects/upload` round trip with
-  `UPLOAD_MAX_ENTRIES=5`: a 6-entry zip was rejected (400), a 5-entry zip
-  (exactly at the limit) was accepted (200) — proves the env var is actually
-  wired into the enforcement check at `app/app.py:2794`, not just parsed and
-  unused.
-- Confirmed the malformed-value crash behavior is bit-for-bit identical in
-  shape to the sibling `GITEA_POLL_INTERVAL_SECONDS` var.
-- No real browser was available in this environment to visually render
-  `:has()`; verified instead by reading the actual CSS values and comparing
-  against the already-shipped `.pill`/`.pill.active` rules (see Findings).
-
-## Findings (most severe first)
-
-### 1. `docs/design.md`'s stated contrast ratios are inaccurate (both understate the actual, safer, value) — nit
-- File: `docs/design.md:215-216`
-- Design doc states pill-idle contrast (`#aaa` on `#2a2a2a`) as "~4.5:1" and
-  pill-active (`#111` on `#34c759`) as "~11:1". Recomputed both from the
-  literal hex values using WCAG relative luminance: idle is actually
-  **~6.18:1**, active is actually **~8.52:1**. Both real values still
-  comfortably clear the 4.5:1 AA text threshold, so there is no accessibility
-  regression — the stated numbers were just imprecise, and in the safe
-  direction (understating idle, overstating active, both still passing).
-  These are also pre-existing `.pill`/`.pill.active` values reused verbatim,
-  not new colors introduced by this diff. Not blocking; flagging only
-  because the design doc's own numbers were off and a future contrast change
-  nearby should recompute rather than copy this doc's figures forward.
-
-No other findings. Correctness, security, and simplicity review below found nothing further.
+## Answers to the coordinator's five questions
+1. **Finding 1 closed at the class level** — yes, per items 3–4 above: a 47-shape fuzz sweep (94 boundary-wrapper calls) produced zero crashes, and the fix's own regression test was confirmed non-vacuous via revert-and-watch-it-fail.
+2. **The blanket `except Exception` judgment** — sound as designed; see item 5's three-part reasoning (doesn't swallow real signals, preserves enough diagnostic detail to distinguish an internal bug from external shape drift, doesn't affect the run's actual success/failure classification).
+3. **Findings 2/3 verified, including that the strict-umask test really exercises the failure** — yes, both confirmed fixed; the umask test's genuineness confirmed via revert-and-watch-it-fail (item 7), not just re-reading its assertions.
+4. **Is the Q2 consolidation sufficient?** — yes; no further patch-on-patch structure found worth addressing before 6b builds on this module.
+5. **Verification labels still accurate** — yes, independently re-confirmed live against the current code this round (item 9); no update needed.
 
 ## Spec coverage
-All 6 acceptance criteria plus all 3 documented edge cases in `docs/spec.md`
-are implemented and covered by at least one test that was actually run this
-session (automated or live-exercised), per the table above. No gap.
-
-## Correctness / security / simplicity review
-- **Env var fail-fast**: `UPLOAD_MAX_ENTRIES = int(os.environ.get("UPLOAD_MAX_ENTRIES", "20000"))` at `app/app.py:84` is textually and behaviorally identical in pattern to `GITEA_POLL_INTERVAL_SECONDS` (line 170) and `UPLOAD_STAGING_TTL_SECONDS` — confirmed both via code read and by triggering the same `ValueError` shape for both at import time.
-- **Single enforcement site**: `UPLOAD_MAX_ENTRIES` is read exactly once at module import and used at exactly one call site (`app/app.py:2794`, `if len(infolist) > UPLOAD_MAX_ENTRIES:`) — no stale-copy or shadowing risk.
-- **Conditional Back button**: `wizardState.detectResult` is always set (`app/app.py:2341`) before `wizardState.step` can become `5` (single assignment site, immediately followed by the `step = 5` transition), so `renderStep5Actions(wizardState.detectResult)`'s `d` is never undefined when step 5 renders — no null-deref risk. `proceedToConfirm()`/Confirm's own behavior is untouched by this diff (only the surrounding conditional emits Back's HTML or not); the unambiguous flow's Confirm button and its onclick are unchanged.
-- **No injection/security surface**: purely a CSS class addition, a conditional string-concat around an already-existing static button, and a config-driven `int()` — no new user input reaches HTML output or a shell/SQL boundary. `esc()` usage on `d.root_name`/`splitLabel` in `renderStep5()` is pre-existing and untouched.
-- **Scope**: diff matches `docs/spec.md`'s "Affected areas" exactly — `app/app.py` (const, CSS, `renderStep5()`, `renderStep5Actions()`, one call site), `config/switchboard.env.example`, `docs/BACKLOG.md`, plus the two test files. No unrelated changes found in `git diff`.
-
-## Follow-ups (non-blocking)
-- None required. The contrast-figure nit above is informational only.
+Unchanged from round 3's assessment (all acceptance criteria traced to a
+passing automated test or an independently-verified manual step) — this
+round added no new spec surface, only fixed the three findings and trimmed
+comments, all covered by the re-verification above.
 
 ## Overall verdict
-**Approve.** Testing pass is clean: 289/289 Python, 8/8 new + 9/9 + 15/15 JS,
-all independently re-run this session, plus a live HTTP end-to-end exercise
-(real server, real login/TOTP/upload round trip) confirming `UPLOAD_MAX_ENTRIES`
-actually gates the entry-count guard at the configured threshold and that the
-served page's markup/CSS matches the diff verbatim. Review pass found no
-must-fix or should-fix issues — one informational nit on `docs/design.md`'s
-imprecise (but safely-directioned) contrast figures. All 6 acceptance
-criteria and all 3 edge cases are implemented and covered. This closes the
-build cycle — hand back to product-manager.
+**Approved.** Four rounds in: Defect 1 and Defect 2 (blocking, testing-pass
+failures) and Findings 1–3 plus the Q2 ask (review-pass findings) are all
+independently re-confirmed fixed this round, not just re-read against the
+developer's own summary — every fix that could reasonably be verified via a
+revert-and-watch-it-fail check was verified that way, and Finding 1's
+closure was additionally stress-tested against 43 shapes beyond the four
+originally found. The one test flake observed is real but non-reproducible
+in isolation (0/25) and consistent with genuine shared-environment
+contention rather than a defect in this diff; it doesn't warrant another
+round, though the "Known limitations" wording could be broadened slightly
+(non-blocking, noted above). No further issues found despite deliberately
+adversarial re-testing beyond the coordinator's own checklist. This build
+cycle is done — hand control back to the product-manager agent for the next
+iteration.
