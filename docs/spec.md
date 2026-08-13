@@ -904,6 +904,56 @@ as 6a recorded its own manual verification. `aider`'s real-CLI tier-3
 status is explicitly **not** claimed beyond the stand-in fixture, same
 disclosure 6a already gave `aider.engine` itself.
 
+## Correction: `{schema}` is inline for Claude, a file for Codex (2026-08-13)
+
+Found by running the real `claude` CLI, not by re-reading docs. The spec's
+single `HEADLESS_SCHEMA_FLAG=--json-schema {schema}` path-substitution design
+is wrong: the two engines take **different forms**, confirmed from their own
+`--help`:
+
+```
+claude  --json-schema <schema>   inline JSON Schema text
+codex   --output-schema <FILE>   path to a JSON Schema file
+```
+
+**Two placeholders, not one** — mirroring the `{prompt}` / `{prompt_file}`
+distinction 6a already established for `HEADLESS_PROMPT=arg|file`, so this is
+an existing pattern rather than a new mechanism:
+
+- `{schema}` — substituted with the schema's **JSON text**, `shlex.quote()`d
+  as a single argv element like any other prompt-shaped value.
+- `{schema_file}` — substituted with a **path** to the schema written into the
+  run directory, alongside the prompt file, covered by the same
+  `try/finally` cleanup.
+
+Engine definitions become:
+
+```
+claude.engine   HEADLESS_SCHEMA_FLAG=--json-schema {schema}
+codex.engine    HEADLESS_SCHEMA_FLAG=--output-schema {schema_file}
+```
+
+A definition using neither placeholder is a configuration error and must be
+reported as such at roster-build time, not at the first tier-2 lead call.
+
+Note the inline form interacts with `TEAM_HEADLESS_ARG_PROMPT_MAX_BYTES`:
+the schema now occupies argv space alongside the prompt. The four-tool schema
+is well under any cap, but the size check must account for both rather than
+the prompt alone.
+
+## Correction: repeated delegation of an already-completed task
+
+A live `qwen3:8b` run delegated the *same* task to `claude` twice before
+calling `finish`, with a correct, well-formed prior result already in context.
+Not a crash, and not a spec violation — a judgment miss, the same class as the
+spike's single `wrong_tool`.
+
+Mitigate at the prompt level, where the other tier-1 judgment issues are
+handled: the round-history summary must make prior delegations and their
+outcomes **explicit and salient** — agent, task, and whether it succeeded —
+rather than leaving them to be inferred from a prose transcript. Cheap, and
+consistent with how `fact_check`'s recall gap is handled.
+
 ## Open questions
 
 - **Should a second `delegate` call to the *lead's own engine name* (when
