@@ -17,16 +17,24 @@ before touching code.
 
 ## 1. Local backlog tracker (Taiga), tracked by Claude
 
-**Status: 1a shipped (2026-08-12)** — `install.sh --with-taiga` (Taiga via
-its official `taiga-docker` Docker Compose stack, this codebase's
-first-ever Docker dependency, off by default) plus a singleton toggle row
-in the web UI. Reviewer-approved after three review rounds that caught and
-fixed two real races in the frontend toggle-off state machine plus one
-follow-up leak fix. Full spec/design/implementation/test-review in
-`docs/spec.md` / `docs/design.md` / `docs/implementation.md` /
-`docs/test-review.md`. **1b (the "Claude should track it" MCP/API
-integration) is still open** — deliberately scoped out of 1a as a separate
-future cycle, see below.
+**Status: shipped in full (2026-08-12/13), both 1a and 1b.**
+- **1a**: `install.sh --with-taiga` (Taiga via its official `taiga-docker`
+  Docker Compose stack, this codebase's first-ever Docker dependency, off
+  by default) plus a singleton toggle row in the web UI. Reviewer-approved
+  after three review rounds that caught and fixed two real races in the
+  frontend toggle-off state machine plus one follow-up leak fix.
+- **1b**: `scripts/taiga_push_spec.py` + `scripts/taiga-configure-push.sh`
+  — a one-way (spec → Taiga) CLI tool any agent with shell access can
+  invoke to push a local spec into a Taiga backlog item as a userstory.
+  Reviewer-approved clean on the second pass (one must-fix uncaught-
+  exception defect found and fixed on the first pass; two cosmetic nits
+  left unfixed, non-blocking). Wiring this into `product-manager`'s own
+  standing instructions (the cross-repo `D:\Entwicklung\.claude` side) is
+  explicitly out of scope — this repo only delivers the mechanism.
+- Full spec/implementation/test-review for **1b specifically** (the current
+  state of these files) in `docs/spec.md` / `docs/implementation.md` /
+  `docs/test-review.md`; 1a's own versions of those files are preserved in
+  git history at commit `ed84d73`.
 
 **Decision:** Taiga (agile/scrum, kanban + sprints), not Atlassian Jira —
 self-hosted Jira now requires a paid Data Center license, which doesn't fit

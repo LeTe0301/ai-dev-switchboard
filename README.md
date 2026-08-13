@@ -110,6 +110,9 @@ pipx install aider-chat                    # aider
 - **An optional extra row** for a persistent session on a *different*
   machine (e.g. the Proxmox host itself, outside any container) — see
   [`host-agent/README.md`](host-agent/README.md).
+- **Push a spec into a Taiga backlog item** via
+  `scripts/taiga_push_spec.py`, a standalone CLI tool (no new web UI) — see
+  `docs/spec.md`.
 
 ## Reaching the UI
 
@@ -150,7 +153,8 @@ engines.d/               engine definitions (see docs/ADDING_AN_ENGINE.md)
 config/                  *.env.example reference configs
 install.sh               installer — run on any existing box
 ct/create.sh             Proxmox-host wrapper: creates a container, then runs install.sh inside it
-scripts/                 optional git-hosting + project-scaffolding (docs/GIT_HOSTING.md)
+scripts/                 optional git-hosting + project-scaffolding (docs/GIT_HOSTING.md);
+                          also scripts/taiga_push_spec.py + taiga-configure-push.sh (docs/spec.md)
 host-agent/               optional persistent session on a separate machine (host-agent/README.md)
 systemd/                 reference systemd unit for manual installs
 docs/                    architecture notes, engine format, git-hosting detail
@@ -172,6 +176,9 @@ docs/                    architecture notes, engine format, git-hosting detail
 - The optional host-control SSH channel is scoped to exactly three
   whitelisted scripts via `sudoers.d` — see
   [`host-agent/README.md`](host-agent/README.md).
+- `scripts/taiga_push_spec.py` stores its password in plain text in
+  `~/.config/ai-dev-switchboard/taiga-push.env` (file mode `600`, owned by
+  `RUN_USER`).
 
 ## Contributing
 

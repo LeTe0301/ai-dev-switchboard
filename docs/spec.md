@@ -1,527 +1,477 @@
-# Spec: Local backlog tracker (Taiga) — part 1a: install flag + singleton UI row
+# Spec: Local backlog tracker (Taiga) — part 1b: push a spec into Taiga
 
 ## Summary
-Add an optional `install.sh --with-taiga` flag that installs a self-hosted
-Taiga instance (via its own official Docker Compose stack) and gives it one
-shared on/off-toggle-plus-link row in the web UI, the same way code-server
-gets a per-project row today — **not** the "Claude should track it"
-MCP/API integration (`docs/BACKLOG.md` item 1's second bullet), which stays
-out of scope for a future 1b cycle.
+Add a small, standalone, unprivileged command-line tool
+(`scripts/taiga_push_spec.py` + a one-time setup helper,
+`scripts/taiga-configure-push.sh`) that pushes the content of a local
+`docs/spec.md` into a running Taiga instance (installed via 1a's
+`install.sh --with-taiga`) as a new userstory — one direction only
+(spec → Taiga), invocable manually or by any agent with shell access
+(including `product-manager`, per the global Entwicklung workflow) via a
+single command, with no new web UI surface.
 
 ## Goals
-- `install.sh --with-taiga`, following the exact `--with-git-hosting` /
-  `--with-code-server` flag-parsing pattern, installs Docker + Taiga's own
-  official `taiga-docker` Compose stack, configured (generated secrets,
-  loopback-only port binding) but **left stopped** after install.
-- A new singleton row in the web UI (`kind: 'taiga'`, mirroring the existing
-  host-control row, not a per-project row) with an on/off toggle and,
-  when on, a link to the running instance.
-- Toggling on starts the whole Taiga stack (`docker compose up -d`);
-  toggling off stops it (`docker compose down`), actually freeing the RAM —
-  this is the point of the toggle, not just session convenience (see
-  "Resource-cost callout" below).
-- State survives `ai-dev-switchboard` service restarts correctly (Taiga's
-  containers are not children of `app.py`'s process tree, unlike
-  ttyd/code-server) — Background/Proposed approach below.
+- A script, runnable by any unprivileged user with a shell (in practice
+  `RUN_USER`, the account real coding-agent work — and `product-manager`'s
+  own Claude Code session — already runs as), that takes a local
+  `docs/spec.md` and creates one new userstory in a specified, pre-existing
+  Taiga project via Taiga's REST API.
+- A one-time interactive setup step that collects and stores the Taiga
+  credentials/target project this script needs, following this project's
+  existing "plain value in a small env-style file, mode 600, owned by the
+  user that reads it" pattern (`TOTP_SECRET`'s storage — see "Background"
+  for why this needs a *different file* than `switchboard.env`, not the
+  same one).
+- Clear, actionable failure output (not a raw traceback) for the failure
+  modes an operator will actually hit: Taiga unreachable, bad credentials,
+  unknown project, missing/empty spec file.
+- A `--dry-run` mode that does everything except the final `POST` — lets
+  someone (or an agent) verify subject/description formatting and
+  connectivity/auth/project-lookup without creating real backlog noise.
 
 ## Non-goals
-- The MCP/API "Claude should track it" integration (`docs/BACKLOG.md` item
-  1, bullet 3) — explicitly deferred to a 1b cycle.
-- Gitea (`docs/BACKLOG.md` item 2) — unrelated, separate item.
-- Per-project Taiga projects/rows, or any UI beyond the single shared
-  toggle+link — Taiga's own web UI handles everything past that link,
-  including creating projects, sprints, users, etc. inside Taiga itself.
-- Automatic creation of the first Taiga admin/superuser account — this is a
-  one-time interactive step documented in `taiga-docker`'s own instructions;
-  install.sh prints a pointer to it but does not automate it (doing so
-  interactively conflicts with `--yes` non-interactive installs).
-- A `--without-taiga` uninstall flag, or any automated removal of
-  Docker/the `taiga-docker` checkout — matches every other `--with-*` flag
-  in this installer today (none of them have an uninstall path either).
-- Auto-upgrading the `taiga-docker` checkout on a re-run of
-  `install.sh --with-taiga` (see "Open questions").
-- Any change to how `AUTH_MODE`/TOTP work — the Taiga toggle inherits the
-  existing shared TOTP gate in `do_POST` for free, no new auth code.
-- LAN/tailscale exposure decisions beyond what `PUBLISH_MODE` already
-  decides for ttyd/code-server — Taiga's loopback bind + `_publish`/
-  `_unpublish` follow the exact same rule, no new publish mode.
+- **Taiga → spec sync, or any two-way sync.** This is spec → Taiga only,
+  per this cycle's confirmed direction. Nothing reads back from Taiga into
+  `docs/spec.md`.
+- **Update-in-place / de-duplication.** Every invocation creates a brand
+  new userstory. Running this script twice against the same `docs/spec.md`
+  creates two backlog items. Tracking "this spec already became userstory
+  #N, update it instead of creating a new one" would require persisting a
+  Taiga ID back into `docs/spec.md` or a side mapping file — that's real
+  sync-state machinery, explicitly out of scope for a one-way v1 (flagged
+  under "Open questions", not silently assumed).
+- **Automating Taiga project creation.** The target Taiga project must
+  already exist (created once, manually, through Taiga's own web UI, the
+  same "log in and do it yourself" precedent 1a already set for first-admin
+  creation). The script looks the project up by slug and fails clearly if
+  it doesn't exist; it never creates one.
+- **Automating Taiga user/account creation.** Same precedent as 1a's
+  non-automated `createsuperuser` step: whichever Taiga user's
+  username/password the operator puts in the new credentials file is their
+  choice (the superuser from 1a's setup, or a separate account created
+  through Taiga's own UI) — this cycle doesn't create or provision that
+  account.
+- **Any change to `install.sh` or 1a's already-shipped
+  `--with-taiga`/toggle/`app.py` code.** This is a fully decoupled add-on
+  that only needs Taiga to be *reachable* at some URL — it doesn't touch,
+  read, or depend on `switchboard.env`, the toggle's on/off state, or any
+  `app.py` code path. See "Background" for why.
+- **Any new web UI surface.** No new row, no new `/status` field, no new
+  `do_POST` branch. This is a CLI tool only — `ux-designer` has nothing to
+  design here (flag this explicitly for the orchestrator: this feature has
+  no user-visible UI dimension, matching `workflows/feature.md`'s
+  documented skip condition for that stage).
+- **Teaching the global `product-manager` agent (defined in the separate
+  `D:\Entwicklung\.claude` tree) to actually call this script as part of
+  its own routine workflow.** Per this cycle's brief, the wrapper lives in
+  *this* repo only. This cycle delivers the mechanism and its documentation
+  (so any agent *can* invoke it); wiring it into `product-manager`'s own
+  standing instructions is a separate, future, cross-repo change.
+- **A long-lived/refreshed/cached auth token, or Taiga's "Application
+  token" mechanism.** See "Proposed approach" for why a fresh
+  username+password → bearer-token exchange per invocation is the right
+  fit here, not a stored token.
+- **Attachments, custom fields, status/points/assignee/tags, or any other
+  userstory field beyond subject + description.** A plain "spec became a
+  backlog item" — everything else is something a human can set inside
+  Taiga's own UI afterward.
+- **Handling arbitrarily large spec files** (Taiga description length
+  limits, request size limits) — no truncation/splitting logic. If a spec
+  is ever large enough to hit a real limit, that will surface as a clear
+  API error, not silent corruption; not engineered around preemptively.
 
 ## Background / current state
-Two existing singleton-ish patterns are the precedent to build on, and this
-feature is a genuine hybrid of both — that hybrid shape is the main design
-decision this spec is making, so it's worth spelling out clearly:
+**1a shipped** (`install.sh --with-taiga`, commit `ed84d73`; full detail in
+git history — `git show ed84d73:docs/spec.md`/`docs/implementation.md`):
+Taiga runs as a 9-container `taiga-docker` stack, off by default, toggled
+via a singleton web UI row. Relevant facts this cycle builds on, confirmed
+by re-reading 1a's own `docs/implementation.md`:
+- `TAIGA_ENABLED`, `TAIGA_PORT` (default `9000`), `TAIGA_DIR`, and the
+  three wrapper-script paths live in `/etc/ai-dev-switchboard/switchboard.env`.
+  Taiga's own URL, when on, is `http://127.0.0.1:$TAIGA_PORT` in
+  `PUBLISH_MODE=none`, or `$BASE_URL/taiga` in `tailscale` mode
+  (`app.py`'s `_taiga_display_url()`).
+- **No automated superuser/admin creation** — still true, unchanged by
+  this cycle. `install.sh --with-taiga`'s final summary only prints a
+  pointer to `taiga-docker`'s own `./taiga-manage.sh createsuperuser`,
+  which the operator runs manually, once, after first toggling Taiga on.
+  This means: **as of 1a, there is no Taiga user account known to the
+  switchboard at all** — 1b's "how does the wrapper authenticate to
+  Taiga's own API" is a real sub-problem this cycle has to solve, not
+  something it can assume already exists.
+- **A Taiga project is not created automatically either** — Taiga's own
+  onboarding has you create your first project through its web UI after
+  logging in. 1b treats "a target project already exists" as a
+  precondition, matching 1a's own established pattern for "one-time,
+  interactive, inside Taiga's own UI, not automated."
 
-- **code-server** (`install.sh` lines ~128-166, sudoers line ~242,
-  `app.py` `_code_start`/`_code_stop`/`code_running`, `_code_procs`/
-  `_code_ports`/`_code_urls` dicts) is **per-project**: one instance per
-  project name, tracked as an in-memory `subprocess.Popen` per name.
-  `_reap_dead_state()` (`app.py` ~890-904) cleans up when that child process
-  dies — which it reliably does on an `ai-dev-switchboard` service
-  restart/stop, since it's in the same systemd cgroup (`KillMode=
-  control-group` default) and gets killed along with the parent. This is
-  the precedent for "how a spawnable, on-demand, loopback-bound local
-  process gets a toggle + `_publish`/`_unpublish` URL", but its state model
-  (trust the in-memory `Popen` handle) does **not** fit Taiga.
-- **host-control** (`app.py` `host_run()` ~916-924, `HOST_CONTROL_ENABLED`/
-  `HOST_LABEL` config, the `s.host_enabled` singleton row in `refresh()`
-  ~1108, `docs/ARCHITECTURE.md` "In-memory state and its one sharp edge")
-  is **singleton**: exactly one row, not per-project, no engine picker
-  (`engineRow()` is only called for `kind === 'inst'`). Its state is
-  **never** trusted in memory — every `/status` poll (every 4s,
-  `setInterval(refresh, 4000)`) re-queries a fresh `host_run("status")`
-  subprocess call, because the thing being controlled (a session on a
-  genuinely separate machine) outlives `app.py`'s own process regardless of
-  what `app.py` remembers.
-- **Taiga needs both halves**: it's a *singleton* row like host-control (one
-  shared instance, not one per project — `docs/BACKLOG.md` item 1 is
-  explicit: "on/off toggle + link, not a full project-per-row entry"), but
-  it's a *local* thing like code-server (runs on this box, needs
-  `_publish`/`_unpublish` + `PUBLISH_MODE` handling, not an SSH round-trip
-  to a different machine). And critically, its lifecycle state must be
-  queried fresh like host-control's, **not** trusted from an in-memory
-  handle like code-server's — Taiga's containers are managed by `dockerd`,
-  entirely outside `app.py`'s process tree, so they do **not** die when the
-  `ai-dev-switchboard` systemd unit restarts. An in-memory
-  `_taiga_procs`-style dict would silently go stale exactly the way
-  `docs/ARCHITECTURE.md` already warns about for `_session_urls`, except
-  worse here because the underlying thing being tracked routinely outlives
-  a restart instead of rarely doing so.
-- **No Docker/container-orchestration usage exists anywhere in this repo
-  today** (confirmed: `grep -ri docker` across the whole tree returns
-  nothing but this spec). This is a real first — see "Open questions"
-  below for the explicit callout.
+**Where `TOTP_SECRET` actually lives, and why that matters here**
+(`install.sh` lines 193-197, `config/switchboard.env.example` lines 49-55,
+`app/app.py` line 59, README.md "Security notes"): a random value,
+generated once if not already set, stored as a plain `KEY=value` line in
+`/etc/ai-dev-switchboard/switchboard.env`. The *file*, not the individual
+key, is what's locked down — `chown "$SVC_USER:$SVC_USER" "$ENV_FILE"` +
+`chmod 600 "$ENV_FILE"` (`install.sh` lines 355-356) apply to the whole
+file, and every secret in it (`TOTP_SECRET`, `SIMPLE_PASSWORD`, and now
+Taiga's own Postgres/RabbitMQ secrets inside `taiga-docker`'s separate
+`.env`) inherits that same file-level protection. `app.py` reads it via
+`os.environ["TOTP_SECRET"]`, populated by systemd's
+`EnvironmentFile=$ENV_FILE` — i.e. this file is readable only by the
+process that runs *as* `SVC_USER`.
 
-**Confirmed operationally** (via a fetch of `taiga-docker`'s current
-`stable`-branch `docker-compose.yml`, `github.com/taigaio/taiga-docker`):
-Taiga's own supported deployment is a 9-service Compose stack
-(`taiga-db` (Postgres), `taiga-back`, `taiga-async`,
-`taiga-async-rabbitmq`, `taiga-events`, `taiga-events-rabbitmq`,
-`taiga-front`, `taiga-protected`, `taiga-gateway`), reading config from a
-`.env` file, with exactly one container (`taiga-gateway`, an nginx
-front door) publishing a host port — `9000:80` by default, unauthenticated
-bind (all interfaces) unless overridden. This matches `docs/BACKLOG.md`
-item 1's "several GB RAM" callout: Postgres + 2x RabbitMQ + a Django
-backend + async workers is a genuinely heavy stack for a homelab box,
-which is exactly why this spec keeps it **off by default** post-install
-(see Goals) rather than auto-starting it.
+**Why this cycle cannot just add a `TAIGA_API_...` line to that same
+file**, despite the instruction to mirror `TOTP_SECRET`'s storage pattern:
+`switchboard.env` is owned by `SVC_USER` and mode `600` — readable by
+`SVC_USER` (i.e. `app.py`) and root, nothing else. The principal that
+needs to invoke this script is **`RUN_USER`** — that's who owns every
+project directory (`PROJECTS_DIR="/home/$RUN_USER/projects"`,
+`install.sh` line 147), who every engine session (Claude Code, aider,
+Codex) already runs as, and who this very Claude Code session (the one
+`product-manager` runs inside, per the global Entwicklung workflow) is
+running as (confirmed: `whoami` in this sandbox is `dev`, the default
+`RUN_USER`). `RUN_USER` cannot read a `600` file owned by `SVC_USER` — and
+loosening `switchboard.env`'s permissions to let it would leak every other
+secret in that file (`SIMPLE_PASSWORD`, `PVE_HOST` credentials if set,
+Taiga's own Postgres/RabbitMQ secrets) to a broader audience just to expose
+one new value. **This spec mirrors the *mechanism* (plain value, small
+dedicated env-style file, mode 600, owned by the user that actually reads
+it) but in a new file scoped to `RUN_USER`, not inside `switchboard.env`
+itself** — see "Proposed approach". This is called out explicitly here,
+and again under "Open questions", since it's a literal-instruction
+deviation made for a concrete, checkable reason (permission-boundary
+mismatch), not a judgment call to slide past silently.
+
+**Taiga's actual REST API auth mechanism, verified today (not assumed)**
+against `taigaio/taiga-doc`'s own current docs
+(`api/general-notes.adoc`, `api/user-stories/endpoints.adoc`,
+`api/projects/endpoints.adoc`):
+- `POST /api/v1/auth` with body `{"type": "normal", "username": "...",
+  "password": "..."}` returns `{"auth_token": "...", ...}`. There is
+  **no simple static long-lived personal API key** in a stock self-hosted
+  install — Taiga does have an "Application token" mechanism, but it
+  requires registering an "Application" (via Django admin or the API) plus
+  a shared encryption key between Taiga and the caller — meaningfully
+  heavier setup than this feature's scope justifies for a single trusted
+  local script. **This confirms the assumption to proceed under: the
+  credentials file holds a Taiga *username + password* pair, not a static
+  token** — the script exchanges it for a bearer `auth_token` fresh on
+  every invocation (no token persisted to disk, nothing to expire/refresh
+  across runs, since each invocation is a short-lived one-shot process).
+- The returned token is used as `Authorization: Bearer <auth_token>` on
+  subsequent calls. It does expire, but well beyond the lifetime of one
+  script invocation, so no refresh logic is needed.
+- `GET /api/v1/projects/by_slug?slug=<slug>` resolves a project slug to its
+  numeric `id` — needed because `POST /api/v1/userstories` takes a numeric
+  `project` id, not a slug.
+- `POST /api/v1/userstories` with body `{"project": <id>, "subject":
+  "...", "description": "..."}` creates a new userstory; `project` and
+  `subject` are the only required fields (confirmed against
+  `taiga-doc`'s own field list — `assigned_to`, `status`, `points`, `tags`,
+  etc. are all optional and left at Taiga's defaults, per Non-goals). The
+  response includes the new userstory's `id` and `ref` (its per-project
+  display number, e.g. `#42`); Taiga's web URL for a userstory is
+  `<taiga-url>/project/<slug>/us/<ref>`, useful for printing a direct link
+  back to the operator on success.
+- Exact field names were verified against `taiga-doc`'s live docs today,
+  same as 1a did for `taiga-docker`'s `.env` keys — but Taiga (the live
+  hosted API *and* self-hosted API surface) is an external project that
+  can change field names in a future release. The developer should
+  sanity-check these three calls against whatever Taiga version is
+  actually running at implementation/test time rather than trusting this
+  spec as gospel, matching 1a's own "Open questions" precedent for
+  external-repo drift.
+
+**The MCP-vs-script decision.** `docs/BACKLOG.md` item 1 originally framed
+this as "a new MCP server or a small script wrapper." This spec's call:
+**a small, dependency-free script**, callable via the Bash tool any agent
+in this pipeline already has, not a standalone MCP server process. This
+project's whole ethos is stdlib-only Python (`app/app.py`'s own top
+comment) and "no new dependencies without strong justification" — standing
+up and maintaining a long-running MCP server process (its own packaging,
+its own auth to Taiga, its own lifecycle to keep alive alongside the
+switchboard) is real ongoing infrastructure for a use case that's
+naturally a one-shot, on-demand action ("push this spec now"), not a
+persistent service. A general-purpose Taiga MCP server does already exist
+upstream (`illodev/taiga-mcp`, found during this cycle's research) for
+anyone who later wants a fuller two-way Taiga↔agent integration — this
+spec deliberately doesn't build or adopt one, since v1's actual
+requirement (one-way, one action, one script) doesn't need it. Not flagged
+as a blocking open question — the reasoning above is a clean call, same
+confidence level 1a had picking `taiga-docker` over hand-packaging Taiga.
 
 ## Proposed approach
 
-### The Docker-dependency decision (read "Open questions" for the flagged tradeoff)
-There is no lightweight, no-Docker path to a real, maintainable self-hosted
-Taiga: hand-packaging Django + 2x RabbitMQ + Postgres + an nginx gateway as
-systemd units would mean this project taking on ongoing maintenance of
-someone else's multi-service packaging (tracking every Taiga version bump,
-migration step, and inter-service config knob by hand) — work the
-upstream `taiga-docker` repo already does and keeps current. **This spec's
-call: `--with-taiga` shells out to Taiga's own official `taiga-docker`
-Compose stack** (`stable` branch, `github.com/taigaio/taiga-docker`),
-accepting that this is the first Docker dependency this codebase has ever
-had. This is flagged explicitly under Open Questions for the user's
-sign-off before build starts, per this cycle's brief — proceed only once
-that's confirmed.
-
-### `install.sh` changes
-Follow the existing flag-parsing pattern exactly (`install.sh` lines
-47-60): add `WITH_TAIGA=0` and a `--with-taiga) WITH_TAIGA=1 ;;` case arm.
-
-New install block, gated on `[ "$WITH_TAIGA" -eq 1 ]`, placed after the
-existing code-server block (~line 166) so it can reuse the same
-`path_has_symlink`/`set_env`/`get_env`/`random_token` helpers already
-defined earlier in the script:
-
-1. **Docker itself** — `if [ "$WITH_TAIGA" -eq 1 ] && ! command -v docker
-   >/dev/null 2>&1`, install via Docker's own official convenience script
-   (`curl -fsSL https://get.docker.com | sh`), mirroring the exact
-   curl-pipe-sh precedent code-server already uses one block above
-   (`install.sh` line 130) rather than the distro's often-stale `docker.io`
-   apt package. Idempotent: skip entirely if `docker` is already on the
-   box (never assume ownership of a pre-existing Docker install someone
-   else set up). After install, verify `docker compose version` works
-   (the Compose *plugin*, not the old standalone `docker-compose` v1
-   binary) — if it doesn't, echo a clear warning and continue rather than
-   `set -e`-aborting the whole install (same "warn and continue" spirit as
-   the ttyd-no-prebuilt-binary branch, `install.sh` ~123-125).
-2. **The `taiga-docker` checkout** — `TAIGA_DIR=/opt/ai-dev-switchboard-taiga`
-   (parallel to the existing `/opt/ai-dev-switchboard-src` bootstrap-clone
-   pattern at the top of this same file). `[ -d "$TAIGA_DIR/.git" ] ||
-   git clone --branch stable --depth 1
-   https://github.com/taigaio/taiga-docker.git "$TAIGA_DIR"`. **Do not**
-   `git pull` on re-run — pinned at whatever commit was first cloned,
-   matching this file's own "never clobbers already-set values" philosophy
-   (see "Open questions" — flagged as an assumption, not a hard requirement).
-3. **Config** — copy `taiga-docker`'s example env file to its real `.env`
-   if not already present (same "copy example only if missing" idiom as
-   `switchboard.env`/`git-hosting.env` a few lines up), then reuse this
-   same script's own `set_env`/`get_env` helpers (they're generic
-   `<file> <key> <value>` functions, not switchboard-specific) to fill in:
-   - `SECRET_KEY`, `POSTGRES_PASSWORD`, RabbitMQ credentials — generated
-     once via the existing `random_token` helper, preserved on re-run
-     exactly like `TOTP_SECRET`/`SIMPLE_PASSWORD` already are.
-   - `TAIGA_SCHEME=http`, `TAIGA_DOMAIN` derived automatically from
-     whatever `PUBLISH_MODE`/`BASE_URL` already resolved to earlier in
-     this same install run (`BASE_URL`'s host in `tailscale` mode, else
-     `localhost`) — no separate interactive prompt (see "Open questions").
-   - The exact `.env` key names must be verified against whatever's
-     actually in the `stable` branch at implementation time, not assumed
-     from this spec — `taiga-docker` is a live external repo that can
-     rename keys between versions (see "Open questions").
-4. **Loopback-only binding** — `taiga-gateway`'s default `9000:80` port
-   mapping binds all interfaces, which conflicts with this project's
-   "everything binds `127.0.0.1` only, `PUBLISH_MODE`/a reverse proxy
-   decides real exposure" rule (`docs/ARCHITECTURE.md` "Per-project
-   terminals... bind to `127.0.0.1` only"). Write a
-   `docker-compose.override.yml` next to the cloned `docker-compose.yml`
-   (Compose auto-merges `docker-compose.yml` + `docker-compose.override.yml`
-   in the same directory — this is the standard Compose mechanism for
-   local overrides without touching the upstream-tracked file, so a future
-   manual `git pull` in `$TAIGA_DIR` never conflicts with it) that
-   overrides just `taiga-gateway`'s `ports:` to `"127.0.0.1:${TAIGA_PORT}:80"`.
-5. **Pre-pull images at install time, not first toggle** — run
-   `docker compose -f "$TAIGA_DIR/docker-compose.yml" -f
-   "$TAIGA_DIR/docker-compose.override.yml" pull` (pull only, **not**
-   `up`) during install. Without this, the *first* time someone flips the
-   UI toggle on, that HTTP request blocks on pulling 9 images over the
-   network — a bad first impression and a real timeout risk. Pulling at
-   install time means every later toggle-on is just "start already-cached
-   containers", fast. Warn-and-continue (not fatal) if the pull fails
-   (e.g. no network at install time) — Taiga stays installed-but-unpulled,
-   and the first toggle-on will just be slow instead, same UX depth as
-   `ttyd`'s "no prebuilt binary, install yourself" degrade path.
-6. **Wrapper scripts + sudoers** — see "Crossing the privilege boundary"
-   below.
-7. **`switchboard.env`** — `set_env "$ENV_FILE" TAIGA_ENABLED 1`,
-   `TAIGA_PORT` (a fixed default, e.g. `9000` — no interactive prompt,
-   matching `TTYD_BIN`/`CODE_SERVER_BIN` being plain non-interactive
-   defaults today), `TAIGA_LABEL` (default `"Taiga"`),
-   `TAIGA_UP_SCRIPT`/`TAIGA_DOWN_SCRIPT`/`TAIGA_STATUS_SCRIPT` (the
-   installed `/usr/local/bin/...` paths, mirroring how
-   `NEW_PROJECT_FROM_UPLOAD_SCRIPT` is recorded today).
-8. **Final summary block** (`install.sh` ~308-318) — when
-   `WITH_TAIGA=1`, print an explicit resource-cost + next-steps note:
-   Taiga runs 9 containers and can use several GB RAM once turned on; it
-   stays off until toggled in the web UI; and point at `taiga-docker`'s
-   own documented one-time "create your first admin user" command to run
-   once the stack is up (this project deliberately doesn't automate that
-   step — see Non-goals).
-
-### Crossing the privilege boundary
-`SVC_USER` (the unprivileged process `app.py` runs as) cannot be added to
-the `docker` group to run `docker compose` directly — Docker group
-membership is root-equivalent (full access to the Docker socket, which can
-mount arbitrary host paths into a container), a much broader grant than
-every other sudoers rule this project uses, all of which are narrowly
-scoped to one specific binary/script (`docs/ARCHITECTURE.md`
-"Processes and privilege boundaries"). **This is a deliberate, called-out
-deviation from the RUN_USER/SVC_USER user-separation model used
-everywhere else in this project**: Docker daemon access is inherently
-root-equivalent regardless of which user nominally owns a container, so
-there's no "run Taiga's containers as RUN_USER" equivalent to reach for.
-The mitigation is the same one this project already uses at the
-command-narrowing layer instead of the user-separation layer: three tiny,
-fixed, zero-argument wrapper scripts, whitelisted individually in sudoers,
-each doing exactly one `docker compose` invocation against a hardcoded
-`$TAIGA_DIR` — no passthrough arguments, no injection surface. This
-mirrors `host-agent/{host-start,host-stop,host-status}.sh` +
-`host_run()`'s action-triplet shape (`app.py` ~916-924) far more closely
-than `new-project-from-upload.sh`'s single-script-with-positional-args
-shape, since host-control already established exactly this "fixed
-start/stop/status triplet, root-run, zero-trust of caller-supplied
-arguments" pattern for an analogous "toggle a persistent external thing"
-case:
-
-- `scripts/taiga-up.sh` → installed as
-  `/usr/local/bin/ai-dev-switchboard-taiga-up.sh` → `cd "$TAIGA_DIR" &&
-  docker compose -f docker-compose.yml -f docker-compose.override.yml
-  up -d`
-- `scripts/taiga-down.sh` → `...taiga-down.sh` → `... down`
-- `scripts/taiga-status.sh` → `...taiga-status.sh` → prints `on` or `off`
-  as its first line (same single-line contract `host-status.sh` already
-  uses, per `host_run()`'s `out[0] == "on"` check) — e.g. based on whether
-  `docker compose ps taiga-gateway --format '{{.State}}'` reports
-  `running`.
-
-All three take **zero arguments** (even narrower than
-`new-project-from-upload.sh`'s `*`-suffixed sudoers line), `$TAIGA_DIR`
-hardcoded inside each script the same way `new-project-from-upload.sh`
-sources `switchboard.env` and falls back to a hardcoded default (follow
-that exact idiom — `CONFIG=/etc/ai-dev-switchboard/switchboard.env;
-[ -f "$CONFIG" ] && source "$CONFIG"`). Sudoers additions (gated behind
-`WITH_TAIGA`, inside the existing sudoers-generation block,
-`install.sh` ~237-251):
-
+### Credentials/config file: `~/.config/ai-dev-switchboard/taiga-push.env`
+New, `RUN_USER`-owned, `chmod 600` file — a sibling convention to
+`switchboard.env`'s `/etc/ai-dev-switchboard/` (root/`SVC_USER`-owned
+config) but scoped to `RUN_USER`'s own home, the same "controls everything
+under their own home directory" boundary `install.sh` already establishes
+for `PROJECTS_DIR`/`CODE_SERVER_DIR` (`install.sh` line ~157's comment).
+Plain `KEY=value` lines, sourced by both the bash setup helper and parsed
+(not shell-evaluated) by the Python script:
 ```
-$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-taiga-up.sh
-$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-taiga-down.sh
-$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-taiga-status.sh
+TAIGA_URL=http://127.0.0.1:9000
+TAIGA_USERNAME=taiga-bot
+TAIGA_PASSWORD=...
+TAIGA_PROJECT_SLUG=my-project
 ```
+Not written by `install.sh` (Taiga's own user account doesn't exist at
+`install.sh --with-taiga` time — see "Background" — so there's nothing
+correct to prompt for at that point). Instead:
 
-### `app.py` changes
-New config reads (alongside `HOST_CONTROL_ENABLED` etc., ~line 107):
-`TAIGA_ENABLED`, `TAIGA_LABEL`, `TAIGA_PORT`, `TAIGA_UP_SCRIPT`,
-`TAIGA_DOWN_SCRIPT`, `TAIGA_STATUS_SCRIPT`.
+### `scripts/taiga-configure-push.sh` (new, bash, unprivileged, interactive)
+Run once by `RUN_USER`, any time after a Taiga user + target project exist.
+Follows `install.sh`'s own `prompt()` idiom (show a default, accept
+override) for consistency, but is self-contained (does not source
+`install.sh`):
+1. Prompts for Taiga URL (default `http://127.0.0.1:9000`, matching 1a's
+   own `TAIGA_PORT` default — the operator overrides this if `TAIGA_PORT`
+   was customized, or if reaching Taiga through its `tailscale`-mode
+   `$BASE_URL/taiga` path instead of loopback), username, password (read
+   with `read -rs`, never echoed or logged), and target project slug.
+2. Writes `~/.config/ai-dev-switchboard/taiga-push.env`, creating the
+   parent directory (`mkdir -p`) if needed.
+3. **`chmod 600` immediately after writing** — no window where the file
+   with a live password in it is briefly more permissive than its final
+   mode (mirrors the spirit of `install.sh`'s own ordering discipline
+   elsewhere, e.g. writing secrets then immediately locking down
+   `$ENV_FILE`).
+4. Runs `python3 scripts/taiga_push_spec.py --verify` (see below) right
+   away and reports pass/fail — catches a typo'd password or wrong project
+   slug at setup time, not on the first real push.
 
+### `scripts/taiga_push_spec.py` (new, Python 3, stdlib only — `urllib.request`, `json`, `argparse`, `os`, `configparser`-free manual `KEY=value` parsing to match the rest of this project's `.env` handling rather than pulling in `python-dotenv`)
+```
+usage: taiga_push_spec.py [--spec PATH] [--project SLUG] [--config PATH]
+                           [--dry-run] [--verify]
+```
+- `--spec` (default `docs/spec.md`, resolved relative to CWD — matches how
+  every other doc/`docs/*.md` reference in this pipeline is a relative
+  path from the project root).
+- `--project` (default: `TAIGA_PROJECT_SLUG` from the config file; an
+  explicit flag overrides it per-invocation without needing a second
+  config file for a second project).
+- `--config` (default `~/.config/ai-dev-switchboard/taiga-push.env`).
+- `--dry-run`: does everything (load config, read+parse the spec file,
+  authenticate, look up the project) except the final `POST
+  /api/v1/userstories` — prints the subject/description that *would* be
+  sent and exits 0. Lets an agent (or a human) sanity-check formatting and
+  connectivity without creating backlog noise.
+- `--verify`: does auth + project lookup only (no spec file needed, no
+  userstory creation) — used by `taiga-configure-push.sh`'s own step 4.
+
+Structure — one small function per HTTP call, matching 1a's own
+`taiga_run()`/`_taiga_display_url()` "one clear function per
+responsibility" style and giving the test suite one seam to monkeypatch
+(mirrors how `tests/test_taiga.py` monkeypatches `appmod.taiga_run` rather
+than mocking `subprocess` globally):
 ```python
-def taiga_run(action: str) -> str:
-    assert action in ("up", "down", "status")
-    script = {"up": TAIGA_UP_SCRIPT, "down": TAIGA_DOWN_SCRIPT,
-              "status": TAIGA_STATUS_SCRIPT}[action]
-    r = subprocess.run(["sudo", script], capture_output=True, text=True,
-                       timeout=(10 if action == "status" else 90))
-    return r.stdout.strip()
+def _taiga_request(base_url, method, path, token=None, body=None):
+    """One shared urllib.request wrapper: builds the request, sets
+    Authorization if token is given, sends JSON, parses JSON response,
+    raises TaigaPushError with a clear message on any non-2xx status or
+    connection failure. This is the one function tests monkeypatch."""
+
+def _load_config(path) -> dict: ...       # parses the KEY=value file
+def _authenticate(base_url, username, password) -> str: ...  # -> auth_token
+def _lookup_project(base_url, token, slug) -> int: ...        # -> project id
+def _create_userstory(base_url, token, project_id, subject, description) -> dict: ...
+def _build_subject_and_description(spec_text, spec_path) -> tuple[str, str]: ...
 ```
-(Longer timeout for `up`/`down` than `host_run`'s 30s — a local
-`docker compose up -d`/`down` against an already-pulled stack should be
-fast, but give it real headroom; `status` stays short since it's just
-`docker compose ps`.)
+`_build_subject_and_description`: subject is the spec's own `# Spec: ...`
+first line with that prefix stripped (falls back to the file's first
+non-blank line, then to the filename itself, if the file doesn't follow
+that convention — never errors out over a missing heading); description
+is the full raw spec text, with a short auto-generated footer appended
+(origin repo/path + UTC timestamp) for traceability, since there is no
+back-link the other direction (per Non-goals, this is one-way).
 
-URL handling deliberately does **not** reuse `_publish()` on every
-`/status` poll — `_publish()` has a real side effect (re-issuing
-`tailscale serve --bg ...`) meant to run once per toggle-on, not once
-every 4 seconds. Split into a registration call (toggle time only) and a
-pure display-string function (safe to call every poll):
+`main()` wires argument parsing to these functions, catches
+`TaigaPushError` at the top level and prints a single clear line to
+`stderr` (no traceback) with a non-zero exit code — the specific messages
+per failure mode are enumerated under "Edge cases" below, since a caller
+(a human, or an agent parsing this script's exit code/stderr) needs to be
+able to tell *why* it failed without reading source.
 
-```python
-TAIGA_URL_PATH = "/taiga"  # fixed, singleton — no per-name path like /term or /code
+On success (non-dry-run): prints the created userstory's ref and full URL
+(`<taiga_url>/project/<slug>/us/<ref>`) to stdout, exits 0.
 
-def _taiga_display_url() -> str:
-    return f"{BASE_URL}{TAIGA_URL_PATH}" if PUBLISH_MODE == "tailscale" \
-        else f"http://127.0.0.1:{TAIGA_PORT}"
-```
-Toggle-on: `taiga_run("up")` then `_publish(TAIGA_URL_PATH, TAIGA_PORT)`
-(registers the tailscale-serve path in `tailscale` mode; a no-op return in
-`none` mode, matching `_publish`'s existing behavior). Toggle-off:
-`_unpublish(TAIGA_URL_PATH)` then `taiga_run("down")`. No per-name port
-allocator dict is needed (unlike `_code_port()`/`_ttyd_port()`) — Taiga is
-a singleton with one fixed port.
-
-`/status` (`do_GET`, ~2107-2128): alongside the existing `host_enabled`/
-`host`/`host_url` triplet, add a `taiga_enabled`/`taiga`/`taiga_label`/
-`taiga_url` triplet, computed the same way — fresh `taiga_run("status")`
-call every poll (not an in-memory dict), `taiga_url` only populated via
-`_taiga_display_url()` when on:
-```python
-taiga_on, taiga_url = False, None
-if TAIGA_ENABLED:
-    out = taiga_run("status").splitlines()
-    taiga_on = bool(out) and out[0] == "on"
-    taiga_url = _taiga_display_url() if taiga_on else None
-```
-
-`do_POST` (~2169 on): new branch alongside the existing `host`
-on/off branch —
-```python
-elif parts[0] == "taiga" and len(parts) == 2 and parts[1] in ("on", "off"):
-    if not TAIGA_ENABLED:
-        return self._json({"error": "taiga disabled"}, 404)
-    if parts[1] == "on":
-        taiga_run("up")
-        _publish(TAIGA_URL_PATH, TAIGA_PORT)
-    else:
-        _unpublish(TAIGA_URL_PATH)
-        taiga_run("down")
-    self._json({"ok": True})
-```
-This sits after the shared TOTP gate (~2161-2167) exactly like the
-existing `host`/`instance`/`code` branches — it inherits 428/403 TOTP
-behavior for free, no special-casing.
-
-### Frontend (`PAGE_TEMPLATE`, `refresh()`/`row()`/`actionPath()`)
-Add a `taiga_enabled` row to `refresh()` (~1108) the same way the host row
-is added, as a **singleton row alongside the host row, not mixed into the
-per-project `instances` loop**:
-```js
-if (s.taiga_enabled) html += row(s.taiga_label, s.taiga, s.taiga_url, 'taiga', null, '', null, false, null);
-```
-`row()`'s existing `kind === 'inst'` guards on `engineRow()`/`codeRow()`
-already correctly exclude both for any other `kind` (including `'taiga'`)
-with no change needed there. `actionPath()` (~1157) needs one new line:
-```js
-if (kind === 'taiga') return '/taiga/' + (on ? 'on' : 'off');
-```
-Exact visual placement (before/after the host row, any RAM-cost tooltip
-or badge, etc.) is a `ux-designer` call for `docs/design.md`, not
-prescribed here — the functional contract above (singleton row, no engine
-picker, on/off + link) is what this spec fixes.
-
-### `config/switchboard.env.example`
-Document the new keys in a new `## Optional: self-hosted Taiga (--with-taiga)`
-section, following the exact comment style/depth of the existing
-`HOST_CONTROL_ENABLED` section (lines 87-103) — `TAIGA_ENABLED`,
-`TAIGA_PORT`, `TAIGA_LABEL`, and the three script-path variables, all
-marked "install.sh sets these for you when you pass --with-taiga".
+### Documentation
+- **README.md**: one new bullet under "What you get" ("push a spec into a
+  Taiga backlog item via `scripts/taiga_push_spec.py`, see `docs/spec.md`"
+  — or, once this ships, a short standalone note, following how other
+  optional features are one-liners there with a doc pointer), one new line
+  under "Repo layout" for `scripts/taiga_push_spec.py` +
+  `taiga-configure-push.sh`, and one new bullet under "Security notes"
+  describing the new credentials file using the *exact* phrasing pattern
+  already used there for `switchboard.env`'s `AUTH_MODE=simple` password
+  ("... stores its password in plain text in `~/.config/ai-dev-switchboard/taiga-push.env`
+  (file mode `600`, owned by `RUN_USER`)").
+- No `docs/ARCHITECTURE.md` change needed — this script doesn't cross a
+  privilege boundary (no sudoers entry, no root anything, runs entirely as
+  whatever unprivileged user invokes it), so "Processes and privilege
+  boundaries" doesn't need a new entry; it's simply not part of that
+  model, and saying so briefly in the README's Security notes bullet above
+  is enough.
 
 ## Affected areas
-- `install.sh` — new flag, Docker install block, `taiga-docker` clone +
-  config + pre-pull, wrapper-script install, sudoers additions,
-  `switchboard.env` keys, final summary note. (Single file, but see note
-  below on why this isn't split further.)
-- `scripts/taiga-up.sh`, `scripts/taiga-down.sh`, `scripts/taiga-status.sh`
-  — three new small root-run wrapper scripts.
-- `app/app.py` — new config reads, `taiga_run()`, `_taiga_display_url()`,
-  `/status` fields, new `do_POST` branch, `refresh()`/`actionPath()` JS.
-- `config/switchboard.env.example` — new documented section.
-- No data model / schema changes. No changes to existing endpoints'
-  request/response shapes beyond additive new `/status` fields and one new
-  `/taiga/{on,off}` route.
-
-This does touch installer + a new privileged-script layer + the app +
-frontend JS, which on paper looks like several architectural layers — but
-it's the same shape (and comparable size) as the already-shipped
-code-server and host-control features, each of which landed as one spec/
-one build cycle in this same repo. Not splitting further.
+- `scripts/taiga_push_spec.py` — new, Python 3 stdlib only.
+- `scripts/taiga-configure-push.sh` — new, bash, unprivileged, interactive.
+- `tests/test_taiga_push.py` — new, `unittest`, monkeypatching
+  `_taiga_request` the same way `tests/test_taiga.py` monkeypatches
+  `taiga_run`.
+- `README.md` — three small additions (What you get / Repo layout /
+  Security notes), no structural changes.
+- No changes to `install.sh`, `app/app.py`, `config/switchboard.env.example`,
+  or any existing sudoers/systemd/frontend code. No data model or schema
+  changes. This is a single new, self-contained CLI tool — one layer, no
+  load-balanced-decomposition split needed (see skill 11's own criteria:
+  no schema/API/edge-function/multi-screen spread here, just one script +
+  one setup helper + its tests + doc pointers).
 
 ## Edge cases
-- **Re-running `install.sh --with-taiga`** on a box that already has it
-  installed: must not re-clone (checked via `$TAIGA_DIR/.git`), not
-  regenerate secrets (checked via `get_env` returning a non-empty existing
-  value, same idiom as `TOTP_SECRET`), not restart already-stopped
-  containers, not duplicate sudoers lines (whole file is regenerated
-  deterministically each run, same as today).
-- **Docker already present** (installed by the operator for something
-  else, e.g. via a different distro path than `get.docker.com`) — the
-  `command -v docker` check must skip the install step entirely, never
-  touch their existing Docker config.
-- **`docker` present but the Compose *plugin* isn't** (an old standalone
-  `docker-compose` v1 binary, no `docker compose` subcommand) — detect via
-  `docker compose version`, warn clearly and continue (not a fatal
-  `set -e` abort), leaving Taiga installed-but-not-functional until the
-  operator sorts out their own Compose install — matches the ttyd
-  no-prebuilt-binary degrade path already in this file.
-- **No network at install time** (image pull fails) — warn and continue;
-  Taiga stays configured but with uncached images, so the first UI
-  toggle-on will simply be slow (pulls then) instead of the install
-  failing outright.
-- **`app.py` restarts while Taiga is running** — `/status` must still
-  report `taiga: true` with a correct URL on the very next poll, with no
-  re-toggle needed — this is the central reason state is queried fresh via
-  `taiga_run("status")` every poll rather than trusted from memory (see
-  Background).
-- **Rapid double-toggle** (two quick `POST /taiga/on`, or on-then-off
-  before the first completes) — `docker compose up -d`/`down` are both
-  idempotent by design, matching how `host_run()`'s SSH calls are already
-  assumed idempotent with no extra locking in this codebase; no new
-  locking needed here either.
-- **Toggling `/taiga/on` or `/taiga/off` when `TAIGA_ENABLED` is false**
-  (e.g. someone hand-edits `switchboard.env` without ever having run
-  `--with-taiga`, so the scripts/checkout don't exist) — 404, exactly
-  mirroring the existing `host disabled` → 404 branch.
-- **TOTP not yet verified this session** — inherited automatically from
-  the shared gate in `do_POST`; no special-casing needed, but worth an
-  explicit acceptance criterion (below) since it's easy for a reviewer to
-  assume new routes need their own check.
-- **Disk space** — 9 images plus Postgres/RabbitMQ data volumes need real
-  disk, not just RAM; call this out alongside the RAM warning in the
-  install summary (Proposed approach, step 8).
-- **Platform**: this feature only makes sense on `x86_64`/`aarch64` Linux
-  like the rest of the installer (Docker's convenience script already
-  handles that distinction internally) — no new platform branching needed
-  beyond what `get.docker.com` itself does.
+- **Taiga unreachable** (toggled off, wrong `TAIGA_URL`, box down) —
+  connection error caught in `_taiga_request`, surfaced as: `"Could not
+  reach Taiga at <url> — make sure it's toggled on in the ai-dev-switchboard
+  web UI, or check TAIGA_URL in <config path>."`
+- **Bad credentials** (`POST /api/v1/auth` returns non-2xx) — `"Taiga
+  rejected the configured username/password — check TAIGA_USERNAME/
+  TAIGA_PASSWORD in <config path>, or re-run
+  scripts/taiga-configure-push.sh."`
+- **Unknown project slug** (`by_slug` returns 404) — `"No Taiga project
+  found with slug '<slug>' — create it first in Taiga's own web UI, or
+  check TAIGA_PROJECT_SLUG / --project."` Never auto-creates.
+- **Missing or unreadable config file** — `"No Taiga push config found at
+  <path> — run scripts/taiga-configure-push.sh first."`
+- **Config file present but incomplete** (e.g. blank password from a
+  copy-paste mistake) — same message shape as "bad credentials", not a
+  raw `KeyError`.
+- **Missing or empty `docs/spec.md`** — `"No spec found at <path> (or it's
+  empty) — nothing to push."`, exits non-zero, no request sent at all.
+- **Config file permissions looser than 600** — checked once at the start
+  of `main()` (`os.stat(...).st_mode`); if group/other-readable, print a
+  loud warning (not a hard failure — an operator who deliberately loosened
+  it isn't blocked, but should know) before proceeding. This is a small,
+  deliberate addition beyond `switchboard.env`'s own precedent (which
+  doesn't self-check its permissions at read time) — worth doing here
+  specifically because this file holds a live, standalone password with no
+  other secret co-located to notice a leak via, unlike `switchboard.env`
+  where a permissions slip would be far more likely to be noticed/audited
+  given how many other things read/depend on that file.
+- **Re-running the script against the same spec** — by design, creates a
+  second userstory (see Non-goals' "no update-in-place"). Not treated as
+  an error; the operator is expected to know this given the documented
+  behavior.
+- **`--dry-run` and `--verify` together, or with missing `--spec`** —
+  `--verify` doesn't need a spec file at all (auth + project lookup only);
+  if both flags are passed, `--verify`'s narrower behavior wins (auth-only,
+  no spec read, no dry-run "would send this" preview) — document this
+  precedence in the script's own `--help` text rather than leaving it
+  ambiguous.
+- **Very long-running Taiga auth-token expiry mid-invocation** — not a
+  real concern (see "Background": one-shot process, token used
+  immediately after being issued), but worth a defensive check: if
+  `_create_userstory` itself gets a 401 despite a token just having been
+  issued, surface it as the same "bad credentials"-shaped error rather
+  than an unhandled exception — cheap insurance against a genuinely
+  short-lived token on some future Taiga version.
+- **Platform**: pure Python stdlib + `urllib.request`, no platform
+  branching needed (unlike `install.sh`'s Docker-install path, this has no
+  OS/arch dependency at all).
 
 ## Acceptance criteria
-- [ ] Given a box without Docker, when `install.sh --with-taiga` is run,
-      then `docker` and the Compose plugin are installed, `/opt/ai-dev-switchboard-taiga`
-      contains a `stable`-branch checkout with generated secrets and a
-      `docker-compose.override.yml` binding `taiga-gateway` to
-      `127.0.0.1:$TAIGA_PORT`, images are pre-pulled, and no Taiga
-      containers are running yet.
-- [ ] Given `install.sh --with-taiga` completes, then `switchboard.env` has
-      `TAIGA_ENABLED=1` plus the port/label/script-path keys, the three
-      wrapper scripts exist at `/usr/local/bin/ai-dev-switchboard-taiga-{up,down,status}.sh`
-      mode 755, and `/etc/sudoers.d/ai-dev-switchboard` grants `SVC_USER`
-      exactly those three scripts as root (`visudo -cf` still passes).
-- [ ] Given `install.sh` is run **without** `--with-taiga`, then no Docker
-      install is attempted, `TAIGA_ENABLED` is unset, and the web UI is
-      byte-for-byte unchanged in its rendered rows versus before this
-      feature (no empty/broken Taiga row appears).
-- [ ] Given `TAIGA_ENABLED=1` right after install, when `/status` is
-      polled, then the response reports Taiga off (containers not
-      auto-started by install).
-- [ ] Given the Taiga row's toggle is switched on with a valid TOTP code,
-      when the request completes, then `docker compose ps` under
-      `/opt/ai-dev-switchboard-taiga` shows `taiga-gateway` running, and
-      the next `/status` poll reports Taiga on with a URL (loopback in
-      `PUBLISH_MODE=none`, `BASE_URL/taiga` in `PUBLISH_MODE=tailscale`).
-- [ ] Given the Taiga row's toggle is switched off, when the request
-      completes, then all `taiga-docker` containers are stopped and, in
-      `tailscale` mode, the `/taiga` `tailscale serve` path mapping is
-      removed.
-- [ ] Given `app.py`/the systemd service restarts while Taiga containers
-      are already running, when `/status` is polled afterward, then Taiga
-      still reports on with a correct URL, with no re-toggle required.
-- [ ] Given TOTP has not yet been verified this browser session, when
-      `POST /taiga/on` or `/taiga/off` is called, then it returns 428
-      (no code) / 403 (wrong code) exactly like the existing `instance`/
-      `host` toggle routes, with no bespoke Taiga-specific auth code.
-- [ ] Given both project rows and the Taiga row are visible, then Taiga
-      renders as exactly one always-present row (when enabled) with no
-      engine picker, distinct from the per-project `instances` list —
-      never one row per project.
+- [ ] Given no config file exists, when
+      `scripts/taiga-configure-push.sh` is run and valid Taiga URL/
+      username/password/project slug are entered, then
+      `~/.config/ai-dev-switchboard/taiga-push.env` is created with mode
+      `600`, owned by the invoking user, and step 4's built-in
+      `--verify` check reports success.
+- [ ] Given a valid config file and a `docs/spec.md` starting with
+      `# Spec: <title>`, when `python3 scripts/taiga_push_spec.py` is run
+      with no flags, then Taiga contains exactly one new userstory in the
+      configured project whose subject is `<title>` and whose description
+      contains the full spec body, and the script prints that userstory's
+      ref + a working URL to stdout and exits 0.
+- [ ] Given the same setup, when run with `--dry-run`, then no new
+      userstory is created in Taiga (verified via Taiga's own API/UI
+      showing no new item), the script still prints the subject/
+      description it *would* have sent, and exits 0.
+- [ ] Given `--verify` is run with correct credentials and an existing
+      project slug, then it exits 0 and prints a success message, having
+      made no `POST /api/v1/userstories` call.
+- [ ] Given Taiga is unreachable (e.g. toggled off), when the script is
+      run (with or without `--dry-run`), then it exits non-zero with the
+      "could not reach Taiga" message and no traceback.
+- [ ] Given the configured password is wrong, when the script is run,
+      then it exits non-zero with the "rejected the configured
+      username/password" message, and no userstory is created.
+- [ ] Given `TAIGA_PROJECT_SLUG` (or `--project`) names a project that
+      doesn't exist in Taiga, then it exits non-zero with the "no project
+      found" message, and no userstory is created.
+- [ ] Given `docs/spec.md` doesn't exist (or exists but is empty), then
+      the script exits non-zero with a clear "no spec / nothing to push"
+      message before making any network call.
+- [ ] Given the config file's mode is looser than `600` (e.g. `644`), then
+      the script prints a loud warning but still proceeds (not a hard
+      block).
+- [ ] Given `--project other-slug` is passed explicitly, then it overrides
+      whatever `TAIGA_PROJECT_SLUG` is in the config file for that one
+      invocation, without modifying the config file itself.
+- [ ] Given the script succeeds, then `~/.config/ai-dev-switchboard/taiga-push.env`
+      is never logged, printed, or included in any error message verbatim
+      (the password specifically must never appear in stdout/stderr, even
+      in a "bad credentials" error).
 
 ## Open questions
-- **The Docker dependency itself** — this is the one flagged explicitly
-  per this cycle's brief, not a minor implementation detail: shipping
-  `--with-taiga` means this codebase takes on its first-ever Docker
-  dependency (confirmed nothing Docker-related exists in the repo today).
-  This spec's assumption is **yes, proceed** — shelling out to Taiga's own
-  official `taiga-docker` Compose stack is the only realistic way to get a
-  maintainable self-hosted Taiga (see "The Docker-dependency decision"
-  above for the reasoning) — but this materially changes the project's
-  dependency footprint for anyone who opts in, and should get explicit
-  user sign-off before build starts, not just be inferred from this spec
-  existing.
-- **`taiga-docker`'s exact `.env` key names** — verified today
-  (`SECRET_KEY`, `POSTGRES_PASSWORD`, RabbitMQ credentials, `TAIGA_SCHEME`,
-  `TAIGA_DOMAIN`) against the live `stable` branch, but it's an external
-  repo that can rename keys in a future version bump before this build
-  actually runs. Assumption: the developer re-verifies against whatever's
-  actually in the cloned `stable` branch at implementation time rather
-  than trusting these names as gospel from this spec.
-- **No auto-pull/upgrade of the `taiga-docker` checkout on re-run** —
-  assumed pinned-at-first-clone (see Proposed approach step 2), matching
-  this installer's existing "never clobbers already-set values"
-  philosophy. Flag if a future session wants an explicit
-  `--upgrade-taiga`-style path instead.
-- **`TAIGA_DOMAIN`/`TAIGA_SCHEME` derived automatically, no interactive
-  prompt** — assumed acceptable (derived from `PUBLISH_MODE`/`BASE_URL`,
-  same values already computed earlier in the same install run); an
-  operator who wants a custom domain can hand-edit `taiga-docker`'s own
-  `.env` afterward, same as any other `taiga-docker` knob this project
-  doesn't manage.
-- **`TAIGA_PORT` fixed default (9000), not interactively prompted** —
-  matches `TTYD_BIN`/`CODE_SERVER_BIN` being plain env defaults with no
-  prompt today; flag if a collision with something else on 9000 turns out
-  to be common enough to warrant a prompt.
-- **One shared Taiga instance for the whole box** (not one per switchboard
-  project) — this is explicitly what `docs/BACKLOG.md` item 1 already
-  settled ("Open for the future session: ... whether one shared Taiga
-  project covers all switchboard projects or one per project folder" is
-  about organizing *within* Taiga's own multi-project support, once
-  logged in — not about running multiple Taiga *instances*, which this
-  spec does not do).
+- **Credentials file location deviates from a literal reading of "mirror
+  `TOTP_SECRET`'s storage in `switchboard.env`"** — flagged prominently
+  above (see "Background"). The assumption this spec proceeds under: a
+  *new*, `RUN_USER`-owned file mirroring the same *mechanism* (plain
+  value, small env-style file, mode 600, owned by its reader) is correct,
+  since the actual consuming principal (`RUN_USER`, via any agent's Bash
+  access) differs from `switchboard.env`'s owner (`SVC_USER`). This is a
+  reasoned architectural call based on a concrete permission-boundary fact
+  discovered during this cycle's archaeology, not a preference — flagging
+  it explicitly in case there's a reason (not visible from this repo
+  alone) to prefer a different location.
+- **No update-in-place / no spec↔userstory ID tracking** (Non-goals) —
+  assumed acceptable for v1 given the confirmed one-way-only direction;
+  flag if a future cycle wants re-runs to update an existing userstory
+  instead of creating duplicates (would need a persisted mapping, which
+  starts to resemble sync state this cycle deliberately avoids).
+- **Which Taiga user's credentials go in the config file** — deliberately
+  unprescribed (any valid Taiga user with write access to the target
+  project works; could be the same superuser from 1a's manual setup, or a
+  dedicated "bot" account created for this purpose). Not a blocker; an
+  operator preference, not an architecture decision.
+- **Whether `product-manager`'s own standing instructions should
+  eventually call this automatically** during its normal spec-writing flow
+  — explicitly out of scope for this cycle (Non-goals), left for whoever
+  next edits the global `D:\Entwicklung\.claude\agents\product-manager.md`
+  definition, informed by this script now existing and working.
+- **Taiga API field names/behavior** — verified against `taiga-doc`'s
+  current docs today (see "Background"), but as with 1a's `taiga-docker`
+  `.env` keys, this is a live external project; the developer should
+  re-verify the three endpoints' exact request/response shape against
+  whatever Taiga version is actually running before trusting this spec's
+  field names as final.
 
 ## Risk / rollback notes
-- **Blast radius is bounded by "off by default"**: install prepares
-  everything but starts nothing, so `--with-taiga` alone (before ever
-  flipping the toggle) costs disk space (checkout + pulled images) but no
-  extra RAM/CPU at runtime.
-- **Immediate rollback**: flip the toggle off in the UI — `docker compose
-  down` stops all 9 containers right away, freeing RAM. This is the
-  primary "something's using too many resources" escape hatch and is
-  exercised by this spec's own acceptance criteria, not just a
-  theoretical rollback path.
-- **Full removal** (uninstalling Docker, deleting `$TAIGA_DIR`, removing
-  the sudoers lines) is a manual step, not automated by this feature — see
-  Non-goals. Document this as a known gap, not a bug, matching every other
-  `--with-*` flag's lack of an uninstall path today.
-- **What could break existing functionality**: nothing, if
-  `--with-taiga` is never passed — every change here is additive and
-  gated behind `WITH_TAIGA`/`TAIGA_ENABLED`, following the same pattern
-  `--with-host-control`/`HOST_CONTROL_ENABLED` already use for zero
-  impact on installs that don't opt in (see the "Given install.sh is run
-  without --with-taiga..." acceptance criterion above).
-- **Docker install itself is the riskiest single step** (runs a curl-piped
-  root install script, same trust model this project already accepts for
-  code-server's own `curl -fsSL https://code-server.dev/install.sh | sh`)
-  — no new trust boundary is being crossed relative to precedent already
-  in this file, just a new vendor.
+- **Blast radius is small and additive**: two new files plus a test file
+  plus a few README lines; nothing existing is modified or depends on this
+  running. If it's never configured (`taiga-configure-push.sh` never run),
+  `taiga_push_spec.py` simply fails its first config-file check and does
+  nothing else — zero effect on the rest of the switchboard.
+- **No privilege boundary is touched** — no sudoers entry, no root
+  anything, no change to `app.py`'s process or its trust model. Worst case
+  of a bug here is a malformed/duplicate userstory in Taiga (cheap to
+  delete by hand) or a leaked Taiga password if the config file's
+  permissions are mishandled (mitigated by the immediate `chmod 600` in
+  the setup script and the loose-permissions warning in the push script
+  itself).
+- **Rollback**: delete `scripts/taiga_push_spec.py`,
+  `scripts/taiga-configure-push.sh`, and
+  `~/.config/ai-dev-switchboard/taiga-push.env` — no other state anywhere
+  in the system references any of this.
+- **What could break existing functionality**: nothing — this cycle makes
+  zero changes to any file 1a (or any earlier feature) shipped.
