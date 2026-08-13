@@ -75,13 +75,31 @@ i.e. a Markdown paragraph or a single bullet including its wrapped
 continuation lines. Blocks are built per file from the same full content
 `fact_check` already reads.
 
-Two bounds, both required, because an unbounded block is how precision would
-silently erode:
+> **Revised after round 1 (see "Round-1 correction" below). The original
+> bounds — 12 lines / 1500 chars — were far too wide and produced five
+> precision regressions. The values below are the corrected ones.**
 
-- `_GROUNDING_BLOCK_MAX_LINES` (default **12**) — a run longer than this is
-  split into successive blocks rather than joined into one.
-- `_GROUNDING_BLOCK_MAX_CHARS` (default **1500**) — same, by character count,
-  so one very long unwrapped line cannot create an enormous matchable region.
+A block is a **wrap-joined unit**, not an arbitrary run of lines. The defect
+being fixed is one sentence split across two lines by hard wrapping; the unit
+needs to be just wide enough to reunite that, and no wider.
+
+A block ends at **any** of:
+
+- a blank line;
+- a line whose stripped text ends in sentence-terminal punctuation
+  (`.`, `!`, `?`, and `:` before a list);
+- the **start of a new structural element** — a Markdown heading (`#`), a list
+  item marker (`-`, `*`, `+`, or `N.`), a block quote (`>`), or a table row
+  (`|`). A structural marker starts a new block even mid-run;
+- a code-fence delimiter (` ``` ` or `~~~`). **Fenced code content is excluded
+  from matching entirely** — it is not prose and cannot support a claim;
+- `_GROUNDING_BLOCK_MAX_LINES` (**3**) lines, or
+  `_GROUNDING_BLOCK_MAX_CHARS` (**400**) characters.
+
+Three lines and 400 characters are sized to the real job: a hard-wrapped
+sentence at typical widths spans two lines, occasionally three. Anything
+beyond that is a different sentence, and joining it is how unrelated terms
+start co-occurring.
 
 Both fixed module constants, deliberately **not** env-configurable: they are
 the precision guarantee, not an operator preference. An operator who could
@@ -172,10 +190,50 @@ against the real `docs/ARCHITECTURE.md`, the adversarial claim set, and the
 
 The `/proc` case is simulated rather than by unmounting `/proc`.
 
+## Round-1 correction (2026-08-13)
+
+Round 1 implemented the original spec faithfully and was **blocked** with five
+precision regressions, each confirmed to be introduced by the change (6b's
+single-line matcher rejected all five correctly). Reproductions are in
+`docs/test-review.md`; the clearest:
+
+```
+- widget rotation config
+- gadget storage config
+- unrelated topic zebra migration
+```
+
+joined into one block, so a claim about "widget storage config" matched — three
+unrelated bullets presented to the lead as verification.
+
+**The fault was in this spec, not the implementation.** Two errors:
+
+1. **The window was ~6x too wide.** The defect being fixed is a single
+   sentence wrapped across two lines. Twelve lines is wide enough that
+   co-occurrence carries no information — demonstrated by the reviewer's
+   `terms_12_lines_apart_in_unrelated_filler` case, which has no Markdown
+   structure at all and therefore cannot be fixed by better structure parsing.
+2. **Blank lines and sentence-terminal punctuation are not the only semantic
+   boundaries.** Headings, list items, block quotes, table rows and code
+   fences are all boundaries, and terse bullets frequently carry no terminal
+   punctuation at all — which is exactly the shape that broke.
+
+Round 1's sentence-terminal rule was a sound addition and is retained; it was
+just insufficient on its own. The corrections are the tighter bounds and the
+structural boundary set above.
+
+**A recall figure below the 5/6 target is an acceptable outcome now.**
+Precision is the property that must hold. If the corrected bounds cannot reach
+useful recall without a precision regression, stop and report — the fallback
+is to keep 6b's single-line matcher and raise recall in 6c at the prompt
+level, by instructing the lead to make short claims quoting exact phrases.
+That path costs no code and carries no precision risk.
+
 ## Open questions
 
-- `12` lines / `1500` chars are chosen, not measured. They are bounded above
-  by precision (the adversarial set must keep failing to match) and below by
-  recall (the benchmark must reach 5/6). If both cannot hold simultaneously,
-  **stop and report** — that would mean the block approach is wrong, and it
-  should not be papered over by loosening one of the bounds.
+- `3` lines / `400` chars are reasoned from typical wrap widths, not measured
+  across a corpus. They are bounded above by precision and below by recall.
+- Whether the structural-boundary set is complete for Markdown as it appears
+  in real project docs. Setext headings (`===`/`---` underlines) and indented
+  code blocks are not handled; both are judged rare enough in this context to
+  defer, and both fail *closed* (they split rather than merge).
