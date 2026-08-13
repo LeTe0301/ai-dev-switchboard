@@ -287,6 +287,12 @@ def mark_session_totp_ok(sid: str) -> None:
 _HEADLESS_FORMATS = {"claude-stream-json", "codex-jsonl", "plain"}
 _HEADLESS_PROMPT_MODES = {"arg", "stdin", "file"}
 
+# Engine-name prefixes _parse_engine_file() reserves outright (see its own
+# comment at the point of use) -- "switchboard" (backlog item 6a) and "team"
+# (backlog item 6d part 1), each guarding against the identical session-name
+# collision shape for its own subsystem.
+_RESERVED_ENGINE_NAME_PREFIXES = ("switchboard", "team")
+
 
 class Engine:
     __slots__ = ("name", "label", "cmd", "url_regex", "startup",
@@ -343,17 +349,23 @@ def _parse_engine_file(path: str):
     if not cmd:
         return None
     name = os.path.splitext(os.path.basename(path))[0]
-    # Reserved engine-name prefix (docs/spec.md "Session naming"): headless
-    # tmux sessions are named f"switchboard-headless-{run_id}" (app/teams.py)
-    # via the *same* TMUX rule instance_start() uses, and active_engine()
-    # keys purely off f"{engine_name}-{project_name}" with no other
-    # cross-check. Reserving only the exact name "switchboard-headless"
-    # would still leave a constructible collision open (engine "switchboard"
-    # + a project directory literally named "headless-<run_id>"), so the
-    # *whole* "switchboard" prefix is reserved -- any .engine file whose
-    # derived name starts with it is ignored, same "intentionally inert"
-    # treatment .engine.example templates already get below.
-    if name.startswith("switchboard"):
+    # Reserved engine-name prefixes (docs/spec.md "Session naming", extended
+    # by backlog item 6d part 1 "Engine-name reservation"): headless tmux
+    # sessions are named f"switchboard-headless-{run_id}" (app/teams.py) via
+    # the *same* TMUX rule instance_start() uses, and active_engine() keys
+    # purely off f"{engine_name}-{project_name}" with no other cross-check.
+    # Reserving only the exact name "switchboard-headless" would still leave
+    # a constructible collision open (engine "switchboard" + a project
+    # directory literally named "headless-<run_id>"), so the *whole*
+    # "switchboard" prefix is reserved. Same bug class, same fix shape for
+    # "team": a team-<project> tmux session (app/teams.py, backlog item 6d)
+    # is structurally identical to a single-engine session name for any
+    # engine literally named "team" (or "team-anything") against ANY
+    # project -- f"{engine}-{project}" == f"team-{project}". Any .engine
+    # file whose derived name starts with either reserved prefix is ignored,
+    # same "intentionally inert" treatment .engine.example templates already
+    # get below.
+    if name.startswith(_RESERVED_ENGINE_NAME_PREFIXES):
         return None
     startup = []
     i = 1

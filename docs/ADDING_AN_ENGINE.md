@@ -152,15 +152,21 @@ still parses normally (`LABEL`/`CMD`/`URL_REGEX`/`STARTUP_*` all still
 work) — the engine is just left headless-ineligible
 (`Engine.headless_enabled == False`), never a `load_engines()` failure.
 
-**Reserved name: the whole `switchboard` prefix.** Any `.engine` file whose
-filename stem (with `.engine` stripped) *starts with* `switchboard` is
-ignored by `load_engines()` — same "intentionally inert" treatment
-`.engine.example` templates get. This is what keeps a headless run's own
-throwaway tmux session (`switchboard-headless-<run_id>`) structurally unable
-to collide with any real project's own `<engine>-<project>` session name,
-including the non-obvious case of an engine literally named `switchboard`
-combined with a project directory named `headless-<run_id>`. Don't name your
-own engine file starting with `switchboard`.
+**Reserved names: the whole `switchboard` and `team` prefixes.** Any
+`.engine` file whose filename stem (with `.engine` stripped) *starts with*
+either `switchboard` or `team` is ignored by `load_engines()` — same
+"intentionally inert" treatment `.engine.example` templates get. `switchboard`
+is what keeps a headless run's own throwaway tmux session
+(`switchboard-headless-<run_id>`) structurally unable to collide with any
+real project's own `<engine>-<project>` session name, including the
+non-obvious case of an engine literally named `switchboard` combined with a
+project directory named `headless-<run_id>`. `team` (backlog item 6d part 1)
+guards the identical collision shape for a **team**'s own
+`team-<project>` tmux dashboard session (`app/teams.py`) — an engine
+literally named `team` (or `team-anything`) would otherwise produce a
+single-engine session name `f"{engine}-{project}"` == `f"team-{project}"`
+for any project. Don't name your own engine file starting with `switchboard`
+or `team`.
 
 **`HEADLESS_ROLE_FLAG`** (mentioned in `docs/story.md` §4.2) stays
 **reserved** — 6c deliberately did not implement it (see `docs/spec.md`

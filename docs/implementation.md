@@ -564,3 +564,537 @@ python3 app/teams.py team-start /tmp/scratch-projects-6c/demo \
   --task "First delegate to the teammate named claude: ask them to name the project's database technology in one word, based on the project docs. Then use fact_check to verify that this project uses SQLAlchemy. Then delegate to claude again: ask them to name the web framework in one word. Then finish with a one-sentence summary covering both answers." \
   --lead-ollama --members "claude"
 ```
+
+---
+
+# Implementation: Team session lifecycle, part 1 -- worktrees + tmux dashboard session (sub-spec 6d, part 1 of 2)
+
+## Summary
+
+`app/teams.py` gains the full worktree + tmux-dashboard lifecycle described
+in `docs/spec.md`: `_run_run_user_command()` (the TMUX-only synchronous
+RUN_USER helper git worktree operations go through), `_validate_project_for_
+team()` (SVC_USER, read-only preconditions), `_worktree_path()`/
+`_create_worktree()`/`_remove_worktree()`, `_agent_log_path()`,
+`_team_session_name()`/`_create_team_session()`, `launch_team()`/
+`stop_team()`/`sweep_dead_teams()`, three new CLI subcommands (`team-launch`,
+`team-stop`, `team-reap`), `_new_state()`'s two additive fields
+(`project_name`, `worktrees`), and `team_step()`'s `delegate` branch now
+targeting a teammate's own worktree with a stable, append-mode log path.
+`app/app.py` gains exactly the one conceptual change the spec named: the
+`switchboard`-only engine-name reservation becomes `(switchboard, team)`
+(`_RESERVED_ENGINE_NAME_PREFIXES`) -- `app.py` still does not import
+`app.teams` anywhere, confirmed by grep.
+
+Four real, previously-undisclosed defects were found and fixed while
+building/reviewing this, all by exercising real git + real tmux sequences
+past the spec's own enumerated acceptance criteria (per this story's own
+established pattern) -- two found by the developer, two (both in the
+developer's own successive fixes for the first) found by the reviewer --
+see "Defects found and fixed" below. All hard constraints (no new sudoers
+line, `git worktree remove` never uses `--force`, grounding/`realpath()`
+guards untouched) hold, verified directly, not assumed.
+
+## Changes by file
+
+- **`app/teams.py`** (2859 -> 3661 lines, including round 2's atomic-
+  session-creation fix and round 3's failing-link cleanup fix, plus both
+  rounds' docstring updates):
+  - Two new config constants: `TEAM_WORKTREE_OP_TIMEOUT_SECONDS` (30s
+    default), `TEAM_SESSION_STALE_TTL_SECONDS` (86400s default) -- same
+    declare-once-at-module-level convention as every other `TEAM_*`
+    constant, plus `_WORKTREE_OP_KILL_GRACE_SECONDS` (fixed, not an env
+    var, same rationale as `_GROUNDING_READ_CAP_BYTES`).
+  - `_run_run_user_command(argv, cwd, timeout=None)` -- the TMUX-only
+    synchronous RUN_USER helper (spec §1). Spawns a throwaway
+    `switchboard-worktree-op-<id>` tmux session running `argv...; echo $? >
+    rcfile` as a background job (mirrors `_build_script()`'s own
+    background-then-`wait`-then-record-rc idiom), polls for the rc file the
+    same way `_run_headless_session()` polls for `out.rc`, and escalates
+    TERM-then-`kill-session` (a single stage, not the full multi-stage
+    ladder) if the command outlives `timeout`. Never raises.
+  - `_validate_project_for_team(workdir)` -- SVC_USER, plain
+    `subprocess.run(["git", "-C", workdir, ...])`, three ordered checks
+    (not-a-repo / detached HEAD / dirty tree via `git status --porcelain`
+    non-empty, tracked-or-untracked per the user's settled decision), each
+    with its own specific message.
+  - `_worktree_path()`/`_create_worktree()`/`_remove_worktree()` -- verbatim
+    per spec §3, including the specific "a previous team run's worktree for
+    '<agent>' still has uncommitted changes at <path>..." leftover message
+    and the three-way `_remove_worktree()` outcome (`"removed"`/`"dirty"`/
+    `"error"`), classified from git's own real stderr text (`"modified or
+    untracked files"`/`"use --force"`), verified against the real binary,
+    not assumed.
+  - `_agent_log_path()`, `_team_session_name()`, `_create_team_session()`
+    (dashboard windows: `lead` + one per member, each `tail -n +1 -F
+    {log_path} || sleep infinity`, `remain-on-exit on`).
+  - `_TEAM_SESSION_RUN_ID_OPTION`/`_team_session_run_id()`/
+    `_kill_team_session_if_owned()` -- **not named in the spec**, added to
+    fix a real defect found during testing; see "Defects found and fixed"
+    below.
+  - `launch_team()`/`stop_team()`/`sweep_dead_teams()` -- per spec §7-§9,
+    with one additional structural fix each (dropping a reclaimed
+    worktree's entry from the persisted `worktrees` map) -- see "Defects
+    found and fixed".
+  - `_new_state()` -- two additive keyword-only fields, `None`/`{}` default,
+    every existing positional caller (6c's own `_cli_team_start()`, every
+    existing test) unaffected.
+  - `team_step()`'s `delegate` branch -- the one behavioral change to
+    existing lead-loop code, exactly as specced: `worktree =
+    state.get("worktrees", {}).get(agent)`, `agent_run(agent, worktree or
+    state["workdir"], task, ..., log_path=_agent_log_path(...))`. A run with
+    no `worktrees` entry (every 6c test, any bare `team-start`) falls back
+    to `state["workdir"]`, byte-for-byte unchanged.
+  - Three new CLI subcommands: `team-launch` (copy-pasted `--lead`/
+    `--lead-ollama`/`--members` validation from `team-start`, per spec's own
+    explicit sanction of duplication over refactoring the existing,
+    reviewed `_cli_team_start()`), `team-stop`, `team-reap`.
+  - `import calendar` added (for `_iso_to_epoch()`, used by
+    `sweep_dead_teams()`'s TTL age calculation).
+- **`app/app.py`** -- `_RESERVED_ENGINE_NAME_PREFIXES = ("switchboard",
+  "team")` (new module constant) and `_parse_engine_file()`'s single
+  `if name.startswith(...)` check now uses it. `git diff --stat -- app/
+  app.py`: 23 insertions / 11 deletions -- larger than a literal one line
+  because the surrounding comment explaining the collision was expanded to
+  cover both prefixes (the spec's own "Summary" describes this as "one
+  small, additive **change**", i.e. one conceptual change, not a literal
+  one-line diff -- 6c's own AC requiring a literal minimal diff was scoped
+  to 6c, not repeated verbatim as an AC in this spec). No route, no
+  template/JS, no new import of `app.teams` -- confirmed by grep.
+- **`config/switchboard.env.example`** -- `TEAM_WORKTREE_OP_TIMEOUT_
+  SECONDS`, `TEAM_SESSION_STALE_TTL_SECONDS`, same commented-out-with-
+  explanation style as every existing `TEAM_*` block.
+- **`docs/ADDING_AN_ENGINE.md`** -- "Reserved name" section renamed
+  "Reserved name**s**" and extended to name both prefixes and both
+  collision shapes they guard against.
+- **New test file**: `tests/test_teams_lifecycle.py` (50 tests -- 47 from
+  the first pass, `CreateTeamSessionAtomicStampTests` (round 2) and
+  `CreateTeamSessionFailingLinkCleanupTests` (round 3, 2 tests) added in
+  response to review) -- see "Verification status" below.
+
+## Key decisions / tradeoffs
+
+- **`_run_run_user_command()`'s rundir/session naming/cleanup mirrors
+  `agent_run()`'s own shape exactly** (a scratch dir under
+  `TEAM_STATE_DIR/_worktree_ops/<id>/`, `out`/`err`/`pid`/`rc` files, a
+  `finally: shutil.rmtree(...)` + best-effort `kill-session`) -- reused, not
+  reinvented, even though the function itself is much smaller (no NDJSON
+  translation, no multi-stage cancellation ladder), per the spec's own
+  explicit instruction.
+- **`_remove_worktree()`'s "dirty" classification is a substring match
+  against git's own real stderr** (`"modified or untracked files"` /
+  `"use --force"`), verified directly against the real `git` binary (both
+  the tracked-and-uncommitted and untracked-only cases) rather than assumed
+  from documentation -- see `tests/test_teams_lifecycle.py`'s
+  `CreateRemoveWorktreeRealGitTests`.
+- **`launch_team()`'s permission pre-touching order matches the spec's own
+  reasoning exactly**: `_run_dir()`/`agents/` chmod'd and every log file
+  pre-touched+chmod'd 0644 *before* `_create_team_session()` is called, so
+  no dashboard window's `tail -F` ever races file creation. Verified for
+  real under a strict `umask(0o077)` (`LaunchTeamWorldReadableUnderStrict
+  UmaskTests`), reusing 6a's own fixture technique.
+- **`_cli_team_launch()` duplicates `_cli_team_start()`'s lead-resolution
+  block rather than extracting a shared helper** -- the spec's own words
+  ("copy-pasted validation ... reused, not reinvented") read as an explicit
+  instruction to duplicate rather than touch the existing, reviewed
+  `_cli_team_start()` at all; matches minimal-diff discipline for existing
+  code.
+
+## Defects found and fixed (not in the spec's own enumerated cases)
+
+Per this story's own established pattern ("every defect so far was found by
+probing past the spec's enumerated cases... structural fixes beat tuned
+constants, running the real thing beats reasoning about it"), building this
+part surfaced two real defects, both found by exercising real git + real
+tmux sequences beyond the acceptance criteria's own literal cases, both
+fixed structurally rather than patched around.
+
+### 1. A stale, already-swept run's own state could destroy a NEWER run's live resources at the same name/path
+
+**How it was found**: manually exercising the exact "crash, reap twice,
+then launch again for the same project" sequence the acceptance criteria
+describe -- but continuing one step further than the ACs literally ask for
+(re-running `sweep_dead_teams()`/`stop_team()` a THIRD time, against the
+OLD run_id, after a brand new run had already been launched for the same
+project).
+
+**Root cause**: `_team_session_name(project_name)` and
+`_worktree_path(project_workdir, agent)` are BOTH pure functions of
+*project*, not of any one `run_id` (this is correct and matches the spec
+exactly -- `docs/story.md` §4's own architecture diagram names them this
+way). Once an old run's own session/worktree genuinely disappears (crashed,
+or cleanly reclaimed by an earlier sweep/stop pass), a completely
+different, later run for the SAME project can legitimately create a new
+session/worktree under the IDENTICAL name/path. The old run's own
+`run.json` still records that name/path, though. A LATER
+`sweep_dead_teams()`/`stop_team()` pass re-processing the OLD (still
+terminal, still past its TTL) run's record would find something now
+sitting at that name/path -- the NEW run's live session or worktree -- and
+destroy it, genuinely believing it was reclaiming its own leftover
+resource.
+
+**Fix, in two parts, both structural**:
+1. **Worktree side**: `stop_team()`/`sweep_dead_teams()` now drop a
+   `"removed"`/`"absent"` agent entry from the run's own persisted
+   `state["worktrees"]` map immediately after processing it (keeping only
+   `"dirty"`/`"error"` entries, which are self-protected anyway --
+   `_create_worktree()`'s own "path already exists" check already refuses
+   to let a future launch silently overwrite a directory that's still
+   genuinely there). Once dropped, that run's own future sweep passes never
+   look at that path again.
+2. **Session side**: this alone wasn't enough -- a session's *name* carries
+   no persisted "have I already reclaimed this" state the way a worktree
+   map entry does. Added `_TEAM_SESSION_RUN_ID_OPTION` (a tmux user option,
+   `@switchboard_team_run_id`, stamped onto the session at creation time in
+   `_create_team_session()`) and `_kill_team_session_if_owned(session,
+   run_id)`, which queries that option (`tmux show-options -t session -v
+   @switchboard_team_run_id`) before ever killing a session on a run's
+   behalf, and leaves it completely alone if it's stamped with a
+   *different* run_id. `stop_team()`/`sweep_dead_teams()`'s TTL branch both
+   now go through this instead of a raw `kill-session`. No new privileged
+   path -- `show-options`/`set-option` go through the same `TMUX` constant
+   every other tmux call in this module already uses.
+
+**Severity**: real resource destruction (a live team's tmux session or git
+worktree silently killed out from under it by an unrelated sweep pass), not
+a cosmetic issue -- but requires the TTL window to have genuinely elapsed
+for an abandoned old run while a new run for the same project is live,
+which needs real elapsed time (default 24h) at production defaults, not an
+immediate race. Fixed structurally (ownership is now checked, not assumed)
+rather than by tuning the TTL or adding a warning.
+
+**Regression coverage**: `SessionOwnershipCollisionRealTmuxTests` (2 tests,
+real git + real tmux) -- one exercising the collision via
+`sweep_dead_teams()`, one via an explicit `stop_team()` call on the old
+`run_id`, both confirming the new run's session and worktree survive
+untouched.
+
+### 2. `_run_run_user_command()`'s completion check raced a fast command's own session teardown
+
+**How it was found**: not a hypothetical -- the very first real, in-process
+smoke test of `_run_run_user_command()` (`echo "hello world"`) failed
+intermittently, and `tests/test_teams_lifecycle.py` as a whole flaked in
+6 of 10 full-file runs before the fix (well above the ~1-in-8 rate this
+story's one other disclosed flake carries), each time in a different real
+git/tmux test, always with the identical symptom: `{"ok": false, "error":
+"command session ended unexpectedly"}`.
+
+**Root cause**: the poll loop read `rc_path`, and -- only if that read came
+back empty -- checked `tmux_has(session)` to decide "still running" vs.
+"vanished without an exit code". For a command that completes in
+microseconds (`echo`, `git status` against a small repo), the entire
+spawn-run-write-rc-exit-teardown sequence can complete within a single
+polling iteration, faster than the loop's own two separate observations
+(the rc read, then the has-session check) could keep up with -- the rc file
+write is always causally complete before the session tears down (bash's own
+last statement is `echo $? > rcfile`, and the pane's process only exits
+after that), but our OWN two reads of that fact are not atomic with each
+other.
+
+**Fix**: when `tmux_has(session)` returns `False`, re-read `rc_path` ONE
+more time before concluding "ended unexpectedly" -- since the write is
+causally guaranteed to have already happened by the time the session is
+observably gone, this re-read always finds it if the command actually
+completed. This is the same class of "the underlying invariant was never
+violated, only our own observation ordering was" fix as `_build_headless_
+argv()`'s round-3 single-pass-substitution fix earlier in this story
+(structural, not a retry/sleep/tuned-timeout band-aid). `_run_headless_
+session()` (6a, unmodified, untouched by this diff) has the theoretical
+same gap but is practically unreachable there -- real engine invocations
+take seconds, never microseconds, so the race window is never wide enough
+to hit in practice; `_run_run_user_command()` is specifically for fast git
+commands, where it hits routinely.
+
+**Verification**: 15 consecutive clean runs of `tests/test_teams_
+lifecycle.py` after the fix (0 failures, versus 6/10 before); the full
+suite run 7 times this session with only the one, separately-confirmed,
+pre-existing, unrelated flake (see "Verification status" below).
+
+### 3. `_create_team_session()` left the session unstamped for a real window -- found by the reviewer, in the fix for defect #1
+
+**Not found by the developer** -- caught by the reviewer's own testing
+pass (and independently reproduced here before accepting it), in the code
+defect #1's own fix introduced this same round: a third instance of the
+identical class ("the underlying invariant can be observed inconsistently
+by a second party mid-update"), this time in the FIX rather than in
+original code.
+
+**Root cause**: `_create_team_session()` sequenced three separate tmux
+client invocations -- `new-session` (create), `set-option remain-on-exit`,
+`set-option @switchboard_team_run_id <run_id>` (the stamp defect #1's fix
+added). Between the first and third, the session existed on the server but
+was NOT yet stamped, and `_kill_team_session_if_owned()` treats an
+unstamped session as safe to kill for any `run_id`. The developer's own
+original docstring claimed this "should not happen in practice... every
+session is stamped before this function could ever see it" -- that claim
+was false, confirmed live by both the reviewer and independently
+re-confirmed here (see "Verification" below). Three things make the window
+worse than a narrow theoretical gap: (1) there is no locking anywhere in
+`app/teams.py` -- no `flock`, no `O_EXCL`, no lock file; (2)
+`sweep_dead_teams()` runs opportunistically inside EVERY `launch_team()`/
+`stop_team()` call for ANY project, not just the one being launched, so the
+window is reachable from a solo crash of the creating process with no
+concurrency on the SAME project required at all; (3) the consequence is not
+only a killed session -- depending on timing, `launch_team()` could return
+a false `{"ok": True}` for an already-dead session with no member windows,
+self-healing only whenever some later sweep happened to run.
+
+**Fix, explicitly NOT fail-closed**: the reviewer traced a concrete
+solo-crash mechanism where a blanket "treat unstamped as not-safe-to-kill"
+rule would strand a genuinely orphaned unstamped session permanently
+(needing manual `tmux kill-session` cleanup) -- trading one failure mode
+for a worse one. The correct fix removes the OBSERVABLE inconsistent state
+entirely: `_create_team_session()` now creates the session, sets
+`remain-on-exit`, and stamps its run_id in ONE atomic tmux client
+invocation, chained via tmux's own `;` command separator (`new-session ...
+; set-option ... remain-on-exit on ; set-option ... <run_id>`, `;` as its
+own argv element -- no shell involved, so no escaping needed). tmux
+processes an entire `;`-chained batch from one client connection without
+yielding to any other client's request in between, so there is never a
+moment where the session exists but isn't stamped, observable or not.
+`_kill_team_session_if_owned()`'s own "unstamped is safe to kill" behavior
+is kept exactly as it was -- correct now that creation is atomic (an
+unstamped session is a genuine orphan), whereas it was papering over a real
+race before.
+
+**Verification**: independently re-confirmed the race BEFORE trusting the
+reviewer's report, via a standalone reproduction of the old three-call
+shape run alongside a tight concurrent poller watching for "session exists,
+stamp absent" -- 10/10 trials observed the window against the old shape,
+0/10 against the fixed one-call shape. The same property is now a permanent
+regression test, `CreateTeamSessionAtomicStampTests.test_session_is_
+never_observable_unstamped_during_creation` -- confirmed this test fails
+reliably (0/8 trials would pass) against the old three-call shape and
+passes reliably (8/8) against the real, fixed `_create_team_session()`,
+not merely asserting the stamp is present after the call returns (which
+the old, racy code also satisfied, just not atomically). The reviewer
+independently re-ran this same test against its own faithful reconstruction
+of the old three-call shape and got 9/10 (matching the developer's 10/10
+within normal timing variance) plus 8/8 clean against the fix -- the
+reviewer's own verdict: "the test genuinely pins the behaviour", approved.
+
+### 4. `_create_team_session()`'s own atomic-creation fix (defect #3) never cleaned up a session that partially failed to create -- found by the reviewer
+
+**Not found by the developer** -- logged as a should-fix by the reviewer
+against round 2's own atomic-chain fix, chosen by the coordinator to close
+in this same round rather than carry as a disclosed limitation.
+
+**Root cause**: tmux's `;`-chain is atomic against a concurrent OBSERVER
+(defect #3's fix; nothing else can ever see a half-stamped session) but
+NOT against a failure PARTWAY THROUGH the chain itself -- these are two
+different guarantees. Confirmed live, both directions: if `new-session`
+itself fails (e.g. a genuine duplicate-session race), tmux aborts the WHOLE
+chain before any `set-option` runs -- the good case, and what makes defect
+#3's fix correct. But if `new-session` SUCCEEDS and a LATER link fails (in
+practice only the run_id `set-option` realistically could, and only if
+something made the option name itself invalid -- neither the hardcoded
+`remain-on-exit on` nor an `@`-prefixed user option's freeform string value
+is expected to fail under normal operation), tmux does NOT roll back the
+already-successful `new-session`. Confirmed directly against the real
+binary: `tmux new-session -d -s S ... \; set-option -t S remain-on-exit on
+\; set-option -t S not-a-real-option val` exits nonzero, but `S` is left
+alive, `remain-on-exit`d, unstamped. `_create_team_session()`'s own failure
+branch detected this (`r.returncode != 0`) and returned an error, but never
+killed the session it had just partially created.
+
+**Consequence, exactly as the coordinator described**: a lockout with no
+self-heal path -- every future `launch_team()` for that project refused by
+the upfront `tmux_has()` precondition; `sweep_dead_teams()` structurally
+unable to ever find it (`launch_team()` never persists a `run.json` on this
+failure path, and `sweep_dead_teams()` only ever iterates recorded runs);
+recovery via manual `tmux kill-session` only. The same shape as 6a's own
+first defect (a fallible call sitting outside its own cleanup, leaking a
+resource) -- there, a rundir; here, a tmux session. Rated should-fix, not
+must-fix (a well-formed hardcoded `set-option` failing has no realistic
+trigger under normal operation), but fixed anyway per the coordinator's own
+reasoning: "recoverable only by manual intervention" is exactly the sharp
+edge this codebase keeps engineering out, and the same defect CLASS
+deserves the same structural treatment it already got in 6a, not a
+narrower patch scoped to "this one unlikely trigger".
+
+**Fix, and the ownership question worked through explicitly (per the
+coordinator's own instruction to think it through, not just patch it)**:
+the failure branch now kills whatever session it finds at `session` --
+`_kill_team_session_if_owned()` is the WRONG tool here, because it
+identifies ownership from the STAMP, and the stamp is precisely what may
+never have landed on this failure path. Ownership is instead established
+structurally, from the calling context itself, not from any tmux-side
+state: this function's own upfront `tmux_has(session)` check already
+confirmed no session with this exact name existed the instant this call
+started, and (confirmed above) a failing `new-session` aborts before any
+`set-option` runs, so a concurrent second caller for the SAME project can
+never reach this cleanup branch holding someone ELSE's session at this
+name -- either `new-session` failed for THIS call (nothing exists to clean
+up) or it succeeded (only this call created whatever exists at this name).
+So `tmux_has(session)` being true on this failure path can only mean "this
+exact call's own partially-created session" -- a direct, unconditional
+`kill-session` is correct and safe without consulting a stamp that may not
+exist. Both function docstrings (`_create_team_session()`'s own, and a
+forward-reference from `_kill_team_session_if_owned()`'s) spell out this
+reasoning so it isn't re-derived from scratch by a future reader.
+
+**Regression coverage**: `CreateTeamSessionFailingLinkCleanupTests` (2
+tests) -- reproduces the failing-link path FOR REAL (not mocked) by
+monkeypatching `_TEAM_SESSION_RUN_ID_OPTION` to a non-`"@"`-prefixed name,
+which makes the real tmux `set-option` call itself genuinely fail with
+"invalid option", exercising the actual code path. One test asserts no
+session survives the failure; the other proves the lockout consequence
+directly -- a SECOND `_create_team_session()` call for the same project
+succeeds cleanly right after the first one's failure, which it could not
+have done against the old (leaking) code. Independently verified the first
+test fails against a reverted (no-cleanup) copy of the function before
+trusting it as a regression test, mirroring the same discipline used for
+defect #3's own test.
+
+## Deviations from spec
+
+None found to be genuine deviations from the letter of `docs/spec.md` --
+the two items above are **additions** (new functions/logic not named by the
+spec) fixing defects the spec's own design didn't anticipate, not
+departures from what the spec specified. Every function signature, message
+string, and control-flow shape named explicitly in "Proposed approach" (§1-
+§11) was implemented as written. One assumption made where the spec is
+silent: **`launch_team()`'s `project_name` is derived as
+`os.path.basename(os.path.normpath(workdir))`** -- the spec never states
+this derivation explicitly (only that `_worktree_path()`/session names are
+keyed off "the project"), but it is the only reading consistent with
+`app.py`'s own existing `active_engine()`/`instance_start()` convention
+(`workdir = PROJECTS_DIR/<name>`, session `f"{engine}-{name}"`), and is what
+makes `docs/spec.md`'s acceptance criterion ("a `team-<project>` tmux
+session") concrete.
+
+## Known limitations
+
+- **A real unstamped-session race window existed in this cycle's own first
+  pass and is now closed** -- see "Defects found and fixed" #3. Disclosed
+  here explicitly (not just in that section) because the window itself was
+  never called out anywhere before the reviewer found it, and this section
+  is supposed to be the complete, honest list of what's still true about
+  the shipped code: as of the fix, it is NOT still true (the atomic-
+  creation fix + its regression test close it), but the omission itself is
+  worth naming so it isn't silently dropped from this cycle's own record.
+- **`launch_team()`'s `project_name = os.path.basename(os.path.normpath
+  (workdir))` yields an empty string for a filesystem-root `workdir`**
+  (`os.path.basename(os.path.normpath("/")) == ""`), which would produce a
+  session literally named `"team-"` -- a real, if extremely unlikely, edge
+  case (non-blocking nit, logged by the reviewer). **Decision: left
+  as-is, not hardened.** In every real path that reaches `launch_team()`
+  (this cycle's own CLI, and part 2's future HTTP route), `workdir` is
+  always `PROJECTS_DIR/<name>` where `<name>` already passed this
+  codebase's own `NAME_RE` validation elsewhere -- it is never a bare `/`.
+  The only way to hit this at all is calling `launch_team("/", ...)`
+  directly as a library function with a project actually rooted at the
+  filesystem root (and even then, `_validate_project_for_team("/")` would
+  need to actually pass -- a real git repo living at `/` with a clean,
+  non-detached HEAD -- which is already an exceptionally unusual host
+  configuration in its own right, gating this out in practice before
+  `project_name` is ever computed). Hardening it (e.g. rejecting an empty
+  `project_name` explicitly) would be a one-line, low-risk addition, but
+  adding a check with no reachable, real-world caller to protect against
+  is exactly the kind of speculative hardening this codebase's own
+  "minimal diff, no drive-by additions" discipline argues against; revisit
+  if part 2's HTTP route ever accepts an operator-supplied path rather than
+  a `PROJECTS_DIR`-relative name.
+- **Part 2's own scope is untouched, as specced**: no HTTP routes, no
+  `app.py` import of `app.teams`, no background driving thread, no
+  `_reap_dead_state()` wiring, no `install.sh --with-ollama`. A human still
+  drives a launched team via `team-resume <run_id>` from a shell.
+- **The four-things-don't-stop-together footgun disclosed in the spec is
+  real and unchanged**: running `team-stop` while a `team-start`/
+  `team-resume` process for the same `run_id` is active in another terminal
+  can still race that process's own in-flight `agent_run()` call, exactly
+  as `docs/spec.md` "What 'stopping a team' does and does not stop" already
+  discloses. Not addressed here -- explicitly part 2's job (a real
+  cancellation channel the driving thread can observe).
+- **6c's own three carried-forward limitations** (codex tier 2 unverified
+  end to end; repeated delegation mitigated, not fixed; the `None`-mapping-
+  value follow-up) remain untouched, as the spec itself states this cycle
+  never touches the lead loop/tier adapters/`_build_headless_argv()` (true
+  except for the one, unrelated, `_run_run_user_command()` fix above, which
+  is new code in a new function, not a change to any of those three areas).
+- **The tier-1/tier-2/tier-3 real-model verification this file's 6c section
+  documents was not re-run this cycle** -- 6d part 1 never touches
+  `_call_lead()`/the adapters, and the one delegate-branch change (worktree
+  + `log_path`) is exercised for real in `TeamRunDelegateWorktreeAndDashboard
+  Tests` with a scripted stand-in engine (real tmux, real `agent_run()`
+  call, real file-placement/session-continuity check), not against a real
+  `claude`/`codex`/Ollama endpoint -- disclosed here rather than silently
+  reused from 6c's own verification.
+
+## What was mocked vs. exercised for real
+
+Per this role's own "not testable is a claim to verify" discipline: nothing
+in this cycle's core logic was left mocked without first trying the real
+thing.
+
+- **Real, not mocked**: every git operation (`git init`/`worktree add`/
+  `worktree remove`/`status`/`symbolic-ref`/`branch --list`) against real
+  temp repositories; every tmux operation (`new-session`/`new-window`/
+  `list-windows`/`capture-pane`/`kill-session`/`show-options`/`set-option`)
+  against a real, locally-running tmux server (TMUX patched from `["sudo",
+  "-u", RUN_USER, "/usr/bin/tmux"]` down to `["tmux"]`, same technique
+  `tests/test_teams_headless.py` already established -- no sudo needed for
+  the test suite; the CLI-subprocess tests deliberately do NOT patch this,
+  relying on the same real `sudo -u $RUN_USER tmux` path 6c's own
+  `ResolveInSeparateProcessTests` already proved works in this environment);
+  a real strict `umask(0o077)` for the permission test.
+- **A scripted stand-in engine (`fake_teammate.py`), not the real `claude`/
+  `codex`/`aider` CLI**, for the delegate-worktree-continuity test --
+  matches 6a's own `RealTmuxHeadlessTests` precedent (script-based stand-ins
+  for the actual engine binary, real tmux/real `agent_run()` around them).
+  The real `claude`/`codex` binaries were not re-exercised through the
+  worktree path this cycle (no new claim is made that they were); this is
+  the same class of disclosed gap 6c already carries for `codex`/`aider`.
+- **A stub, unreachable `TEAM_LLM_BASE_URL`** for the CLI subprocess tests
+  (`team-launch --lead-ollama`) -- `launch_team()` never actually calls the
+  lead (it doesn't drive the loop, per spec), so the endpoint is validated
+  for presence only, never dialed. Disclosed rather than silently assumed
+  equivalent to a real endpoint.
+
+## Verification status
+
+| Check | Command | Result |
+|---|---|---|
+| Syntax/compile | `python3 -m py_compile app/app.py app/teams.py` | clean |
+| `app.py` diff scope | `git diff --stat -- app/app.py` | 23 insertions / 11 deletions, entirely the reservation-tuple change + its comment |
+| `app.py` imports `app.teams`? | `grep -n "import teams\|app\.teams" app/app.py` | no matches -- confirmed absent, per spec |
+| Pre-existing suites byte-for-byte unmodified | `git diff --stat -- tests/test_teams_headless.py tests/test_teams_lead.py tests/test_teams_grounding.py` | empty -- all three untouched |
+| New test file alone, 29 consecutive runs across three rounds | `pytest tests/test_teams_lifecycle.py -q` x15 (round 1, post defect #2 fix, 47 tests) + x8 (round 2, post defect #3 fix, 48 tests) + x6 (round 3, post defect #4 fix, 50 tests) | passed every single run, 0 flakes any round |
+| Full suite, 17 runs across three rounds | `pytest tests/ -q` | round 1: 6/7 clean at 635 passed; round 2: 4/5 clean at 636 passed; round 3: 5/5 clean at **638 passed** (588 baseline + 50). 2 runs total (both rounds 1/2) hit the pre-existing, disclosed `test_run_sh_and_prompt_file_are_world_readable_under_a_strict_umask` flake in `test_teams_headless.py` (untouched by this diff -- `git diff --stat -- tests/test_teams_headless.py` empty), independently confirmed to pass in isolation immediately after every time -- not attributable to this change; 0 such flakes in round 3's own 5 runs |
+| No new sudoers/privileged path | `git diff -- app/teams.py \| grep -iE "sudo\|subprocess\.(run\|Popen)"` on added lines, manually reviewed | every call outside `TMUX + [...]` is one of the three read-only SVC_USER `git -C workdir ...` precondition checks in `_validate_project_for_team()` -- confirmed, no new crossing |
+| `git worktree remove` never uses `--force` | `grep -n '"remove"' app/teams.py`, `grep -n force app/teams.py` | only reachable use of `--force` is inside a human-facing error MESSAGE (the manual-cleanup suggestion), never in an actual argv passed to git |
+| Grounding read-only guards untouched | `git diff --stat -- tests/test_teams_grounding.py` | empty |
+| `realpath()` fallback section untouched | `grep -n realpath app/teams.py`, compared against pre-diff | unchanged, this diff doesn't touch that section |
+| Deploy stays manual-click-only | `git diff -- app/teams.py \| grep -i deploy` | no matches -- unrelated to this diff |
+| Real git `git worktree remove` dirty-message text | manual repro (see report), `CreateRemoveWorktreeRealGitTests` | confirmed live: `"contains modified or untracked files, use --force to delete it"`, both tracked-and-uncommitted and untracked-only cases |
+| Defect #1 (session/worktree ownership collision) | `SessionOwnershipCollisionRealTmuxTests` (2 tests), manually reproduced before the fix and re-verified after | fixed, regression-tested |
+| Defect #2 (`_run_run_user_command()` fast-command race) | 15x `test_teams_lifecycle.py` full-file reruns, manual repro before/after | fixed, 0/15 flakes after the fix vs. 6/10 before |
+| Defect #3 (unstamped-session race, reviewer-found) | `CreateTeamSessionAtomicStampTests` (1 test, concurrent-poller technique); independently reproduced via a standalone old-vs-new comparison before trusting the report; reviewer's own independent re-run against its own reconstruction: 9/10 old-shape catches, 8/8 clean vs. the fix | fixed, reviewer-approved |
+| Defect #4 (failing-link cleanup, reviewer-found) | `CreateTeamSessionFailingLinkCleanupTests` (2 tests), a REAL (not mocked) failing-link repro via a monkeypatched invalid tmux option name; independently confirmed the first test fails against a reverted (no-cleanup) copy of the function before trusting it | fixed; real repro confirms a leftover, unstamped session under the old code, and its absence plus a successful subsequent launch under the fixed code |
+
+## How to verify locally
+
+```bash
+# Full suite (run several times -- one pre-existing, disclosed flake in
+# test_teams_headless.py, unrelated to this diff, appears roughly 1 run in 8)
+/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q
+
+# New test file alone
+/home/dev/.local/bin/uv run --with pytest python -m pytest tests/test_teams_lifecycle.py -v
+
+# Confirm app/app.py's diff is limited to the reservation-tuple change
+git diff --stat -- app/app.py
+grep -n "import teams\|app\.teams" app/app.py   # expect: no matches
+
+# Real end-to-end smoke test against a real scratch git repo (no sudo --
+# run as whichever user has a locally-running tmux; substitute a real
+# RUN_USER-privileged environment to exercise the real sudoers crossing)
+mkdir -p /tmp/scratch-6d/demo && cd /tmp/scratch-6d/demo
+git init -q && echo hi > README.md && git add README.md && git commit -q -m init
+python3 /home/dev/projects/ai-dev-switchboard/app/teams.py team-launch \
+  /tmp/scratch-6d/demo --task "do the thing" --lead-ollama --members "claude,codex"
+tmux list-windows -t team-demo
+git worktree list
+python3 /home/dev/projects/ai-dev-switchboard/app/teams.py team-stop <run_id>
+python3 /home/dev/projects/ai-dev-switchboard/app/teams.py team-reap
+```

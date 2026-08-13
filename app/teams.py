@@ -31,6 +31,7 @@ Run with:
     python3 -m unittest discover -s tests -v
 """
 import argparse
+import calendar
 import errno
 import json
 import os
@@ -129,6 +130,27 @@ TEAM_DELEGATE_RESULT_MAX_CHARS = int(os.environ.get("TEAM_DELEGATE_RESULT_MAX_CH
 # own maximum simultaneously (docs/spec.md's own "every magic constant here
 # must be justified against a real oversize case" -- see docs/implementation.md).
 TEAM_LEAD_PROMPT_MAX_CHARS = int(os.environ.get("TEAM_LEAD_PROMPT_MAX_CHARS", "20000"))
+
+# Team session lifecycle -- worktrees + tmux dashboard session (backlog item
+# 6d, part 1, docs/spec.md §11). TEAM_WORKTREE_OP_TIMEOUT_SECONDS bounds a
+# single `git worktree add`/`remove` invocation (via _run_run_user_command())
+# -- 30s is generous for a well-behaved git command against a local
+# filesystem, not tuned against a measured pathological case the way the
+# headless-engine timeouts above are (a hung git process, e.g. an index lock
+# held by another process, is the only realistic way to hit this).
+TEAM_WORKTREE_OP_TIMEOUT_SECONDS = float(os.environ.get("TEAM_WORKTREE_OP_TIMEOUT_SECONDS", "30"))
+
+# TTL backstop for a team-<project> tmux session/its worktrees once the run
+# has reached a terminal status (finished/escalated_max_rounds/error/
+# stopped) -- mirrors UPLOAD_STAGING_TTL_SECONDS's own precedent (app/app.py,
+# docs/ARCHITECTURE.md "Upload staging"): a resource deliberately NOT torn
+# down in a `finally`, reclaimed opportunistically instead (sweep_dead_
+# teams()). 86400 (24h) -- long enough that a human reviewing a finished
+# team's worktrees the next morning still finds them, short enough not to
+# accumulate indefinitely on a box that's never rebooted. Never applies to
+# status=="blocked_ask_user", at any age -- see sweep_dead_teams()'s own
+# docstring and docs/spec.md "Open questions".
+TEAM_SESSION_STALE_TTL_SECONDS = int(os.environ.get("TEAM_SESSION_STALE_TTL_SECONDS", "86400"))
 
 # Bash's own `$?` convention for a foreground child killed by signal N is
 # 128+N (POSIX, confirmed live for SIGTERM against `claude -p` during this
@@ -2240,7 +2262,8 @@ def _inbox_resolved_path(run_id: str) -> str:
 
 
 def _new_state(run_id: str, workdir: str, lead: dict, members: list, task: str,
-               max_rounds: int = None) -> dict:
+               max_rounds: int = None, *, project_name: str = None,
+               worktrees: dict = None) -> dict:
     now = _now_iso()
     return {
         "run_id": run_id, "workdir": workdir, "lead": lead, "members": list(members),
@@ -2248,6 +2271,11 @@ def _new_state(run_id: str, workdir: str, lead: dict, members: list, task: str,
         "max_rounds": max_rounds or TEAM_MAX_ROUNDS, "teammate_sessions": {},
         "history": [], "malformed_retries": 0, "in_progress_delegate": None,
         "summary": None, "error": None, "created_at": now, "updated_at": now,
+        # Both additive (backlog item 6d part 1, docs/spec.md §4) -- None/{}
+        # for a bare team-start (6c path, no team-launch), exactly the same
+        # shape 6c's own tests already persist. Only launch_team() ever
+        # supplies real values.
+        "project_name": project_name, "worktrees": worktrees or {},
     }
 
 
@@ -2484,8 +2512,18 @@ def team_step(state: dict) -> dict:
         state["in_progress_delegate"] = {"round": round_n, "agent": agent, "task_preview": task[:200]}
         _persist(state)  # marked BEFORE the blocking call -- see docs/spec.md
                          # "Mid-delegate crash"
-        result = agent_run(agent, state["workdir"], task,
-                          session_id=state["teammate_sessions"].get(agent))
+        # backlog item 6d part 1, docs/spec.md §4: a teammate with its own
+        # worktree (created by launch_team()) runs there, not against the
+        # shared project tree -- and every delegation to the same agent
+        # shares one stable, append-mode log path, so that agent's tmux
+        # dashboard window shows continuity across multiple delegations. A
+        # run with no worktrees entry for `agent` (every 6c test, any bare
+        # team-start that skipped team-launch) falls back to
+        # state["workdir"] -- byte-for-byte the existing 6c behavior.
+        worktree = state.get("worktrees", {}).get(agent)
+        result = agent_run(agent, worktree or state["workdir"], task,
+                          session_id=state["teammate_sessions"].get(agent),
+                          log_path=_agent_log_path(state["run_id"], agent))
         state["in_progress_delegate"] = None
         state["teammate_sessions"][agent] = result.get("session_id")
         state["action_count"] += 1
@@ -2583,6 +2621,687 @@ def team_run(state: dict) -> dict:
             break
         team_step(state)
     return state
+
+
+# ─── team session lifecycle: worktrees + tmux dashboard session ──────────
+# (backlog item 6d, part 1, docs/spec.md) -- per-teammate git worktrees, a
+# persistent team-<project> tmux session with one DASHBOARD window per agent
+# (a `tail -F` over that agent's own stable, append-mode event log -- NOT a
+# window whose command is the headless CLI itself; see docs/story.md §2.2's
+# own "Correction" and docs/spec.md "Why dashboard windows, not process
+# windows" for why that's the correct reading, not a deviation), and a
+# sweep_dead_teams() self-heal function for both. CLI-only this part
+# (team-launch/team-stop/team-reap) -- no HTTP route, no background thread,
+# no change to how a human currently drives a run (team-resume, unchanged).
+
+# Fixed, deliberately not an env var -- same rationale as
+# _GROUNDING_READ_CAP_BYTES: the grace window between a targeted SIGTERM and
+# falling back to `tmux kill-session` for a worktree op is an implementation
+# detail of the escalation itself, not an operator knob a well-behaved git
+# command should ever need tuned.
+_WORKTREE_OP_KILL_GRACE_SECONDS = 3.0
+
+
+def _run_run_user_command(argv: list, cwd: str, timeout: float = None) -> dict:
+    """
+    Runs argv as RUN_USER, synchronously, via the SAME TMUX constant
+    app.py's instance_start()/agent_run() already use -- no new sudoers
+    rule, no new privileged path (docs/ARCHITECTURE.md "Processes and
+    privilege boundaries"). Spawns a throwaway tmux session (`sudo -u
+    RUN_USER tmux new-session -d -c cwd bash -lc "argv...; echo $? >
+    rcfile"`), polls for rcfile the same way agent_run()/_run_headless_
+    session() poll for out.rc, and -- if the command outlives `timeout` --
+    sends one targeted SIGTERM to the backgrounded process (reusing
+    _send_signal(), the same cross-UID-signal-via-a-throwaway-tmux-session
+    trick agent_run() already uses), then falls back to `tmux kill-session`
+    after a short, fixed grace period if it's still not gone. A single
+    TERM-then-kill-session escalation is enough for a well-behaved git
+    command -- not the full multi-stage ladder _run_headless_session() uses
+    for an LLM-driven engine that might ignore SIGTERM mid-tool-use.
+
+    Returns {"ok": bool, "rc": int|None, "stdout": str, "stderr": str,
+    "timed_out": bool, "error": str|None}. Never raises -- a failure to
+    start the session, a permission error reading RUN_USER-written state
+    files back (a strict RUN_USER umask, mirroring agent_run()'s own
+    _HeadlessReadPermissionError handling), a vanished session, and a
+    timeout all degrade to a specific `ok=False`/`error`, never an
+    exception escaping to the caller.
+    """
+    if timeout is None:
+        timeout = TEAM_WORKTREE_OP_TIMEOUT_SECONDS
+    op_id = f"{int(time.time())}-{secrets.token_hex(6)}"
+    rundir = os.path.join(TEAM_STATE_DIR, "_worktree_ops", op_id)
+    session = f"switchboard-worktree-op-{op_id}"
+    try:
+        os.makedirs(rundir, exist_ok=True)
+        os.chmod(rundir, 0o711)
+        out_path = os.path.join(rundir, "out")
+        err_path = os.path.join(rundir, "err")
+        pid_path = os.path.join(rundir, "pid")
+        rc_path = os.path.join(rundir, "rc")
+
+        script = shlex.join(argv)
+        script += f" >{shlex.quote(out_path)} 2>{shlex.quote(err_path)}"
+        script += f" & echo $! >{shlex.quote(pid_path)}; wait $!; echo $? >{shlex.quote(rc_path)}"
+
+        try:
+            subprocess.run(TMUX + ["new-session", "-d", "-s", session, "-c", cwd,
+                                   "bash", "-lc", script])
+        except OSError as e:
+            return {"ok": False, "rc": None, "stdout": "", "stderr": "",
+                    "timed_out": False, "error": f"failed to start command: {e}"}
+
+        def _finish_if_rc_ready(rc):
+            if rc is None:
+                return None
+            try:
+                stdout = _read_stderr_tail(out_path, TEAM_HEADLESS_STDERR_TAIL_BYTES)
+                stderr = _read_stderr_tail(err_path, TEAM_HEADLESS_STDERR_TAIL_BYTES)
+            except _HeadlessReadPermissionError as e:
+                return {"ok": False, "rc": rc, "stdout": "", "stderr": "",
+                        "timed_out": False, "error": f"permission denied reading {e.path}"}
+            return {"ok": rc == 0, "rc": rc, "stdout": stdout, "stderr": stderr,
+                    "timed_out": False,
+                    "error": None if rc == 0 else (stderr.strip() or f"command exited with code {rc}")}
+
+        deadline = time.time() + timeout
+        pid = None
+        escalated_at = None
+        while True:
+            try:
+                if pid is None:
+                    pid = _read_int_file(pid_path)
+                rc = _read_int_file(rc_path)
+            except _HeadlessReadPermissionError as e:
+                return {"ok": False, "rc": None, "stdout": "", "stderr": "",
+                        "timed_out": False, "error": f"permission denied reading {e.path}"}
+            result = _finish_if_rc_ready(rc)
+            if result is not None:
+                return result
+            if not tmux_has(session):
+                # The rc-file WRITE always causally precedes the pane
+                # process exiting (bash's own last statement is `echo $? >
+                # rcfile`, only after which the script -- and therefore the
+                # pane's sole process -- exits), so once tmux_has() has
+                # transitioned to False the write is guaranteed to already
+                # be on disk. But OUR two observations (the rc read a few
+                # lines above, and this has-session check) are not atomic
+                # with each other -- for a very fast command (a plain
+                # `echo`, `git status` against a small repo) the entire
+                # spawn-run-exit-teardown sequence can complete within a
+                # single polling iteration, faster than our own rc read
+                # noticed it. A real, frequently-reproducing race found by
+                # exercising this for real (not a hypothetical): re-read
+                # rc_path ONE more time before concluding "vanished without
+                # a recorded exit code" -- structurally closes the gap
+                # rather than papering over it with a retry/sleep.
+                try:
+                    rc = _read_int_file(rc_path)
+                except _HeadlessReadPermissionError as e:
+                    return {"ok": False, "rc": None, "stdout": "", "stderr": "",
+                            "timed_out": False, "error": f"permission denied reading {e.path}"}
+                result = _finish_if_rc_ready(rc)
+                if result is not None:
+                    return result
+                # Genuinely gone with no exit code ever recorded (the whole
+                # tmux server killed, kill-session called externally, disk
+                # failure mid-write) -- never optimistically assumed clean,
+                # same discipline _run_headless_session() already applies
+                # to this exact ambiguity for the headless-engine case.
+                return {"ok": False, "rc": None, "stdout": "", "stderr": "",
+                        "timed_out": False, "error": "command session ended unexpectedly"}
+            now = time.time()
+            if now >= deadline and escalated_at is None:
+                if pid is not None:
+                    _send_signal(session, pid, "TERM")
+                escalated_at = now
+            elif escalated_at is not None and (now - escalated_at) >= _WORKTREE_OP_KILL_GRACE_SECONDS:
+                subprocess.run(TMUX + ["kill-session", "-t", session], capture_output=True)
+                return {"ok": False, "rc": None, "stdout": "", "stderr": "",
+                        "timed_out": True, "error": f"command timed out after {timeout}s"}
+            time.sleep(0.1)
+    finally:
+        shutil.rmtree(rundir, ignore_errors=True)
+        if tmux_has(session):
+            subprocess.run(TMUX + ["kill-session", "-t", session], capture_output=True)
+
+
+def _validate_project_for_team(workdir: str):
+    """
+    Read-only checks against the project's own working tree (NOT a
+    worktree -- the main directory a team is launched against). Run as
+    SVC_USER, plain subprocess.run(["git", "-C", workdir, ...]) -- no
+    privilege crossing needed, matching the existing precedent that
+    grounding discovery (load_grounding()) already reads project files
+    directly as SVC_USER with no TMUX involvement. Returns a specific error
+    message, or None if the project is a clean, non-detached git repo.
+    Three distinct checks, three distinct messages, in order:
+      1. `git -C workdir rev-parse --is-inside-work-tree` fails/!= "true"
+         -> "not a git repository"
+      2. `git -C workdir symbolic-ref -q HEAD` fails (detached HEAD)
+         -> "HEAD is detached -- check out a branch before starting a team"
+      3. `git -C workdir status --porcelain` non-empty (tracked OR
+         untracked changes -- settled by the user, docs/spec.md "Open
+         questions": the safer default)
+         -> "working tree has uncommitted changes -- commit or stash them
+             before starting a team"
+    Never raises -- a missing git binary or an unexpected subprocess error
+    also degrades to a specific, non-traceback message.
+    """
+    try:
+        r = subprocess.run(["git", "-C", workdir, "rev-parse", "--is-inside-work-tree"],
+                           capture_output=True, text=True)
+    except OSError as e:
+        return f"could not run git: {e}"
+    if r.returncode != 0 or r.stdout.strip() != "true":
+        return "not a git repository"
+
+    try:
+        r = subprocess.run(["git", "-C", workdir, "symbolic-ref", "-q", "HEAD"],
+                           capture_output=True, text=True)
+    except OSError as e:
+        return f"could not run git: {e}"
+    if r.returncode != 0:
+        return "HEAD is detached -- check out a branch before starting a team"
+
+    try:
+        r = subprocess.run(["git", "-C", workdir, "status", "--porcelain"],
+                           capture_output=True, text=True)
+    except OSError as e:
+        return f"could not run git: {e}"
+    if r.returncode != 0:
+        return f"could not check working tree status: {r.stderr.strip() or 'unknown error'}"
+    if r.stdout.strip():
+        return "working tree has uncommitted changes -- commit or stash them before starting a team"
+    return None
+
+
+def _worktree_path(project_workdir: str, agent: str) -> str:
+    return f"{project_workdir}.teams/{agent}"  # docs/spec.md §3, verbatim
+
+
+def _create_worktree(project_workdir: str, agent: str, run_id: str) -> dict:
+    """
+    {"ok": True, "path": ..., "branch": ...} or {"ok": False, "error": ...}.
+    A leftover from a previous run (the path already exists -- including the
+    same-launch-attempt "member named twice" case, docs/spec.md "Edge
+    cases") gets a SPECIFIC message naming the agent and path, never a raw
+    git "already exists" stderr dump. On a real `git worktree add` failure,
+    the error is the command's own stderr tail, never a bare non-zero exit
+    with no explanation.
+    """
+    path = _worktree_path(project_workdir, agent)
+    if os.path.exists(path):
+        return {"ok": False, "error":
+                f"a previous team run's worktree for '{agent}' still has uncommitted "
+                f"changes at {path} -- resolve and remove it manually "
+                "(`git worktree remove --force`) before starting a new team"}
+    branch = f"team-{run_id}-{agent}"
+    result = _run_run_user_command(
+        ["git", "-C", project_workdir, "worktree", "add", "-b", branch, path, "HEAD"],
+        cwd=project_workdir)
+    if not result["ok"]:
+        detail = (result.get("stderr") or "").strip() or result.get("error") or "unknown error"
+        return {"ok": False, "error": f"failed to create worktree for '{agent}': {detail}"}
+    return {"ok": True, "path": path, "branch": branch}
+
+
+def _remove_worktree(project_workdir: str, path: str) -> str:
+    """
+    `git -C project_workdir worktree remove {path}` (NO --force) via
+    _run_run_user_command(). Three-way outcome, not a bool: "removed" (rc
+    0), "dirty" (git refused because of local/untracked changes -- path is
+    left exactly as-is, branch untouched -- git's own real behavior,
+    confirmed live: "contains modified or untracked files, use --force to
+    delete it"), "error" (anything else -- also left as-is). Callers report
+    "dirty" distinctly from "error", since a dirty worktree being left
+    behind is the INTENDED safety behavior, not a failure. Callers are
+    responsible for checking existence first (this function assumes `path`
+    exists -- a nonexistent path is a caller-level "absent" case, not one of
+    this function's three).
+    """
+    result = _run_run_user_command(
+        ["git", "-C", project_workdir, "worktree", "remove", path],
+        cwd=project_workdir)
+    if result["ok"]:
+        return "removed"
+    stderr = (result.get("stderr") or "").lower()
+    if "modified or untracked files" in stderr or "use --force" in stderr:
+        return "dirty"
+    return "error"
+
+
+def _agent_log_path(run_id: str, agent: str) -> str:
+    return os.path.join(_run_dir(run_id), "agents", f"{agent}.jsonl")
+
+
+def _team_session_name(project_name: str) -> str:
+    return f"team-{project_name}"
+
+
+# tmux session-scoped user option (must start with "@", tmux's own
+# convention) this module stamps onto every team-<project> session at
+# creation time -- see _kill_team_session_if_owned()'s own docstring for why
+# this exists: team-<project> session NAMES are scoped to the project, not
+# to any one run_id, so once one run's session is gone, a later, different
+# run for the SAME project can legitimately create another session under
+# the IDENTICAL name. Without a way to tell "is the currently-live
+# team-<project> session actually mine", a stale stop_team()/
+# sweep_dead_teams() pass over an old, terminal run could kill a newer run's
+# live session out from under it -- a real defect found by exercising a
+# crash-then-relaunch-then-reap sequence for real, not a hypothetical.
+_TEAM_SESSION_RUN_ID_OPTION = "@switchboard_team_run_id"
+
+
+def _team_session_run_id(session: str) -> str:
+    """Returns the run_id stamped into `session`'s own tmux user option, or
+    "" if the session doesn't exist or was never stamped (e.g. a
+    partially-failed _create_team_session() call)."""
+    r = subprocess.run(TMUX + ["show-options", "-t", session, "-v", _TEAM_SESSION_RUN_ID_OPTION],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return ""
+    return r.stdout.strip()
+
+
+def _kill_team_session_if_owned(session: str, run_id: str) -> bool:
+    """
+    Kills `session` and returns True (removed, or was already absent)
+    UNLESS it exists AND is stamped with a DIFFERENT run_id than `run_id` --
+    in which case it's left completely alone (it belongs to a newer run for
+    the same project) and this returns True anyway, since from THIS run_id's
+    own perspective its session is not there to remove either way (it was
+    never that one). An unstamped session is treated as safe to kill.
+
+    This is only correct because _create_team_session() creates AND stamps
+    a team-<project> session in ONE atomic tmux client invocation (`new-
+    session ... ; set-option ... remain-on-exit ... ; set-option ...
+    _TEAM_SESSION_RUN_ID_OPTION ...`, chained via tmux's own `;` command
+    separator) -- there is never a moment where a session with this name
+    exists on the server but hasn't been stamped yet. An earlier version of
+    this function's docstring claimed the same thing about three SEPARATE
+    tmux calls ("should not happen in practice") -- that claim was false: a
+    real, independently-confirmed race existed in that window (no locking
+    exists anywhere in this module; sweep_dead_teams() runs opportunistically
+    inside every launch_team()/stop_team() call for ANY project, not just
+    the one being launched, so the window was reachable without any
+    concurrency on the SAME project at all -- a solo crash of the creating
+    process between the `new-session` and the stamp was enough). Fixed by
+    removing the observable unstamped state entirely (atomic creation),
+    not by making this function fail-closed on an unstamped session -- a
+    fail-closed rule here would instead strand a genuinely orphaned
+    unstamped session (the one class the OLD three-call code really could
+    still produce, e.g. a crash between the `new-session` reply and the
+    stamp) permanently, requiring manual `tmux kill-session` cleanup. See
+    docs/implementation.md "Defects found and fixed" for the full history.
+    """
+    if not tmux_has(session):
+        return True
+    owner = _team_session_run_id(session)
+    if owner and owner != run_id:
+        return True  # belongs to a different, newer run -- not touched
+    subprocess.run(TMUX + ["kill-session", "-t", session], capture_output=True)
+    return not tmux_has(session)
+
+
+def _create_team_session(project_name: str, run_id: str, members: list) -> dict:
+    """
+    {"ok": True, "session": ...} or {"ok": False, "error": ...}. Refuses up
+    front (tmux_has() check, same precondition style instance_start() already
+    uses for active_engine()) if a session with this name already exists --
+    never lets a raw `tmux new-session` "duplicate session" error be the
+    thing that surfaces. Window 0 named "lead" (transcript.jsonl), one window
+    per member in --members order, named after the member's own engine name
+    (that agent's own .jsonl log, see _agent_log_path()). Each window's pane
+    command is `tail -n +1 -F {log_path} || sleep infinity` (`-n +1` so
+    attaching mid-run shows full history, not just new lines; `|| sleep
+    infinity` keeps the window alive/attachable even if `tail` itself fails
+    outright, e.g. a permission edge case, rather than the window vanishing).
+
+    The session is created, `remain-on-exit on` set, AND stamped with its
+    own run_id as a tmux user option (see _TEAM_SESSION_RUN_ID_OPTION) --
+    all in ONE atomic tmux client invocation, chained via tmux's own `;`
+    command separator (its own argv element, not shell-escaped -- no shell
+    is involved, subprocess.run() gets a plain argv list). This is
+    deliberate, not a style choice: tmux processes every command in one
+    `;`-chained batch from a single client connection without yielding to
+    any OTHER client's request in between (the whole point of `;`-chaining,
+    verified directly against the real binary), so there is never a moment
+    where a session with this name exists on the server but isn't stamped
+    yet -- closing a real race an earlier, three-separate-calls version of
+    this function had (see _kill_team_session_if_owned()'s own docstring
+    for the full history: no locking exists anywhere in this module, and
+    sweep_dead_teams() runs opportunistically inside every launch_team()/
+    stop_team() call for ANY project, so the unstamped window was reachable
+    even from a solo crash with no concurrency at all). What that race
+    could produce was not merely a killed session -- launch_team() could
+    return a false {"ok": True} for a session already-dead-but-still-
+    starting, self-healing only whenever a later sweep happened to run.
+
+    Callers (launch_team()) are responsible for pre-touching/chmod'ing every
+    log file this creates a window over BEFORE calling this -- see
+    launch_team()'s own docstring for why (the window's `tail -F` must never
+    race file creation, and read permission must never depend on _Tailer's
+    own default append-mode `open()` widening an already-existing file).
+
+    **The `;`-chain is atomic against a concurrent OBSERVER, not against a
+    failure partway through it -- these are two different guarantees, and
+    only the first was closed by making creation+stamping one call.**
+    Confirmed live: if `new-session` itself fails (e.g. a genuine
+    duplicate-session race between this call's own upfront `tmux_has()`
+    check and its actual `new-session` -- see below for why that specific
+    race can't happen here anyway), tmux aborts the WHOLE chain before any
+    `set-option` runs, so a losing racer's chain can never touch a winning
+    racer's already-stamped session. But if `new-session` SUCCEEDS and a
+    LATER link fails (in practice only the run_id `set-option` could --
+    `remain-on-exit`'s value is a hardcoded literal, and `@`-prefixed user
+    options accept any string, so neither is expected to fail under normal
+    operation), tmux does NOT roll back the already-successful
+    `new-session` -- the session survives, alive, unstamped. Left alone,
+    this is a lockout with no self-heal path: every future launch_team()
+    for this project is refused by the upfront tmux_has() check, sweep_
+    dead_teams() can never find it (this call's own caller, launch_team(),
+    already deleted the run's run.json on this failure path), and recovery
+    is manual `tmux kill-session` only -- the same "fallible call sitting
+    outside its own cleanup, leaking a resource" shape as 6a's own first
+    defect (there, a rundir; here, a tmux session).
+
+    On this failure path, the session (if one now exists at all) is killed
+    directly -- NOT via _kill_team_session_if_owned(), which is the wrong
+    tool here: it identifies ownership from the STAMP, and the stamp is
+    precisely what may not have landed. Ownership is instead established
+    structurally, from the calling context itself: this function's own
+    upfront `tmux_has(session)` check already confirmed no session with
+    this exact name existed the moment this call started, and tmux's own
+    `new-session` refuses a duplicate name outright (confirmed above --
+    a failing `new-session` aborts before any `set-option`, so a
+    concurrent second caller for the SAME project can never reach this
+    kill-on-failure branch with someone ELSE's session sitting at this
+    name). So if `new-session` for THIS call succeeded (this branch is
+    only reached when it did -- see the code below), any session found
+    existing at `session` right now can only be the one THIS call just
+    created, stamped or not, and killing it is safe without consulting a
+    stamp that may not exist.
+    """
+    session = _team_session_name(project_name)
+    if tmux_has(session):
+        return {"ok": False, "error": f"a team session is already running for "
+                                       f"'{project_name}' ({session})"}
+    lead_log = _transcript_path(run_id)
+    try:
+        r = subprocess.run(TMUX + [
+            "new-session", "-d", "-s", session, "-n", "lead",
+            "bash", "-lc", f"tail -n +1 -F {shlex.quote(lead_log)} || sleep infinity",
+            ";", "set-option", "-t", session, "remain-on-exit", "on",
+            ";", "set-option", "-t", session, _TEAM_SESSION_RUN_ID_OPTION, run_id,
+        ])
+    except OSError as e:
+        return {"ok": False, "error": f"failed to create team session: {e}"}
+    if r.returncode != 0 or not tmux_has(session):
+        # `new-session` itself may have failed (nothing to clean up -- the
+        # whole chain aborted before creating anything), OR `new-session`
+        # succeeded and a LATER link failed (the session exists, half-
+        # configured, unstamped -- clean it up here so this failure path
+        # leaves nothing behind, matching the guarantee launch_team()'s own
+        # worktree rollback already gives). Either way, `tmux_has(session)`
+        # right now can only be true for a session THIS call itself just
+        # created (see this function's own docstring for why) -- direct
+        # kill-session, not _kill_team_session_if_owned() (the stamp this
+        # call may never have reached is exactly what that helper needs).
+        if tmux_has(session):
+            subprocess.run(TMUX + ["kill-session", "-t", session], capture_output=True)
+        return {"ok": False, "error": "failed to create team session (tmux new-session failed)"}
+    for agent in members:
+        log_path = _agent_log_path(run_id, agent)
+        subprocess.run(TMUX + ["new-window", "-t", session, "-n", agent, "bash", "-lc",
+                               f"tail -n +1 -F {shlex.quote(log_path)} || sleep infinity"])
+    return {"ok": True, "session": session}
+
+
+def launch_team(workdir: str, task: str, lead: dict, members: list,
+                max_rounds: int = None) -> dict:
+    """
+    {"ok": True, "run_id": ..., "session": "team-<name>",
+     "worktrees": {agent: path, ...}} or {"ok": False, "error": ...}.
+    Order (docs/spec.md §7): sweep dead teams opportunistically (same "not a
+    background thread/timer" philosophy _sweep_stale_runs() already
+    documents) -> validate project (§2) -> refuse if the team session name
+    is already taken (§6, BEFORE touching any worktree) -> create worktrees
+    for each member in order, rolling back on partial failure (§3) ->
+    _new_state() + _persist() (status="running", 0 rounds -- team-resume
+    drives it, unchanged from 6c) -> create the tmux session/windows (§6),
+    rolling back (remove all worktrees just created + delete the fresh
+    run_id's state dir) if session creation itself fails. Does NOT drive the
+    lead loop -- that's still team-resume <run_id>, completely unchanged
+    from 6c (a freshly-launched run's status="running", 0 rounds is exactly
+    what team-resume already expects).
+    """
+    sweep_dead_teams()
+    err = _validate_project_for_team(workdir)
+    if err:
+        return {"ok": False, "error": err}
+
+    project_name = os.path.basename(os.path.normpath(workdir))
+    session = _team_session_name(project_name)
+    if tmux_has(session):
+        return {"ok": False, "error": f"a team is already running for '{project_name}' "
+                                       f"({session}) -- stop it first"}
+
+    run_id = _run_id()
+    worktrees = {}
+    for agent in members:
+        result = _create_worktree(workdir, agent, run_id)
+        if not result["ok"]:
+            for done_path in worktrees.values():
+                _remove_worktree(workdir, done_path)
+            return {"ok": False, "error": result["error"]}
+        worktrees[agent] = result["path"]
+
+    state = _new_state(run_id, workdir, lead, members, task, max_rounds,
+                       project_name=project_name, worktrees=worktrees)
+    _persist(state)
+
+    # Permission requirement (docs/spec.md §5): every file a dashboard
+    # window's `tail -F` needs to read is written by SVC_USER but must be
+    # readable by RUN_USER's tmux pane -- chmod explicitly rather than
+    # relying on SVC_USER's ambient umask, the exact same discipline
+    # agent_run() already uses for prompt_path/schema_path. Done BEFORE
+    # _create_team_session() so no window's `tail -F` ever races file
+    # creation.
+    d = _run_dir(run_id)
+    agents_dir = os.path.join(d, "agents")
+    os.makedirs(agents_dir, exist_ok=True)
+    os.chmod(d, 0o755)
+    os.chmod(agents_dir, 0o755)
+    transcript_path = _transcript_path(run_id)
+    open(transcript_path, "a").close()
+    os.chmod(transcript_path, 0o644)
+    for agent in members:
+        log_path = _agent_log_path(run_id, agent)
+        open(log_path, "a").close()
+        os.chmod(log_path, 0o644)
+
+    session_result = _create_team_session(project_name, run_id, members)
+    if not session_result["ok"]:
+        for path in worktrees.values():
+            _remove_worktree(workdir, path)
+        shutil.rmtree(d, ignore_errors=True)
+        return {"ok": False, "error": session_result["error"]}
+
+    return {"ok": True, "run_id": run_id, "session": session, "worktrees": worktrees}
+
+
+def stop_team(run_id: str) -> dict:
+    """
+    Unconditional -- works regardless of status (running / blocked_ask_user
+    / finished / error / escalated_max_rounds / stopped), same "an explicit
+    human action always wins" precedent instance_stop() already sets. Kills
+    the team-<project> tmux session (if present -- a no-op, not an error, if
+    it's already gone, or if this run never had one -- a bare team-start
+    that skipped team-launch). Attempts _remove_worktree() for EVERY
+    teammate regardless of an earlier one's outcome (one dirty/errored
+    worktree never aborts the rest). If status was non-terminal, marks it
+    "stopped" (a new status value, additive to the existing enum) and
+    persists. Raises FileNotFoundError for an unknown run_id (same as
+    _load_state() itself -- callers/CLI handle it the same way team-status/
+    team-resolve/team-resume already do).
+
+    Returns {"session_removed": bool, "worktrees": {agent: "removed"|
+    "dirty"|"error"|"absent", ...}}.
+
+    A "removed"/"absent" outcome ALSO drops that agent's entry from the
+    persisted state["worktrees"] map before writing it back (a real defect
+    found by exercising this for real, not a spec-literal requirement: the
+    same project+agent's worktree PATH is not run-scoped -- _worktree_path()
+    is purely a function of project_workdir+agent, docs/spec.md §3 -- so a
+    LATER, unrelated run against the same project+agent can legitimately
+    recreate a worktree at that identical path once this run's copy is
+    gone. If this run's own stale "removed" path entry were left in place,
+    a future sweep_dead_teams()/team-stop call re-processing THIS run would
+    find a directory sitting at that path again -- now the LATER run's live
+    worktree -- and destroy it, believing it was reclaiming its own leftover
+    resource. "dirty"/"error" entries are kept (the directory is genuinely
+    still there, and _create_worktree()'s own "path already exists" check
+    already protects it from being silently overwritten by a future launch,
+    so leaving the record in place for a human to find via team-status is
+    both safe and useful).
+    """
+    sweep_dead_teams()
+    state = _load_state(run_id)
+    project_name = state.get("project_name")
+    session_removed = True
+    if project_name:
+        session = _team_session_name(project_name)
+        # Ownership-checked (_kill_team_session_if_owned(), not a raw
+        # kill-session): the currently-live team-<project> session might no
+        # longer be THIS run's own -- a different, newer run for the same
+        # project could have created another session under the identical
+        # name after this one's own session already ended some other way.
+        session_removed = _kill_team_session_if_owned(session, run_id)
+
+    worktrees_result = {}
+    remaining_worktrees = {}
+    for agent, path in (state.get("worktrees") or {}).items():
+        if not os.path.exists(path):
+            worktrees_result[agent] = "absent"
+            continue
+        outcome = _remove_worktree(state["workdir"], path)
+        worktrees_result[agent] = outcome
+        if outcome in ("dirty", "error"):
+            remaining_worktrees[agent] = path
+    state["worktrees"] = remaining_worktrees
+
+    if state["status"] not in ("finished", "escalated_max_rounds", "error", "stopped"):
+        state["status"] = "stopped"
+    _persist(state)
+
+    return {"session_removed": session_removed, "worktrees": worktrees_result}
+
+
+def _iso_to_epoch(s: str) -> float:
+    return calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ"))
+
+
+def sweep_dead_teams() -> list:
+    """
+    Opportunistic (called at the top of launch_team()/stop_team(), plus its
+    own dedicated team-reap CLI subcommand for explicit/scripted use and
+    straightforward testing) -- same "not a background thread/timer"
+    philosophy _sweep_stale_runs() already documents. For every run_id under
+    _leads_root() with a project_name (a bare team-start that skipped
+    team-launch has no team session/worktrees to sweep -- skipped entirely):
+
+      1. status in (running, blocked_ask_user) but the team-<project>
+         session is gone (tmux_has() false) -- crash/reboot: mark
+         status="error", error naming what was observed, persist, and STOP
+         for this run_id this pass (does not fall through to step 2 in the
+         SAME call -- "now terminal" means eligible starting the NEXT sweep
+         pass, matching the acceptance criterion's own two-pass sequence:
+         crash-detection first, worktree/session sweep only on a
+         subsequent call).
+      2. status in (finished, escalated_max_rounds, error, stopped) AND age
+         since updated_at > TEAM_SESSION_STALE_TTL_SECONDS -- sweep: kill
+         the session if still present, attempt _remove_worktree() for every
+         teammate (best-effort; one failure doesn't stop the rest), leave
+         run.json/transcript.jsonl in place (matches TEAM_HEADLESS_STALE_
+         RUN_TTL_SECONDS's own precedent -- the state RECORD persists, only
+         the live session/worktrees are reclaimed).
+      3. status == "blocked_ask_user" is NEVER swept by TTL, at any age
+         (docs/spec.md "Open questions" -- settled by the user: no backstop
+         TTL this cycle) -- its session/worktrees stay alive so a human can
+         `tmux attach` for context before answering, same reasoning
+         docs/spec.md "Resolved from docs/story.md §5's own open notes"
+         already gives.
+
+    Returns a list of {run_id, action, detail} for team-reap's own printed
+    report. Never raises -- a corrupt/missing run.json for one run_id is
+    skipped, not fatal to the sweep of every other run_id.
+    """
+    results = []
+    root = _leads_root()
+    if not os.path.isdir(root):
+        return results
+    now = time.time()
+    for run_id in sorted(os.listdir(root)):
+        try:
+            state = _load_state(run_id)
+        except (OSError, ValueError):
+            results.append({"run_id": run_id, "action": "skipped",
+                            "detail": "unreadable/corrupt run.json"})
+            continue
+
+        project_name = state.get("project_name")
+        if not project_name:
+            continue
+
+        status = state.get("status")
+        session = _team_session_name(project_name)
+
+        if status in ("running", "blocked_ask_user"):
+            if not tmux_has(session):
+                state["status"] = "error"
+                state["error"] = f"team session '{session}' is gone (crash or reboot)"
+                _persist(state)
+                results.append({"run_id": run_id, "action": "marked_error",
+                                "detail": state["error"]})
+            continue  # never sweep worktrees/session in this same pass
+
+        if status not in ("finished", "escalated_max_rounds", "error", "stopped"):
+            continue  # some other/unknown status -- nothing this sweep does
+
+        try:
+            age = now - _iso_to_epoch(state.get("updated_at", ""))
+        except ValueError:
+            continue  # unparsable updated_at -- never guess an age
+        if age <= TEAM_SESSION_STALE_TTL_SECONDS:
+            continue
+
+        # Ownership-checked, same reasoning as stop_team()'s own comment: the
+        # currently-live team-<project> session might belong to a newer run
+        # for the same project, not to run_id (a real collision found by
+        # exercising crash-then-relaunch-then-reap for real).
+        removed_session = _kill_team_session_if_owned(session, run_id)
+        worktrees_result = {}
+        remaining_worktrees = {}
+        for agent, path in (state.get("worktrees") or {}).items():
+            if not os.path.exists(path):
+                worktrees_result[agent] = "absent"
+                continue
+            outcome = _remove_worktree(state["workdir"], path)
+            worktrees_result[agent] = outcome
+            if outcome in ("dirty", "error"):
+                remaining_worktrees[agent] = path
+        # A "removed"/"absent" entry is dropped from the persisted
+        # state["worktrees"] map -- see stop_team()'s own docstring for why
+        # (the path is not run-scoped, so leaving a stale entry here risks a
+        # LATER run's live worktree at the same path being destroyed by a
+        # future sweep pass re-processing THIS already-terminal run).
+        state["worktrees"] = remaining_worktrees
+        _persist(state)
+        results.append({"run_id": run_id, "action": "swept",
+                        "detail": {"session_removed": removed_session,
+                                   "worktrees": worktrees_result}})
+    return results
 
 
 # ─── CLI ────────────────────────────────────────────────────────────────
@@ -2769,6 +3488,59 @@ def _cli_team_resume(args: argparse.Namespace) -> int:
     return _drive_and_report(state)
 
 
+def _cli_team_launch(args: argparse.Namespace) -> int:
+    """
+    Same argument shape as team-start, deliberately (docs/spec.md §7):
+    copy-pasted --lead/--lead-ollama/--members validation, reused not
+    reinvented. Creates the worktrees/tmux dashboard session and persists a
+    fresh run (status="running", 0 rounds) but does NOT drive it -- run
+    `team-resume <run_id>` (unchanged from 6c) to actually run the lead
+    loop. Prints {run_id, session, worktrees} as JSON on success.
+    """
+    if args.lead_ollama:
+        if not (TEAM_LLM_BASE_URL and TEAM_LLM_MODEL):
+            print("error: --lead-ollama requires TEAM_LLM_BASE_URL and TEAM_LLM_MODEL "
+                 "to be set", file=sys.stderr)
+            return 1
+        lead = {"kind": "ollama", "name": TEAM_LLM_MODEL, "tier": 1}
+    else:
+        eng = load_engines().get(args.lead)
+        if eng is None or not eng.headless_enabled:
+            print(f"error: lead engine '{args.lead}' is unknown or not headless-enabled",
+                 file=sys.stderr)
+            return 1
+        tier = _lead_tier_for_engine(eng)
+        if tier == 2:
+            schema_err = _schema_flag_config_error(eng)
+            if schema_err:
+                print(f"error: lead engine '{args.lead}' is misconfigured for tier-2 "
+                     f"use: {schema_err}", file=sys.stderr)
+                return 1
+        lead = {"kind": "engine", "name": eng.name, "tier": tier}
+    members = [m.strip() for m in (args.members or "").split(",") if m.strip()]
+    result = launch_team(args.workdir, args.task, lead, members)
+    if not result["ok"]:
+        print(f"error: {result['error']}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def _cli_team_stop(args: argparse.Namespace) -> int:
+    try:
+        result = stop_team(args.run_id)
+    except FileNotFoundError:
+        print(f"error: no such run_id: {args.run_id}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def _cli_team_reap(args: argparse.Namespace) -> int:
+    print(json.dumps(sweep_dead_teams(), indent=2))
+    return 0
+
+
 def _parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="teams.py",
@@ -2827,6 +3599,30 @@ def _parse_args(argv=None) -> argparse.Namespace:
                                    "from persisted state, not from memory.")
     p_team_resume.add_argument("run_id")
 
+    p_team_launch = sub.add_parser("team-launch", help="Create per-teammate git worktrees "
+                                   "and a persistent team-<project> tmux dashboard session, "
+                                   "then persist a fresh run WITHOUT driving it -- follow with "
+                                   "team-resume (backlog item 6d part 1).")
+    p_team_launch.add_argument("workdir", help="Project directory the team works against.")
+    p_team_launch.add_argument("--task", required=True,
+                               help="The run's own task text, given once, never re-truncated.")
+    lead_group2 = p_team_launch.add_mutually_exclusive_group(required=True)
+    lead_group2.add_argument("--lead", default=None,
+                             help="engines.d engine name to use as lead (tier 2/3).")
+    lead_group2.add_argument("--lead-ollama", action="store_true",
+                             help="Use the configured TEAM_LLM_* Ollama model as lead (tier 1).")
+    p_team_launch.add_argument("--members", default="",
+                               help="Comma-separated engines.d engine names delegate() may "
+                                    "target; each gets its own git worktree.")
+
+    p_team_stop = sub.add_parser("team-stop", help="Kill a team's tmux session and attempt "
+                                 "worktree removal, unconditionally (backlog item 6d part 1).")
+    p_team_stop.add_argument("run_id")
+
+    sub.add_parser("team-reap", help="Opportunistically reconcile crashed team sessions and "
+                                     "sweep stale worktrees/sessions past their TTL (backlog "
+                                     "item 6d part 1).")
+
     return p.parse_args(argv)
 
 
@@ -2849,7 +3645,13 @@ def main(argv=None) -> int:
             return _cli_team_status(args)
         if args.command == "team-resolve":
             return _cli_team_resolve(args)
-        return _cli_team_resume(args)
+        if args.command == "team-resume":
+            return _cli_team_resume(args)
+        if args.command == "team-launch":
+            return _cli_team_launch(args)
+        if args.command == "team-stop":
+            return _cli_team_stop(args)
+        return _cli_team_reap(args)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
