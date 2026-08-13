@@ -84,6 +84,23 @@ This keeps "everything is a tmux session" — the project's core primitive since
 the start — intact, while the actual message passing gets a real format, a
 real completion signal, and immunity to CLI prompt-format changes.
 
+**Correction (6d spec, 2026-08-13): "spawned inside its own tmux window" must
+NOT be read as "the window's own command is the headless CLI".** That literal
+reading is incompatible with two settled constraints at once. It breaks 6a's
+design, where `agent_run()` spawns one throwaway session per call and
+continuity comes from `--resume {session_id}` rather than a persistent
+window; and it breaks the no-new-sudoers constraint, since a process already
+running as `RUN_USER` cannot itself invoke `sudo -u RUN_USER tmux` without a
+new sudoers rule — the exact privilege escalation §3 forbids.
+
+The window is therefore a **dashboard, not the process**: each persistent
+per-agent window `tail -F`s that agent's own stable append-mode `.jsonl` log
+(`agent_run()`'s `log_path`, already append-mode). A human attaching still
+watches live raw output, which is the whole point of the hybrid decision —
+but the agent process itself continues to be spawned exactly as 6a spawns it.
+Same visibility, no new privileged path. 6e and 6f should inherit this
+reading, not the sentence above it.
+
 ### 2.3 What the ecosystem already does (and what to take from it)
 
 Surveyed: **Vibe Kanban** (cross-platform CLI + web UI, Kanban board,
@@ -458,12 +475,25 @@ blocking:
 
 ### 6d — Team session lifecycle
 
-**Deliverable.** `team-<project>` tmux session, one window per agent. One git
-worktree per teammate under `PROJECTS_DIR/<name>.teams/<agent>/`, created on
-start and cleaned up on stop. Start/stop wired into the web UI as a per-project
-"Start team" control. `_session_urls` generalized from per-project to
-per-window. `_reap_dead_state()` extended to sweep dead team sessions,
-orphaned worktrees, and stale state dirs.
+**Split into two build cycles** (product-manager's call, user-confirmed
+2026-08-13): part 1 is worktree + tmux dashboard lifecycle, CLI/backend only;
+part 2 is web routes, the background driving thread, and
+`install.sh --with-ollama`. Part 1 alone is real-git + real-tmux + a new
+self-heal contract — comparable in size and risk to any one of 6a/6b/6c — and
+folding HTTP routes plus threading into the same dispatch is the shape that
+produced this story's largest defects.
+
+**Deliverable.** `team-<project>` tmux session, one **dashboard** window per
+agent (see §2.2's correction — the window tails the agent's log, it does not
+host the agent process). One git worktree per teammate under
+`PROJECTS_DIR/<name>.teams/<agent>/`, created on start and cleaned up on stop.
+Start/stop wired into the web UI as a per-project "Start team" control
+(part 2). `_reap_dead_state()` extended to sweep dead team sessions, orphaned
+worktrees, and stale state dirs.
+
+**Resolved, not deferred:** `_session_urls` does **not** need generalizing
+from per-project to per-window. Headless invocations never produce a hosted
+URL, so there is nothing to generalize. This closes the story's own §5 note.
 
 **Acceptance criteria.**
 - Starting a team creates the session, the windows, and the worktrees;
