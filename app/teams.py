@@ -31,6 +31,7 @@ Run with:
     python3 -m unittest discover -s tests -v
 """
 import argparse
+import errno
 import json
 import os
 import re
@@ -798,6 +799,64 @@ _GROUNDING_MAX_HEADINGS_PER_FILE = 20
 # Cap on fact_check()'s own returned match list.
 _GROUNDING_FACT_CHECK_MAX_MATCHES = 5
 
+# Bounds on fact_check()'s matching UNIT (docs/spec.md 6b.1) -- a "block" of
+# consecutive non-blank lines joined into one matchable region, replacing
+# 6b's single-physical-line matcher. Both fixed, deliberately **not**
+# environment-configurable, same rationale as _GROUNDING_READ_CAP_BYTES
+# above: they are the precision guarantee (an unbounded block is how
+# accidental co-occurrence -- and therefore a false "confirmation" -- would
+# silently creep in), not an operator preference an operator could loosen.
+#
+# Round-1 correction (docs/spec.md "Round-1correction", docs/test-review.md):
+# the original 12/1500 shipped with round 1 were ~6x too wide -- a block is
+# a WRAP-JOINED UNIT (one hard-wrapped sentence, occasionally two), not an
+# arbitrary run of lines, and 12 lines carries no co-occurrence signal at
+# all. Corrected to 3 lines / 400 chars, sized to the actual defect being
+# fixed (a sentence wrapped across two, occasionally three, physical
+# lines) and nothing beyond it.
+_GROUNDING_BLOCK_MAX_LINES = 3
+_GROUNDING_BLOCK_MAX_CHARS = 400
+
+# A block also ends after any line whose stripped text ends in sentence-
+# terminal punctuation (optionally followed by a closing quote/bracket/
+# emphasis marker) -- now including `:` (docs/spec.md "Round-1 correction"),
+# even short of either bound above and even with no blank line separating
+# it from the next line. docs/spec.md 6b.1's own block definition is
+# literally "delimited by blank lines" -- but this repo's own real
+# documentation (see docs/ARCHITECTURE.md) uses TIGHT Markdown lists (no
+# blank line between sibling bullets), so blank-line-only delimiting would
+# silently merge unrelated adjacent bullets into one matchable region purely
+# as an artifact of list formatting -- precisely the accidental-co-occurrence
+# risk 6b.1's own design section warns against. It would also regress 6b's
+# own existing precision test (two independent one-line sentences with no
+# blank line between them must not become one matchable block just because
+# neither line is blank). This rule alone was later shown (round 1's
+# testing pass) to be insufficient on its own against headings, terse
+# non-sentence bullets, and code fences -- see _grounding_structural_kind()
+# and the fence handling in _iter_grounding_blocks() below, and
+# docs/implementation.md "Deviations from spec" for the full history.
+_GROUNDING_SENTENCE_END_RE = re.compile(r"""[.!?:][)\]"'*_`]*$""")
+
+_GROUNDING_HEADING_RE = re.compile(r"^#{1,6}(\s|$)")
+_GROUNDING_LIST_MARKER_RE = re.compile(r"^(?:[-*+]|\d+\.)\s")
+
+
+def _grounding_structural_kind(stripped: str):
+    """Classifies a non-blank, non-fence-delimiter stripped line as the
+    start of a Markdown structural element (docs/spec.md "Round-1
+    correction") -- `"heading"`, `"list"`, `"quote"`, `"table"` -- or
+    `None` for ordinary prose. These are mutually exclusive prefixes; a
+    line can be at most one."""
+    if _GROUNDING_HEADING_RE.match(stripped):
+        return "heading"
+    if _GROUNDING_LIST_MARKER_RE.match(stripped):
+        return "list"
+    if stripped.startswith(">"):
+        return "quote"
+    if stripped.startswith("|"):
+        return "table"
+    return None
+
 # A specific, greppable sentence used when nothing was discovered -- not an
 # empty string a caller could mistake for "not yet loaded".
 _GROUNDING_NO_FILES_DIGEST = (
@@ -817,6 +876,30 @@ _GROUNDING_STOPWORDS = frozenset({
 
 _GROUNDING_TOKEN_RE = re.compile(r"[A-Za-z0-9_']+")
 
+# Set once, process-wide, the first time _open_grounding_candidate() detects
+# /proc/self/fd is unresolvable (docs/spec.md 6b.1 follow-up 2) -- so the
+# one-time stderr note fires exactly once per process, not once per rejected
+# candidate (which could otherwise be up to 4 times per load_grounding()
+# call, every call, for the life of the process).
+_grounding_proc_warned = False
+
+
+def _warn_proc_unavailable_once() -> None:
+    global _grounding_proc_warned
+    if _grounding_proc_warned:
+        return
+    _grounding_proc_warned = True
+    print(
+        "grounding: /proc/self/fd did not resolve (realpath() returned the "
+        "literal, unresolved path) -- containment cannot be verified for any "
+        "grounding candidate, so every candidate is being rejected rather "
+        "than trusted. This is expected if /proc is not mounted (e.g. some "
+        "minimal containers/namespaces); no path-based realpath() fallback "
+        "is used here, since that would reopen the TOCTOU race closed in "
+        "6b (docs/test-review.md Defect 2).",
+        file=sys.stderr,
+    )
+
 
 def _under_workdir(path: str, workdir_real: str) -> bool:
     """True iff path's realpath is workdir_real itself or lives strictly
@@ -835,10 +918,17 @@ def _under_workdir(path: str, workdir_real: str) -> bool:
 
 def _open_grounding_candidate(path: str, workdir_real: str):
     """
-    Opens `path` exactly once and returns a validated, open, read-only file
-    descriptor, or None if it's unusable for any reason -- the single
-    operation both discovery and content-reading are now built on (post-
-    review fix, docs/test-review.md Defects 1 and 2). Previously,
+    Opens `path` exactly once and returns `(fd, None)` -- a validated, open,
+    read-only file descriptor -- or `(None, reason)` if it's unusable, where
+    `reason` is either `None` (the candidate simply doesn't exist -- ENOENT/
+    ENOTDIR, the same silent "not present" outcome this has always had, not
+    something a caller should treat as a `skipped` entry) or one of
+    `"symlink"`, `"not_regular_file"`, `"out_of_bounds"`, `"unreadable"`,
+    `"proc_unavailable"` (docs/spec.md 6b.1 follow-ups 1 and 2) -- a
+    candidate that genuinely exists but was rejected. `_discover_and_read()`
+    uses the non-None reasons to populate `load_grounding()`'s `skipped`
+    list; everything else about this function (the single open()/fstat()/
+    fd-based containment re-check) is unchanged from 6b. Previously,
     containment was checked once (via `_under_workdir` against the literal
     path string) and the file was then read separately, sometimes twice
     (once to decide "is this usable", once more for its kept content) --
@@ -874,16 +964,32 @@ def _open_grounding_candidate(path: str, workdir_real: str):
     symlink at all, so `O_NOFOLLOW` alone would not catch it) get rejected
     *before* `os.open()` is ever called on it at all -- verified directly
     by tests/test_teams_grounding.py wrapping `os.open` itself.
+
+    `/proc/self/fd` unavailability (docs/spec.md 6b.1 follow-up 2): if
+    `/proc` isn't mounted, `os.path.realpath(f"/proc/self/fd/{fd}")` can't
+    resolve anything and simply hands back the same literal, unresolved
+    string it was given -- which then never equals/starts-with
+    `workdir_real`, so every candidate for every project would previously
+    be rejected as "out of bounds" with no distinguishing signal from a
+    project that genuinely has no docs. Detected explicitly here (`real ==
+    fd_proc_path`, the same condition tests/test_teams_grounding.py
+    simulates by monkeypatching os.path.realpath) and surfaced via a
+    distinct `"proc_unavailable"` reason plus a one-time stderr note
+    (_warn_proc_unavailable_once()) -- deliberately NOT a path-based
+    `realpath()` fallback, which would silently reopen the exact TOCTOU
+    race Defect 2 closed (validating a path string instead of the fd that
+    was actually opened). Failing closed here is correct; failing closed
+    *silently* was the bug.
     """
     if not _under_workdir(path, workdir_real):
-        return None
+        return None, "out_of_bounds"
     fd = None
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             os.close(fd)
-            return None
+            return None, "not_regular_file"
         # Re-verify containment against the fd's OWN resolved path (tied to
         # the specific open file description, not re-derived from `path`)
         # -- this is what closes the actual TOCTOU window between the
@@ -899,12 +1005,17 @@ def _open_grounding_candidate(path: str, workdir_real: str):
         # is what actually reproduces the original leak -- see
         # tests/test_teams_grounding.py's PostReviewRegressionTests for the
         # regression tests this reasoning is pinned by.
-        real = os.path.realpath(f"/proc/self/fd/{fd}")
+        fd_proc_path = f"/proc/self/fd/{fd}"
+        real = os.path.realpath(fd_proc_path)
+        if real == fd_proc_path:
+            os.close(fd)
+            _warn_proc_unavailable_once()
+            return None, "proc_unavailable"
         if real != workdir_real and not real.startswith(workdir_real + os.sep):
             os.close(fd)
-            return None
-        return fd
-    except OSError:
+            return None, "out_of_bounds"
+        return fd, None
+    except OSError as e:
         # Missing file, permission denied, a directory (see the fstat
         # check above for the common case, but e.g. a race making it
         # disappear entirely is still just an OSError here too),
@@ -912,17 +1023,25 @@ def _open_grounding_candidate(path: str, workdir_real: str):
         # O_NOFOLLOW turns a loop into an immediate ELOOP rather than the
         # kernel chasing it), FIFO/device/socket already handled by the
         # fstat check above without ever reaching read -- all reduce to
-        # the same "unusable" outcome here.
+        # the same "unusable" outcome here, but are distinguished for the
+        # `skipped` list: ENOENT/ENOTDIR is "doesn't exist" (not skip-
+        # worthy -- unchanged, silent, as it's always been), ELOOP is a
+        # rejected symlink, anything else (permission denied, etc.) is
+        # generically "unreadable".
         if fd is not None:
             try:
                 os.close(fd)
             except OSError:
                 pass
-        return None
+        if e.errno == errno.ELOOP:
+            return None, "symlink"
+        if e.errno in (errno.ENOENT, errno.ENOTDIR):
+            return None, None
+        return None, "unreadable"
 
 
 def _read_grounding_candidate(path: str, workdir_real: str,
-                              read_cap: int = _GROUNDING_READ_CAP_BYTES) -> str:
+                              read_cap: int = _GROUNDING_READ_CAP_BYTES):
     """
     The one read of one real grounding file, start to finish: open once
     (validated as above), read up to `read_cap` BYTES (not characters --
@@ -935,15 +1054,21 @@ def _read_grounding_candidate(path: str, workdir_real: str,
     for a NUL in the first 512 (the binary check -- no separate open() for
     this anymore, since the bytes are already in hand), then decode as
     UTF-8 with errors="ignore" (same tolerance app.py's `_read_head()`
-    itself uses for genuinely malformed-but-not-binary text). Returns ""
-    for any unusable candidate -- missing, wrong type, out-of-bounds,
-    symlink, binary, or empty -- the same unified "empty means skip" rule
-    as before, just now resting on one filesystem operation per file
-    instead of two or three.
+    itself uses for genuinely malformed-but-not-binary text).
+
+    Returns `(content, reason)`: `content` is `""` for any unusable
+    candidate -- missing, wrong type, out-of-bounds, symlink, binary, or
+    empty -- the same unified "empty means skip" rule as before, just now
+    resting on one filesystem operation per file instead of two or three.
+    `reason` passes `_open_grounding_candidate()`'s own reason straight
+    through (`None` for success or "doesn't exist"; binary content is
+    likewise reported as `reason=None` -- out of scope for the `skipped`
+    list per docs/spec.md 6b.1's own minimum reason set, and consistent
+    with this module's pre-existing "empty/missing/unusable" unification).
     """
-    fd = _open_grounding_candidate(path, workdir_real)
+    fd, reason = _open_grounding_candidate(path, workdir_real)
     if fd is None:
-        return ""
+        return "", reason
     try:
         chunks = []
         remaining = read_cap
@@ -957,11 +1082,11 @@ def _read_grounding_candidate(path: str, workdir_real: str,
     finally:
         os.close(fd)
     if b"\x00" in raw[:512]:
-        return ""
-    return raw.decode("utf-8", errors="ignore")
+        return "", None
+    return raw.decode("utf-8", errors="ignore"), None
 
 
-def _discover_and_read(workdir: str, read_cap: int = _GROUNDING_READ_CAP_BYTES) -> list:
+def _discover_and_read(workdir: str, read_cap: int = _GROUNDING_READ_CAP_BYTES):
     """
     The one place that both decides which of the four candidate sources are
     present *and* fetches their content -- every real underlying file is
@@ -970,25 +1095,45 @@ def _discover_and_read(workdir: str, read_cap: int = _GROUNDING_READ_CAP_BYTES) 
     `load_grounding()` are both thin wrappers around this, so
     `load_grounding()` never re-reads a path `discover_grounding_files()`
     (or this function, on a separate call) already validated.
+
+    Returns `(entries, skipped)`: `entries` is unchanged from 6b (the list
+    of usable `{"label", "path", "content"}` dicts). `skipped` (docs/spec.md
+    6b.1 follow-up 1) is a new list of `{"label", "relpath", "reason"}`
+    dicts, one per candidate that genuinely exists but was rejected --
+    populated straight from `_read_grounding_candidate()`'s own `reason`,
+    never for a candidate that simply doesn't exist (that stays silent, as
+    it always has been -- see `_open_grounding_candidate()`'s docstring).
+    `relpath` is the candidate's own path relative to `workdir` (the
+    `@target` indirection's target for CLAUDE.md/AGENTS.md when that's what
+    was actually rejected, matching `entries`' own "what was actually read"
+    convention).
     """
     workdir_real = os.path.realpath(workdir)
     entries = []
+    skipped = []
+
+    def _read(label, relpath, path):
+        content, reason = _read_grounding_candidate(path, workdir_real, read_cap)
+        if reason is not None:
+            skipped.append({"label": label, "relpath": relpath, "reason": reason})
+        return content
 
     for relpath in ("docs/ARCHITECTURE.md", "docs/BACKLOG.md"):
         path = os.path.join(workdir, relpath)
-        content = _read_grounding_candidate(path, workdir_real, read_cap)
+        content = _read(relpath, relpath, path)
         if content:
             entries.append({"label": relpath, "path": path, "content": content})
 
     for name in ("CLAUDE.md", "AGENTS.md"):
         path = os.path.join(workdir, name)
-        text = _read_grounding_candidate(path, workdir_real, read_cap)
+        text = _read(name, name, path)
         if not text:
             continue
         stripped = text.strip()
         if stripped.startswith("@") and len(stripped.splitlines()) == 1:
-            target_path = os.path.join(workdir, stripped[1:])
-            target_content = _read_grounding_candidate(target_path, workdir_real, read_cap)
+            target_relpath = stripped[1:]
+            target_path = os.path.join(workdir, target_relpath)
+            target_content = _read(name, target_relpath, target_path)
             if target_content:
                 entries.append({"label": name, "path": target_path, "content": target_content})
                 break
@@ -998,12 +1143,12 @@ def _discover_and_read(workdir: str, read_cap: int = _GROUNDING_READ_CAP_BYTES) 
 
     for name in ("README.md", "Readme.md", "readme.md", "README"):
         path = os.path.join(workdir, name)
-        content = _read_grounding_candidate(path, workdir_real, read_cap)
+        content = _read("README.md", name, path)
         if content:
             entries.append({"label": "README.md", "path": path, "content": content})
             break
 
-    return entries
+    return entries, skipped
 
 
 def discover_grounding_files(workdir: str) -> list:
@@ -1024,9 +1169,13 @@ def discover_grounding_files(workdir: str) -> list:
     open() (see _open_grounding_candidate()), so this is not the TOCTOU
     class of bug Defect 2 was: load_grounding() below never chains off of
     a call to this function's own result to avoid re-reading, it always
-    goes through _discover_and_read() directly, once, itself.
+    goes through _discover_and_read() directly, once, itself. `skipped` is
+    intentionally not surfaced from this function -- only `load_grounding()`
+    returns it (docs/spec.md 6b.1 follow-up 1's own scope), matching this
+    function's pre-existing, unchanged two-key return shape.
     """
-    return [{"label": e["label"], "path": e["path"]} for e in _discover_and_read(workdir)]
+    entries, _skipped = _discover_and_read(workdir)
+    return [{"label": e["label"], "path": e["path"]} for e in entries]
 
 
 def _extract_headings(content: str) -> list:
@@ -1063,10 +1212,14 @@ def load_grounding(workdir: str, *, max_bytes: int = TEAM_GROUNDING_MAX_BYTES,
     validated (docs/test-review.md Defect 2's fix). The same content is
     both the source for headings/digest and the corpus a later
     fact_check() call against this returned dict searches; nothing
-    re-reads from disk for that call.
+    re-reads from disk for that call. `skipped` (docs/spec.md 6b.1
+    follow-up 1) surfaces candidates that genuinely exist but were rejected
+    -- see _discover_and_read()'s own docstring for exactly what does and
+    doesn't count.
     """
     files = []
-    for entry in _discover_and_read(workdir, read_cap):
+    entries, skipped = _discover_and_read(workdir, read_cap)
+    for entry in entries:
         content = entry["content"]
         files.append({
             "label": entry["label"],
@@ -1080,6 +1233,7 @@ def load_grounding(workdir: str, *, max_bytes: int = TEAM_GROUNDING_MAX_BYTES,
         "workdir": workdir,
         "loaded_at": _now_iso(),
         "files": files,
+        "skipped": skipped,
         "digest": build_digest(files, max_bytes),
         "empty": files == [],
     }
@@ -1122,30 +1276,147 @@ def _significant_terms(claim: str) -> list:
     return [t for t in tokens if t not in _GROUNDING_STOPWORDS and len(t) > 1]
 
 
+def _iter_grounding_blocks(content: str) -> list:
+    """
+    Splits `content` into fact_check()'s matching UNIT (docs/spec.md 6b.1,
+    "Round-1 correction"): a "block" is a **wrap-joined unit** -- just wide
+    enough to reunite one hard-wrapped sentence, no wider -- consecutive
+    non-blank lines joined with a single space (never concatenated bare --
+    "...an" + "unprivileged..." must become "an unprivileged", never
+    "anunprivileged", so a wrap boundary never accidentally fuses into a
+    term nothing on disk actually spells out). A block ends at **any** of:
+
+    - a blank line;
+    - the previous line's stripped text ending in sentence-terminal
+      punctuation (`_GROUNDING_SENTENCE_END_RE`: `.`, `!`, `?`, or `:`),
+      even with no blank line separating it from the next line -- round 1's
+      own fix for 6b's existing precision test and this repo's own
+      tight-list Markdown, retained;
+    - the **current** line being the start of a new structural element --
+      a heading, list item, block quote, or table row
+      (`_grounding_structural_kind()`) -- which is a hard boundary from
+      whatever came before, "even mid-run" (docs/spec.md). A **heading**
+      line is additionally excluded from matching entirely, never added to
+      any block: unlike a list item or block quote, an ATX heading is
+      always exactly one line (never has a "wrapped continuation" to
+      legitimately join), and it's a title, not a prose assertion -- a
+      claim quoting a heading verbatim isn't "confirmed" by the section
+      title alone, and a heading can never drag unrelated following prose
+      into its own block either (docs/test-review.md's own heading-merge
+      attacks, round 1);
+    - a fenced code-block delimiter (` ``` ` or `~~~`) -- a hard boundary
+      in both directions, and the delimiter line itself is never
+      matchable. Every line **between** a pair of delimiters is likewise
+      excluded from every block entirely (code is not prose and cannot
+      support a claim, docs/spec.md) -- not merely kept from merging, but
+      never part of any block's text at all, the same treatment as a
+      heading;
+    - `_GROUNDING_BLOCK_MAX_LINES` lines accumulated, or the next line
+      would push the joined length past `_GROUNDING_BLOCK_MAX_CHARS` --
+      both fixed, non-configurable (see their own module-level comment).
+
+    Returns a list of `{"start_line", "end_line", "text"}` dicts, 1-indexed,
+    in document order. `text` is unconditionally truncated to
+    `_GROUNDING_BLOCK_MAX_CHARS` before being returned -- the same
+    unconditional-final-truncation pattern build_digest() already uses --
+    so even a single physical line far longer than the cap (which cannot be
+    split any further) never becomes an unbounded matchable region.
+    """
+    blocks = []
+    cur_lines = []  # list of (lineno, stripped_text)
+    cur_len = 0      # len(" ".join(text for _, text in cur_lines))
+    in_fence = False
+
+    def flush():
+        if cur_lines:
+            text = " ".join(t for _, t in cur_lines)
+            blocks.append({
+                "start_line": cur_lines[0][0],
+                "end_line": cur_lines[-1][0],
+                "text": text[:_GROUNDING_BLOCK_MAX_CHARS],
+            })
+        cur_lines.clear()
+
+    for lineno, raw in enumerate(content.splitlines(), start=1):
+        stripped = raw.strip()
+
+        if stripped[:3] in ("```", "~~~"):
+            # A fence delimiter is a hard boundary either way, and is
+            # itself never matchable -- toggling in/out excludes every
+            # line between a pair of delimiters from every block.
+            flush()
+            cur_len = 0
+            in_fence = not in_fence
+            continue
+
+        if in_fence:
+            continue  # fenced content is excluded from matching entirely
+
+        if not stripped:
+            flush()
+            cur_len = 0
+            continue
+
+        kind = _grounding_structural_kind(stripped)
+        if kind == "heading":
+            # Excluded from matching entirely -- see this function's own
+            # docstring for why a heading gets fenced-code-like treatment,
+            # not just boundary treatment.
+            flush()
+            cur_len = 0
+            continue
+        if kind is not None:
+            # list / quote / table: a hard boundary from whatever came
+            # before, even mid-run -- but the marker line itself still
+            # starts a normal, still-joinable block, so its own wrapped
+            # continuation lines (which are not themselves markers) still
+            # accumulate via the rules below.
+            flush()
+            cur_len = 0
+        elif cur_lines:
+            prev_ends_sentence = bool(_GROUNDING_SENTENCE_END_RE.search(cur_lines[-1][1]))
+            projected_len = cur_len + 1 + len(stripped)
+            if (prev_ends_sentence
+                    or len(cur_lines) >= _GROUNDING_BLOCK_MAX_LINES
+                    or projected_len > _GROUNDING_BLOCK_MAX_CHARS):
+                flush()
+                cur_len = 0
+
+        cur_len += (1 if cur_lines else 0) + len(stripped)
+        cur_lines.append((lineno, stripped))
+
+    flush()
+    return blocks
+
+
 def fact_check(claim: str, grounding: dict, *,
               max_matches: int = _GROUNDING_FACT_CHECK_MAX_MATCHES) -> dict:
     """
     Deterministic, precision-biased textual match against the FULL per-file
     content grounding["files"][*]["content"] (not grounding["digest"]) --
-    docs/spec.md 6b §5. A line matches iff EVERY significant term of `claim`
-    is a case-insensitive substring of it -- a strict conjunctive match, no
-    scoring, no nearest-weak-match fallback: an empty `terms` list or zero
-    matching lines both simply return found=False, never an exception.
+    docs/spec.md 6b §5, matching unit widened to a bounded block by 6b.1
+    (see _iter_grounding_blocks()). A block matches iff EVERY significant
+    term of `claim` is a case-insensitive substring of it -- a strict
+    conjunctive match, no scoring, no nearest-weak-match fallback: an empty
+    `terms` list or zero matching blocks both simply return found=False,
+    never an exception. `max_matches` still caps the returned list, but now
+    counts blocks, not lines (docs/spec.md 6b.1 "Result shape").
     """
     terms = _significant_terms(claim)
     matches = []
     if terms:
         for f in grounding.get("files", []):
-            for lineno, line in enumerate(f.get("content", "").splitlines(), start=1):
-                lower = line.lower()
+            for block in _iter_grounding_blocks(f.get("content", "")):
+                lower = block["text"].lower()
                 if all(term in lower for term in terms):
                     matches.append({
                         "label": f["label"],
                         "path": f["path"],
                         "relpath": f["relpath"],
-                        "line": lineno,
-                        "file_line": f"{f['label']}:{lineno}",
-                        "text": line.strip(),
+                        "line": block["start_line"],
+                        "file_line": f"{f['label']}:{block['start_line']}",
+                        "text": block["text"],
+                        "end_line": block["end_line"],
                     })
                     if len(matches) >= max_matches:
                         break

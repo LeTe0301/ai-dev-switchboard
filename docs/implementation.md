@@ -1,416 +1,327 @@
-# Implementation: Grounding — discovery, digest, and `fact_check` (backlog item 6, sub-spec 6b)
+# Implementation: `fact_check` recall via bounded block matching (sub-spec 6b.1)
 
 ## Summary
-Extended `app/teams.py` with a new, self-contained "grounding" section:
-`discover_grounding_files(workdir)` finds a project's `docs/ARCHITECTURE.md`,
-`docs/BACKLOG.md`, `CLAUDE.md`/`AGENTS.md` (with `@target` indirection),
-`README.md` (casing variants), mirroring `_gather_project_context()`'s own
-matching rules; `load_grounding(workdir)` reads each real file exactly once
-(bounded at a fixed 2 MiB per file) into one snapshot dict with per-file
-headings and a pre-built digest; `build_digest(files, max_bytes)` is a pure,
-hard-byte-capped digest assembler; `fact_check(claim, grounding)` is a
-deterministic, precision-biased single-line substring matcher against each
-file's full content, returning `file:line` matches or an explicit
-`found=False` — never a nearest-weak-match fallback. Two new `argparse` CLI
-subcommands (`grounding`, `fact-check`) exercise the same code with no
-server and no UI, matching 6a's own CLI precedent. `app/app.py` is
-untouched.
+`fact_check()` (`app/teams.py`) matches claims against a **bounded block**
+instead of a single physical line. **This is round 2.** Round 1 (12
+lines/1500 chars, blank-line + sentence-terminal delimiting only) shipped
+with a measured 6/6 self-authored recall benchmark and was blocked in
+testing: the reviewer's own five adversarial attacks (heading + unrelated
+body, terse tight-list bullets, fenced code adjoining prose, terms 12 lines
+apart in unrelated filler, a heading-only claim) all produced a false
+`found: True`. The coordinator's own correction (`docs/spec.md` "Round-1
+correction", `bbf2316`) identified two root causes — the window was ~6x too
+wide, and blank lines/sentence-terminal punctuation aren't the only
+structural boundaries — and relaxed the recall target ("A recall figure
+below the 5/6 target is an acceptable outcome now. Precision is the
+property that must hold.").
 
-**Round 1's testing pass found two blocking defects** (a named-pipe hang,
-and a TOCTOU race defeating the symlink-containment guarantee) plus two
-non-blocking should-fix items, all in `docs/test-review.md`. **This is the
-round-1 fix pass** — see "Post-review fixes" below for the full root
-cause/fix/regression-test writeup of each. The fix restructures file access
-around a single `os.open()`/`fstat()`/read/`os.close()` per real file
-(replacing the original design's reuse of `app.py`'s `_read_head()`, which
-is what made the double-read/TOCTOU shape possible in the first place) —
-this is the one substantive architectural change from the original build,
-documented in full under "Deviations from spec" below.
+**This round**: bounds tightened to `_GROUNDING_BLOCK_MAX_LINES = 3`,
+`_GROUNDING_BLOCK_MAX_CHARS = 400`; a block now also ends at the start of a
+heading, list item, block quote, or table row (even mid-run), and fenced
+code content is excluded from matching entirely. All five of the
+reviewer's adversarial cases now return `found: False` (verified by
+running their own scratch script directly, then porting all five verbatim
+into the permanent suite as `ReviewerAdversarialBlockPrecisionTests`).
+Recall is honestly re-measured on two batches of six claims each, written
+and committed to **before being run even once** — see "Six-claim
+benchmark, round 2" below for the real numbers, which are materially lower
+than round 1's self-measured 6/6 (as the coordinator predicted). The
+original motivating defect (a single sentence hard-wrapped across two
+lines, `docs/ARCHITECTURE.md`'s own `SVC_USER` example) is still fixed.
 
-## Root cause
-N/A for the original feature — new capability, not a bugfix. See
-"Post-review fixes" below for the two defects' own root causes.
+**Judgment call made and reported, not silently decided**: recall did not
+reach zero, precision holds against every adversarial case tried
+(reviewer's five plus 6b's own full suite), and the original motivating
+defect is still solved — so this round does **not** invoke the "stop and
+report, fall back to 6b's single-line matcher" escape hatch. That
+determination is reported explicitly here, with the honest numbers, rather
+than assumed; see "Should this have been a stop-and-report instead?" below.
+
+## Root cause (round-1 regression)
+The round-1 sentence-terminal-punctuation rule only ends a block when the
+**previous line's own text** happens to end in `.`/`!`/`?`. It was built
+and verified against exactly one shape (full-sentence prose that does end
+in periods — 6b's own regression test, and this repo's own
+`docs/ARCHITECTURE.md` bullets, which happen to all end in periods) and
+provided no protection against the much larger class of real Markdown
+constructs that don't: headings (`## Foo`), terse/non-sentence bullet items
+(`- foo config`), and fenced code (code is not prose and essentially never
+ends a line in terminal punctuation). Combined with a 12-line/1500-char
+bound wide enough to carry no co-occurrence signal at all (the reviewer's
+`terms_12_lines_apart_in_unrelated_filler` case has no Markdown structure
+whatsoever and cannot be fixed by better structure parsing alone), this let
+genuinely unrelated adjacent content merge into one matchable block and
+produce false confirmations. Full analysis: `docs/test-review.md`
+("Blocking finding"), `docs/spec.md` ("Round-1 correction").
 
 ## Changes by file
-- `app/teams.py`
-  - Import line: `from app import TMUX, tmux_has, load_engines` — **no
-    longer imports `_read_head`** (round-1 fix; see "Deviations from
-    spec"). Added `import re` (heading extraction, claim tokenizer) and
-    `import stat` (regular-file check on an open fd).
-  - One new operator-facing config constant in the existing module-level
-    config block: `TEAM_GROUNDING_MAX_BYTES` (default `8000`), read once at
-    import time from `os.environ`, matching the `TEAM_*` pattern 6a already
-    established.
-  - New `# ─── grounding ──` section, added just before the existing
-    `# ─── CLI ──` marker:
-    - `_under_workdir(path, workdir_real)` — cheap realpath-based
-      containment pre-check (pure path arithmetic, no open).
-    - `_open_grounding_candidate(path, workdir_real)` (round-1 fix) — the
-      single validated `os.open()` per real file: `O_RDONLY | O_NOFOLLOW |
-      O_NONBLOCK`, `os.fstat()` to confirm a regular file, then a second
-      containment check against the **fd's own** resolved path (via
-      `/proc/self/fd/<fd>`) before returning the fd. See "Post-review
-      fixes" for why this replaces the original two-checks-then-two-reads
-      design.
-    - `_read_grounding_candidate(path, workdir_real, read_cap)` (round-1
-      fix) — opens via the above, reads up to `read_cap` raw **bytes**
-      (not characters) off the fd in a loop, sniffs the first 512 bytes of
-      what was read for a NUL (the binary check, now free — no separate
-      open), decodes UTF-8 with `errors="ignore"`, closes the fd. Returns
-      `""` for any unusable candidate.
-    - `_discover_and_read(workdir, read_cap)` (round-1 fix) — the one place
-      that both decides which of the four candidates are present *and*
-      fetches their content; every real file is opened and read exactly
-      once here. `discover_grounding_files()` and `load_grounding()` are
-      both thin wrappers around it.
-    - `discover_grounding_files(workdir)` — same public shape as before
-      (`[{"label":..., "path":...}]`), now built from
-      `_discover_and_read()`.
-    - `_extract_headings(content)` — unchanged: ATX heading scan, fenced-
-      code-block-aware, capped at `_GROUNDING_MAX_HEADINGS_PER_FILE` (20).
-    - `load_grounding(workdir, *, max_bytes=..., read_cap=...)` — now calls
-      `_discover_and_read()` directly (not `discover_grounding_files()`
-      followed by a second read) — exactly one open+read per real file for
-      the whole snapshot build, closing the round-1 TOCTOU gap by
-      construction (see "Post-review fixes").
-    - `build_digest(files, max_bytes=...)` — unchanged: pure, no disk I/O;
-      the empty-files sentinel branch, the `max_bytes <= 0` branch, the
-      fairness-heuristic per-file budget, and the unconditional final
-      encode/slice/decode truncation that's the actual safety guarantee.
-    - `_significant_terms(claim)` / `fact_check(claim, grounding, *,
-      max_matches=...)` — unchanged: the tokenizer/stopword filter and the
-      strict conjunctive, single-line, no-fallback matcher.
-    - Three module-level constants deliberately **not**
-      environment-configurable: `_GROUNDING_READ_CAP_BYTES` (2 MiB, now a
-      genuine byte bound — see Defect 4 below), `_GROUNDING_MAX_HEADINGS_PER_FILE`
-      (20), `_GROUNDING_FACT_CHECK_MAX_MATCHES` (5); plus
-      `_GROUNDING_NO_FILES_DIGEST` (the sentinel string) and
-      `_GROUNDING_STOPWORDS`/`_GROUNDING_TOKEN_RE`.
-  - CLI: `_cli_grounding()`, `_cli_fact_check()`, two new `sub.add_parser()`
-    entries (`grounding <workdir>`, `fact-check <workdir> <claim>`) in
-    `_parse_args()`, and `main()`'s dispatch generalized from a two-way
-    `if/else` to an explicit `if/elif` chain covering all four subcommands
-    (`run`/`list-engines`/`grounding`/`fact-check`). Unchanged this round.
-  - No existing (pre-6b) function in this file changed.
-- `config/switchboard.env.example` — one new commented-out block
-  (`TEAM_GROUNDING_MAX_BYTES`, default `8000`). Unchanged this round.
-- `tests/test_teams_grounding.py` (65 tests as of this round, up from 56 at
-  the original build) — see "How to verify locally" below. Round-1 changes:
-  two existing "never opened" tests switched from wrapping `builtins.open`
-  to wrapping `os.open` (the function actually called now — wrapping the
-  no-longer-called `builtins.open` would have made those tests silently
-  vacuous); the runtime read-only test and the static AST scan both
-  extended to also cover `os.open()`'s flags argument, not just
-  `builtins.open()`'s mode string; the AST scan's function-name list
-  updated to the new function set; 9 new tests (regressions for both
-  blocking defects plus the two should-fix items, one documenting the
-  deliberate in-bounds-symlink behavior change, and one covering a distinct
-  adversarial shape — an intermediate symlinked directory — found while
-  verifying the fix's own layering — see "Post-review fixes").
+- `app/teams.py` (grounding section only, `app/app.py` untouched):
+  - `_GROUNDING_BLOCK_MAX_LINES`: `12` → **`3`**. `_GROUNDING_BLOCK_MAX_CHARS`:
+    `1500` → **`400`**. Still fixed, non-env-configurable.
+  - `_GROUNDING_SENTENCE_END_RE` now also treats `:` as sentence-terminal
+    (`docs/spec.md` "Round-1 correction"), in addition to `.`/`!`/`?`.
+  - New `_GROUNDING_HEADING_RE` (`^#{1,6}(\s|$)`), `_GROUNDING_LIST_MARKER_RE`
+    (`^(?:[-*+]|\d+\.)\s`), and `_grounding_structural_kind(stripped)` —
+    classifies a non-blank, non-fence line as `"heading"`, `"list"`,
+    `"quote"` (`>` prefix), `"table"` (`|` prefix), or `None`.
+  - `_iter_grounding_blocks(content)` — rewritten to add, on top of the
+    unchanged blank-line and sentence-terminal rules:
+    - **Structural markers are a hard boundary "even mid-run"**: a list
+      item, block quote, or table row line always flushes whatever came
+      before it and starts a fresh block — but that fresh block can still
+      accumulate its own non-marker wrapped-continuation lines via the
+      existing rules (so a bulleted sentence's own wrap still joins).
+    - **Headings are additionally excluded from matching entirely**, not
+      just prevented from merging forward — see "Deviations from spec"
+      below for why this goes beyond spec's literal text and was still
+      necessary.
+    - **Fenced code (` ``` `/`~~~`) delimiters are a hard boundary in both
+      directions**, and every line between a pair of delimiters (including
+      an unclosed fence running to EOF) is skipped entirely, never added
+      to any block — mirrors `_extract_headings()`'s own pre-existing
+      fence-toggle style for consistency.
+  - `fact_check()` itself: unchanged this round (still iterates
+    `_iter_grounding_blocks()`, same conjunctive substring rule).
+- `tests/test_teams_grounding.py`:
+  - 8 new Tier-1 pure tests in `GroundingBlockConstructionTests` covering
+    heading exclusion, list/quote/table hard-boundary behavior, a list
+    item's own wrapped continuation still joining, fenced-code exclusion,
+    and an unclosed fence.
+  - 1 new real-file test in `FactCheckBlockMatchingTests`
+    (`test_wrap_boundary_claim_matches_the_real_docs_architecture_md`) —
+    the spec's own wrap-boundary acceptance criterion, verified against
+    the real file, not just a synthetic mirror of it.
+  - `SixClaimBenchmarkTests` **replaced** — see "Six-claim benchmark,
+    round 2" below.
+  - New `ReviewerAdversarialBlockPrecisionTests` — the reviewer's five
+    adversarial cases, ported verbatim (same content, same claims, same
+    assertions) from their scratch script into the permanent suite, per
+    the coordinator's explicit instruction.
+  - No test from round 1 that was already reviewed/approved (the two
+    forced test-body edits, the round-1 Tier-1/skipped/proc-unavailable
+    tests) was touched again this round.
+
+## Six-claim benchmark, round 2
+Per the coordinator's explicit instruction, this round's benchmark was
+**written and committed to before being run even once**, in two batches of
+six, both drawn from `docs/ARCHITECTURE.md` sections round 1's own
+(self-authored, after-the-fact) benchmark hadn't drawn from:
+
+**Batch A — vocabulary drift** (natural paraphrase, swapping the source's
+own key nouns for synonyms):
+
+| Claim (paraphrase) | Old (6b) | New (6b.1, round 2) |
+|---|---|---|
+| "`_reap_dead_state` runs on every `/status` call and **heals** session state..." | False | False |
+| "the host-start.sh URL file used to only get written after the full startup sequence succeeded..." | False | False |
+| "`run_startup_watch` always writes or clears `URL_FILE` when it finishes..." | False | False |
+| "a failed confirm on a name collision leaves the upload staging directory in place..." | False | False |
+| "generalizing engine handling into `engines.d` engine files collapsed two separate implementations..." | False | False |
+| "per-project terminals always bind only to **loopback** no matter what `PUBLISH_MODE` is set to" | False | False |
+
+**0/6 old, 0/6 new.** Every miss here is a **vocabulary** mismatch
+(`"heals"` vs. the source's `"self-heals"`, `"loopback"` vs. `"127.0.0.1"`,
+etc.), not a line-boundary problem — `fact_check()` has never done fuzzy or
+synonym matching (explicit 6b non-goal) and block-widening cannot change
+that. Kept in the permanent suite specifically so this stays a clearly
+separate, already-understood limitation rather than being re-litigated as
+a block-boundary regression later.
+
+**Batch B — same vocabulary** (paraphrased grammar, but the source's own
+distinctive identifiers kept verbatim — closer to the original reviewer
+benchmark's own style):
+
+| Claim (paraphrase) | Old (6b) | New (6b.1, round 2) |
+|---|---|---|
+| "`run_startup_watch` always writes-or-clears `URL_FILE` when it's done, success or timeout" | False | False |
+| "the already running fast path checks whether the cached URL predates the session it's attached to and drops it if so" | False | **True** |
+| "a failed confirm leaves staging in place so the Back to review button can retry the same token" | False | False |
+| "generalizing engine handling into `engines.d` collapsed two separate implementations of handle a startup prompt then look for a URL into one shared tested behavior" | False | False |
+| "`_reap_dead_state` is called on every `/status` and this self-heals as soon as the underlying tmux session actually ends" | False | False |
+| "per-project terminals bind to `127.0.0.1` only regardless of `PUBLISH_MODE`" | False | **True** |
+
+**0/6 old, 2/6 new.** A real, honest improvement over 6b's single-line
+matcher on these exact six claims — just far more modest than round 1's
+self-measured 6/6. The three longest-paragraph claims (`run_startup_watch`,
+the failed-confirm one, the engines-config one) each need support spanning
+more than 3 lines / 400 chars of real prose and are correctly *not*
+matched under the tightened, precision-first bounds — this is the
+deliberate, disclosed cost of the round-1 correction, not a bug.
+
+**Combined: 0/12 old, 2/12 new.** Both counts are pinned via `assertEqual`
+in `SixClaimBenchmarkTests` (not a `>=` threshold) so a future change to
+the matcher has to consciously update this record rather than silently
+drift it either direction.
+
+**The one thing that must still work, and does**: the actual motivating
+defect this whole sub-spec exists to fix — one sentence hard-wrapped across
+two lines, `docs/ARCHITECTURE.md`'s own `SVC_USER` bullet — still matches
+against the real file
+(`test_wrap_boundary_claim_matches_the_real_docs_architecture_md`), with
+its `text` showing the correctly space-joined sentence.
+
+### Should this have been a stop-and-report instead?
+`docs/spec.md`'s own "Round-1 correction" and the coordinator's message
+both offer an explicit fallback: keep 6b's single-line matcher, raise
+recall in 6c at the prompt level instead. I considered this and did **not**
+take it, for a specific, reportable reason: the corrected design (a)
+robustly closes the round-1 regression (all five reviewer attacks plus 6b's
+full existing adversarial suite hold `found: False`, verified by running
+the reviewer's own script directly, not just re-deriving it), (b) still
+demonstrably solves the one defect the sub-spec was written to fix (the
+two-line hard-wrap case, against the real file, not a synthetic stand-in),
+and (c) measurably improves recall on the honestly-authored benchmark (0/6
+→ 2/6 on Batch B), even though the improvement is modest. None of the
+three conditions that would make this "the block approach is wrong" hold:
+precision doesn't regress, the original defect isn't left unfixed, and
+recall isn't literally zero. If the coordinator's own bar for "useful
+recall" is stricter than "measurably better than zero, without any
+precision cost," that's a legitimate call to make — but it's the
+coordinator's call to make with the honest numbers in front of them, not
+something to decide unilaterally by either shipping an inflated headline
+or silently reverting the whole feature.
 
 ## Key decisions / tradeoffs
-- **`README.md`'s returned `label` is always the literal string
-  `"README.md"`**, regardless of which casing variant
-  (`Readme.md`/`readme.md`/`README`) was actually matched — the spec's own
-  fixed-entries example shows a single `"README.md"` label in the output
-  shape, and (unlike `CLAUDE.md`/`AGENTS.md`, where the spec explicitly
-  calls out that the label should reflect "what the project author wrote")
-  says nothing about preserving README's casing in the label. `relpath`
-  still reflects the actual on-disk name.
-- **The static AST scan (`GroundingStaticASTScanTests`) walks a fixed list
-  of function names**, not "everything after a certain line number" — more
-  precise (survives reordering), and the test asserts its own name list
-  isn't stale so a future function added to the section without updating
-  the test's list fails loudly rather than being silently unscanned. Kept
-  and extended (not replaced) this round.
-- **The sparse-200MB-file fixture pads its real (non-hole) prefix past 512
-  bytes deliberately** — an all-zero sparse file's first 512 bytes are NUL
-  (part of the hole), which the binary sniff is designed to reject; a naive
-  fixture would get classified as binary and skipped, silently defeating
-  the read-cap test's own purpose.
-- **Discovery's own standalone read is still a separate operation from
-  `load_grounding()`'s.** Calling `discover_grounding_files(workdir)` and
-  then separately calling `load_grounding(workdir)` still reads each real
-  file twice, once per call — this is *not* the bug Defect 2 was about.
-  Each of those two calls does its own single, validated, TOCTOU-safe
-  open+read; nothing chains one call's result into a second, unvalidated
-  read of the same path the way the original design did *within*
-  `load_grounding()`'s own single call. Two independent, safe reads across
-  two separate top-level calls is an accepted, spec-consistent cost (the
-  spec's own snapshot-semantics section already treats each `load_grounding()`
-  call as an independent read of current disk state); one call silently
-  re-reading a path it already validated, without re-validating, is what
-  had to be eliminated.
-
-## Post-review fixes (docs/test-review.md, round 1 — blocked)
-
-### Defect 1 (must-fix, blocking) — a named pipe at any candidate path hung discovery indefinitely
-**Root cause**: the original `_looks_binary()` called `open(path, "rb")`
-unconditionally as part of the pre-read checks. `open()` on a FIFO in
-read-only mode blocks the calling thread until a writer connects — which
-never happens for an adversarial project directory containing a bare
-`os.mkfifo()`'d file at any of the four candidate paths. No timeout existed
-anywhere in the call chain.
-
-**Fix**: folded into the same structural fix as Defect 2 (see below) —
-`_open_grounding_candidate()`'s single `os.open()` call now includes
-`O_NONBLOCK`. For a FIFO opened read-only with `O_NONBLOCK` set, POSIX
-guarantees `open()` succeeds immediately even with no writer present; the
-immediately-following `os.fstat()` check then sees `stat.S_ISFIFO` (not
-`S_ISREG`) and the candidate is closed and rejected *before* any read is
-attempted — no blocking read is ever reached either. Verified live: `mkfifo
-$workdir/README.md` (no writer) then `timeout 6 python3 app/teams.py
-grounding $workdir` used to hang until the timeout killed it; now returns
-`{"empty": true, ...}` immediately.
-
-**Regression tests added** (`tests/test_teams_grounding.py`,
-`PostReviewRegressionTests`): `test_defect1_named_pipe_at_candidate_path_does_not_hang`
-(a real `os.mkfifo()`, called in a background thread with a bounded
-`join(timeout=5)` — the reviewer's own verification technique — so a
-regression fails cleanly instead of hanging the test process),
-`test_defect1_fifo_at_docs_architecture_md_does_not_hang` (confirms the fix
-isn't specific to the README.md slot), `test_defect1_fifo_via_real_cli_subprocess_bounded`
-(the reviewer's exact reproduction shape, through the real CLI subprocess
-with a hard external `timeout=8` as a backstop).
-
-### Defect 2 (must-fix, blocking) — TOCTOU between discovery's probe read and load_grounding()'s second read defeated symlink containment
-**Root cause**: `discover_grounding_files()` validated containment via
-`os.path.realpath()` against the *literal candidate path string*, then
-returned that same literal path in its result. `load_grounding()` then
-called `_read_head()` (reused from `app.py`) a second time against that
-same literal path, with no containment re-check — a real window existed
-between "checked" and "read (for keeps)" in which the file could be
-replaced (e.g. swapped for a symlink pointing outside the project, by
-something else editing the project tree — a real possibility given this
-repo's own Gitea sync-on-push feature) and the swapped-in content would be
-read and trusted anyway. The reviewer reproduced this deterministically by
-forcing the swap to land exactly between the two `_read_head()` calls.
-
-**Fix — structural, not a faster re-check.** A faster or repeated
-`realpath()`-then-`open()` pattern narrows the window but can never close
-it (any two separate syscalls have a gap between them, however small).
-The actual fix, per explicit review direction: validate the *file
-descriptor*, not the path string, and never read the same real file
-through more than one `open()` call within a single `load_grounding()`
-build. `_open_grounding_candidate()` (see "Changes by file" above)
-opens once with `O_NOFOLLOW` (so a final-path-component symlink — exactly
-what a same-path swap would introduce — makes the `open()` call itself
-fail with `ELOOP`, rather than silently following it) and then verifies
-containment against the **opened fd's own resolved path**
-(`os.path.realpath("/proc/self/fd/<fd>")`), which is pinned to the specific
-inode that's now open and cannot be affected by anything happening to the
-path string afterward. `_discover_and_read()` (see "Changes by file")
-collapses discovery and content-fetching into one pass so `load_grounding()`
-never performs a second, independent read of a path it (or an earlier
-call within the same build) already validated.
-
-**Deliberate behavior change, called out explicitly**: because `O_NOFOLLOW`
-rejects *any* final-component symlink (not just an out-of-bounds one), a
-real filesystem symlink at a candidate path — even one that legitimately
-resolves in-bounds — is now categorically unusable as grounding input. The
-original design (matching the spec's literal prose) would have followed
-and used an in-bounds symlink. No acceptance criterion in `docs/spec.md`
-requires an in-bounds symlink to be honored (the spec's own criteria only
-test the out-of-bounds case), so this narrows the accepted input shape
-without violating anything the spec pins down — and it's the direct,
-necessary consequence of closing the TOCTOU race the reviewer identified:
-supporting "usable if it happens to point in-bounds" requires a
-check-then-open pattern, which is exactly the vulnerable shape being
-eliminated.
-
-**Regression test added**: `test_defect2_symlink_swap_in_the_open_window_does_not_leak_outside_content`
-forces the real race (not a simulation of "two reads far apart") by
-monkeypatching `os.open()` itself to perform the swap — replacing an
-in-bounds `docs/ARCHITECTURE.md` with a symlink to an out-of-bounds secret
-file — as a side effect immediately before delegating to the real
-`os.open()`, landing exactly in the window between
-`_open_grounding_candidate()`'s own `_under_workdir()` pre-check and its
-`os.open()` call. Asserts the swapped file is excluded from `files` and
-that the outside content never appears in the digest or any file's
-content. Also added `test_in_bounds_symlink_candidate_is_now_categorically_unusable`
-(pinning the deliberate behavior change above) and
-`test_defect2_intermediate_symlinked_directory_is_also_rejected` (a
-distinct file *shape* — a symlinked `docs/` directory with an ordinary
-regular file at the final path component — found worth covering
-separately while verifying the fix's layering, below). The two
-pre-existing "never opened" tests
-(`test_claude_md_at_indirection_out_of_bounds_is_skipped_and_never_opened`,
-`test_real_symlink_resolving_outside_workdir_is_skipped_never_opened`)
-were updated to wrap `os.open` (the function actually called post-fix)
-instead of `builtins.open`.
-
-**Revert-and-watch-it-fail, done for both defects before considering them
-closed** (matching 6a's own review discipline, applied here proactively
-rather than waiting for the reviewer's second pass to ask for it):
-- Removing only `O_NONBLOCK` → `test_defect1_named_pipe_at_candidate_path_does_not_hang`
-  fails exactly as expected (`AssertionError: True is not false` — the
-  background thread is still alive after the 5s join, i.e. the FIFO open
-  hangs again).
-- Removing only `O_NOFOLLOW` → `test_in_bounds_symlink_candidate_is_now_categorically_unusable`
-  fails (the in-bounds symlink is now followed and used, as it would have
-  been pre-fix) — confirms that test is genuinely pinned to `O_NOFOLLOW`
-  specifically, not some other check.
-- Removing **either** `O_NOFOLLOW` alone or the post-open `/proc/self/fd`
-  containment check alone → `test_defect2_symlink_swap_in_the_open_window_does_not_leak_outside_content`
-  still passes in both cases: for this specific attack shape (the final
-  path component becoming a symlink during the race), the two checks are
-  genuinely redundant defense-in-depth, each independently sufficient.
-  Removing **both** together → the test fails and reproduces the original
-  leak verbatim (`content == "TOP SECRET HOST CONTENT THAT MUST NEVER
-  LEAK"`), confirming the test is non-vacuous and that at least one of the
-  two mechanisms is load-bearing.
-- `test_defect2_intermediate_symlinked_directory_is_also_rejected` was
-  added *because* this exploration surfaced that it's actually the cheap
-  `_under_workdir()` pre-check (whose `os.path.realpath()` call resolves
-  an entire path, intermediate components included, not just the final
-  one) that rejects a symlinked intermediate directory in the current,
-  non-racing case — not the post-open fd-based check as an earlier
-  docstring draft (now corrected, see `_open_grounding_candidate()`'s
-  in-source comment) overstated. Kept as its own test regardless, as a
-  distinct real adversarial shape worth covering on its own terms.
-- All reverts above were applied to a scratch copy of `app/teams.py`
-  outside of git (the tracked file was restored byte-identical after each,
-  confirmed via `diff`), never committed or left in place.
-
-### Defect 3 (non-blocking, should-fix — documented, not built) — negated lines produce a misleading `found=True`
-Per the reviewer's own assessment: this is inherent to a deliberately
-"dumb," non-semantic conjunctive substring matcher, which is exactly what
-the spec's "Non-goals" section asks for (semantic/LLM-assisted matching is
-explicitly out of scope) — not treated as a defect to fix. Documented
-below under "Known limitations" and pinned by a new test,
-`test_defect3_negated_line_is_a_known_false_confirmation_documented_not_fixed`,
-so a future change to the matcher doesn't silently alter this
-already-known-and-accepted behavior without the limitations note being
-revisited too.
-
-### Defect 4 (non-blocking, should-fix — fixed as a consequence of the Defect 1/2 restructuring) — `_GROUNDING_READ_CAP_BYTES` didn't measure bytes for multi-byte-heavy content
-**Root cause**: `_read_head()` (reused from `app.py`, opened in text mode)
-reads up to `limit` *characters* via `f.read(limit)`, not bytes.
-`_GROUNDING_READ_CAP_BYTES` was passed straight through as that character
-limit, so a file of entirely multi-byte UTF-8 characters (e.g. 3-byte-each
-`€` signs) could be read up to ~3-4x past the stated byte cap.
-
-**Fix**: `_read_grounding_candidate()`'s replacement of `_read_head()`
-reads raw bytes directly off the validated fd (`os.read(fd, ...)` in a
-bounded loop, decoding to `str` only at the very end) — this was already
-required by the Defect 1/2 restructuring (moving off `_read_head()`
-entirely), and it fixes Defect 4 as a direct consequence: the byte count
-read off disk is now genuinely bounded at `_GROUNDING_READ_CAP_BYTES`
-regardless of character width. No separate patch was needed.
-
-**Regression test added**: `test_defect4_read_cap_is_bytes_not_characters_for_multibyte_heavy_content`
-— a file of `_GROUNDING_READ_CAP_BYTES` repetitions of `€` (3 bytes each in
-UTF-8, so the file is ~3x the cap in real bytes) — asserts the returned
-content's UTF-8-encoded length never exceeds the cap.
+- **Headings are excluded from matching entirely, not merely prevented
+  from merging forward** — this is a deliberate extension beyond
+  `docs/spec.md`'s own literal text (which lists a heading only as one of
+  four *boundary*-triggering structural elements, distinct from the
+  fenced-code case it explicitly calls "excluded from matching entirely").
+  It was still necessary: the reviewer's own `test_heading_only_claim_matches_unrelated_following_paragraph`
+  attack uses a claim that is fully satisfied by the **heading's own text
+  alone** (`"## Setup database configuration"` contains every term of the
+  claim `"setup database configuration"` by itself) — merely keeping the
+  heading from merging *forward* with the next paragraph doesn't stop the
+  heading's own one-line block from independently satisfying the claim.
+  Full exclusion does, and is semantically defensible on the same grounds
+  spec already uses for fenced code: an ATX heading is a title, not a
+  prose assertion, and (unlike a list item or block quote) never has a
+  legitimate "wrapped continuation" to preserve by staying matchable.
+  **Flagging one factual discrepancy found while verifying this**:
+  `docs/test-review.md`'s own attack table records the *old* (6b,
+  single-line) matcher's result for this exact case as `False (correct)`;
+  independently re-measuring 6b's original single-line matcher against
+  this exact content and claim gives `True` (the heading line alone
+  satisfies all three terms under simple per-line matching too, with no
+  block logic involved at all) — reproduced live, not assumed; see
+  "Independent re-verification" below. This doesn't change what needed to
+  be built (the coordinator's requirement that all five return `False` is
+  unconditional, and heading-exclusion is the correct fix either way), but
+  it means this specific case isn't purely a *new* 6b.1 regression the way
+  the other four are — it's a pre-existing 6b characteristic (a claim
+  quoting a heading verbatim was already "confirmable" by the heading
+  alone) that this round also happens to close as a side effect of the
+  fix required for the other four.
+- **List items, block quotes, and table rows are boundaries but stay
+  matchable** (unlike headings) — a marker line's own non-marker
+  continuation lines still accumulate normally, which is what keeps a
+  wrapped bullet's own recall win (the original `SVC_USER` motivating
+  example) working. Only the *next* marker line is a hard stop, matching
+  spec's literal "starts a new block even mid-run" language exactly.
+- **`:` added to `_GROUNDING_SENTENCE_END_RE` unconditionally**, not only
+  "before a list" as spec's parenthetical suggests — the list-marker rule
+  already independently ends a block whenever the *next* line is itself a
+  marker, regardless of what the *previous* line ended with, so a
+  conditional "only before a list" reading would be redundant with that
+  rule in the cases it's meant to cover, while an unconditional reading is
+  strictly more conservative (ends blocks more eagerly) in the cases it
+  isn't. Precision-safe by construction; simpler than adding lookahead.
+- **Fence handling mirrors `_extract_headings()`'s own existing
+  toggle-on-three-char-prefix style** (`stripped[:3] in ("```", "~~~")`)
+  rather than inventing a new convention — matches this module's own
+  established precedent for the identical problem (fenced-code detection),
+  per this role's own "convention matching" discipline.
 
 ## Deviations from spec
-- **No longer imports or reuses `app.py`'s `_read_head()`.** `docs/spec.md`'s
-  "Background" section explicitly directs reusing `_read_head()` "rather
-  than duplicating a bounded-read helper." This was followed in the
-  original build. The round-1 review found that `_read_head()`'s own
-  semantics — a fresh `open()` by path string, with no way to tie a
-  containment check to the specific file that gets read — is structurally
-  what made both Defect 1 (no `O_NONBLOCK`, so a FIFO blocks the open
-  itself) and Defect 2 (validating a path and then re-opening that same
-  path string later, with no way to bind the validation to the actual
-  open, leaves an unavoidable TOCTOU window) possible. Closing both
-  required moving to `os.open()` with explicit flags
-  (`O_NOFOLLOW|O_NONBLOCK`) and fd-based validation
-  (`os.fstat()`/`/proc/self/fd`), which `_read_head()`'s
-  `open(path, "r", errors="ignore")` interface cannot express. This is a
-  deliberate, review-directed deviation from the spec's literal reuse
-  instruction, not an oversight — `_read_head()` is unaffected and remains
-  exactly as-is in `app.py` (still used elsewhere, e.g.
-  `_gather_project_context()`); only this module stopped calling it.
-- **A real filesystem symlink at any candidate path is now unusable
-  regardless of where it points**, not just when it resolves out-of-bounds
-  — see Defect 2's writeup above for why this is the direct, necessary
-  consequence of the TOCTOU fix, and why it doesn't violate any literal
-  spec acceptance criterion.
-- Otherwise none substantive beyond the original build's own "none
-  substantive" assessment (exact function signatures, dict shapes, constant
-  values/configurability split, CLI subcommand shapes all still match
-  `docs/spec.md`'s "Proposed approach" as written).
+1. **Heading full-exclusion** (see "Key decisions" above) — spec's literal
+   text treats headings as boundary-only, on par with list items/quotes/
+   tables; empirically, boundary-only treatment is insufficient to satisfy
+   the reviewer's own required-to-pass attack #5, so headings additionally
+   get the same "excluded from matching entirely" treatment spec already
+   specifies for fenced code. Reported here rather than silently decided.
+2. **`:` as an unconditional (not list-conditional) terminal-punctuation
+   trigger** — see "Key decisions" above; a conservative simplification,
+   not a loosening.
+3. Round 1's own deviation record (the sentence-terminal-punctuation rule
+   itself, and the two forced pre-existing test-body edits) is unchanged
+   and carried forward — both were independently re-verified as legitimate
+   by the coordinator and the reviewer this round (`docs/test-review.md`
+   check #5: the reviewer reproduced the "63 passed, 2 failed" baseline
+   exactly against a clean copy of the pre-6b.1 test file). Per the
+   coordinator's explicit instruction, they are kept, unmodified again
+   this round.
+4. Everything else is unchanged from round 1's own "Deviations from spec"
+   #3 (discovery, digest, caps, read path, `app/app.py` all untouched).
 
 ## Known limitations
-- **`TEAM_GROUNDING_MAX_BYTES`'s default (8000) is unmeasured against a
-  real local model's context budget**, per the spec's own "Open questions"
-  — carried forward unchanged.
-- **Single-line-only `fact_check` matching** is deliberately conservative
-  per the spec (precision over recall) — a true claim whose support spans
-  two adjacent lines of a wrapped paragraph will not match. Per spec's own
-  "Open questions," not built now.
-- **Negated lines produce a misleading `found=True` confirmation**
-  (docs/test-review.md Defect 3, non-blocking, deliberately not fixed): a
-  grounding line reading e.g. "The lead never writes directly to
-  `docs/BACKLOG.md`" will register as `found=True` "support" for the claim
-  "the lead writes directly to `docs/BACKLOG.md`" — the exact opposite of
-  what the line actually says. This is inherent to the spec's own
-  deliberately dumb, non-semantic conjunctive substring matcher (semantic
-  matching is an explicit non-goal) and is not being fixed, but it directly
-  undercuts the stated precision bias for a very common real documentation
-  pattern ("X never...", "X does not..."). **6c's lead-loop side, which
-  will eventually treat a `fact_check` `found=True` result as confirmation,
-  should be aware of this failure mode** — flagging it here as a candidate
-  follow-up open question for that sub-spec, the same way the
-  single-line-only limitation already is. Pinned by
-  `test_defect3_negated_line_is_a_known_false_confirmation_documented_not_fixed`.
-- **A real filesystem symlink at any of the four candidate paths is now
-  unusable, even one that legitimately resolves in-bounds** (deliberate
-  behavior change, see "Deviations from spec" and Defect 2 above) — a
-  project author who genuinely wants (say) `README.md` to be a symlink to
-  a file elsewhere in the same repo will find it silently excluded from
-  grounding, the same as an out-of-bounds one. No acceptance criterion
-  requires the in-bounds case to work, but flagging this explicitly as a
-  real, if narrow, usability cost of the security fix.
-- **6b intentionally ships no HTTP route, no UI, no lead loop, no
-  `fact_check`-as-LLM-tool wiring** — all deferred to 6c/6d/6e/6f per the
-  spec's own non-goals.
+- **Recall is now genuinely modest for claims whose support spans more
+  than ~3 lines / 400 characters of real prose** — a deliberate,
+  reported-not-hidden cost of the round-1 correction. `docs/test-review.md`
+  already flagged the real `run_startup_watch` paragraph in
+  `docs/ARCHITECTURE.md` (17 physical lines, one bullet) as an example that
+  won't be recoverable under these bounds; this round's own Batch B
+  confirms the same pattern on three of six fresh claims. 6c's own
+  real-usage recall check (per `docs/spec.md`'s "Open questions") should
+  go in with this expectation set correctly, not assuming round 1's
+  since-corrected 6/6.
+- **Vocabulary mismatch is untouched and unaffected by this sub-spec** —
+  `fact_check()` remains a literal, non-fuzzy substring matcher (explicit
+  6b non-goal); Batch A's 0/6 is evidence of this pre-existing limitation,
+  not a regression.
+- **`_significant_terms()`'s possessive-apostrophe tokenization quirk**
+  (flagged by the reviewer: `"row's"` tokenizes as one token that never
+  matches the source's `"row talks"`) is pre-existing 6b behavior, out of
+  this cycle's scope, not touched.
+- 6b's own already-documented limitations (negated lines producing a
+  misleading `found=True`; a real filesystem symlink at any candidate path
+  being categorically unusable even in-bounds) are unchanged.
+- Setext headings (`===`/`---` underlines) and indented code blocks are
+  not specially handled (`docs/spec.md`'s own "Open questions" judges both
+  rare enough to defer; both fail *closed* — they split rather than merge,
+  which is the safe direction).
+
+## Independent re-verification performed this round
+- Ran the reviewer's own scratch script
+  (`/tmp/claude-1001/.../scratchpad/test_reviewer_adversarial.py`)
+  directly, unmodified, against the round-1 code first (reproduced all
+  five failures exactly, confirming the starting point) and then against
+  the round-2 fix (all five pass).
+- Independently re-measured 6b's original single-line matcher against the
+  reviewer's own attack #5 content/claim (see "Key decisions" above) —
+  found a discrepancy with `docs/test-review.md`'s own table for that one
+  row, reported rather than silently corrected or ignored.
+- Wrote both benchmark batches to a scratch script and ran each exactly
+  once before recording results in this document or in the test file.
 
 ## Verification status
 | Check | Command | Result |
 |---|---|---|
-| New grounding test file alone | `python -m pytest tests/test_teams_grounding.py -q` | 65 passed |
-| Full suite, 8 total runs across this round (5 at the 64-test intermediate state, 3 at the final 65-test state, after the last regression test was added) | `/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q` | `436`/`437 passed` respectively (372 pre-existing + 64 or 65 new) every time, ~34-35s each, no flake observed |
-| Full suite, alternate harness | `python3 -m unittest discover -s tests` | `Ran 437 tests ... OK` |
-| No pre-existing file touched | `git diff --stat -- tests/`, `git diff -- app/app.py` | both as expected — only `tests/test_teams_grounding.py` changed among test files (new/untracked, not a modification of an existing file), `app/app.py` byte-identical (0 diff lines) |
+| Reviewer's scratch adversarial script, against round-1 code (baseline) | `pytest .../test_reviewer_adversarial.py -v` | 5 failed (reproduced exactly) |
+| Reviewer's scratch adversarial script, against round-2 code | `pytest .../test_reviewer_adversarial.py -v` | **5 passed** |
+| Grounding test file alone | `pytest tests/test_teams_grounding.py -q` | 104 passed |
+| Full suite, 5 consecutive runs this round | `uv run --with pytest python -m pytest tests/ -q` | **476 passed**, all 5 runs, no flake this round |
+| `app/app.py` untouched | `git diff --stat -- app/app.py` | empty diff |
+| Pre-existing test bodies touched | `git diff -- tests/test_teams_grounding.py` | only the two round-1-forced edits (independently re-verified legitimate by the coordinator/reviewer) remain from round 1; this round only adds new test classes/methods, doesn't modify any existing assertion |
 | Syntax/compile | `python3 -m py_compile app/teams.py tests/test_teams_grounding.py` | clean |
-| CLI, real repo tree | `python3 app/teams.py grounding "$(pwd)"` | real JSON: discovers `docs/ARCHITECTURE.md`, `docs/BACKLOG.md`, `README.md`, digest capped at `TEAM_GROUNDING_MAX_BYTES` |
-| CLI, `fact_check`, real repo tree | `python3 app/teams.py fact-check "$(pwd)" "Nothing else. A bug in this stdlib-only app is not an instant path"` | `found: true`, `docs/ARCHITECTURE.md:12` |
-| CLI, FIFO (Defect 1 live repro) | `mkfifo $tmp/README.md; time timeout 6 python3 app/teams.py grounding $tmp` | returns in `0.05s` with `empty: true` (previously hung until an external `timeout` killed it) |
-
-One earlier full-suite attempt this round appeared to stall at ~16% when
-run as one of five sequential invocations inside a single 2-minute-capped
-shell call — investigated via a separate, unbounded background run of the
-identical command: it completed cleanly in the normal ~35s with all 436
-tests passing. The apparent stall was the outer tool call's own 120-second
-default timeout being exceeded by five sequential ~35s runs (5×35s > 120s),
-not a hang in the code or the test suite — noted here since it's exactly
-the kind of thing worth not silently omitting, but it is not a real
-flake: every full-suite run that was allowed to actually finish, finished
-clean.
-
-No project lint/CI config exists in this repo — the test suite above is
-this project's own bar, matching 6a's own verification approach.
+| CLI, real wrap-boundary claim, real repo tree | `python3 app/teams.py fact-check "$(pwd)" "app.py runs as SVC_USER, an unprivileged system account with no login shell"` | `found: true`, `docs/ARCHITECTURE.md:5`, joined text shown |
 
 ## How to verify locally
 ```bash
-# New grounding test file only
+# Grounding test file only
 /home/dev/.local/bin/uv run --with pytest python -m pytest tests/test_teams_grounding.py -v
 
-# Full existing suite (nothing pre-existing touched, but a good sanity pass)
-python3 -m unittest discover -s tests -v
-
-# Same, via pytest
+# Full suite (run more than once)
 /home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q
 
-# CLI, against this repo's own tree (no server, no UI):
-export TOTP_SECRET=JBSWY3DPEHPK3PXP AUTH_MODE=simple SIMPLE_USERNAME=x SIMPLE_PASSWORD=x
-export ENGINES_DIR=$(pwd)/engines.d PROJECTS_DIR=/tmp/scratch-projects-6b
-python3 app/teams.py grounding "$(pwd)"
-python3 app/teams.py fact-check "$(pwd)" "some phrase you know appears in README.md/docs/ARCHITECTURE.md/docs/BACKLOG.md"
+# The reviewer's own adversarial script, directly:
+/home/dev/.local/bin/uv run --with pytest python -m pytest \
+  /tmp/claude-1001/-home-dev-projects-ai-dev-switchboard/4f087ac5-0b6c-490d-9c0b-c9f5049e0818/scratchpad/test_reviewer_adversarial.py -v
 
-# Defect 1's live repro (should return immediately, not hang):
-mkdir -p /tmp/fifotest && rm -f /tmp/fifotest/README.md && mkfifo /tmp/fifotest/README.md
-timeout 6 python3 app/teams.py grounding /tmp/fifotest
+# Confirm app/app.py is untouched:
+git diff --stat -- app/app.py
+
+# CLI, against this repo's own tree:
+export TOTP_SECRET=JBSWY3DPEHPK3PXP AUTH_MODE=simple SIMPLE_USERNAME=x SIMPLE_PASSWORD=x
+export ENGINES_DIR=$(pwd)/engines.d PROJECTS_DIR=/tmp/scratch-projects-6b1
+python3 app/teams.py fact-check "$(pwd)" "app.py runs as SVC_USER, an unprivileged system account with no login shell"
 ```

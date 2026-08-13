@@ -28,6 +28,7 @@ Run with:
 import ast
 import builtins
 import contextlib
+import io
 import json
 import os
 import shutil
@@ -287,7 +288,14 @@ class FactCheckPureTests(unittest.TestCase):
         self.assertEqual(result["matches"], [])
 
     def test_matches_capped_at_max_matches(self):
-        content = "\n".join(f"the target term appears on line {i}" for i in range(20))
+        # 6b.1 (docs/spec.md): fact_check() now counts and caps BLOCKS, not
+        # lines -- "max_matches capping behaviour is unchanged. Blocks, not
+        # lines, are counted." A blank line between each synthetic "line"
+        # keeps every one its own block (undoing this would collapse them
+        # into far fewer than 20 blocks under _GROUNDING_BLOCK_MAX_LINES,
+        # which is the fixture's own intent -- proving the cap, not the
+        # block-splitting bounds).
+        content = "\n\n".join(f"the target term appears on line {i}" for i in range(20))
         files = [_sf("README.md", content)]
         g = _synthetic_grounding(files)
         result = fact_check("target term appears", g, max_matches=3)
@@ -375,7 +383,19 @@ class DiscoverThisRepoTests(unittest.TestCase):
         result = fact_check(claim, g_tiny)  # fact_check searches full content, not the (tiny) digest
         self.assertTrue(result["found"])
         hit = next(m for m in result["matches"] if m["label"] == "docs/BACKLOG.md")
-        self.assertEqual(hit["line"], target_line_no)
+        # 6b.1 (docs/spec.md "Result shape"): line/file_line now point at
+        # the matching BLOCK's first line, not the exact physical line the
+        # claim's own text happens to sit on -- this claim's support spans
+        # the whole wrapped paragraph (lines 337-343 as of this writing),
+        # so the match correctly reports where that paragraph begins.
+        # Computed here the same way fact_check() itself does, rather than
+        # hardcoding a line number that would go stale on any edit to this
+        # paragraph.
+        backlog_content = next(f["content"] for f in g_tiny["files"] if f["label"] == "docs/BACKLOG.md")
+        enclosing_block = next(b for b in teamsmod._iter_grounding_blocks(backlog_content)
+                               if b["start_line"] <= target_line_no <= b["end_line"])
+        self.assertEqual(hit["line"], enclosing_block["start_line"])
+        self.assertEqual(hit["end_line"], enclosing_block["end_line"])
 
     def test_docs_subdirectory_missing_entirely_no_crash(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -958,6 +978,528 @@ class GroundingCLITests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         data = json.loads(result.stdout)
         self.assertFalse(data["found"])
+
+
+# ─── Tier 1: _iter_grounding_blocks() -- pure, no disk I/O (docs/spec.md 6b.1) ──
+class GroundingBlockConstructionTests(unittest.TestCase):
+    def test_empty_content_returns_no_blocks(self):
+        self.assertEqual(teamsmod._iter_grounding_blocks(""), [])
+
+    def test_only_blank_lines_returns_no_blocks(self):
+        self.assertEqual(teamsmod._iter_grounding_blocks("\n\n   \n\t\n"), [])
+
+    def test_blank_line_delimits_two_blocks(self):
+        blocks = teamsmod._iter_grounding_blocks("first paragraph\n\nsecond paragraph")
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual((blocks[0]["start_line"], blocks[0]["end_line"]), (1, 1))
+        self.assertEqual((blocks[1]["start_line"], blocks[1]["end_line"]), (3, 3))
+
+    def test_wrapped_continuation_joins_into_one_block_with_a_single_space(self):
+        # The exact shape docs/spec.md calls out by name: a wrap boundary
+        # must join with a space, not concatenate bare -- "...an" +
+        # "unprivileged..." must become "an unprivileged", never
+        # "anunprivileged".
+        content = "This line ends mid-sentence with an\nunprivileged continuation right here"
+        blocks = teamsmod._iter_grounding_blocks(content)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual((blocks[0]["start_line"], blocks[0]["end_line"]), (1, 2))
+        self.assertIn("an unprivileged", blocks[0]["text"])
+        self.assertNotIn("anunprivileged", blocks[0]["text"])
+
+    def test_sentence_terminal_line_ends_a_block_even_with_no_blank_line(self):
+        # Two complete, independent sentences stacked with no blank line
+        # between them must NOT become one block -- see
+        # _GROUNDING_SENTENCE_END_RE's own module-level comment and
+        # docs/implementation.md "Deviations from spec" for exactly why:
+        # without this rule, 6b's own existing precision test
+        # (test_partial_term_overlap_on_every_line_is_not_a_match) would
+        # regress under blank-line-only delimiting.
+        content = "Setup instructions live here.\nThe database lives elsewhere."
+        blocks = teamsmod._iter_grounding_blocks(content)
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0]["end_line"], 1)
+        self.assertEqual(blocks[1]["start_line"], 2)
+
+    def test_run_longer_than_max_lines_is_split(self):
+        max_lines = teamsmod._GROUNDING_BLOCK_MAX_LINES
+        # No terminal punctuation, no blank lines -- isolates the line-count
+        # bound from the sentence-boundary and blank-line rules.
+        lines = [f"filler token number {i} without any terminal mark" for i in range(max_lines + 5)]
+        blocks = teamsmod._iter_grounding_blocks("\n".join(lines))
+        self.assertGreaterEqual(len(blocks), 2)
+        self.assertEqual(blocks[0]["start_line"], 1)
+        self.assertEqual(blocks[0]["end_line"], max_lines)
+        self.assertEqual(blocks[1]["start_line"], max_lines + 1)
+
+    def test_run_exceeding_max_chars_is_split_before_the_line_cap(self):
+        max_chars = teamsmod._GROUNDING_BLOCK_MAX_CHARS
+        long_line = "x" * 200 + " filler words with no terminal mark at the end"
+        num_lines = (max_chars // len(long_line)) + 3
+        content = "\n".join(long_line for _ in range(num_lines))
+        blocks = teamsmod._iter_grounding_blocks(content)
+        self.assertGreaterEqual(len(blocks), 2)
+        self.assertLessEqual(len(blocks[0]["text"]), max_chars)
+        self.assertLess(blocks[0]["end_line"], num_lines)  # split before every line is consumed
+
+    def test_single_line_far_longer_than_max_chars_is_its_own_block_and_truncated(self):
+        max_chars = teamsmod._GROUNDING_BLOCK_MAX_CHARS
+        blocks = teamsmod._iter_grounding_blocks("a" * (max_chars * 3))
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual((blocks[0]["start_line"], blocks[0]["end_line"]), (1, 1))
+        self.assertEqual(len(blocks[0]["text"]), max_chars)
+
+    def test_two_unrelated_adjacent_bullets_in_a_tight_markdown_list_do_not_merge(self):
+        # This repo's own docs/ARCHITECTURE.md uses tight lists (no blank
+        # line between sibling bullets) -- reproduced synthetically here so
+        # this doesn't depend on that file's own prose staying exactly as
+        # it is today. Each bullet ends in terminal punctuation, so the
+        # sentence-boundary rule (not a blank line) is what keeps them
+        # apart, exactly like the real file (verified directly against
+        # docs/ARCHITECTURE.md's own bullets while building this fix).
+        content = (
+            "- The alpha subsystem handles widget rotation entirely.\n"
+            "- The omega subsystem handles gadget storage entirely."
+        )
+        blocks = teamsmod._iter_grounding_blocks(content)
+        self.assertEqual(len(blocks), 2)
+        g = _synthetic_grounding([_sf("README.md", content)])
+        result = fact_check("widget storage", g)  # one term from each bullet
+        self.assertFalse(result["found"])
+
+    # ── Round-1 correction (docs/spec.md "Round-1 correction",
+    # docs/test-review.md): structural elements -- headings, list items,
+    # block quotes, table rows, code fences -- are boundaries the original
+    # blank-line/sentence-terminal rules alone did not cover.
+
+    def test_heading_line_is_excluded_from_every_block(self):
+        blocks = teamsmod._iter_grounding_blocks("## A Heading\nOrdinary body text follows")
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["start_line"], 2)  # the heading itself never appears
+        self.assertNotIn("Heading", blocks[0]["text"])
+
+    def test_heading_only_content_produces_no_blocks_at_all(self):
+        self.assertEqual(teamsmod._iter_grounding_blocks("## Just A Heading"), [])
+
+    def test_list_item_marker_is_a_hard_boundary_even_mid_run(self):
+        # No terminal punctuation anywhere, no blank lines -- only the
+        # marker itself separates these two items.
+        content = "- first item continuation words here\n- second item continuation words here"
+        blocks = teamsmod._iter_grounding_blocks(content)
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0]["start_line"], 1)
+        self.assertEqual(blocks[1]["start_line"], 2)
+
+    def test_list_items_own_wrapped_continuation_still_joins(self):
+        # A marker line's own non-marker continuation lines still
+        # accumulate normally -- this is what keeps the wrap-boundary
+        # recall win working for real bulleted prose.
+        content = "- this bullet wraps onto\n  a second line with no period"
+        blocks = teamsmod._iter_grounding_blocks(content)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual((blocks[0]["start_line"], blocks[0]["end_line"]), (1, 2))
+        self.assertIn("wraps onto a second line", blocks[0]["text"])
+
+    def test_block_quote_marker_is_a_hard_boundary(self):
+        content = "ordinary prose line with no punctuation\n> a quoted line follows"
+        blocks = teamsmod._iter_grounding_blocks(content)
+        self.assertEqual(len(blocks), 2)
+
+    def test_table_row_marker_is_a_hard_boundary(self):
+        content = "ordinary prose line with no punctuation\n| col1 | col2 |"
+        blocks = teamsmod._iter_grounding_blocks(content)
+        self.assertEqual(len(blocks), 2)
+
+    def test_fenced_code_content_is_excluded_from_every_block(self):
+        content = "prose before the fence\n```\ncode line one\ncode line two\n```\nprose after the fence"
+        blocks = teamsmod._iter_grounding_blocks(content)
+        texts = [b["text"] for b in blocks]
+        self.assertEqual(len(blocks), 2)
+        self.assertTrue(all("code line" not in t for t in texts))
+
+    def test_unclosed_fence_excludes_everything_to_end_of_file(self):
+        content = "prose before\n```\ncode that never closes\nmore code"
+        blocks = teamsmod._iter_grounding_blocks(content)
+        self.assertEqual(len(blocks), 1)
+        self.assertNotIn("code", blocks[0]["text"])
+
+
+# ─── fact_check() block-matching behavior (docs/spec.md 6b.1) ─────────────
+class FactCheckBlockMatchingTests(unittest.TestCase):
+    def test_claim_split_across_a_wrap_boundary_matches_and_text_shows_joined_sentence(self):
+        content = ("- **`app/app.py`** runs as `SVC_USER` (default `switchboard-svc`), an\n"
+                   "  unprivileged system account with no login shell of its own.")
+        g = _synthetic_grounding([_sf("docs/ARCHITECTURE.md", content)])
+        result = fact_check("app.py runs as SVC_USER, an unprivileged system account", g)
+        self.assertTrue(result["found"])
+        hit = result["matches"][0]
+        self.assertEqual(hit["line"], 1)
+        self.assertEqual(hit["end_line"], 2)
+        self.assertIn("an unprivileged system account", hit["text"])
+
+    def test_wrap_boundary_claim_matches_the_real_docs_architecture_md(self):
+        # docs/spec.md's own acceptance criterion, against the real file
+        # (not a synthetic mirror of it) -- the specific defect this whole
+        # sub-spec exists to fix: a single sentence hard-wrapped across two
+        # physical lines by docs/ARCHITECTURE.md's own prose style.
+        g = load_grounding(REPO_ROOT)
+        result = fact_check(
+            "app.py runs as SVC_USER, an unprivileged system account with no login shell", g)
+        self.assertTrue(result["found"])
+        hit = next(m for m in result["matches"] if m["label"] == "docs/ARCHITECTURE.md")
+        self.assertEqual(hit["line"], 5)
+        self.assertIn("an unprivileged system account", hit["text"])
+
+    def test_wrap_boundary_space_insertion_fused_token_fails_natural_phrase_matches(self):
+        content = "This line ends mid-sentence with an\nunprivileged continuation right here"
+        g = _synthetic_grounding([_sf("README.md", content)])
+        fused = fact_check("anunprivileged", g)
+        self.assertFalse(fused["found"])
+        natural = fact_check("an unprivileged continuation", g)
+        self.assertTrue(natural["found"])
+
+    def test_claim_spanning_two_different_paragraphs_does_not_match(self):
+        content = "First paragraph mentions apple.\n\nSecond paragraph mentions banana."
+        g = _synthetic_grounding([_sf("README.md", content)])
+        result = fact_check("apple banana", g)
+        self.assertFalse(result["found"])
+
+    def test_claim_straddling_a_max_lines_split_does_not_match(self):
+        max_lines = teamsmod._GROUNDING_BLOCK_MAX_LINES
+        lines = [f"filler token number {i} without any terminal mark" for i in range(max_lines + 3)]
+        lines[0] = "alpha marker filler token without any terminal mark"
+        lines[-1] = "omega marker filler token without any terminal mark"
+        g = _synthetic_grounding([_sf("README.md", "\n".join(lines))])
+        result = fact_check("alpha omega", g)
+        self.assertFalse(result["found"])
+        # Sanity: each half still matches fine on its own.
+        self.assertTrue(fact_check("alpha marker", g)["found"])
+        self.assertTrue(fact_check("omega marker", g)["found"])
+
+    def test_line_file_line_and_end_line_point_at_the_blocks_first_and_last_lines(self):
+        content = "\n".join([
+            "# Heading",
+            "",
+            "First block line one talks about zebras",
+            "First block line two continues about zebras,",
+            "and a third line finishes the zebra thought.",
+        ])
+        g = _synthetic_grounding([_sf("docs/ARCHITECTURE.md", content)])
+        result = fact_check("zebras continues finishes", g)
+        self.assertTrue(result["found"])
+        hit = result["matches"][0]
+        self.assertEqual(hit["line"], 3)
+        self.assertEqual(hit["file_line"], "docs/ARCHITECTURE.md:3")
+        self.assertEqual(hit["end_line"], 5)
+
+
+# ─── Recall benchmark, round 2 -- corrected bounds (docs/spec.md "Round-1
+# correction", docs/test-review.md) ─────────────────────────────────────────
+class SixClaimBenchmarkTests(unittest.TestCase):
+    """Round 1's own six-claim benchmark was authored by the developer
+    AFTER the matcher was already implemented, then measured against that
+    same matcher -- both the reviewer (a fresh 7-claim benchmark) and the
+    coordinator independently measured a materially lower 4/7 on claims
+    they wrote without seeing the matcher's behavior first, and flagged
+    round 1's "6/6" headline as optimistic self-measurement. This round
+    replaces it with two batches of six claims each, both **written and
+    committed to before being run even once** against this repo's real
+    docs/ARCHITECTURE.md, under the corrected 3-line/400-char bounds:
+
+    - CLAIMS_VOCAB_DRIFT: natural paraphrases that swap the source's own
+      key nouns for synonyms (e.g. "loopback" for "127.0.0.1", "heals" for
+      "self-heals"). Scored **0/6**, old matcher and new matcher alike --
+      not a block-boundary recall failure: fact_check() has never been
+      anything but a literal substring matcher (explicit 6b non-goal: "no
+      fuzzy matching"), so a claim using different words than the source
+      can never match regardless of how wide the matching unit is. Kept
+      and pinned here specifically so "vocabulary mismatch" and "line-wrap
+      recall" stay two clearly distinct things, not conflated in a future
+      cycle into "the block matcher still doesn't work."
+    - CLAIMS_SAME_VOCAB: paraphrases that keep the source's own distinctive
+      identifiers (`SVC_USER`, `run_startup_watch`, `URL_FILE`,
+      `127.0.0.1`, `PUBLISH_MODE`, ...) verbatim while paraphrasing the
+      surrounding grammar -- closer to the original 6b reviewer
+      benchmark's own style. Scored **2/6** under the corrected bounds, up
+      from **0/6** under 6b's original single-line matcher on the exact
+      same six claims -- a real, honest improvement, just a far more
+      modest one than round 1's self-measured 6/6.
+
+    Neither count is a target to hit or a gate to pass: per the
+    coordinator's own round-1 correction, a recall figure below the spec's
+    original "5 of 6" language is now an explicitly acceptable outcome --
+    precision (see ReviewerAdversarialBlockPrecisionTests below, and the
+    unmodified 6b adversarial suite elsewhere in this file) is the
+    property that must hold. Both counts are pinned via assertEqual so a
+    future change to the matcher has to consciously update this record
+    rather than silently drift either number. Full per-claim results are
+    recorded in docs/implementation.md."""
+
+    CLAIMS_VOCAB_DRIFT = [
+        "_reap_dead_state runs on every /status call and heals session state "
+        "once the underlying tmux session actually ends",
+        "the host-start.sh URL file used to only get written after the full "
+        "startup sequence succeeded, which could leave a stale file if a step timed out",
+        "run_startup_watch always writes or clears URL_FILE when it finishes, "
+        "whether the startup succeeded or timed out",
+        "a failed confirm on a name collision leaves the upload staging directory "
+        "in place so the UI's Back to review button can retry",
+        "generalizing engine handling into engines.d engine files collapsed two "
+        "separate implementations of the startup prompt then find a URL logic "
+        "into one shared tested behavior",
+        "per-project terminals always bind only to loopback no matter what "
+        "PUBLISH_MODE is set to",
+    ]
+
+    CLAIMS_SAME_VOCAB = [
+        "run_startup_watch always writes-or-clears URL_FILE when it's done, success or timeout",
+        "the already running fast path checks whether the cached URL predates the "
+        "session it's attached to and drops it if so",
+        "a failed confirm leaves staging in place so the Back to review button can "
+        "retry the same token",
+        "generalizing engine handling into engines.d collapsed two separate "
+        "implementations of handle a startup prompt then look for a URL into one "
+        "shared tested behavior",
+        "_reap_dead_state is called on every /status and this self-heals as soon "
+        "as the underlying tmux session actually ends",
+        "per-project terminals bind to 127.0.0.1 only regardless of PUBLISH_MODE",
+    ]
+
+    @staticmethod
+    def _old_single_line_fact_check_found(claim, grounding):
+        # 6b's pre-6b.1 matcher, reproduced verbatim here for measurement
+        # only -- not a production code path any more. Every significant
+        # term must appear on one physical line.
+        terms = teamsmod._significant_terms(claim)
+        if not terms:
+            return False
+        for f in grounding.get("files", []):
+            for line in f.get("content", "").splitlines():
+                lower = line.lower()
+                if all(term in lower for term in terms):
+                    return True
+        return False
+
+    def test_vocab_drift_batch_scores_zero_regardless_of_matching_unit(self):
+        g = load_grounding(REPO_ROOT)
+        old_hits = sum(self._old_single_line_fact_check_found(c, g) for c in self.CLAIMS_VOCAB_DRIFT)
+        new_hits = sum(fact_check(c, g)["found"] for c in self.CLAIMS_VOCAB_DRIFT)
+        self.assertEqual(old_hits, 0)
+        self.assertEqual(new_hits, 0)
+
+    def test_same_vocabulary_batch_recall_measured_honestly(self):
+        g = load_grounding(REPO_ROOT)
+        old_hits = sum(self._old_single_line_fact_check_found(c, g) for c in self.CLAIMS_SAME_VOCAB)
+        new_hits = sum(fact_check(c, g)["found"] for c in self.CLAIMS_SAME_VOCAB)
+        self.assertEqual(old_hits, 0)
+        self.assertEqual(new_hits, 2)
+
+    def test_every_benchmark_match_is_reported_against_the_real_file_it_supports(self):
+        g = load_grounding(REPO_ROOT)
+        for claim in self.CLAIMS_VOCAB_DRIFT + self.CLAIMS_SAME_VOCAB:
+            result = fact_check(claim, g)
+            for m in result["matches"]:
+                self.assertEqual(m["label"], "docs/ARCHITECTURE.md")
+                self.assertGreaterEqual(m["end_line"], m["line"])
+
+
+# ─── The reviewer's round-1 adversarial precision attacks (docs/test-review.md
+# "Blocking finding: new false positives from block-widening"), ported
+# permanently ─────────────────────────────────────────────────────────────
+class ReviewerAdversarialBlockPrecisionTests(unittest.TestCase):
+    """Ported verbatim (same content, same claims) from the reviewer's own
+    scratch script
+    (test_reviewer_adversarial.py, docs/test-review.md round-1 testing
+    pass) into the permanent suite, per the coordinator's explicit
+    instruction. All five reproduced a false `found: True` against round
+    1's 12-line/1500-char, blank-line + sentence-terminal-only matcher;
+    all five are must-fix precision regressions the round-1 diff
+    introduced, independently confirmed by the reviewer to return `False`
+    under 6b's original single-line matcher. All five now return
+    `found: False` under the corrected structural-boundary rules and
+    3-line/400-char bounds."""
+
+    def test_heading_with_no_terminal_punctuation_merges_with_unrelated_body(self):
+        content = ("## Widget rotation subsystem\n"
+                   "The gadget storage subsystem handles persistence for unrelated items.")
+        g = _synthetic_grounding([_sf("t.md", content)])
+        result = fact_check("widget rotation gadget storage", g)
+        self.assertFalse(result["found"],
+            f"heading + unrelated body merged into a false match: {result['matches']}")
+
+    def test_tight_bullet_list_with_no_terminal_punctuation_merges_unrelated_bullets(self):
+        content = ("- widget rotation config\n"
+                   "- gadget storage config\n"
+                   "- unrelated topic zebra migration\n")
+        g = _synthetic_grounding([_sf("t.md", content)])
+        result = fact_check("widget rotation zebra migration", g)
+        self.assertFalse(result["found"],
+            f"three unrelated terse bullets merged into a false match: {result['matches']}")
+
+    def test_fenced_code_block_merges_with_adjoining_unrelated_prose(self):
+        content = ("The deploy script does the following\n"
+                   "```\n"
+                   "run_as_root()\n"
+                   "grant_secret_access()\n"
+                   "```\n"
+                   "for the unrelated widget subsystem\n")
+        g = _synthetic_grounding([_sf("t.md", content)])
+        result = fact_check("deploy script grant_secret_access widget subsystem", g)
+        self.assertFalse(result["found"],
+            f"code fence content merged with surrounding unrelated prose: {result['matches']}")
+
+    def test_terms_12_lines_apart_in_unrelated_filler_still_match(self):
+        lines = [f"filler line {i} with no punctuation at end" for i in range(12)]
+        lines[0] = "alpha marker appears here with no punctuation at end"
+        lines[11] = "omega marker appears here with no punctuation at end"
+        content = "\n".join(lines)
+        g = _synthetic_grounding([_sf("t.md", content)])
+        result = fact_check("alpha marker omega marker", g)
+        self.assertFalse(result["found"],
+            f"terms 12 lines apart in unrelated filler falsely co-occur: {result['matches']}")
+
+    def test_heading_only_claim_matches_unrelated_following_paragraph(self):
+        content = ("## Setup database configuration\n"
+                   "Unrelated content about deployment follows here without periods\n")
+        g = _synthetic_grounding([_sf("t.md", content)])
+        result = fact_check("setup database configuration", g)
+        self.assertFalse(result["found"],
+            f"heading text falsely co-occurs with unrelated following paragraph: {result['matches']}")
+
+
+# ─── `skipped` list (docs/spec.md 6b.1 follow-up 1) ────────────────────────
+class GroundingSkippedListTests(unittest.TestCase):
+    """An in-bounds candidate rejected for any reason is now surfaced in
+    load_grounding()'s `skipped` list rather than vanishing with no
+    signal -- see docs/test-review.md's "Answer to the coordinator's
+    in-bounds-symlink question" for the original ask."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="switchboard-grounding-skipped-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_skipped_empty_for_a_clean_project(self):
+        _write(os.path.join(self.tmp, "README.md"), "# Clean\n\nNothing unusual here.")
+        g = load_grounding(self.tmp)
+        self.assertEqual(g["skipped"], [])
+
+    def test_skipped_empty_when_no_candidates_exist_at_all(self):
+        # Simply absent is not "rejected" -- see
+        # _open_grounding_candidate()'s own docstring for the distinction.
+        g = load_grounding(self.tmp)
+        self.assertTrue(g["empty"])
+        self.assertEqual(g["skipped"], [])
+
+    def test_skipped_populated_for_an_in_bounds_symlink(self):
+        _write(os.path.join(self.tmp, "docs", "REAL_README.md"), "# Real\n\nActual content.")
+        os.symlink(os.path.join(self.tmp, "docs", "REAL_README.md"),
+                   os.path.join(self.tmp, "README.md"))
+        g = load_grounding(self.tmp)
+        self.assertTrue(g["empty"])  # still categorically unusable, docs/test-review.md Defect 2
+        self.assertEqual(g["skipped"], [
+            {"label": "README.md", "relpath": "README.md", "reason": "symlink"},
+        ])
+
+    def test_skipped_populated_for_out_of_bounds_indirection_target(self):
+        outside_dir = tempfile.mkdtemp(prefix="switchboard-grounding-outside-")
+        try:
+            outside_path = os.path.join(outside_dir, "secret.txt")
+            _write(outside_path, "top secret host content")
+            rel = os.path.relpath(outside_path, self.tmp)
+            _write(os.path.join(self.tmp, "CLAUDE.md"), f"@{rel}")
+
+            g = load_grounding(self.tmp)
+            self.assertTrue(g["empty"])
+            self.assertEqual(g["skipped"], [
+                {"label": "CLAUDE.md", "relpath": rel, "reason": "out_of_bounds"},
+            ])
+        finally:
+            shutil.rmtree(outside_dir, ignore_errors=True)
+
+    def test_skipped_populated_for_a_directory_where_a_file_is_expected(self):
+        os.makedirs(os.path.join(self.tmp, "docs", "ARCHITECTURE.md"))
+        g = load_grounding(self.tmp)
+        arch_skips = [s for s in g["skipped"] if s["label"] == "docs/ARCHITECTURE.md"]
+        self.assertEqual(arch_skips, [
+            {"label": "docs/ARCHITECTURE.md", "relpath": "docs/ARCHITECTURE.md",
+             "reason": "not_regular_file"},
+        ])
+
+    @unittest.skipIf(os.getuid() == 0, "permission bits are not enforced against root")
+    def test_skipped_populated_for_a_permission_denied_file(self):
+        path = os.path.join(self.tmp, "README.md")
+        _write(path, "# Unreadable\n\nContent nobody -- including us -- can read.")
+        os.chmod(path, 0o000)
+        try:
+            g = load_grounding(self.tmp)
+            self.assertEqual(g["skipped"], [
+                {"label": "README.md", "relpath": "README.md", "reason": "unreadable"},
+            ])
+        finally:
+            os.chmod(path, 0o644)  # so tearDown's rmtree can remove it
+
+
+# ─── /proc/self/fd unavailability (docs/spec.md 6b.1 follow-up 2) ─────────
+class GroundingProcUnavailableTests(unittest.TestCase):
+    """If /proc/self/fd doesn't resolve (as if /proc weren't mounted), every
+    candidate must be rejected with a distinct, surfaced reason -- not
+    silently -- and never by falling back to a path-based realpath() check
+    (which would reopen the TOCTOU race docs/test-review.md Defect 2
+    closed). Simulated the same way docs/test-review.md's own round-2
+    testing pass simulated it (test case #12): monkeypatch
+    os.path.realpath to hand back the literal, unresolved string for any
+    /proc/self/fd/... argument, delegating to the real implementation for
+    everything else -- only the fd-based post-open containment check is
+    meant to degrade; workdir/candidate-path resolution must still work
+    normally."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="switchboard-grounding-procsim-")
+        self._real_realpath = os.path.realpath
+        teamsmod._grounding_proc_warned = False
+
+    def tearDown(self):
+        os.path.realpath = self._real_realpath
+        teamsmod._grounding_proc_warned = False
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _simulate_proc_unavailable(self):
+        real_realpath = self._real_realpath
+
+        def _fake_realpath(path, *a, **kw):
+            if isinstance(path, str) and path.startswith("/proc/self/fd/"):
+                return path  # unresolved -- exactly what a missing /proc yields
+            return real_realpath(path, *a, **kw)
+
+        os.path.realpath = _fake_realpath
+
+    def test_every_candidate_is_rejected_with_a_distinct_reason_not_silent_emptiness(self):
+        _write(os.path.join(self.tmp, "README.md"), "# Genuinely Fine\n\nReal content.")
+        self._simulate_proc_unavailable()
+
+        stderr_capture = io.StringIO()
+        with contextlib.redirect_stderr(stderr_capture):
+            g = load_grounding(self.tmp)
+
+        self.assertTrue(g["empty"])
+        self.assertEqual(g["files"], [])
+        self.assertEqual(g["skipped"], [
+            {"label": "README.md", "relpath": "README.md", "reason": "proc_unavailable"},
+        ])
+        self.assertIn("proc", stderr_capture.getvalue().lower())
+
+    def test_warning_prints_exactly_once_across_multiple_rejected_candidates(self):
+        _write(os.path.join(self.tmp, "docs", "ARCHITECTURE.md"), "# A\n\nSome text.")
+        _write(os.path.join(self.tmp, "README.md"), "# R\n\nSome text.")
+        self._simulate_proc_unavailable()
+
+        stderr_capture = io.StringIO()
+        with contextlib.redirect_stderr(stderr_capture):
+            g = load_grounding(self.tmp)
+
+        self.assertEqual(len(g["skipped"]), 2)
+        self.assertEqual(stderr_capture.getvalue().count("did not resolve"), 1)
 
 
 if __name__ == "__main__":

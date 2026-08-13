@@ -1,151 +1,225 @@
-# Test & Review: Grounding — discovery, digest, and `fact_check` (backlog item 6, sub-spec 6b)
+# Test & Review: `fact_check` recall via bounded block matching (sub-spec 6b.1)
 
 ## Scope
-Round 2. Round 1 (testing pass) found two blocking defects (a named-pipe
-hang, a TOCTOU race defeating symlink containment) plus two non-blocking
-should-fix items (negated-line false confirmation, byte-vs-character read
-cap). The developer's round-1 fix restructures file access around a single
-`os.open(O_RDONLY|O_NOFOLLOW|O_NONBLOCK)` → `os.fstat()` → fd-pinned
-`/proc/self/fd` containment re-check → single bounded read, replacing the
-original `app.py`-`_read_head()`-based double-read design. This round
-re-verifies both fixes at the class level (not just the original two
-repros), re-runs the full suite, confirms the 9 new tests are non-vacuous,
-answers the coordinator's in-bounds-symlink question, then — since testing
-came back clean — completes the review pass deferred from round 1.
+Testing pass only. A blocking precision defect was found — new, genuine
+false positives introduced by the block-widening this sub-spec exists to
+ship — so per process this stops at the testing pass and does not proceed
+to the independent review pass (spec-to-code traceability / correctness /
+security / simplicity). Route back to the developer.
 
-## Test cases — re-verification of round-1 fixes
+## What I independently re-verified from the coordinator's own checks
+All of the following were re-run by me this session, not taken on trust:
 
-| # | Item | Method | Result | Evidence |
-|---|---|---|---|---|
-| 1 | Regression suite | `pytest tests/ -q`, 3 separate runs this round | pass, no flake | `437 passed` every time (372 + 65) |
-| 2 | No pre-existing test modified, `app/app.py` untouched | `git diff --stat -- tests/`, `git diff -- app/app.py` | pass | tests/ diff empty (only the new/untracked file); app.py 0 diff lines |
-| 3 | 9 new tests genuinely fail against the pre-fix (round-1) module | swapped `app/teams.py` for the saved pre-fix version, ran the new/changed tests, restored | pass — non-vacuous | 7 explicit failures (the 2 not expected to fail as regressions — `test_defect2_intermediate_symlinked_directory_is_also_rejected` and `test_defect3_negated_line...` — correctly did **not** fail, since both already held/were already-accepted pre-fix, exactly as the developer's own writeup claims); the two FIFO-hang tests failed *cleanly* via their bounded `join(timeout=5)`, not by hanging the test run — confirms that design choice actually works |
-| 4 | Defect 1 fix (`O_NONBLOCK`) is load-bearing | my own revert-and-watch-it-fail: removed `O_NONBLOCK` only, re-ran the 3 Defect-1 tests | fails exactly as expected (FIFO hangs again, all 3 fail) | restored, byte-diff clean |
-| 5 | Defect 2 fix, `O_NOFOLLOW` + fd-recheck redundancy claim | my own revert-and-watch-it-fail: removed **both** `O_NOFOLLOW` and the `/proc/self/fd` recheck together | fails and reproduces the exact original leak (`content == "TOP SECRET HOST CONTENT THAT MUST NEVER LEAK"`) | restored, byte-diff clean, confirms the test is non-vacuous and at least one mechanism is load-bearing, matching the developer's own claim |
-| 6 | Defect 4 (byte vs. character read cap) fix | my own script, independent of the new test | pass | 3,000,000×`€` (3 bytes each) → `content` byte length `2,097,150` ≤ cap `2,097,152` (was `6,291,436` — ~3x over — against the pre-fix code in round 1) |
-| 7 | *(beyond the two original repros)* symlink-to-a-FIFO at a candidate path | my own script (real `os.mkfifo` + `os.symlink` to it), bounded thread join | pass — rejected via `O_NOFOLLOW` before the FIFO's blocking behavior is ever reached; no hang | `hung=False`, `empty=True` |
-| 8 | *(beyond spec)* Unix domain socket at a candidate path | my own script (`socket.bind()`), bounded thread join | pass — rejected via the `S_ISREG` `fstat` check; no hang | `hung=False`, `empty=True` |
-| 9 | *(beyond spec)* device node at a candidate path | not tested — creating a real device node requires `CAP_MKNOD`/root, unavailable in this sandbox | not directly tested, but same codepath as the socket case (`fstat` → `S_ISREG` check) would reject it the identical way; low-risk gap, noted, not blocking |
-| 10 | *(beyond spec)* symlink whose parent directory is itself a symlink | developer's own `test_defect2_intermediate_symlinked_directory_is_also_rejected`, independently re-read and reasoned through (caught by `_under_workdir`'s whole-path `realpath()`, not the fd check) | pass | ran as part of the full suite; reasoning double-checked against the code, correct |
-| 11 | *(beyond spec)* symlink created in the window **between `os.open()` succeeding and `os.fstat()` running** (narrower than the pre-check→open window Defect 2 fixed) | my own script: monkeypatched `os.fstat` to swap the path to a symlink-to-secret as a side effect on its first call, before delegating to the real `fstat` | pass — **not exploitable**, correctly returns the *original* file's content, not the swapped target's, confirming the file descriptor is pinned to the already-open inode and cannot be affected by a later path-level change (this is the Unix guarantee the fix's whole approach rests on) | `content` == the original real content, not `"SECRET"` |
-| 12 | *(beyond spec)* `/proc/self/fd` unavailable (e.g. a container without procfs mounted) | my own script: monkeypatched `os.path.realpath` to return the literal (unresolved) string for any `/proc/self/fd/...` argument, simulating an unresolvable procfs entry | **degrades silently to permanently-empty grounding for every project, no exception, no signal** — see Finding 3 below | `entries == []`, `g["empty"] == True` for a genuinely valid in-bounds file |
+| # | Check | Command | Result |
+|---|---|---|---|
+| 1 | Grounding test file alone | `pytest tests/test_teams_grounding.py -q` | **89 passed** |
+| 2 | Full suite, 3 consecutive runs | `uv run --with pytest python -m pytest tests/ -q` | **461 passed**, all 3 runs, no flake (could not reproduce the `test_teams_headless.py` flake the developer/coordinator saw either) |
+| 3 | `app/app.py` untouched | `git diff --stat -- app/app.py` | empty diff |
+| 4 | Exactly one pre-existing test file touched, and exactly two pre-existing test *bodies* | `git diff -- tests/test_teams_grounding.py` (read in full) | confirmed: `import io`, two modified assertions (`test_matches_capped_at_max_matches`, `test_fact_check_finds_passage_present_in_full_content_but_truncated_out_of_digest`), five new test classes appended |
+| 5 | The "63 passed, 2 failed" pre-change baseline claim | Restored the **unmodified** old test file (from `4925c49`'s parent) verbatim against the *new* `app/teams.py`, ran it, restored the working tree | **Reproduced exactly**: 63 passed, 2 failed, the identical two tests, for the identical reason (block-first-line semantics vs. the old hardcoded line/count expectations). This independently confirms the two test-body edits are a faithful adaptation to spec's own redefined "Result shape," not a weakened assertion. |
+| 6 | No path-based `realpath()` fallback for `/proc`-unavailable | `grep -n realpath app/teams.py`, read every call site | Confirmed: only `_under_workdir`'s pre-check (pre-existing, always followed by the fd-based re-check), the fd-based `/proc/self/fd` re-check itself, and `workdir_real` setup. The `/proc`-unavailable branch returns `(None, "proc_unavailable")` and stops — no fallback re-derives containment from the path string. |
+| 7 | `skipped` list / `/proc`-unavailable follow-ups | ran as part of the full 89-test suite (`GroundingSkippedListTests`, `GroundingProcUnavailableTests`) | pass |
+
+## My own six-claim (extended to seven) recall benchmark
+Per the brief, I did not reuse the developer's reconstruction. I wrote seven
+fresh true claims about this repo, independent of both the developer's and
+the coordinator's wording, and ran them against `load_grounding(REPO_ROOT)` +
+`fact_check()` directly:
+
+| Claim | Found |
+|---|---|
+| "app.py can run tmux, ttyd, and code-server as RUN_USER via narrow sudoers rules" | True |
+| "the folder upload wizard's hand-off script does an atomic mkdir, cp -a, and chown" | True |
+| "RUN_USER holds the engine credentials including claude's own login" | False |
+| "in tailscale mode per-project terminals are published via tailscale serve --set-path" | True |
+| "the host-control row's dedicated SSH key can run exactly three whitelisted scripts" | False |
+| "run_startup_watch always writes or clears URL_FILE when it's done, success or timeout" | False |
+| "a failed confirm on a name collision leaves staging in place so Back to review can retry" | True |
+
+**4/7.** This lands close to the coordinator's own 4/7, not the developer's
+self-authored 6/6 — I agree with the coordinator's read that 6/6 is weak
+evidence (a benchmark authored by the same person who then measures their
+own implementation against it). Diagnosis of the three misses:
+- **"RUN_USER holds... including claude's own login"** — vocabulary
+  mismatch (`_significant_terms` tokenizes `"including"`/`"holds"`, neither
+  literal word appears in the source, which says "is where... engine
+  credentials (e.g. `claude`'s own login)"). Same category the developer
+  already identified (`configuration`/`config`).
+- **"the host-control row's dedicated SSH key..."** — near-exact match to
+  the source sentence, but fails because `_significant_terms` tokenizes the
+  possessive `"row's"` as one token (the token regex includes `'`), which
+  never appears as a substring of the source's `"row talks"`. This is a
+  **pre-existing tokenization quirk in `_significant_terms()`**, unrelated
+  to this cycle's diff — not caused by 6b.1, just newly visible because
+  block matching makes near-misses like this the dominant failure mode now.
+- **"run_startup_watch always writes or clears URL_FILE when it's done..."**
+  — genuinely structural, and worth flagging even though non-blocking: the
+  real supporting bullet in `docs/ARCHITECTURE.md` (the host-control
+  in-memory-state paragraph, lines 65–81 as of this writing) is **17
+  physical lines of one single bullet** with no sentence-terminal
+  punctuation until near the end, so it exceeds
+  `_GROUNDING_BLOCK_MAX_LINES = 12` and is split mid-sentence, right
+  between `"run_startup_watch() ... is the fix:"` and `"it captures
+  opportunistically..."`. This is one long paragraph, not two — a case
+  spec's own non-goals section ("a claim whose support genuinely spans two
+  separate paragraphs remains unmatched — that is correct conservative
+  behaviour") doesn't quite cover, since this is one paragraph split only
+  by the fixed bound. Not blocking (the bound is deliberately fixed and the
+  spec's actual bar is the 5/6 benchmark, not "every claim"), but it is
+  concrete evidence that `12`/`1500` are already binding in this repo's own
+  real prose, not just a theoretical concern.
+
+Both 4/7 numbers (mine and the coordinator's) clear the spec's own ">= 5 of
+6" bar only if you round generously; taken literally as a fraction, 4/7 ≈
+0.57 vs. the spec's implicit ≥ 0.83. I'd flag the **"6/6" headline in
+`docs/implementation.md`'s Summary as overstated** relative to what two
+independent fresh benchmarks measured — not blocking by itself (the encoded
+test uses a `>= 5` threshold against its *own* reconstructed claims, which
+does pass, and a self-authored benchmark passing is still weak-but-real
+signal), but the coordinator's instinct to distrust the self-authored 6/6
+was correct and should be reflected in the record rather than the 6/6
+number standing as the reported result.
+
+## Blocking finding: new false positives from block-widening (must-fix)
+
+Per the brief's explicit direction ("Attack it: claims whose terms scatter
+across a genuinely unrelated block, claims matching a heading rather than
+substance, claims matching inside fenced code blocks, terms co-occurring in
+a bullet list of unrelated items. Any false positive is blocking"), I wrote
+five adversarial attacks targeting exactly those four categories, using the
+same `_sf`/`_synthetic_grounding` test helpers this project's own suite
+uses. **All five produced a false `found: True`.** I verified each is a
+genuine regression (not pre-existing 6b behavior) by also running each
+through 6b's old single-line matcher, reproduced verbatim — all five
+correctly returned `False` under the old matcher.
+
+Test code: `/tmp/claude-1001/-home-dev-projects-ai-dev-switchboard/4f087ac5-0b6c-490d-9c0b-c9f5049e0818/scratchpad/test_reviewer_adversarial.py`
+(scratch, not committed — role is not to fix, only to report). Run with:
+`python3 -m pytest test_reviewer_adversarial.py -v` (needs `APP_DIR` on
+`sys.path`, see the file's own header, copied from
+`tests/test_teams_grounding.py`'s own import setup).
+
+| # | Attack | Synthetic content | Claim | `_iter_grounding_blocks` verdict | Old (6b) matcher | New (6b.1) matcher |
+|---|---|---|---|---|---|---|
+| 1 | Heading (no terminal punctuation) merges with unrelated body | `"## Widget rotation subsystem\nThe gadget storage subsystem handles persistence for unrelated items."` | "widget rotation gadget storage" | one block, lines 1-2 | `False` (correct) | **`True` (false positive)** |
+| 2 | Tight bullet list, no terminal punctuation on any item, three unrelated topics | `"- widget rotation config\n- gadget storage config\n- unrelated topic zebra migration\n"` | "widget rotation zebra migration" | one block, lines 1-3 | `False` (correct) | **`True` (false positive)** |
+| 3 | Fenced code block adjoining unrelated prose, no blank line | ```` "The deploy script does the following\n```\nrun_as_root()\ngrant_secret_access()\n```\nfor the unrelated widget subsystem\n" ```` | "deploy script grant_secret_access widget subsystem" | one block, lines 1-6 | `False` (correct) | **`True` (false positive)** |
+| 4 | Terms 12 lines apart in wholly unrelated filler, at exactly the line-count bound | 12 lines of `"filler line N with no punctuation at end"`, `"alpha marker..."` at line 1, `"omega marker..."` at line 12 | "alpha marker omega marker" | one block, lines 1-12 | `False` (correct) | **`True` (false positive)** |
+| 5 | Heading-only claim matches an unrelated following paragraph | `"## Setup database configuration\nUnrelated content about deployment follows here without periods\n"` | "setup database configuration" | one block, lines 1-2 | `False` (correct) | **`True` (false positive)** |
+
+### Root cause
+The sentence-terminal-punctuation rule (`_GROUNDING_SENTENCE_END_RE`,
+"Deviations from spec" #1 in `docs/implementation.md`) only ends a block
+when the **previous line's own text** happens to end in `.`/`!`/`?`. It was
+built and measured against exactly one shape: full-sentence prose lines
+that do end in periods (6b's regression test, and this repo's own
+`docs/ARCHITECTURE.md` bullets, which the developer verified all happen to
+end in periods). It provides **no protection at all** against the much
+larger class of real Markdown constructs that don't end lines in terminal
+punctuation: headings (`## Foo`), terse/non-sentence bullet items (`- foo
+config`), and fenced code blocks (whose lines are code, not prose, and
+essentially never end in `.`/`!`/`?`). For all of these, the *only* thing
+stopping unrelated adjacent content from merging is a blank line — which
+`docs/spec.md`'s own literal "delimited by blank lines" rule already
+assumed would be sufficient, and which the developer's own testing (rightly)
+found isn't sufficient for the *specific* case of sentence-ending prose
+without a blank line, but the fix doesn't generalize to these other three
+common shapes. Attack #4 additionally shows the raw bound is exploitable on
+its own even with zero markdown structure involved: 12 lines of otherwise
+totally unrelated filler is still well within `_GROUNDING_BLOCK_MAX_LINES`,
+so two markers with no relationship to each other "confirm" a claim that
+they're related, purely because they're within the fixed window.
+
+This is exactly the risk `docs/spec.md`'s own "precision/recall tradeoff"
+section names ("Widening the unit does make accidental co-occurrence more
+likely... If any adversarial claim starts matching, the bounds are wrong
+and the fix must not ship on a recall improvement alone") and exactly what
+the coordinator's brief asked me to attack. A lead using this tool would see
+`found: True` and treat a claim as **verified** — for `fact_check`'s stated
+purpose (guarding a lead loop against confidently wrong claims), a false
+confirmation triggered by a heading, a terse bullet list, or a code fence is
+not a hypothetical edge case; headings, terse lists, and fenced code blocks
+are extremely common in real project documentation (README files, this
+project's own `AGENTS.md`/`CLAUDE.md` indirection target, any project 6c
+will eventually be pointed at) — this is not confined to contrived prose.
+
+### Why this blocks
+Per the brief: "Precision is the blocking property... Any false positive is
+blocking." All five attacks are false positives, all five are demonstrated
+regressions introduced by this cycle's own diff (not pre-existing 6b
+behavior), and all five sit squarely inside the four attack categories the
+coordinator explicitly asked me to test. This is a must-fix, not a nit or
+should-fix.
+
+## Test-case table (spec.md acceptance criteria)
+
+| # | Acceptance criterion | Result | Evidence |
+|---|---|---|---|
+| 1 | Six-claim benchmark encoded, ≥5/6 | Encoded test passes (`>= 5` against developer's own reconstructed claims) | but see "My own benchmark" above — real recall on two independent fresh benchmarks is 4/7, not 6/6; encoded test itself is not wrong, its headline framing in `docs/implementation.md` is optimistic |
+| 2 | 6b's existing adversarial claims still `found: False` | **Pass** | 89/89 grounding tests pass, includes `FactCheckPureTests`/`PostReviewRegressionTests` unmodified |
+| 2b | *(beyond spec, per this cycle's brief)* New adversarial attacks (unrelated block, heading, code fence, unrelated bullet list) | **FAIL — blocking** | 5/5 of my own attacks produce `found: True`; see table above |
+| 3 | Wrap-boundary claim on `docs/ARCHITECTURE.md` matches, joined text shown | Pass | `FactCheckBlockMatchingTests`, plus my own CLI re-run |
+| 4 | Cross-paragraph claim does not match | Pass | `test_claim_spanning_two_different_paragraphs_does_not_match` |
+| 5 | Run > `_GROUNDING_BLOCK_MAX_LINES` split, proven by straddling claim | Pass | `test_claim_straddling_a_max_lines_split_does_not_match`; independently reproduced the real-world version of this (the `run_startup_watch` paragraph) — see benchmark diagnosis above |
+| 6 | Wrap-boundary space insertion (`anunprivileged` fails, `an unprivileged` matches) | Pass | `test_wrap_boundary_space_insertion_fused_token_fails_natural_phrase_matches` |
+| 7 | `line`/`file_line`/`end_line` correctness | Pass | `test_line_file_line_and_end_line_point_at_the_blocks_first_and_last_lines` |
+| 8 | `skipped` populated for in-bounds symlink, empty for clean project | Pass | `GroundingSkippedListTests`, part of 89-test run |
+| 9 | `/proc`-unavailable detected/surfaced, no path-based fallback | Pass | `GroundingProcUnavailableTests`; independently confirmed no fallback exists by reading every `realpath()` call site |
+| 10 | Full suite green, several runs; no pre-existing test modified beyond what's forced; `app/app.py` untouched | Pass (with the two forced test-body edits independently re-verified as forced, not a loosening) | 461/461 × 3 runs; `git diff --stat -- app/app.py` empty; old-test-file-against-new-matcher reproduction (63 passed/2 failed, identical two) |
 
 ## Regression check
-`/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q` — **437 passed**, 3 separate runs this round, no flake. `git diff --stat -- tests/` and `git diff -- app/app.py` both confirm no pre-existing file touched.
+`uv run --with pytest python -m pytest tests/ -q` — 461 passed, 3
+consecutive runs this session, no flake observed (including
+`test_teams_headless.py`, which both the developer and coordinator flagged
+as an occasional unrelated flake — clean all 3 times for me).
 
-## Answer to the coordinator's in-bounds-symlink question
-**Silent skipping is defensible but not the best outcome, and I'd call it a should-fix, not a blocker.** The module already treats "empty/missing/unusable" as one unified, deliberately-unobservable-in-detail category by design (this predates the fix — the original spec explicitly unifies missing/empty/permission-denied/directory/symlink-loop into the same outcome). Extending that same unification to "rejected because it's a symlink, even an in-bounds one" is consistent with that existing precedent and isn't a spec violation. But the module's own design already cares about *some* observability — `empty: bool` and `_GROUNDING_NO_FILES_DIGEST` exist specifically so "genuinely nothing found" is legible to a caller rather than silently indistinguishable from "not yet loaded." A symlinked `README.md` is a plausible real setup (a monorepo, a shared-docs template) and its rejection is invisible at every level: not in `files`, not in `empty`'s reasoning, no separate `skipped`/`rejected` list, no log line. An operator debugging "why is grounding empty for this project" has no path to discovering the cause without already knowing to suspect a symlink and going and checking by hand. Recommend a lightweight follow-up (not blocking this round): either a `skipped: [{"label":..., "reason": "symlink"}]` entry in the returned dict, or at minimum a one-line log/stderr note — something that turns "grounding is mysteriously empty" into "grounding found a symlinked README.md but can't use it." This is already honestly documented in `docs/implementation.md`'s "Known limitations," which is the right thing to have done even before deciding whether to build the visibility improvement.
+## Overall verdict: **Blocked**
 
-## Spec coverage
-Re-checked against `docs/spec.md`'s full acceptance-criteria list (all 22 items from round 1, unchanged by this round's fix): every criterion still traces to a passing automated test, all still hold under the restructured implementation. No acceptance criterion requires in-bounds symlink support (confirmed by re-reading the criteria list directly, not just trusting the developer's own claim), so the deliberate behavior narrowing doesn't create a spec gap. No acceptance criterion covers named pipes, sockets, or the TOCTOU race either — both defects were found via testing beyond the literal list, as flagged in the original brief, and both are now closed with dedicated regression tests.
+Must-fix before this can proceed to a review pass:
 
-## Findings (most severe first)
+1. **Block-boundary rule doesn't generalize past "ends in a period."**
+   Headings, terse/non-sentence bullets, and fenced code blocks all merge
+   with unrelated adjacent content because none of them reliably end a line
+   in `.`/`!`/`?`, and the bound alone (12 lines / 1500 chars) is not tight
+   enough to prevent this on its own (attack #4 needs no markdown structure
+   at all). This needs either: additional block-ending triggers (heading
+   lines, fenced-code-block boundaries, list-item-start lines) alongside the
+   existing sentence-terminal rule, or a different mechanism entirely.
+   `docs/spec.md`'s own "Open questions" already anticipates this
+   possibility: *"If both cannot hold simultaneously, stop and report —
+   that would mean the block approach is wrong, and it should not be
+   papered over by loosening one of the bounds."* I'm not asserting the
+   block approach itself is wrong — narrowing the delimiting rule further
+   (rather than loosening a bound) looks like the right next move — but the
+   current single heuristic is demonstrably incomplete against exactly the
+   attack surface this round's brief asked me to test, and per spec's own
+   words this is a "stop and report," not a ship-and-follow-up.
+2. Once a fix is in place, precision must be **re-attacked** with these
+   same five cases (or equivalents) plus anything else in the same spirit
+   before this round can be re-submitted — a fix narrowly targeting these
+   five literal inputs without addressing the underlying gap (headings /
+   terse lists / code fences / bare bound) would not actually close it.
 
-### 1. `fact_check`'s single-line matching is a real, not just theoretical, usefulness constraint for this repo's actual documentation style — should-fix / strong recommendation, non-blocking
-- Tried 6 realistic claims a lead might plausibly generate against this
-  repo's own `docs/ARCHITECTURE.md` (a close paraphrase of an actual
-  sentence, several natural paraphrases of true architectural facts):
-  only 2/6 returned `found: True`, and one of those only because its
-  particular supporting text happened to fit on one unwrapped line. The
-  other 4 failures were not because the claims were false or the terms
-  didn't appear — every failure was `docs/ARCHITECTURE.md`'s own wrapped
-  bullet-point prose splitting the supporting text across two lines (e.g.
-  "runs as `SVC_USER`... an" / "unprivileged system account..." — a single
-  sentence, two lines), which single-line-only matching structurally
-  cannot join.
-- This is explicitly the spec's own known, accepted limitation ("Open
-  questions": join adjacent non-blank lines into one matchable unit, if
-  6c's real usage shows this is too conservative) — not a defect, and not
-  something I'm asking this round to fix. But my testing turns "if 6c's
-  real usage shows this" from a hypothetical into a concrete, repo-specific
-  measurement: for *this* project's actual prose style, single-line-only
-  matching fails the *majority* of natural true claims I tried, not a rare
-  edge case. Recommend the product-manager treat the paragraph-joining
-  follow-up as a near-term (not someday-maybe) item for 6c, and that 6c's
-  own acceptance testing include a similar realistic-claims exercise before
-  concluding the tool is useful enough to wire into the lead loop.
+Non-blocking, carry forward once the above is fixed:
+- The `docs/implementation.md` "6/6" headline should be corrected or
+  caveated — two independent fresh benchmarks (mine, the coordinator's)
+  both measured 4/7, not 6/6, on freshly-written claims. The encoded test's
+  `>= 5` threshold is fine and shouldn't change; the narrative claim around
+  it is optimistic.
+- The `"row's"` apostrophe-tokenization miss suggests `_significant_terms()`
+  might be worth a lightweight look in a future cycle (stripping trailing
+  `'s`), but this is pre-existing 6b behavior, not part of this diff, and
+  outside this cycle's scope — noted for the record, not a finding against
+  this diff.
+- `_GROUNDING_BLOCK_MAX_LINES = 12` is already binding against this repo's
+  own real prose in at least one case (the `run_startup_watch` paragraph) —
+  worth keeping in mind when 6c does its own real-usage recall check, per
+  spec's own open question about what to do if the bounds and recall can't
+  both hold.
 
-### 2. In-bounds symlink rejection is invisible to the caller — should-fix, non-blocking
-See "Answer to the coordinator's in-bounds-symlink question" above.
-Recommend a `skipped`/reason list or a log line as a lightweight follow-up;
-not required by any acceptance criterion, already honestly documented as a
-known limitation.
-
-### 3. `/proc/self/fd` unavailability degrades to silent, total, unexplained emptiness — nit, non-blocking
-If `/proc` isn't mounted (some minimal containers, some restricted
-namespaces), `os.path.realpath("/proc/self/fd/<fd>")` returns the literal,
-unresolved string, which never matches `workdir_real`, so **every**
-candidate for **every** project gets rejected as "out of bounds" — silently,
-with no exception and no distinguishing signal from "this project genuinely
-has no docs." Given the module (and this whole app) is already
-Linux-only and `/proc` is virtually always present on Linux, this is low
-practical risk, but it's a real, defined-but-surprising failure mode worth
-a one-line comment or a startup sanity check (`os.path.exists("/proc/self/fd")`)
-producing a clearer signal than universal silent emptiness, especially
-since the switchboard's own install/deploy story already involves
-containerized/service contexts elsewhere in this repo.
-
-### 4. Device-node candidate not directly tested — nit, non-blocking
-Couldn't construct a real device node in this sandbox (needs
-`CAP_MKNOD`/root). The `fstat`-based `S_ISREG` check is the same mechanism
-already verified against a FIFO, a directory, and a Unix domain socket
-(3 distinct non-regular `st_mode` values, all correctly rejected without
-hanging), so I have high confidence a device node is handled identically,
-but it's not something I directly observed this round.
-
-## Follow-ups (non-blocking)
-- Findings 1–4 above, roughly in priority order for a near-term pass.
-- Defect 3 (negated-line false confirmation, from round 1) remains
-  deliberately unfixed and documented — re-confirmed still correctly pinned
-  by `test_defect3_negated_line_is_a_known_false_confirmation_documented_not_fixed`
-  and still listed in `docs/implementation.md`'s "Known limitations." No
-  change requested; carrying forward as a 6c-facing heads-up, same as the
-  developer already flagged it.
-
-## Complexity / simplicity assessment
-**Earns its complexity.** The three-function layering
-(`_open_grounding_candidate` → `_read_grounding_candidate` →
-`_discover_and_read`) is exactly what fd-based TOCTOU elimination requires
-— there's no simpler shape that closes the actual race (a faster
-`realpath()`-then-`open()` narrows but never eliminates the window, as the
-developer's own writeup correctly reasons through). No speculative
-generality found: no unused parameters, no hooks anticipating 6c's
-tool-calling shape, no configuration surface beyond what round 1 already
-had. **No patch-on-patch structure**: the old `_looks_binary`/
-`_candidate_usable`/`_has_grounding_content` helpers are fully removed
-(`grep` confirms zero remaining references outside historical-context
-comments/docstrings), not left behind as dead code alongside the new path;
-the AST scan's function-name list and the read-only runtime test were both
-properly updated to the new function set rather than patched around;
-`app.py`'s own `_read_head()` is untouched and still used by
-`_gather_project_context()` elsewhere, so dropping it from this module's
-own import line was a clean removal, not a fork. `discover_grounding_files()`
-is a genuinely thin (one-line) wrapper around `_discover_and_read()`, not a
-second implementation.
-
-## Overall verdict
-**Approve with follow-ups.** Both round-1 blocking defects are independently
-re-verified fixed at the class level, not just against their original two
-repros — I additionally exercised a symlink-to-FIFO, a Unix domain socket,
-the open()-to-fstat() race window specifically (confirmed the fd-pinning
-property that the whole fix rests on actually holds), and the /proc-
-unavailable degradation mode, none of which were in the original two
-repros. The 9 new tests are confirmed non-vacuous (fail against the pre-fix
-module, including the FIFO tests failing *cleanly* via their own bounded
-join rather than hanging the suite). Regression suite is clean across 3
-consecutive runs (437/437, no flake). Spec coverage is complete — no
-acceptance criterion is unimplemented or untested, and the deliberate
-in-bounds-symlink behavior narrowing doesn't violate anything the spec
-pins down. The diff itself is clean: no dead code, no patch-on-patch
-structure, no unjustified complexity, `app/app.py` genuinely untouched.
-
-Four non-blocking findings are carried forward as follow-ups (most notable:
-Finding 1, which gives the product-manager/6c concrete, repo-specific
-evidence that single-line-only matching may need its near-term follow-up
-sooner rather than later for the feature to be *useful*, not just safe).
-None of the four block this round — none violate a spec requirement, and
-each is either already honestly self-documented by the developer or a low-
-practical-risk edge case.
-
-This build cycle is done — hand control back to the product-manager agent
-for the next iteration.
+Full review pass (spec-to-code traceability beyond the above, correctness
+read-through of the diff for logic/security/simplicity) deliberately not
+done this round — per process, a blocked testing pass routes straight back
+to the developer without spending review effort on known-broken work. Once
+the block-boundary rule is fixed and re-attacks with an adversarial set at
+least as broad as this round's pass clean, resubmit for both passes.
