@@ -1,123 +1,94 @@
-# Test & Review: switchboard-side deploy dispatch (2c part 2b)
+# Test & Review: Upload wizard polish (backlog item 3's deferred follow-ups)
 
 ## Scope
-Covers `docs/spec.md`'s 10 acceptance criteria for the manual-confirmation
-deploy dispatch feature: `deploy-map.json` loading/validation, `deploy_run()`
-push+restart dispatch, the `POST /instance/<name>/deploy` route, `/status`'s
-new `deploy` field, the "Deploy" button UI, and `install.sh`'s two new
-unconditional blocks. **This is the re-review pass after a changes-requested
-loop-back**; it supersedes the prior draft of this file. Per the dispatch
-instructions, the original spec/design/route-auth/concurrency-lock/`esc()`
-injection reasoning (all previously verified sound and unchanged in this
-diff) was not re-litigated — only the fix and the two follow-up additions
-were independently re-verified, plus a fresh full regression run.
+Covers `docs/spec.md`'s 6 acceptance criteria: `UPLOAD_MAX_ENTRIES` becoming
+a real `switchboard.env` knob (fail-fast, matching sibling vars), step 5's
+single/split mode choice rendering as pill-styled labels with native
+`<input type="radio">` preserved, and `renderStep5Actions(d)`'s conditional
+"Back" button. This is a fresh review for this cycle — the prior
+`docs/test-review.md` on disk (2c part 2b, deploy dispatch) was stale and is
+superseded by this file.
 
-## Prior finding and fix verification
+## Test cases
 
-### Defect 1 (must-fix, from prior pass): non-numeric `port` crashed `/status`
-- Read `app/app.py:761-787` (`_load_deploy_map()`) directly. The `int(entry.get("port") or 22)`
-  coercion is now wrapped:
-  ```python
-  try:
-      port = int(entry.get("port") or 22)
-  except (TypeError, ValueError):
-      continue  # non-numeric "port" -- treat as absent, not a crash
-  ```
-  consistent with every other per-entry validation drop-and-continue in that
-  function.
-- **Revert-and-watch-it-fail check performed**: temporarily reverted this
-  exact hunk back to the bare `port = int(entry.get("port") or 22)` (no
-  try/except) and re-ran the three new regression tests. All three failed,
-  and `DeployEndpointTests.test_status_survives_non_numeric_port_and_keeps_other_projects_intact`
-  reproduced the *exact* original live symptom (`http.client.RemoteDisconnected:
-  Remote end closed connection without response`) rather than a generic
-  assertion failure — confirming the test genuinely exercises this bug, not
-  a coincidental pass. Restored the fix afterward; `git diff --stat app/app.py`
-  confirmed no residual changes, and the full suite was re-run clean (below).
-- **Verdict: fix confirmed real and correct.**
+| # | Criterion / case | Method | Result | Evidence |
+|---|---|---|---|---|
+| 1 | `UPLOAD_MAX_ENTRIES=5` set → app starts, effective limit is 5 | automated (`UploadMaxEntriesEnvVarTests.test_env_var_set_overrides_default`) + **live E2E** | pass | subprocess reads back `5`; live HTTP server with `UPLOAD_MAX_ENTRIES=5` rejected a 6-entry zip (400 "too many entries in zip file") and accepted a 5-entry zip (200), boundary-tested at exactly the limit |
+| 2 | No `UPLOAD_MAX_ENTRIES` set → default stays 20000 | automated (`test_env_var_unset_keeps_default_20000`) | pass | subprocess reads back `20000` |
+| 3 | Ambiguous step 5: mode choice renders as 2 pill-styled elements, checked state follows `wizardState.mode`, `setWizardMode()` unchanged | automated (3 JS tests) + live server HTML check | pass | `node tests/test_upload_frontend.js`; live `curl` of a real running server's `/` response contains identical `pill-choice` CSS/HTML at the same lines as the diff |
+| 4 | Ambiguous step 5, keyboard: focus lands on the native radio, not a bare span | automated (JS test) | pass | asserts 2 real `<input type="radio">`, no `<span class="pill">` |
+| 5 | Unambiguous step 5: no Back button, only Confirm | automated (JS test) | pass | `actionsHtml` has no `Back`/`class="secondary"` |
+| 6 | Ambiguous step 5: Back rendered exactly as before (`resetWizardState(); renderWizard();`) | automated (JS test) | pass | onclick string asserted verbatim |
+| edge | `UPLOAD_MAX_ENTRIES` non-numeric → fails fast at import time, same as siblings | manual code exercise | pass | `UPLOAD_MAX_ENTRIES=notanumber` and `GITEA_POLL_INTERVAL_SECONDS=notanumber` both raise the identical `ValueError` at the identical `import app` line pattern, exit code 1 |
+| edge | Unambiguous case still lets user abandon the wizard with Back hidden | code read | pass | `<span class="back" onclick="closeUploadWizard()">‹ close</span>` at `app/app.py:1529` is modal-level, independent of `wizard-actions`, unaffected by this diff |
+| edge | Split-candidate checkboxes stay unstyled (only the 2 mode-choice labels get `pill-choice`) | automated (JS test) | pass | `2 plain wizard-check-row checkbox rows` asserted separately from the 2 `pill-choice` labels |
 
-### Follow-up 1 (AC10 automated regression guard)
-- `tests/test_deploy_dispatch.py::DeployNeverCalledFromPollSyncTests::test_sha_change_drives_sync_but_never_deploy_run`
-  drives the real, unmocked `_gitea_poll_one` → `_gitea_sync_bg` → `_gitea_sync_run`
-  chain (only `_gitea_api` and `subprocess.run` are stubbed, matching
-  `test_gitea_poll.py`'s established technique) through a SHA change, with
-  `appmod.deploy_run` monkeypatched to a call-recording stub, and asserts it
-  is never invoked. Confirmed via direct code read (`grep -n
-  "_gitea_poll_one\|_gitea_sync_bg\|_gitea_sync_run" app/app.py`) that this
-  is the real call chain, not a stand-in. **Verdict: genuine regression
-  guard, not a shallow mock that would pass regardless.**
+## Regression check
+- `python3 -m unittest discover -s tests -v` → **289/289 pass** (matches developer's report).
+- `node tests/test_upload_frontend.js` → **8/8 pass**.
+- `node tests/test_deploy_frontend.js` → **9/9 pass** (no regression).
+- `node tests/test_singleton_toggle_frontend.js` → **15/15 pass** (no regression).
 
-### Follow-up 2 (frontend quote-injection test)
-- `tests/test_deploy_frontend.js` "a quote-containing host/service value
-  renders safely and still dispatches to the right target" constructs a
-  `deploy.host`/`deploy.service` containing `"`/`'`/`onclick=` payloads,
-  asserts the rendered row HTML never contains those raw strings at all and
-  that `onclick` stays exactly `doDeploy('proj')`, then drives an actual
-  `doDeploy('proj')` call and asserts it still dispatches a POST to
-  `/instance/proj/deploy`. This is a real, meaningful assertion (not just
-  "doesn't throw") and matches the reasoning in the prior review's Finding
-  #3. **Verdict: genuine test.**
+All four numbers independently re-run and confirmed this session, matching the developer's reported figures exactly.
 
-## Regression run (actually executed this session)
-- `python3 -m unittest discover -s tests -v` → **287 tests, all pass.**
-- `python3 -m unittest tests.test_deploy_dispatch -v` → **42 tests, all pass**
-  (confirmed the specific new tests ran: `test_entry_with_non_numeric_port_is_dropped_not_raised`,
-  `test_one_entry_with_non_numeric_port_does_not_affect_others`,
-  `test_status_survives_non_numeric_port_and_keeps_other_projects_intact`,
-  `test_sha_change_drives_sync_but_never_deploy_run`).
-- `node tests/test_deploy_frontend.js` → **9/9 pass.**
-- `node tests/test_singleton_toggle_frontend.js` → **15/15 pass** (unrelated
-  regression check, still green).
+## Live exercise (beyond the Node-`vm` harness)
+Started a real `ThreadingHTTPServer` instance of `app.Handler` (both via the
+module's own `__main__` entrypoint and, for the entry-count check, via an
+in-process server matching `tests/test_upload.py`'s own HTTP-test technique):
+- Fetched `/` with `curl` and confirmed the served page's CSS/HTML for
+  `pill-choice` and `renderStep5Actions(d)` are byte-identical to the diff
+  (not just what the JS test's subprocess extraction produced).
+- Did a full login → TOTP → `POST /projects/upload` round trip with
+  `UPLOAD_MAX_ENTRIES=5`: a 6-entry zip was rejected (400), a 5-entry zip
+  (exactly at the limit) was accepted (200) — proves the env var is actually
+  wired into the enforcement check at `app/app.py:2794`, not just parsed and
+  unused.
+- Confirmed the malformed-value crash behavior is bit-for-bit identical in
+  shape to the sibling `GITEA_POLL_INTERVAL_SECONDS` var.
+- No real browser was available in this environment to visually render
+  `:has()`; verified instead by reading the actual CSS values and comparing
+  against the already-shipped `.pill`/`.pill.active` rules (see Findings).
 
-All numbers match the developer's report exactly.
+## Findings (most severe first)
 
-## Test cases (carried forward from prior pass, all still hold)
+### 1. `docs/design.md`'s stated contrast ratios are inaccurate (both understate the actual, safer, value) — nit
+- File: `docs/design.md:215-216`
+- Design doc states pill-idle contrast (`#aaa` on `#2a2a2a`) as "~4.5:1" and
+  pill-active (`#111` on `#34c759`) as "~11:1". Recomputed both from the
+  literal hex values using WCAG relative luminance: idle is actually
+  **~6.18:1**, active is actually **~8.52:1**. Both real values still
+  comfortably clear the 4.5:1 AA text threshold, so there is no accessibility
+  regression — the stated numbers were just imprecise, and in the safe
+  direction (understating idle, overstating active, both still passing).
+  These are also pre-existing `.pill`/`.pill.active` values reused verbatim,
+  not new colors introduced by this diff. Not blocking; flagging only
+  because the design doc's own numbers were off and a future contrast change
+  nearby should recompute rather than copy this doc's figures forward.
 
-| # | Criterion / case | Method | Result |
-|---|---|---|---|
-| 1 | Valid map entry → `/status` includes `deploy{host,deploy_path,service}`, no `key` | automated | pass |
-| 2 | No map entry → `/status` omits `deploy` field | automated | pass |
-| 3 | Reachable target: Deploy click → push lands + restarts + UI success | automated (real ssh/rsync/systemd) | pass |
-| 4 | Unreachable target → 502, no hang, detailed message | automated (real) | pass |
-| 5 | Push OK, restart fails → distinct message | automated (real) | pass |
-| 6 | Overlapping dispatch → second gets 409, no second subprocess pair | automated | pass |
-| 7 | No map entry, direct POST → 404, no crash, no subprocess | automated | pass |
-| 8 | `key` resolves outside `DEPLOY_KEYS_DIR` → treated as absent | automated | pass |
-| 9 | `install.sh` re-run leaves hand-edited map/keys untouched | automated | pass |
-| 10 | Poll/sync path never calls `deploy_run()` | **now automated** | pass (was manual-inspection-only; closed this cycle) |
-| 11 (edge) | Malformed individual map entry must not take down other projects/`/status` | automated, plus live revert-and-fail check this session | **pass (was FAIL, now fixed and verified)** |
-| 12 | `doDeploy`/`esc()` HTML-injection reasoning | independent code read (prior pass) + **new automated quote-character test** (this pass) | confirmed sound, now with a regression guard |
-
-## Diff scope check
-`git diff app/app.py` shows the same hunks as the prior pass (map loading,
-lock, `deploy_run`, route, `/status` field, `PAGE_TEMPLATE` JS/CSS) plus the
-single try/except addition inside `_load_deploy_map()`. No unrelated code
-changed. `tests/test_deploy_dispatch.py` and `tests/test_deploy_frontend.js`
-gained only the new test classes/cases described in `docs/implementation.md`'s
-"Post-review bugfix" section — verified by reading both files directly.
-
-## Findings
-None outstanding. Both non-blocking follow-ups from the prior pass
-(AC10 regression guard, quote-injection frontend test) were addressed and
-independently verified as genuine, not just claimed. The must-fix defect is
-fixed and verified with an actual revert-and-fail check, not just a code
-read.
+No other findings. Correctness, security, and simplicity review below found nothing further.
 
 ## Spec coverage
-All 10 literal acceptance criteria plus the general "one malformed entry
-must not take down others" validation contract (`docs/spec.md`'s "Proposed
-approach" #2 / edge cases) are now implemented and covered by at least one
-automated test that was independently confirmed to fail against the
-pre-fix code.
+All 6 acceptance criteria plus all 3 documented edge cases in `docs/spec.md`
+are implemented and covered by at least one test that was actually run this
+session (automated or live-exercised), per the table above. No gap.
+
+## Correctness / security / simplicity review
+- **Env var fail-fast**: `UPLOAD_MAX_ENTRIES = int(os.environ.get("UPLOAD_MAX_ENTRIES", "20000"))` at `app/app.py:84` is textually and behaviorally identical in pattern to `GITEA_POLL_INTERVAL_SECONDS` (line 170) and `UPLOAD_STAGING_TTL_SECONDS` — confirmed both via code read and by triggering the same `ValueError` shape for both at import time.
+- **Single enforcement site**: `UPLOAD_MAX_ENTRIES` is read exactly once at module import and used at exactly one call site (`app/app.py:2794`, `if len(infolist) > UPLOAD_MAX_ENTRIES:`) — no stale-copy or shadowing risk.
+- **Conditional Back button**: `wizardState.detectResult` is always set (`app/app.py:2341`) before `wizardState.step` can become `5` (single assignment site, immediately followed by the `step = 5` transition), so `renderStep5Actions(wizardState.detectResult)`'s `d` is never undefined when step 5 renders — no null-deref risk. `proceedToConfirm()`/Confirm's own behavior is untouched by this diff (only the surrounding conditional emits Back's HTML or not); the unambiguous flow's Confirm button and its onclick are unchanged.
+- **No injection/security surface**: purely a CSS class addition, a conditional string-concat around an already-existing static button, and a config-driven `int()` — no new user input reaches HTML output or a shell/SQL boundary. `esc()` usage on `d.root_name`/`splitLabel` in `renderStep5()` is pre-existing and untouched.
+- **Scope**: diff matches `docs/spec.md`'s "Affected areas" exactly — `app/app.py` (const, CSS, `renderStep5()`, `renderStep5Actions()`, one call site), `config/switchboard.env.example`, `docs/BACKLOG.md`, plus the two test files. No unrelated changes found in `git diff`.
+
+## Follow-ups (non-blocking)
+- None required. The contrast-figure nit above is informational only.
 
 ## Overall verdict
-**Approved.** The must-fix defect from the prior pass (`app/app.py`'s
-unguarded `int(entry.get("port") or 22)` crashing `/status` on a non-numeric
-`port`) is fixed correctly and the fix was verified with a live
-revert-and-watch-it-fail check against the developer's new regression tests,
-not just a code read. Both previously-noted non-blocking follow-ups (AC10
-automated regression guard, frontend quote-injection test) were also
-addressed and independently confirmed to be genuine, non-vacuous tests. Full
-regression suite re-run clean this session: 287/287 Python, 9/9 + 15/15
-Node. No new findings. This closes the 2c part 2b build cycle — hand back to
-product-manager.
+**Approve.** Testing pass is clean: 289/289 Python, 8/8 new + 9/9 + 15/15 JS,
+all independently re-run this session, plus a live HTTP end-to-end exercise
+(real server, real login/TOTP/upload round trip) confirming `UPLOAD_MAX_ENTRIES`
+actually gates the entry-count guard at the configured threshold and that the
+served page's markup/CSS matches the diff verbatim. Review pass found no
+must-fix or should-fix issues — one informational nit on `docs/design.md`'s
+imprecise (but safely-directioned) contrast figures. All 6 acceptance
+criteria and all 3 edge cases are implemented and covered. This closes the
+build cycle — hand back to product-manager.

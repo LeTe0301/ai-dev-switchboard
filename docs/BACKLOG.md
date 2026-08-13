@@ -174,19 +174,23 @@ over to Gitea's own auth model.
 
 **Status: shipped (2026-08-12), commit `893840c`.** Reviewer-approved with
 follow-ups. Full spec/design/implementation/test-review in `docs/spec.md` /
-`docs/design.md` / `docs/implementation.md` / `docs/test-review.md`. Small
-polish items deliberately deferred rather than blocking the ship — pick up
-whenever, none affect correctness or security:
-- `UPLOAD_MAX_ENTRIES` is documented in `config/switchboard.env.example` as a
-  comment only, not a real settable line — it's currently a hardcoded Python
-  constant. Make it a real config read if someone actually needs to tune it.
-- Step 5 (Review)'s single/split choice uses native `<input type="radio">`
-  rather than design.md's described pill-button styling — functionally and
-  accessibly equivalent, just a visual polish gap.
-- Step 5's "Back" button always resets the wizard to step 1 (no partial
-  "back" exists once a token is staged), and is shown even for the
-  unambiguous sub-case where there's nothing to go back and change — diverges
-  slightly from design.md's wireframe, worth a small UX pass later.
+`docs/design.md` / `docs/implementation.md` / `docs/test-review.md`. The
+three deferred polish items below shipped in a follow-up pass ("Upload
+wizard polish", see current `docs/spec.md` / `docs/design.md` /
+`docs/implementation.md`):
+- ~~`UPLOAD_MAX_ENTRIES` is documented in `config/switchboard.env.example` as
+  a comment only, not a real settable line.~~ Done — now a real
+  `int(os.environ.get("UPLOAD_MAX_ENTRIES", "20000"))` read, same pattern as
+  its siblings.
+- ~~Step 5 (Review)'s single/split choice uses native `<input
+  type="radio">` rather than design.md's described pill-button styling.~~
+  Done — restyled as pills (`.wizard-check-row.pill-choice`) while keeping
+  the underlying native radio inputs.
+- ~~Step 5's "Back" button ... is shown even for the unambiguous sub-case
+  where there's nothing to go back and change.~~ Done — "Back" now only
+  renders when `d.ambiguous === true`; the "Back always fully resets the
+  wizard rather than a partial step-back" behavior itself is unchanged
+  (explicit non-goal of the follow-up pass).
 
 **Shape of the work (this one had no real ambiguity, so it's specced a
 little further than the others):**

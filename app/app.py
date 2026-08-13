@@ -80,9 +80,8 @@ UPLOAD_STAGING_DIR = os.environ.get(
     "UPLOAD_STAGING_DIR", "/var/lib/ai-dev-switchboard/uploads")
 UPLOAD_MAX_BYTES = int(os.environ.get("UPLOAD_MAX_BYTES", "104857600"))  # 100 MiB
 # Cheap guard against a many-tiny-files DoS shape (see docs/spec.md "Size
-# limits") — not exposed as its own switchboard.env knob, same reasoning as
-# the known-heavy-directory exclusion list being a hardcoded JS constant.
-UPLOAD_MAX_ENTRIES = 20000
+# limits") — env-overridable constant, same style as UPLOAD_STAGING_TTL_SECONDS.
+UPLOAD_MAX_ENTRIES = int(os.environ.get("UPLOAD_MAX_ENTRIES", "20000"))
 # How long an unconfirmed staged upload is kept before _reap_dead_state()
 # sweeps it as abandoned (docs/spec.md "Two-phase protocol") — a confirmed
 # upload's staging directory is removed immediately regardless of this.
@@ -1486,6 +1485,15 @@ PAGE_TEMPLATE = """<!doctype html>
   .wizard-check-row input { accent-color: #34c759; width: 18px; height: 18px; flex-shrink: 0; }
   .wizard-check-row .info { font-size: 13px; }
   .wizard-check-row .info .sub { font-size: 12px; color: #888; }
+  /* Step 5's single/split mode choice, styled as pills matching .pill/
+     .pill.active (engineRow/codeRow) while keeping a real <input
+     type="radio"> underneath for keyboard/screen-reader semantics -- see
+     docs/design.md "New CSS rule: .wizard-check-row.pill-choice". */
+  .wizard-check-row.pill-choice { padding: 5px 12px; border-radius: 20px; background: #2a2a2a;
+                                    color: #aaa; border: 1px solid #3a3a3a; gap: 8px;
+                                    margin: 0 4px 0 0; display: inline-flex; }
+  .wizard-check-row.pill-choice:has(input:checked) { background: #34c759; color: #111;
+                                                        font-weight: 600; border-color: #34c759; }
   .wizard-progress-bg { background: #2a2a2a; height: 6px; border-radius: 3px; margin: 10px 0 6px; overflow: hidden; }
   .wizard-progress-fill { height: 6px; border-radius: 3px; transition: none; }
   .wizard-progress-fill.zip { background: #34c759; }
@@ -2510,11 +2518,11 @@ function renderStep5() {
 
   html += '<fieldset style="border:none;padding:0;margin:10px 0;">' +
     '<legend style="font-size:13px;color:#aaa;padding:0 0 4px;">How would you like to register it?</legend>';
-  html += '<label class="wizard-check-row"><input type="radio" name="wizard-mode" ' +
+  html += '<label class="wizard-check-row pill-choice"><input type="radio" name="wizard-mode" ' +
     (wizardState.mode === 'single' ? 'checked' : '') + ' onchange="setWizardMode(\\'single\\')">' +
     '<span class="info">Single project (keep all together as "' + esc(d.root_name) + '")</span></label>';
   const splitLabel = d.root_has_git ? 'Split out nested repos:' : 'Each subfolder as its own project:';
-  html += '<label class="wizard-check-row"><input type="radio" name="wizard-mode" ' +
+  html += '<label class="wizard-check-row pill-choice"><input type="radio" name="wizard-mode" ' +
     (wizardState.mode === 'split' ? 'checked' : '') + ' onchange="setWizardMode(\\'split\\')">' +
     '<span class="info">' + esc(splitLabel) + '</span></label>';
   html += '</fieldset>';
@@ -2533,9 +2541,13 @@ function renderStep5() {
   }
   return html;
 }
-function renderStep5Actions() {
-  return '<button class="secondary" onclick="resetWizardState(); renderWizard();">&lsaquo; Back</button>' +
-         '<button class="primary" onclick="proceedToConfirm()">Confirm &rsaquo;</button>';
+function renderStep5Actions(d) {
+  let html = '';
+  if (d.ambiguous) {
+    html += '<button class="secondary" onclick="resetWizardState(); renderWizard();">&lsaquo; Back</button>';
+  }
+  html += '<button class="primary" onclick="proceedToConfirm()">Confirm &rsaquo;</button>';
+  return html;
 }
 
 function proceedToConfirm() {
@@ -2666,7 +2678,7 @@ function renderWizard() {
   else if (wizardState.step === 2) { body = renderStep2(); actions = renderStep2Actions(); }
   else if (wizardState.step === 3) { body = renderStep3(); actions = renderStep3Actions(); }
   else if (wizardState.step === 4) { body = renderStep4(); }
-  else if (wizardState.step === 5) { body = renderStep5(); actions = renderStep5Actions(); }
+  else if (wizardState.step === 5) { body = renderStep5(); actions = renderStep5Actions(wizardState.detectResult); }
   else if (wizardState.step === 6) { body = renderStep6(); actions = renderStep6Actions(); }
   document.getElementById('wizard-body').innerHTML = body;
   document.getElementById('wizard-actions').innerHTML = actions;

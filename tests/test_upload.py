@@ -962,5 +962,38 @@ class UploadStagingTTLSweepTests(unittest.TestCase):
         self.assertTrue(os.path.isdir(new_dir))
 
 
+class UploadMaxEntriesEnvVarTests(unittest.TestCase):
+    """
+    UPLOAD_MAX_ENTRIES (docs/spec.md "Upload wizard polish", proposed
+    approach #1) must be read the same way its siblings
+    (UPLOAD_STAGING_TTL_SECONDS, GITEA_POLL_INTERVAL_SECONDS) already are:
+    int(os.environ.get("UPLOAD_MAX_ENTRIES", "20000")). Imports app.py in a
+    fresh subprocess (rather than mutating the already-imported `appmod`
+    shared by every other test in this module) so each case gets a real,
+    isolated module-import-time env read -- same technique
+    tests/test_deploy_frontend.js uses to get a real rendered <script>.
+    """
+
+    def _import_and_read(self, env_overrides):
+        env = dict(os.environ)
+        env.update(env_overrides)
+        env.setdefault("TOTP_SECRET", "JBSWY3DPEHPK3PXP")
+        code = (
+            "import sys; sys.path.insert(0, 'app'); import app as appmod; "
+            "print(appmod.UPLOAD_MAX_ENTRIES)"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", code], cwd=REPO_ROOT, env=env,
+            capture_output=True, text=True, check=True)
+        return int(out.stdout.strip())
+
+    def test_env_var_set_overrides_default(self):
+        self.assertEqual(self._import_and_read({"UPLOAD_MAX_ENTRIES": "5"}), 5)
+
+    def test_env_var_unset_keeps_default_20000(self):
+        self.assertNotIn("UPLOAD_MAX_ENTRIES", os.environ)
+        self.assertEqual(self._import_and_read({}), 20000)
+
+
 if __name__ == "__main__":
     unittest.main()
