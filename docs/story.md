@@ -495,6 +495,27 @@ worktrees, and stale state dirs.
 from per-project to per-window. Headless invocations never produce a hosted
 URL, so there is nothing to generalize. This closes the story's own §5 note.
 
+**Part 1 status: done** (reviewer-approved, commit `7a3e0eb`). 638 tests.
+Four defects found and fixed, all in one area — tmux session lifecycle under
+partial failure or concurrency. Carried forward:
+
+- **This area is the story's hardest.** Nine defects total across 6a–6d;
+  four of them are here, and each was found only by exercising real tmux and
+  real git past the spec's enumerated cases. Part 2 puts HTTP routes and a
+  background thread directly on top of this machinery — budget review effort
+  accordingly rather than assuming part 1 stabilised it.
+- **A filesystem-root `workdir` yields an empty `project_name`.** Currently
+  unreachable: every caller supplies an already-`NAME_RE`-validated
+  `PROJECTS_DIR/<name>`, and `_validate_project_for_team()` gates first.
+  Deliberately left unhardened — **revisit in part 2**, whose HTTP route is
+  the first thing that could plausibly accept an operator-supplied path.
+- **One pre-existing unrelated flake.** A real-tmux test in
+  `tests/test_teams_headless.py`
+  (`test_run_sh_and_prompt_file_are_world_readable_under_a_strict_umask`)
+  failed 2 of 17 full-suite runs and passes in isolation. That file's diff is
+  empty, so it is not attributable to 6d, but it is real and should not be
+  rediscovered from scratch.
+
 **Acceptance criteria.**
 - Starting a team creates the session, the windows, and the worktrees;
   stopping removes all three, including on an unclean stop.
