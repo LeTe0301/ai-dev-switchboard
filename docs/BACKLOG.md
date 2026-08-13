@@ -13,6 +13,12 @@ since they share a pattern. Item 3 (folder upload) is a self-contained
 architecturally novel — do it last, and give it a full spec of its own
 before touching code.
 
+Items 7 and 8 both **depend on item 6 being substantially done** and should
+not be started before it: item 7 extends 6c's lead loop with board tools,
+and item 8 reuses 6's roster for its "selectable model". Both also widen
+what an agent may change without a human in the loop, so both carry a scope
+decision to put to the user before building rather than after.
+
 ---
 
 ## 1. Local backlog tracker (Taiga), tracked by Claude
@@ -341,3 +347,110 @@ fallback; how deep "question the team first" goes before escalating (one
 round-trip? N attempts? a timeout?); whether a team is scoped to one
 project at a time or can coordinate across projects; how per-window hosted
 URLs get surfaced in the UI once a project can have more than one.
+
+---
+
+## 7. Project lead gets read-write access to the kanban board
+
+**Intent, as stated:** the project lead should have **read-write** access to
+the kanban board and be able to adjust the backlog itself — not just consume
+a spec handed to it, but move cards, update status, and amend backlog items
+as work actually progresses.
+
+**Directly extends two things that already exist**, so this is a widening of
+a working mechanism rather than a greenfield feature:
+- Item 1b shipped `scripts/taiga_push_spec.py` — deliberately **one-way
+  (spec → Taiga)**, pushing a local spec into a Taiga backlog item as a
+  userstory. This item is what turns that into a two-way channel.
+- Item 6's "lead" is now a real thing (6c shipped the roster + four-tool
+  lead loop: `delegate` / `fact_check` / `ask_user` / `finish`). "Project
+  lead" here should mean *that* lead, and board access is most naturally a
+  **fifth tool** alongside the existing four, not a side channel.
+- It also answers item 1's own open question ("sync direction between Taiga
+  and `docs/spec.md`") in the read-write direction.
+
+**Shape of the work:**
+- Taiga's REST API already covers what's needed (userstories, statuses,
+  milestones). The token-storage pattern is settled: `switchboard.env`-style
+  config, same as every other credential in this project.
+- Most likely a `board_read` / `board_write` tool pair on the lead loop,
+  with `board_write` narrowly scoped to specific verbs (move card, set
+  status, append a comment, amend a description) rather than a general
+  "call any Taiga endpoint" escape hatch — the four existing tools are all
+  narrow and specific, and a broad passthrough would be the odd one out.
+- The lead's grounding (6b) is currently **strictly read-only** with two
+  guards (a runtime monkeypatch and a static AST scan). Board write access
+  must NOT be implemented by loosening those — grounding is the project's
+  own docs, the board is a separate system. Keep them separate paths, and
+  expect the AST scan to need an explicit, narrow allowance rather than a
+  removal.
+
+**Scope decision that must be settled before building:** this is a genuine
+expansion of what an agent may mutate unattended. Every comparable decision
+in this project so far has landed on the cautious side — deploy is
+manual-click-only, a push landing never itself deploys, and no agent
+mutates the project's source of truth unattended. A lead silently rewriting
+the backlog is the same class of question. Options worth putting to the
+user: (a) full autonomous write, (b) write limited to cards the current run
+created or was assigned, (c) proposed changes queued for one-click human
+approval, reusing 6f's escalation inbox. Do not assume (a) just because the
+item says "read-write" — ask.
+
+**Open for the future session:** whether board writes are audited to a log
+the human can review after the fact; whether one shared board covers all
+switchboard projects or one board per project (item 1's own open question,
+still unanswered); what happens when a card the lead is mid-edit was
+changed by the human concurrently.
+
+---
+
+## 8. AI merge-request reviewer, triggered by a Gitea tag
+
+**Intent, as stated:** an AI reviewer for merge requests, checking **code
+consistency**, with a **selectable model**, firing **as soon as a "ready for
+review" tag/label is set** on the MR in Gitea.
+
+**Already-settled decision this must respect — do not relitigate it:**
+**no webhook.** Item 2c part 1 originally proposed a webhook-based design
+and the user rejected it explicitly for introducing new attack surface. The
+shipped pattern is **polling**: `app.py` polls Gitea's REST API piggybacked
+on `/status`, throttled by its own `GITEA_POLL_INTERVAL_SECONDS` (default
+45s), with no new listener and no Docker networking changes. A tag-triggered
+reviewer should extend that existing poll — watch for the label appearing on
+open PRs — rather than opening a port. "As soon as the tag is set" therefore
+means "within one poll interval", which is a deliberate tradeoff to state
+plainly rather than an implementation shortfall.
+
+**Shape of the work:**
+- Poll Gitea for open PRs carrying the configured label (name configurable;
+  `ready for review` is the default, not a hardcoded constant).
+- Fetch the diff via Gitea's REST API, run the selected model against it,
+  post the review back as a PR comment. Posting a comment is additive and
+  reversible, which makes it a good first write verb — distinct from
+  approving, merging, or pushing changes, which are not.
+- **Selectable model** maps onto machinery that already exists: item 6's
+  roster is exactly "every engine the switchboard knows about, tagged with
+  its capability tier" (`engines.d/*.engine` entries plus a configured
+  Ollama model). Reuse the roster rather than inventing a second, parallel
+  model-selection mechanism. Note the roster's tiers were built for
+  *lead* capability (native tool-calling / constrained output / prose
+  parse); review is a plainer task and may not need the same tiering — check
+  before assuming it transfers.
+- "Code consistency" needs sharpening into something checkable: consistency
+  with what? House conventions in `CLAUDE.md`/`docs/ARCHITECTURE.md`, the
+  surrounding file's own idiom, or the project's existing patterns? 6b's
+  grounding (auto-discovered project docs + `fact_check`) is the obvious
+  substrate for "consistent with the project's own documented conventions"
+  and should be reused rather than rebuilt.
+
+**Scope decisions to settle before building:** whether the reviewer may ever
+block or approve a merge, or only ever comment (comment-only is the
+consistent default for this project, and matches "deploy is manual-click
+only"); whether a re-review fires when the tag is removed and re-added, or
+on every new commit while the tag is present; what happens on a large diff
+that exceeds the selected model's context.
+
+**Open for the future session:** whether this shares the escalation inbox
+(item 6/6f) or gets its own surface; whether review output is persisted
+locally as well as posted to Gitea; token/rate cost of reviewing every
+tagged PR against a hosted model versus the local Ollama one.
