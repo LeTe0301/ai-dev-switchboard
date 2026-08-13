@@ -12,13 +12,15 @@
 # Flags (all optional):
 #   --yes                 non-interactive: use defaults / env-var overrides
 #                         instead of prompting (what ct/create.sh uses)
-#   --with-git-hosting    also set up private bare-repo hosting + the
-#                         "+ New project" button (see scripts/, docs/GIT_HOSTING.md)
-#                         -- and, additively, installs Docker + a self-hosted
-#                         Gitea Compose stack (server + db), left OFF until
-#                         toggled in the web UI — see docs/spec.md (backlog
-#                         item 2a). The existing git-hosting flow above is
-#                         untouched; Gitea is inert infrastructure only for now.
+#   --with-git-hosting    also installs Docker + a self-hosted Gitea Compose
+#                         stack (server + db), left OFF until toggled in the
+#                         web UI — the "+ New project" button then creates
+#                         real Gitea repos via its own REST API and clones
+#                         them into PROJECTS_DIR (see docs/GIT_HOSTING.md,
+#                         docs/spec.md backlog item 2b). Two one-time manual
+#                         steps after toggling Gitea on (create its admin
+#                         account, then run scripts/gitea-configure-api.sh)
+#                         — see this script's own printed summary.
 #   --with-code-server    also install code-server (VS Code in the browser)
 #   --with-host-control   also install host-agent/ on THIS machine (see
 #                         host-agent/README.md — usually installed on a
@@ -31,7 +33,7 @@
 #
 # Safe to re-run: every step here either checks for existing state first or
 # overwrites deterministically-generated files (units, sudoers), never
-# clobbers switchboard.env/git-hosting.env values that are already set.
+# clobbers switchboard.env values that are already set.
 set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/LeTe0301/ai-dev-switchboard.git}"
@@ -383,14 +385,18 @@ SUDOERS=/etc/sudoers.d/ai-dev-switchboard
     # git hosting installed.
     echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-new-project-from-upload.sh *"
     if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
-        echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-new-project.sh *"
         # Gitea's own toggle wrapper triplet (docs/spec.md "Crossing the
-        # privilege boundary") — same zero-argument narrowing as Taiga's rules
-        # below, added alongside (not instead of) the existing new-project.sh
-        # rule this same flag already gates.
+        # privilege boundary") — zero-argument narrowing, same as Taiga's
+        # rules below.
         echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-gitea-up.sh"
         echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-gitea-down.sh"
         echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-gitea-status.sh"
+        # create_project()'s privileged clone hand-off (backlog item 2b,
+        # replaces the old new-project.sh rule) — narrowed to exactly this
+        # one script, arguments passed through (owner/repo/name, all
+        # re-validated by the script itself; see docs/spec.md "The
+        # privileged registration script").
+        echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-new-project-from-gitea.sh *"
     fi
     if [ "$WITH_TAIGA" -eq 1 ]; then
         # Zero arguments (no trailing " *") — narrower than every other rule
@@ -425,30 +431,15 @@ systemctl daemon-reload
 systemctl enable --now ai-dev-switchboard
 
 if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
-    echo "-- Git hosting + project scaffolding --"
-    install -m 755 "$REPO_DIR/scripts/new-project.sh" /usr/local/bin/ai-dev-switchboard-new-project.sh
-    install -m 755 "$REPO_DIR/scripts/new-repo.sh" /usr/local/bin/ai-dev-switchboard-new-repo.sh
-    install -m 755 "$REPO_DIR/scripts/new-dev-instance.sh" /usr/local/bin/ai-dev-switchboard-new-dev-instance.sh
-    install -m 755 "$REPO_DIR/scripts/project-sync.sh" /usr/local/bin/ai-dev-switchboard-project-sync.sh
-    install -m 755 "$REPO_DIR/scripts/target-setup.sh" /usr/local/bin/ai-dev-switchboard-target-setup.sh
-    install -m 755 "$REPO_DIR/scripts/git-hosting-setup.sh" /usr/local/bin/ai-dev-switchboard-git-hosting-setup.sh
-    # new-project.sh / new-dev-instance.sh call the others by their
-    # installed /usr/local/bin/ai-dev-switchboard-*.sh names directly.
-
-    GH_ENV="$CONFIG_DIR/git-hosting.env"
-    [ -f "$GH_ENV" ] || cp "$REPO_DIR/config/git-hosting.env.example" "$GH_ENV"
-    set_env "$GH_ENV" RUN_USER "$RUN_USER"
-    set_env "$GH_ENV" PROJECTS_DIR "$PROJECTS_DIR"
-    /usr/local/bin/ai-dev-switchboard-git-hosting-setup.sh
-    set_env "$ENV_FILE" NEW_PROJECT_SCRIPT "/usr/local/bin/ai-dev-switchboard-new-project.sh"
-
-    # ── Self-hosted Gitea (folds into --with-git-hosting, not a new flag —
-    # docs/spec.md "Sequencing — additive, not a swap"). Appended inside this
-    # same block, after the existing steps above, so today's exact output
-    # ordering/behavior is preserved for anyone diffing install logs. Purely
-    # additive: nothing above this point is touched, removed, or warned
-    # against — Gitea is installed but left OFF, inert infrastructure only
-    # until a future cycle (2b) wires create_project() to use it.
+    # ── Self-hosted Gitea (part of --with-git-hosting). Backlog item 2b
+    # retired the old git-shell/bare-repo scripts (git-hosting-setup.sh,
+    # new-repo.sh, new-dev-instance.sh, new-project.sh, project-sync.sh,
+    # target-setup.sh) and config/git-hosting.env.example entirely — repo
+    # creation/registration now goes through Gitea's own REST API (see
+    # docs/spec.md backlog item 2b, docs/GIT_HOSTING.md). Only
+    # new-project-from-gitea.sh (the privileged clone hand-off) is installed
+    # system-wide below; gitea-configure-api.sh is a one-time operator tool
+    # run from the repo checkout, same as taiga-configure-push.sh.
     echo "-- Self-hosted Gitea (part of --with-git-hosting) --"
 
     # 1. Docker itself — shared with --with-taiga via ensure_docker() (see
@@ -538,9 +529,22 @@ if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
     install -m 755 "$REPO_DIR/scripts/gitea-down.sh" /usr/local/bin/ai-dev-switchboard-gitea-down.sh
     install -m 755 "$REPO_DIR/scripts/gitea-status.sh" /usr/local/bin/ai-dev-switchboard-gitea-status.sh
 
+    # 5b. Repo creation/registration (backlog item 2b) — the privileged
+    # clone hand-off create_project() calls once Gitea's own API has already
+    # created the repo (docs/spec.md "The privileged registration script").
+    # Installed system-wide, unlike gitea-configure-api.sh (a one-time
+    # operator tool run from the repo checkout, same as
+    # taiga-configure-push.sh) — its sudoers entry is added above alongside
+    # the gitea-{up,down,status}.sh ones.
+    install -m 755 "$REPO_DIR/scripts/new-project-from-gitea.sh" \
+        /usr/local/bin/ai-dev-switchboard-new-project-from-gitea.sh
+
     # 6. switchboard.env — GITEA_DIR is also recorded here (beyond what
     # app.py itself reads) because the wrapper scripts above source this
     # same file for it, exactly like TAIGA_DIR's usage above.
+    # GITEA_API_TOKEN is deliberately NOT set here — it doesn't exist until
+    # the operator runs scripts/gitea-configure-api.sh, a separate one-time
+    # step after this install finishes (see the summary block below).
     set_env "$ENV_FILE" GITEA_ENABLED 1
     set_env "$ENV_FILE" GITEA_PORT "$GITEA_PORT"
     set_env "$ENV_FILE" GITEA_LABEL "Gitea"
@@ -548,6 +552,8 @@ if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
     set_env "$ENV_FILE" GITEA_UP_SCRIPT "/usr/local/bin/ai-dev-switchboard-gitea-up.sh"
     set_env "$ENV_FILE" GITEA_DOWN_SCRIPT "/usr/local/bin/ai-dev-switchboard-gitea-down.sh"
     set_env "$ENV_FILE" GITEA_STATUS_SCRIPT "/usr/local/bin/ai-dev-switchboard-gitea-status.sh"
+    set_env "$ENV_FILE" NEW_PROJECT_FROM_GITEA_SCRIPT \
+        "/usr/local/bin/ai-dev-switchboard-new-project-from-gitea.sh"
 fi
 
 if [ "$WITH_HOST_CONTROL" -eq 1 ]; then
@@ -590,14 +596,14 @@ if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
     echo "Gitea: installed but left OFF — flip the 'Gitea' row's toggle in the"
     echo "web UI to start it. A 2-container stack (Gitea + Postgres), well under"
     echo "1 GB of RAM once turned on; toggling it back off frees that right away."
-    echo "The existing git-hosting flow ('+ New project', the git user, ${RUN_USER}'s"
-    echo "own repos) is completely unchanged and keeps working exactly as before —"
-    echo "Gitea doesn't do anything with real repos yet (see docs/spec.md)."
-    echo "Before first use, create Gitea's own admin account (one-time, a single"
-    echo "non-interactive command — not automated by this installer):"
-    echo "  docker exec -it --user git ai-dev-switchboard-gitea gitea admin user create \\"
-    echo "    --admin --username <name> --password <password> --email <email>"
-    echo "(run that after the Gitea toggle is on and the stack has finished starting)."
+    echo "The web UI's '+ New project' button creates real Gitea repos once you've"
+    echo "done TWO one-time steps, in order, after the Gitea toggle is on and the"
+    echo "stack has finished starting:"
+    echo "  1. Create Gitea's own admin account (a single non-interactive command):"
+    echo "       docker exec -it --user git ai-dev-switchboard-gitea gitea admin user create \\"
+    echo "         --admin --username <name> --password <password> --email <email>"
+    echo "  2. Run scripts/gitea-configure-api.sh once (as root) to mint an API token"
+    echo "     for the web UI to use — see docs/GIT_HOSTING.md."
 fi
 echo ""
 echo "Next: log in as $RUN_USER and run your engine's CLI once interactively"

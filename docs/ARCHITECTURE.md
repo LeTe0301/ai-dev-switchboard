@@ -7,22 +7,32 @@
   `/etc/sudoers.d` rules it can run `tmux`/`ttyd`/`code-server` as
   `RUN_USER`, and run the folder-upload wizard's privileged hand-off script
   (`ai-dev-switchboard-new-project-from-upload.sh` — see below) — plus,
-  only when `--with-git-hosting` is installed, the git-hosting "+ New
-  project" script. Nothing else. A bug in this stdlib-only app is not an
-  instant path to `RUN_USER`'s account.
+  only when `--with-git-hosting` is installed, the Gitea toggle wrapper
+  triplet and the "+ New project" registration script (see below).
+  Nothing else. A bug in this stdlib-only app is not an instant path to
+  `RUN_USER`'s account.
 - **The folder-upload wizard's privileged hand-off**
   (`scripts/new-project-from-upload.sh`, see `docs/spec.md` "Crossing the
-  privilege boundary") follows the same shape `new-project.sh` already
-  established: runs as root via a whitelisted sudoers entry, does the
-  minimum mechanical work (atomic `mkdir`, `cp -a`, `chown`, an optional
-  `git init`), nothing else. Unlike the git-hosting script, its sudoers
-  entry lives in the **base, always-installed** block of `install.sh`, not
-  behind `--with-git-hosting` — this feature is explicitly the
+  privilege boundary") follows the same narrow shape as Gitea's own
+  registration hand-off below: runs as root via a whitelisted sudoers
+  entry, does the minimum mechanical work (atomic `mkdir`, `cp -a`,
+  `chown`, an optional `git init`), nothing else. Its sudoers entry lives
+  in the **base, always-installed** block of `install.sh`, not behind
+  `--with-git-hosting` — this feature is explicitly the
   project-registration path for people *without* git hosting. Everything
   before that hand-off (receiving the upload, staging, detecting structure,
   naming, collision-checking) runs entirely unprivileged as `SVC_USER`,
   inside `UPLOAD_STAGING_DIR` — only the final registration step needs the
   privileged script.
+- **Git hosting's own privileged hand-off** (`scripts/new-project-from-gitea.sh`,
+  `--with-git-hosting` only, see `docs/spec.md` backlog item 2b) follows the
+  exact same mechanical shape: `create_project()` creates the actual repo
+  itself first, entirely unprivileged, via Gitea's own REST API (as
+  `SVC_USER`, using a token from `scripts/gitea-configure-api.sh`'s one-time
+  bootstrap) — only the final `mkdir`/`chown`/`git clone` into
+  `PROJECTS_DIR/<name>` crosses into root via a narrowly-scoped sudoers
+  entry, same "do the minimum mechanical work as root, nothing else"
+  discipline as the upload wizard's own hand-off.
 - **`RUN_USER`** (default `dev`) is where the actual work happens: project
   files, engine credentials (e.g. `claude`'s own login), and the tmux
   sessions the engines run in all live here. This account needs whatever

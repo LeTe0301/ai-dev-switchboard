@@ -9,7 +9,8 @@
 # this script is explicitly the registration path for people who don't have
 # git hosting installed at all. Runs as root via a narrowly-scoped sudoers
 # entry; keep it as mechanical as possible (mkdir/cp/chown/git-init only),
-# same discipline as scripts/new-dev-instance.sh.
+# same discipline scripts/new-project-from-gitea.sh follows for its own
+# (--with-git-hosting-only) privileged hand-off.
 #
 # Usage: new-project-from-upload.sh <source-dir> <name>
 set -euo pipefail

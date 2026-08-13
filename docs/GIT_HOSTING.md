@@ -1,83 +1,148 @@
 # Git hosting (`--with-git-hosting`)
 
-Optional. Adds:
+Optional. Adds a self-hosted [Gitea](https://gitea.com) instance (a
+2-container Docker Compose stack: `server` + `db`/Postgres, well under 1 GB
+RAM while running) plus the web UI's "+ New project" button, which creates a
+real, private Gitea repository and clones it into `PROJECTS_DIR/<name>` in
+one click.
 
-- A restricted `git` user (git-shell only — no real shell access) serving
-  private bare repos over SSH from `$GIT_ROOT/repos/`.
-- A generic auto-deploy mechanism: push to `main` → rsync to a target
-  machine → that machine restarts its own service. No shared root, no
-  access back to the git-hosting box from the target beyond one restricted
-  rsync key.
-- The web UI's "+ New project" button (`create_project()` in `app.py` calls
-  `ai-dev-switchboard-new-project.sh`, installed by this feature).
+This replaced an earlier lightweight git-shell/bare-repo/rsync setup
+(backlog item 2b) — if you're looking for that flow's docs, they're in git
+history (`git show dcc582b:docs/GIT_HOSTING.md`); it's gone from new
+installs, and this document only describes the current Gitea-backed flow.
 
-## One-time: add your SSH key
+## How it fits together
+
+- Gitea is a **singleton, off-by-default toggle row** in the web UI (`--with-git-hosting`
+  installs it stopped; flip the "Gitea" row's toggle to start/stop it). One
+  instance for the whole box, not per project.
+- **"+ New project"** calls Gitea's own `POST /user/repos` REST API
+  (unprivileged, as the web UI's own service user) to create a private repo,
+  then hands off to a small privileged script that clones it into
+  `PROJECTS_DIR/<name>`, owned by `RUN_USER` — that's what makes it show up
+  in the web UI (`instance_names()` just lists `PROJECTS_DIR` subdirectories).
+- From then on, `PROJECTS_DIR/<name>` **is** your primary working copy: an
+  agent session commits there and pushes to Gitea directly (`git push`,
+  already fully configured — see "Everyday use" below), the same direction
+  any normal git workflow uses. This is the opposite of the old flow, where
+  a bare repo was the source of truth and `PROJECTS_DIR/<name>` was a
+  passively-synced mirror.
+
+## One-time setup (after `install.sh --with-git-hosting`)
+
+Two manual steps, in order, after the "Gitea" row is toggled on and the
+stack has finished starting:
+
+**1. Create Gitea's own admin account** (a single non-interactive command —
+not automated by this installer, no password ever stored by this project
+beyond this one command you type yourself):
 
 ```bash
-ssh-keygen -t ed25519 -C "you@your-laptop"
-cat ~/.ssh/id_ed25519.pub
+docker exec -it --user git ai-dev-switchboard-gitea gitea admin user create \
+  --admin --username <name> --password <password> --email <email>
 ```
 
-Append that to `$GIT_ROOT/.ssh/authorized_keys` on the git-hosting machine
-(as the `git` user, or via `sudo`), then pushes will work.
+(`--user git` matters — `docker exec` defaults to the container's `root`
+user, and Gitea's own CLI refuses to run as root.)
+
+**2. Mint an API token for the web UI to use**, by running the bootstrap
+script once, as root:
+
+```bash
+sudo scripts/gitea-configure-api.sh
+```
+
+This prompts for the admin username and container name (both default to the
+values above), mints a `write:repository,write:user`-scoped Personal Access
+Token directly via Gitea's own CLI (**no password is ever asked for or
+stored by this script** — it only needs `docker exec` access to the
+container), writes it into `/etc/ai-dev-switchboard/switchboard.env` as
+`GITEA_API_TOKEN`, restarts the `ai-dev-switchboard` service so it picks up
+the new value, and verifies the token actually works (`GET /user` against
+Gitea). Safe to re-run any time — it mints a fresh token (with a unique
+name each run — Gitea rejects reusing a token name) and overwrites the old
+one, useful for rotation.
+
+Once both steps are done, "+ New project" works.
 
 ## Everyday use: new private repo
 
-```bash
-# repo only, no auto-deploy
-ai-dev-switchboard-new-repo.sh myproject
+Click "+ New project" in the web UI, type a name, confirm. Behind the
+scenes:
 
-# repo + auto-deploy to a target machine on push to main
-ai-dev-switchboard-new-repo.sh myproject 192.168.1.60 /opt/myproject
-```
+1. `app.py` calls `POST /user/repos` against Gitea (`private: true`,
+   `auto_init: true`, `default_branch: "main"`), authenticated with the
+   token from step 2 above.
+2. A privileged hand-off script clones the new repo into
+   `PROJECTS_DIR/<name>`, owned by `RUN_USER` — the clone's `origin` remote
+   already has the same token embedded (`http://oauth2:<token>@...`), so
+   `git push`/`git pull` from that working copy (as `RUN_USER`, e.g. from an
+   agent session) work immediately, no extra credential setup.
+3. The new project shows up in the web UI right away.
 
-This prints the exact remote to add:
+Local project names can contain spaces (same rules as every other project
+name here); Gitea's own repo names can't, so spaces are mapped to hyphens
+for the Gitea side only (e.g. local name `my project` becomes Gitea repo
+`my-project`) — the local `PROJECTS_DIR/<name>` folder keeps the original
+name with spaces.
 
-```bash
-git remote add dev ssh://git@<git-hosting-host>/srv/git/repos/myproject.git
-git push dev main
-```
+## Reaching a repo from outside the box
 
-Or use the web UI's "+ New project" button, which runs `new-repo.sh` +
-`new-dev-instance.sh` together in one step (this is exactly what
-`ai-dev-switchboard-new-project.sh` does).
+Gitea's own web UI, and the token-authenticated clone URL, are both reached
+the same way every other per-feature URL in this project is:
 
-## Wiring up a deploy target
+- **`PUBLISH_MODE=tailscale`**: `https://<your-tailnet-host>/gitea/...` (the
+  same published `/gitea` path the Gitea row's own link already uses) — a
+  developer's laptop can `git clone`/`git push` against that URL directly.
+- **`PUBLISH_MODE=none`**: `http://127.0.0.1:$GITEA_PORT/...`, reachable
+  only from the box itself unless you put your own reverse proxy / SSH
+  tunnel / VPN in front.
 
-Once, on the target machine, as root:
+`app.py`'s own API call and the privileged clone script always talk to
+Gitea over `127.0.0.1:$GITEA_PORT` directly (both run on the same host as
+Gitea) — `PUBLISH_MODE`/`tailscale serve` only matters for an *external*
+git client reaching in from elsewhere, which needs no extra code on this
+project's side; it falls out of the Gitea toggle's existing `_publish()`
+call.
 
-```bash
-ai-dev-switchboard-target-setup.sh /opt/myproject myproject-service "<pubkey from new-repo.sh's output>"
-```
+## What's NOT included (yet)
 
-This creates a `deploy` user whose SSH key can *only* write into
-`/opt/myproject` (enforced by `rrsync` — no shell, no other commands) and a
-`systemd .path` unit that restarts `myproject-service` automatically the
-moment new files land. The target needs `rsync` installed
-(`apt-get install rsync`) and `myproject-service.service` to already exist
-before the first push.
+- **Auto-sync of `PROJECTS_DIR/<name>` when someone pushes to the same repo
+  from somewhere else** (another contributor via Gitea's own web UI, a
+  merged PR, a second agent session elsewhere). The old flow's
+  `post-receive` hook gave this "for free" because it expected the *bare
+  repo* to be the primary target of pushes; under the new model
+  `PROJECTS_DIR/<name>` is itself the primary working copy, so this is a
+  narrower, less common need than it used to be. For now: `git pull`
+  manually in the working copy if you know something else pushed to it.
+  Revisit if this turns out to matter more in practice — see `docs/BACKLOG.md`.
+- **CI/CD auto-deploy** (Gitea Actions or webhooks replacing the old
+  `project-sync.sh` + `post-receive` deploy-to-a-target-machine flow) — a
+  future cycle, not built yet.
+- **Multiple Gitea orgs, or a separate Gitea account per developer.** Every
+  repo is created under the single admin account from step 1 above
+  (`POST /user/repos`, not `/orgs/{org}/repos`) — same single-shared-identity
+  model the old `git` system user had, just under Gitea's terms.
 
-## How the pieces fit together
+## Troubleshooting
 
-- `scripts/git-hosting-setup.sh` — one-time (idempotent): creates the `git`
-  user, the deploy SSH keypair, and the sudoers rule that lets the `git`
-  user run `project-sync.sh` as `RUN_USER`. Run by `install.sh
-  --with-git-hosting`.
-- `scripts/new-repo.sh <name> [target-ip target-path]` — creates
-  `$GIT_ROOT/repos/<name>.git`, with an optional auto-deploy
-  `post-receive` hook.
-- `scripts/new-dev-instance.sh <name>` — clones that bare repo into
-  `$PROJECTS_DIR/<name>` (where the web UI finds it) and installs a second
-  `post-receive` hook block that keeps the working copy synced on every
-  push to `main`, forever.
-- `scripts/new-project.sh <name>` — the two above, in one step. What the
-  web UI's button calls.
-- `scripts/project-sync.sh <name>` — what the auto-sync hook actually runs
-  (`git fetch && git reset --hard origin/main` in the working copy).
-- `scripts/target-setup.sh` — run once on any auto-deploy *target*, not the
-  git-hosting box itself.
-
-All of these read `$CONFIG_DIR/git-hosting.env` (default
-`/etc/ai-dev-switchboard/git-hosting.env`) for `GIT_ROOT`, `GIT_USER`,
-`RUN_USER`, `PROJECTS_DIR`, and `ADVERTISE_HOST` — see
-`config/git-hosting.env.example`.
+- **"Gitea isn't installed on this box"** — you don't have
+  `--with-git-hosting` installed. Either re-run `install.sh
+  --with-git-hosting`, or just `git init` a folder under `PROJECTS_DIR`
+  yourself; it'll show up in the web UI either way.
+- **"Gitea is installed but not running"** — flip the "Gitea" row's toggle
+  on first.
+- **"Gitea API token isn't configured yet"** — run `sudo
+  scripts/gitea-configure-api.sh` (see "One-time setup" above).
+- **"A Gitea repository named '...' already exists"** — the name you typed
+  (after spaces are mapped to hyphens) collides with a repo that already
+  exists in Gitea, even if no `PROJECTS_DIR` folder of that exact name
+  exists locally yet (e.g. it was created directly through Gitea's own web
+  UI). Pick a different name.
+- **"+ New project" failed partway through** — if Gitea's own API call
+  succeeded but the clone step failed (disk full, a network hiccup, etc.),
+  the just-created Gitea repo is deleted automatically (best-effort) so you
+  don't end up with an orphaned repo. If a retry with the same name then
+  says "already exists" locally even though nothing shows up in the web UI,
+  a previous attempt's `PROJECTS_DIR/<name>` directory was left behind empty
+  — `rmdir` it by hand and try again.

@@ -11,7 +11,7 @@ It grew out of a real homelab setup (Proxmox host + LXC container running
 several projects side by side) and has since been generalized: which
 engines are available is a config file, not code (see
 [`docs/ADDING_AN_ENGINE.md`](docs/ADDING_AN_ENGINE.md)), auth works with or
-without a Proxmox host, and the git-hosting/auto-deploy pieces are optional.
+without a Proxmox host, and the self-hosted git-hosting piece is optional.
 
 ## Quickstart
 
@@ -77,11 +77,10 @@ pipx install aider-chat                    # aider
   is rate-limited, one needs LAN-only data handling, or you're just curious
   which one handles a given task better.
 - **A private git-hosting box that also runs the agents.** With
-  `--with-git-hosting`, "push a new project" and "start an agent on it" are
-  two clicks total, including auto-sync back to disk on every future push
-  — see [`docs/GIT_HOSTING.md`](docs/GIT_HOSTING.md). The same flag also
-  installs a self-hosted Gitea instance (own singleton toggle row, off by
-  default) as inert infrastructure for a future cycle to actually wire up.
+  `--with-git-hosting`, a self-hosted Gitea instance (own singleton toggle
+  row, off by default) creates real private repos and clones them straight
+  into `PROJECTS_DIR` — "create a new project" and "start an agent on it"
+  are two clicks total — see [`docs/GIT_HOSTING.md`](docs/GIT_HOSTING.md).
 
 ## What you get
 
@@ -105,15 +104,14 @@ pipx install aider-chat                    # aider
   a monorepo with nested/vendored repos), choose which pieces become their
   own projects, and confirm. Works standalone — unlike "+ New project"
   below, it does **not** need `--with-git-hosting`.
-- **A "+ New project" button** — optional, needs
-  [`--with-git-hosting`](docs/GIT_HOSTING.md): creates a private bare repo
-  + a working copy in one step, kept in sync automatically on every future
-  `git push`.
-- **A self-hosted Gitea singleton row** — optional, also installed (but left
-  off) by `--with-git-hosting`: a 2-container (Gitea + Postgres) Docker
-  Compose stack, well under 1 GB RAM once toggled on. Doesn't create/host
-  real repos yet in this cycle — see `docs/spec.md` (backlog item 2a); the
-  existing "+ New project" flow above keeps working unchanged either way.
+- **A self-hosted Gitea singleton row** — optional, needs
+  [`--with-git-hosting`](docs/GIT_HOSTING.md): a 2-container (Gitea +
+  Postgres) Docker Compose stack, well under 1 GB RAM once toggled on, off
+  by default.
+- **A "+ New project" button** — needs Gitea (above) toggled on plus a
+  one-time API token bootstrap (`scripts/gitea-configure-api.sh`): creates a
+  real, private Gitea repo via its own REST API and clones it into
+  `PROJECTS_DIR` in one step, ready to `git push` immediately.
 - **An optional extra row** for a persistent session on a *different*
   machine (e.g. the Proxmox host itself, outside any container) — see
   [`host-agent/README.md`](host-agent/README.md).

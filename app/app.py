@@ -68,8 +68,6 @@ SIMPLE_PASSWORD = os.environ.get("SIMPLE_PASSWORD", "")
 RUN_USER = os.environ.get("RUN_USER", "dev")
 PROJECTS_DIR = os.environ.get("PROJECTS_DIR", f"/home/{RUN_USER}/projects")
 ENGINES_DIR = os.environ.get("ENGINES_DIR", "/etc/ai-dev-switchboard/engines.d")
-NEW_PROJECT_SCRIPT = os.environ.get(
-    "NEW_PROJECT_SCRIPT", "/usr/local/bin/ai-dev-switchboard-new-project.sh")
 
 # Folder-upload wizard (see docs/spec.md "Folder upload → auto-detect
 # repo(s)") — phase 1 (POST /projects/upload) stages an uploaded zip and
@@ -92,8 +90,9 @@ UPLOAD_STAGING_TTL_SECONDS = int(os.environ.get("UPLOAD_STAGING_TTL_SECONDS", "1
 # The privileged hand-off script (docs/spec.md "Crossing the privilege
 # boundary") that actually moves a validated, already-named staged directory
 # into PROJECTS_DIR/<name> as RUN_USER. Installed unconditionally by
-# install.sh, unlike NEW_PROJECT_SCRIPT above — this feature is explicitly
-# the path for people WITHOUT git hosting installed.
+# install.sh, unlike NEW_PROJECT_FROM_GITEA_SCRIPT below (--with-git-hosting
+# only) — this feature is explicitly the path for people WITHOUT git hosting
+# installed.
 NEW_PROJECT_FROM_UPLOAD_SCRIPT = os.environ.get(
     "NEW_PROJECT_FROM_UPLOAD_SCRIPT",
     "/usr/local/bin/ai-dev-switchboard-new-project-from-upload.sh")
@@ -138,6 +137,17 @@ GITEA_PORT = int(os.environ.get("GITEA_PORT", "3000"))
 GITEA_UP_SCRIPT = os.environ.get("GITEA_UP_SCRIPT", "/usr/local/bin/ai-dev-switchboard-gitea-up.sh")
 GITEA_DOWN_SCRIPT = os.environ.get("GITEA_DOWN_SCRIPT", "/usr/local/bin/ai-dev-switchboard-gitea-down.sh")
 GITEA_STATUS_SCRIPT = os.environ.get("GITEA_STATUS_SCRIPT", "/usr/local/bin/ai-dev-switchboard-gitea-status.sh")
+# Repo creation/registration (backlog item 2b) -- GITEA_API_TOKEN is minted
+# once by scripts/gitea-configure-api.sh (a separate one-time bootstrap step
+# from the admin-account creation above) and read here exactly like every
+# other SVC_USER-consumed secret in this file (TOTP_SECRET, HOST_CONTROL_KEY)
+# -- see docs/spec.md "Token reuse and where it lives" for why this lives in
+# switchboard.env rather than a RUN_USER-owned config file the way
+# taiga_push_spec.py's own credential does.
+GITEA_API_TOKEN = os.environ.get("GITEA_API_TOKEN", "")
+NEW_PROJECT_FROM_GITEA_SCRIPT = os.environ.get(
+    "NEW_PROJECT_FROM_GITEA_SCRIPT",
+    "/usr/local/bin/ai-dev-switchboard-new-project-from-gitea.sh")
 
 STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT_SECONDS", "45"))
 
@@ -528,19 +538,86 @@ def _code_stop(name: str):
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]{0,59}$")
 
 
+def _gitea_slug(name: str) -> str:
+    # NAME_RE already guarantees name starts with an alnum and is otherwise
+    # [A-Za-z0-9 _-]{0,59} -- the only translation Gitea's own
+    # [A-Za-z0-9_.-]+ rules require is turning spaces into '-' (docs/spec.md
+    # "Local name -> Gitea slug mapping").
+    return re.sub(r"\s+", "-", name.strip())
+
+
+def _gitea_api(method: str, path: str, body: dict = None) -> tuple:
+    """Returns (status, parsed_json_or_{}). Never raises for a non-2xx HTTP
+    status (the caller inspects `status`, e.g. 409 for a name collision) --
+    only for a connection failure, converted to ConnectionError so callers
+    can give the same "Gitea isn't reachable" message the gitea_run("status")
+    pre-flight check already covers for the toggled-off case. Always
+    127.0.0.1:GITEA_PORT -- this call is intra-box (app.py and Gitea's
+    container both run on the same host), never routed through
+    tailscale serve/BASE_URL regardless of PUBLISH_MODE (docs/spec.md
+    "The Gitea API call")."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{GITEA_PORT}/api/v1{path}", data=data, method=method,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"token {GITEA_API_TOKEN}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status, json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b"{}")
+        except ValueError:
+            return e.code, {}
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        raise ConnectionError("gitea unreachable")
+
+
 def create_project(name: str) -> tuple[bool, str]:
     if not NAME_RE.match(name or ""):
         return False, "Use letters, numbers, spaces, - or _ (must start with a letter/number)."
     if name in instance_names():
         return False, f"'{name}' already exists."
-    if not os.path.exists(NEW_PROJECT_SCRIPT):
-        return False, ("New-project scaffolding isn't installed on this box — create "
-                       f"{PROJECTS_DIR}/{name} yourself (e.g. `git init`) and it'll show "
-                       "up here, or install scripts/ from the repo (see docs/GIT_HOSTING.md).")
-    r = subprocess.run(["sudo", NEW_PROJECT_SCRIPT, name],
+    if not GITEA_ENABLED:
+        return False, ("Gitea isn't installed on this box (install.sh --with-git-hosting) "
+                       f"-- or create {PROJECTS_DIR}/{name} yourself (e.g. `git init`) "
+                       "and it'll show up here.")
+    if not GITEA_API_TOKEN:
+        return False, ("Gitea API token isn't configured yet -- run "
+                       "scripts/gitea-configure-api.sh once (see docs/GIT_HOSTING.md).")
+    status_out = gitea_run("status").splitlines()
+    if not status_out or status_out[0] != "on":
+        return False, "Gitea is installed but not running -- toggle it on first."
+
+    slug = _gitea_slug(name)
+    try:
+        status, resp = _gitea_api("POST", "/user/repos",
+                                  {"name": slug, "private": True, "auto_init": True,
+                                   "default_branch": "main"})
+    except ConnectionError:
+        return False, "Couldn't reach Gitea -- is it actually running?"
+    if status in (409, 422):
+        return False, f"A Gitea repository named '{slug}' already exists -- pick a different name."
+    if status not in (200, 201):
+        return False, f"Gitea rejected the repo creation (HTTP {status})."
+    owner = resp.get("owner", {}).get("login", "")
+    repo_name = resp.get("name", slug)
+    if not owner:
+        return False, "Gitea's response didn't include an owner -- can't continue."
+
+    r = subprocess.run(["sudo", NEW_PROJECT_FROM_GITEA_SCRIPT, owner, repo_name, name],
                        capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
-        return False, (r.stderr or r.stdout or "new-project script failed").strip()[:300]
+        # Best-effort cleanup: the Gitea repo now exists but nothing landed
+        # in PROJECTS_DIR -- don't leave an orphaned repo behind silently.
+        # Failure of the cleanup itself is swallowed (the original error is
+        # what the user needs to see), same "best-effort, not guaranteed"
+        # tradeoff docs/spec.md "Risk / rollback notes" accepts explicitly.
+        try:
+            _gitea_api("DELETE", f"/repos/{owner}/{repo_name}")
+        except ConnectionError:
+            pass
+        return False, (r.stderr or r.stdout or "registration script failed").strip()[:300]
     return True, ""
 
 

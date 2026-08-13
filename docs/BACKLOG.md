@@ -68,22 +68,29 @@ projects or one per project folder.
 
 ## 2. Local git hosting UI + CI/CD (Gitea)
 
-**Status: 2a shipped (2026-08-13)** — `install.sh --with-git-hosting` now
-also installs Gitea (Postgres-backed, per user confirmation) via a
-directly-authored Docker Compose stack, off by default, plus a singleton
-toggle row in the web UI reusing (now generalized) the same toggle-state
-machine 1a's Taiga row hardened across three review rounds. Purely additive
-— the existing git-hosting flow (`new-project.sh`, `create_project()`) is
-completely untouched; the actual swap happens in 2b. Reviewer-approved
-after one fix round (a printed admin-account-creation command that failed
-as originally written). Full spec/design/implementation/test-review for
-**2a specifically** in `docs/spec.md` / `docs/design.md` /
-`docs/implementation.md` / `docs/test-review.md`. **2b (repo-creation/
-registration flow, rewiring `create_project()`) and 2c (CI/CD auto-deploy)
-are still open** — deliberately scoped out of 2a as separate future
-cycles; 2b is the moment `git-hosting-setup.sh`/`new-repo.sh`/
-`new-dev-instance.sh`/`new-project.sh`/`project-sync.sh`/`target-setup.sh`
-retirement actually happens, not automatic.
+**Status: 2a and 2b both shipped (2026-08-13).** 2a: `install.sh --with-git-hosting` now also installs
+Gitea (Postgres-backed, per user confirmation) via a directly-authored
+Docker Compose stack, off by default, plus a singleton toggle row in the
+web UI reusing (now generalized) the same toggle-state machine 1a's Taiga
+row hardened across three review rounds. Reviewer-approved after one fix
+round (a printed admin-account-creation command that failed as originally
+written). 2b: `create_project()` in `app.py` now creates real repos
+through Gitea's REST API (`POST /user/repos`), backed by a new one-time
+token-bootstrap script (`scripts/gitea-configure-api.sh`) and a new
+privileged clone hand-off (`scripts/new-project-from-gitea.sh`); the six
+legacy git-hosting scripts (`git-hosting-setup.sh`, `new-repo.sh`,
+`new-dev-instance.sh`, `new-project.sh`, `project-sync.sh`,
+`target-setup.sh`) and `config/git-hosting.env.example` have been retired
+from `install.sh`. Reviewer's live testing against a real Gitea 1.27.1
+instance caught one must-fix defect (a same-second token-name collision in
+`gitea-configure-api.sh`'s re-run safety) — fixed with a random suffix and
+approved on re-review (verified live across 35 runs with zero collisions,
+including runs that genuinely shared the same Unix second). Full
+spec/implementation/test-review for **2a specifically**
+preserved in git history at commit `dcc582b`; **2b specifically** in the
+current `docs/spec.md` / `docs/implementation.md` / `docs/test-review.md`.
+**2c (CI/CD auto-deploy) is still open** — deliberately scoped out as a
+separate future cycle.
 
 **Decision:** Gitea, not full GitLab CE. GitLab's resource footprint (own
 Postgres, Redis, multiple worker processes, several GB RAM minimum) cuts

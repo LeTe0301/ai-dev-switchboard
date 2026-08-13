@@ -1,651 +1,803 @@
-# Spec: Local git hosting UI + CI/CD (Gitea) — part 2a: install + container toggle
+# Spec: Local git hosting UI + CI/CD (Gitea) — part 2b: repo creation via Gitea's API + retiring the old flow
 
 ## Summary
-Fold a self-hosted Gitea Docker Compose stack into the existing
-`install.sh --with-git-hosting` flag (installed off by default, with a
-resource-cost callout) and give it a singleton on/off-toggle-plus-link row
-in the web UI, following the pattern 1a already established for Taiga —
-**not** the repo-creation/registration flow (2b, rewiring `create_project()`
-to actually use Gitea) or CI/CD auto-deploy (2c, Gitea Actions/webhooks),
-both of which stay explicit future cycles that depend on 2a existing first.
+Rewire `create_project()` in `app/app.py` to create real repos through Gitea's
+own REST API (installed and toggleable since 2a, commit `dcc582b`) instead of
+the legacy bare-repo/rsync scripts, and retire those six legacy scripts and
+their sudoers lines in this same cycle once the new flow is verified working
+— **not** CI/CD auto-deploy or auto-sync-on-external-push, both explicitly
+deferred to 2c (see Non-goals).
 
 ## Goals
-- `install.sh --with-git-hosting` — in addition to everything it already
-  does today (unchanged, see Non-goals) — installs Docker (reusing 1a's
-  install/verify logic, factored out so both features share it rather than
-  duplicating it) and Gitea's own officially-documented two-service Docker
-  Compose stack (`server` + `db`/Postgres, verified against
-  `docs.gitea.com/installation/install-with-docker` — see "Background"),
-  configured (generated secrets, loopback-only port bindings, `INSTALL_LOCK`
-  pre-set so the public install wizard never becomes a race — see
-  "Proposed approach") and **left stopped** after install, mirroring
-  Taiga's "installed but off" contract exactly.
-- A resource-cost callout at the install prompt/summary, calibrated to
-  Gitea's actual (much lighter than Taiga's) footprint — see "Background".
-- A new singleton row in the web UI (`kind: 'gitea'`, alongside the
-  existing Taiga row, not a per-project row) with an on/off toggle and,
-  when on, a link to the running instance.
-- Toggling on starts the Gitea stack (`docker compose up -d`); toggling off
-  stops it (`docker compose down`), actually freeing resources.
-- State survives `ai-dev-switchboard` service restarts correctly, exactly
-  like Taiga (Gitea's containers are not children of `app.py`'s process
-  tree — state is queried fresh every poll, never trusted from memory).
-- The toggle's frontend state machine is built defensively from the start,
-  reusing (generalized, not copy-pasted) the exact logic 1a's three review
-  rounds hardened for Taiga — see "Proposed approach: generalizing the
-  toggle state machine".
+- The web UI's "+ New project" button (`create_project()`) creates a real,
+  private Gitea repository via `POST /user/repos` (Gitea's REST API), then
+  clones it into `PROJECTS_DIR/<name>` — replacing today's
+  `NEW_PROJECT_SCRIPT` → `new-project.sh` → `new-repo.sh` +
+  `new-dev-instance.sh` chain end to end.
+- A one-time, non-interactive **token-bootstrap script**
+  (`scripts/gitea-configure-api.sh`), following `taiga-configure-push.sh`'s
+  "one-time interactive setup → small config file" shape, but generating a
+  scoped Gitea Personal Access Token via Gitea's own CLI (no admin password
+  ever prompted or stored) and writing it to `switchboard.env` — the
+  SVC_USER-owned config file `create_project()` itself already reads from,
+  since (unlike `taiga_push_spec.py`, invoked by a human/agent as `RUN_USER`)
+  the code that consumes this credential is `app.py` running as `SVC_USER`.
+- A new privileged, root-run, zero-secret-in-argv registration script
+  (`scripts/new-project-from-gitea.sh`) that does the one thing that
+  genuinely needs root — placing a correctly-owned clone under
+  `PROJECTS_DIR/<name>` as `RUN_USER` — following the exact mechanical,
+  narrow shape of `scripts/new-project-from-upload.sh`.
+- **Retire the six legacy scripts** (`git-hosting-setup.sh`, `new-repo.sh`,
+  `new-dev-instance.sh`, `new-project.sh`, `project-sync.sh`,
+  `target-setup.sh`) and their sudoers lines from `install.sh`'s
+  `--with-git-hosting` block, once the new flow is verified working
+  end-to-end — see "Proposed approach: sequencing" and "Open questions" for
+  what "verified" means given this environment's known Docker limitation.
+- Git access for the new flow rides the **existing loopback +
+  `tailscale serve` path** (`PUBLISH_MODE`/`_publish()`/`_unpublish()`) that
+  2a already set up for Gitea's own web UI link — no new SSH exposure, no
+  new exposure primitive of any kind.
+- `docs/GIT_HOSTING.md` rewritten to describe the new flow; `README.md`'s
+  git-hosting mentions updated to match.
 
 ## Non-goals
-- **The repo-creation/registration flow** (`docs/BACKLOG.md` item 2's "the
-  web UI's '+ New project' button... needs to call whatever replaces
-  new-project.sh") — explicitly 2b. `create_project()` in `app.py` keeps
-  calling the existing `NEW_PROJECT_SCRIPT` (today's `new-project.sh`)
-  completely unchanged; 2a installs Gitea as inert infrastructure only.
-- **CI/CD auto-deploy** (Gitea Actions / webhooks replacing
-  `project-sync.sh` + `post-receive`) — explicitly 2c, depends on 2b's repo
-  model existing first.
-- **Removing or disabling any part of the existing git-hosting flow**
-  (`scripts/git-hosting-setup.sh`, `new-repo.sh`, `new-dev-instance.sh`,
-  `new-project.sh`, `project-sync.sh`, `target-setup.sh`, their sudoers
-  rules, `docs/GIT_HOSTING.md`) — all of it keeps running exactly as it
-  does today. See "Proposed approach: sequencing — additive, not a swap"
-  for why this is the resolved default for 2a specifically, even though
-  `docs/BACKLOG.md` item 2's overall decision is that Gitea eventually
-  *replaces* this flow (that swap is 2b's moment, not 2a's).
-- **Migration for existing `--with-git-hosting` users.** Confirmed default
-  (user sign-off): **new-installs-only, no automatic migration.** Anyone
-  who already ran `--with-git-hosting` before this cycle keeps using the
-  old flow untouched; picking up Gitea (once 2b makes it functional) is a
-  manual re-setup, not an automated migration path, and no automated
-  migration path is ever planned for this item.
-- **Automated Gitea admin-account creation.** Mirrors 1a's Taiga non-goal
-  exactly: `install.sh` configures everything Gitea needs *except* the
-  first admin user, and prints a pointer to the one-time manual step
-  instead. See "Open questions" for why this one's a slightly closer call
-  for Gitea than it was for Taiga, and why the default is still "don't
-  automate it."
-- **A `--without-git-hosting` uninstall flag**, or any automated removal of
-  Docker/the Gitea containers/volumes — matches every other `--with-*` flag
-  in this installer (including Taiga's), none of which have an uninstall
-  path.
-- **Any change to `AUTH_MODE`/TOTP.** The Gitea toggle inherits the
-  existing shared TOTP gate in `do_POST` for free, exactly like Taiga's.
-- **Exposing Gitea's git-over-SSH port beyond loopback**, or any decision
-  about how a developer actually clones/pushes against Gitea (SSH key
-  exposure vs. HTTPS+token) — there is no way to create a Gitea repo yet in
-  2a's scope, so this decision is deferred to 2b. See "Open questions".
-- **A `--with-gitea` flag separate from `--with-git-hosting`.**
-  `docs/BACKLOG.md` item 2 is explicit that the Gitea install step "folds
-  into... the existing `install.sh --with-git-hosting` flag" — this spec
-  follows that literally, not a new flag name.
+- **CI/CD auto-deploy** (Gitea Actions / webhooks replacing the old
+  `project-sync.sh` + `post-receive` deploy hook) — explicitly 2c.
+- **Auto-sync of `PROJECTS_DIR/<name>` on a push that originates somewhere
+  other than that same working copy** (e.g. someone pushes directly via
+  Gitea's own web UI, or a PR gets merged there) — the old flow's
+  `post-receive` → `project-sync.sh` hook gave this "for free"; the new flow
+  deliberately does **not** rebuild an equivalent in 2b. See "Proposed
+  approach: sync-on-push — deferred to 2c, not built here" for the reasoning
+  this was a close call, and why the default resolved here is "defer."
+- **Exposing Gitea's git-over-SSH port** beyond loopback. Per the user's
+  confirmed default, all real git traffic (API calls and the actual
+  clone/push) goes over HTTPS through the same loopback + `tailscale serve`
+  mechanism already used everywhere else in this project.
+- **Migration for existing `--with-git-hosting` users.** Already settled by
+  2a as new-installs-only/no-auto-migration — not reopened here. Concretely:
+  retiring the six scripts means *new* `install.sh --with-git-hosting` runs
+  stop creating the legacy `git` system user / real-sshd exposure at all;
+  an existing box that already has that `git` user, `authorized_keys`, and
+  sudoers rule from a prior install keeps them untouched — no active
+  teardown script for pre-2b installs.
+- **Multiple Gitea orgs/owners, or per-developer Gitea accounts.** Repos are
+  created under the single admin account created manually in 2a's own
+  install summary step (`POST /user/repos`, not `/orgs/{org}/repos`) — see
+  "Proposed approach: owner model" for why this is the resolved default, not
+  an oversight.
+- **A credential helper, SSH agent, or any mechanism for `RUN_USER` to use a
+  *different* identity than the one bootstrap token when pushing from a
+  project's working copy.** One token, reused for both the API call and the
+  embedded-in-remote-URL clone credential — see "Proposed approach: token
+  reuse and where it lives" for the explicit reasoning and the trust-model
+  precedent this follows.
+- **Changing `AUTH_MODE`/TOTP, the `/status` Gitea toggle contract, or
+  anything else 2a already shipped and got reviewed** for the toggle itself
+  — 2b only changes what `create_project()` does when Gitea is enabled and
+  on; the singleton toggle row, `/gitea/{on,off}`, and `gitea_run()` are
+  unchanged.
+- **Automating the 2a admin-account-creation step itself** — still a manual,
+  one-time `docker exec --user git ... gitea admin user create ...` per 2a's
+  already-shipped Non-goals; 2b's own bootstrap script is a *second*,
+  separate one-time step that must run after that one.
 
 ## Background / current state
 
-### The current git-hosting flow (what this replaces, eventually — not yet)
-`docs/GIT_HOSTING.md` + `scripts/git-hosting-setup.sh` today: a restricted
-`git` user (real `git-shell`, no real shell) serving bare repos over the
-box's **actual OpenSSH daemon** (standard port 22, public-key auth via
-`$GIT_ROOT/.ssh/authorized_keys`) from `$GIT_ROOT/repos/`, plus a generic
-rsync-based auto-deploy (`new-repo.sh`'s optional target-ip/target-path →
-a `post-receive` hook → `project-sync.sh` on the target). `new-project.sh`
-(`new-repo.sh` + `new-dev-instance.sh` in one step) is what `app.py`'s
-`create_project()` (`app/app.py` line 519) calls via `NEW_PROJECT_SCRIPT`
-when the web UI's "+ New project" button is used. Crucially: this flow's
-SSH exposure is **not** governed by this project's `PUBLISH_MODE`/loopback
-rule at all — it rides the box's already-externally-reachable real sshd,
-entirely outside `app.py`'s control. Nothing in 2a touches any of this.
+### What the legacy flow actually does today (being replaced)
+Traced through `scripts/new-project.sh` → `new-repo.sh` + `new-dev-instance.sh`:
+1. `new-repo.sh <name>`: `git init --bare` under `$GIT_ROOT/repos/<name>.git`
+   as the restricted `git` system user, with an optional auto-deploy
+   `post-receive` hook block (rsync to a target machine — this is 2c's
+   territory, not touched here).
+2. `new-dev-instance.sh <name>`: `git clone` that bare repo into
+   `PROJECTS_DIR/<name>` as `RUN_USER` (this is what makes it show up in the
+   web UI — `instance_names()` just lists `PROJECTS_DIR` subdirectories),
+   and appends a *second* `post-receive` hook block that runs
+   `project-sync.sh <name>` (as `RUN_USER`, via a sudoers rule granted to
+   the `git` user) on every push to `main` — `git fetch && git reset --hard
+   origin/main` against the working copy. This is the "keeps
+   `PROJECTS_DIR/<name>` synced forever" feature `docs/GIT_HOSTING.md`
+   advertises.
+3. All of this rides the box's **real system sshd** (port 22, public-key
+   auth against `$GIT_ROOT/.ssh/authorized_keys`) — entirely outside
+   `PUBLISH_MODE`/`app.py`'s control, per 2a's own spec.
+4. `create_project()` (`app/app.py` line 531) today: validates the name,
+   checks `NEW_PROJECT_SCRIPT` exists, and does
+   `subprocess.run(["sudo", NEW_PROJECT_SCRIPT, name], ...)` — a single
+   root-run call with no return payload beyond stdout/stderr.
 
-### 1a's Taiga precedent (the shape this spec follows)
-`docs/spec.md`/`docs/implementation.md` at commit `ed84d73` (Taiga, 1a) is
-the direct precedent — same "new optional self-hosted service with its own
-container page" shape `docs/BACKLOG.md` calls out items 1 and 2 as sharing.
-Key patterns reused here, verbatim where they still fit:
-- **Docker as a first-class dependency, installed via
-  `curl -fsSL https://get.docker.com | sh`**, idempotent
-  (`command -v docker` check), never touching a pre-existing install.
-  Already landed in this codebase for Taiga — 2a reuses it rather than
-  re-deciding the tradeoff, but see "Proposed approach" for factoring it
-  into a shared helper instead of a second copy-pasted block.
-- **Loopback-only port binding via a `docker-compose.override.yml`**
-  merged alongside the main compose file, keeping the web UI consistent
-  with "everything binds `127.0.0.1` only, `PUBLISH_MODE` decides real
-  exposure" (`docs/ARCHITECTURE.md`).
-- **Pre-pull images at install time**, not first toggle, so the first UI
-  toggle-on is fast instead of blocking on a cold pull.
-- **Three fixed, zero-argument, root-run wrapper scripts + narrow sudoers
-  entries** (`{taiga}-{up,down,status}.sh`) as the privilege-boundary
-  mitigation for Docker-socket access being root-equivalent — this pattern
-  (not `new-project-from-upload.sh`'s single-script-with-positional-args
-  shape) is what 2a reuses again, since Gitea's toggle is the same
-  "toggle a persistent external thing, root-run, zero-trust of caller
-  input" shape as Taiga's, not a per-invocation scaffolding action.
-- **State never trusted from memory** — `TAIGA_STATUS_SCRIPT`-equivalent
-  queried fresh on every `/status` poll, because Docker-managed containers
-  outlive `app.py`'s own process tree across a service restart.
-- **The frontend toggle state machine, hardened by three real review
-  rounds.** `app/app.py`'s `PAGE_TEMPLATE` JS (lines ~1146–1450 today)
-  tracks `taigaPending`/`taigaWasRunning`/`taigaOffPendingCount` to survive:
-  a slow (30–90s) async start/stop, a poll landing mid-toggle-off, and two
-  overlapping toggle-off dispatches racing each other (`docs/test-review.md`
-  Defects 1 and 2 for 1a, referenced directly in the current code's
-  comments at lines 1163 and 1175). **This is real, hard-won history a
-  fresh Gitea toggle must not re-derive from scratch by copy-pasting and
-  renaming** — see "Proposed approach: generalizing the toggle state
-  machine" for how 2a reuses it correctly instead.
+The **direction of sync is inverted** from what 2b's new flow gives you: in
+the old flow, a *remote* git client (a developer's laptop, or CI) is
+expected to be the primary pusher, and `PROJECTS_DIR/<name>` is a
+passively-kept-current mirror an agent works against read-mostly. In the new
+Gitea-backed flow (see "Proposed approach"), `PROJECTS_DIR/<name>` **is**
+the primary working copy an agent session commits in, and it pushes *to*
+Gitea, not the other way round — this inversion is exactly why "keep
+`PROJECTS_DIR/<name>` synced with pushes from elsewhere" is a meaningfully
+different, smaller-audience feature under the new model than it was under
+the old one (see the sync-on-push discussion below).
 
-### Gitea's actual official Docker setup (verified, not assumed)
-Fetched `docs.gitea.com/installation/install-with-docker` directly (the
-same verification step 1a did for `taiga-docker`). Confirmed:
-- **Two services**, not Taiga's nine: `server` (the Gitea app itself) and
-  `db` (Postgres 14 in the official example). No RabbitMQ, no separate
-  async workers, no separate frontend/gateway containers — Gitea is a
-  single Go binary serving its own web UI, API, and git-over-SSH directly.
-- **Two ports**: `3000` (web) and `22` (git-over-SSH inside the container,
-  conventionally mapped to a non-standard host port like `222` in the
-  official example — this box's own real sshd is already on host port 22,
-  serving the *existing* git-hosting flow's `git` user, so Gitea's SSH
-  needs its own distinct host port regardless).
-- **Fully configurable via `GITEA__section__KEY`-style environment
-  variables** (`GITEA__database__DB_TYPE`, `GITEA__database__HOST`,
-  `GITEA__database__NAME`/`USER`/`PASSWD`, etc.) — no `.env`-file-in-a-
-  cloned-upstream-repo step the way `taiga-docker` needed; the compose file
-  itself is short enough (2 services) that this project can author it
-  directly rather than tracking an external "gitea-docker" companion repo
-  (there isn't one canonical upstream repo to clone the way
-  `taigaio/taiga-docker` exists for Taiga — see "Proposed approach" for
-  what this means for 2a's install steps).
-- **No default admin account** — a fresh Gitea normally shows a public,
-  unauthenticated "finish install" wizard on first web visit (lets whoever
-  gets there first pick the admin username/password and finalize DB
-  config) unless `GITEA__security__INSTALL_LOCK=true` is set, in which case
-  DB/config must already be fully supplied via env vars (as above) and the
-  first admin account is created separately via a CLI command
-  (`docker exec ... gitea admin user create ...`) — a single non-interactive
-  command, unlike Taiga's own interactive superuser prompt. See "Proposed
-  approach" for why 2a sets `INSTALL_LOCK=true` (closing the public-wizard
-  race) while still not automating the admin-creation step itself.
-- **Resource footprint**: Gitea's own documented system requirements are
-  "2 CPU cores and 1GB RAM... typically sufficient for small teams," and
-  it's documented as runnable on a Raspberry Pi / 512MB VPS. The full
-  stack (Gitea + Postgres) is described as comfortably fitting **under 1
-  GB RAM** — an order of magnitude lighter than Taiga's several-GB, 9-
-  container footprint. This is the number the install-time/UI resource
-  callout should be calibrated to (see "Proposed approach").
+### 2a's current state (what already exists to build on)
+- Gitea (`server` + `db`/Postgres) installed via `install.sh
+  --with-git-hosting`, off by default, toggled on/off from the web UI
+  (`GITEA_ENABLED`, `gitea_run()`, `/gitea/{on,off}`, singleton row —
+  `app/app.py` ~lines 130-140, 990-ish for `/status`/`do_POST`).
+  `GITEA_URL_PATH = "/gitea"`, and `GITEA__server__ROOT_URL` is already set
+  to `${BASE_URL}${GITEA_URL_PATH}` at install time — i.e. Gitea already
+  believes it's being served from the `/gitea` sub-path.
+- `GITEA_PORT` (default `3000`, loopback-only) and `GITEA_SSH_PORT`
+  (default `2222`, loopback-only, unused by anything yet) both exist;
+  `_publish(GITEA_URL_PATH, GITEA_PORT)` / `_unpublish(...)` already run on
+  toggle-on/off, exactly like every other per-feature URL in this project.
+- No Gitea admin account exists until the operator runs the one-time
+  `docker exec --user git <container> gitea admin user create ...` command
+  `install.sh`'s summary prints (2a, fixed post-review to include
+  `--user git` — see `docs/test-review.md`'s history at `dcc582b`). 2b's own
+  bootstrap script (below) is a **second**, separate manual step that must
+  run after that one.
+- No repo has ever been created through Gitea. `create_project()` is
+  completely untouched by 2a.
+
+### Verifying `tailscale serve --set-path`'s prefix-stripping against Gitea's own sub-path model (researched, not assumed)
+This matters because it's the load-bearing mechanism behind the user's
+confirmed "HTTPS via the existing loopback + `tailscale serve` path"
+decision, and 2a's own Non-goals explicitly flagged it as undecided
+("`GITEA__server__SSH_PORT` intentionally left at Gitea's own default... SSH
+exposure/clone-URL correctness is explicitly out of scope for 2a...
+Flagged explicitly for 2b, which does need to get this right").
+
+- **`tailscale serve --set-path=/foo <backend>` strips the `/foo` prefix
+  before forwarding** — confirmed directly against Tailscale's own CLI
+  reference: "the mount point is trimmed from the request URL path before
+  sending it to the reverse proxy, so proxied services receive requests as
+  if they were running at the root path." This is exactly the behavior the
+  existing `_ttyd_start()` comment in `app.py` already documents for ttyd.
+- **Gitea's own documented reverse-proxy-under-a-subpath model expects
+  exactly this**: `ROOT_URL` includes the subpath (for correct link
+  generation in Gitea's own UI/API responses/git output), and the proxy in
+  front of it strips that same subpath before forwarding the request to
+  Gitea's backend port (confirmed against `docs.gitea.com`'s reverse-proxy
+  docs and Gitea's own community nginx sub-path write-ups, which need an
+  explicit `rewrite`/strip rule to get this because nginx's `proxy_pass`
+  doesn't do it automatically the way `tailscale serve --set-path` does).
+- **Conclusion: 2a's existing `ROOT_URL` setup and `tailscale serve
+  --set-path=/gitea` are already the *correct*, matching shapes for Gitea's
+  own sub-path deployment model** — no contradiction, nothing to redesign.
+  This means, in `PUBLISH_MODE=tailscale`, a git clone/push URL of the form
+  `${BASE_URL}/gitea/<owner>/<repo>.git` is expected to work through the
+  exact same published mapping the Gitea row's own link already uses today.
+  This has **not** been verified against a real running Gitea +
+  `tailscale serve` in this environment (no Compose plugin here — see 2a's
+  own documented gap, unchanged); it's verified by close reading against
+  both projects' own docs, which is the strongest verification available
+  short of a live box. Flagged again under "Open questions" as something
+  worth a real smoke test the first time this runs somewhere with working
+  Docker + Tailscale.
+- In `PUBLISH_MODE=none`, per `_publish()`'s existing fallback, the URL is
+  simply `http://127.0.0.1:$GITEA_PORT/<owner>/<repo>.git` — reachable only
+  from the box itself, exactly like every other loopback URL this project
+  already returns in that mode.
+
+### Gitea's repo-creation API and token-generation CLI (verified, not assumed)
+Checked directly against Gitea's own API usage docs and CLI reference
+(same verification discipline 1a/2a applied to their own external
+dependencies), not carried over from 1b's Taiga API shape:
+
+- **Repo creation: `POST /user/repos`** (creates the repo under the
+  *authenticated* user/token's own account — not `POST /orgs/{org}/repos`,
+  since there is no org in this project's model; see "Proposed approach:
+  owner model"). Body (`CreateRepoOption`), all fields used here: `name`
+  (string, required), `private` (bool), `auto_init` (bool),
+  `default_branch` (string). A **409/422**-shaped response on a name
+  collision is Gitea's own signal for "a repo with this name already exists
+  under this owner" — see "Edge cases: Gitea-side name collision."
+- **Auth for the API call: a Personal Access Token**, sent as
+  `Authorization: token <token>` (Gitea's own header form, not Taiga's
+  `Bearer`-prefixed one — verified directly, not assumed to match 1b's
+  shape).
+- **Token generation, CLI, non-interactive, no password ever needed**:
+  `gitea admin user generate-access-token --username <admin> --token-name
+  <name> --scopes <scopes> --raw` — prints *only* the raw token to stdout
+  when `--raw` is given. Same `mustNotRunAsRoot()` restriction 2a's own
+  fixed defect already found for `gitea admin user create` applies to every
+  `gitea` CLI subcommand run inside the container, so this must also be
+  invoked via `docker exec --user git <container> gitea admin user
+  generate-access-token ...`, exactly like 2a's corrected admin-creation
+  command. **This is a meaningfully better shape than 1b's Taiga flow**: no
+  admin password is ever prompted for or stored anywhere by this project —
+  the bootstrap script only ever needs `docker exec` access to the
+  container (which the operator already has) to mint a token directly.
+- **Scope: `write:repository`** (Gitea's scope format is
+  `<read|write>:<category>`; `write` implies read for that category) is
+  sufficient for both repo creation and the git-http push/pull the cloned
+  working copy will do afterward — not `all`, following this project's
+  general least-privilege bias for generated credentials.
+- **Git-over-HTTP auth for clone/push**: Gitea accepts the token embedded
+  in the URL as `http://<token>@host/...` or `http://oauth2:<token>@host/...`
+  (either form authenticates); this spec uses the `oauth2:<token>@` form,
+  which is the form Gitea's own docs use in examples and reads unambiguously
+  as "this is a token, not a username."
+- **Repo name character rules differ from this project's own `NAME_RE`**:
+  Gitea repo names must match roughly `[A-Za-z0-9_.-]+` — **no spaces** —
+  whereas `app.py`'s `NAME_RE` (`^[A-Za-z0-9][A-Za-z0-9 _-]{0,59}$`)
+  explicitly allows spaces in the local project/folder name. This is a real
+  mapping problem the old flow never had (bare-repo directory names on disk
+  have no such restriction) — see "Proposed approach: local name → Gitea
+  slug mapping."
 
 ## Proposed approach
 
-### Sequencing — additive, not a swap (resolved default)
-The real question this spec has to settle explicitly (per this cycle's
-brief): does 2a need to warn/refuse if `--with-git-hosting` is combined
-with the *old* scripts still being invoked elsewhere, or can it ship as
-purely additive infrastructure while the actual "replace" moment happens
-in 2b?
+### Sequencing — retire in this cycle, not deferred again (resolved default, per user sign-off)
+Unlike 2a's "purely additive" sequencing, this cycle's confirmed scope is to
+actually retire `git-hosting-setup.sh`, `new-repo.sh`, `new-dev-instance.sh`,
+`new-project.sh`, `project-sync.sh`, `target-setup.sh` and their sudoers
+lines from `install.sh`'s `--with-git-hosting` block, once the new flow is
+verified working. Concretely, inside the existing
+`if [ "$WITH_GIT_HOSTING" -eq 1 ]; then ... fi` block in `install.sh`:
+- **Removed**: the `install -m 755 ...` lines for all six legacy scripts,
+  the `git-hosting-setup.sh` invocation, the `$GH_ENV`/`git-hosting.env`
+  setup, and `set_env "$ENV_FILE" NEW_PROJECT_SCRIPT ...`.
+- **Removed**: `config/git-hosting.env.example` (nothing reads it once the
+  six scripts are gone) and the `GH_ENV`-related lines in `install.sh`.
+- **Added**: `install -m 755 .../gitea-configure-api.sh` isn't installed
+  system-wide the way the wrapper scripts are (it's a one-time operator
+  tool, same as `taiga-configure-push.sh`, which also isn't `install -m
+  755`'d to `/usr/local/bin` — it stays in the repo checkout, run via
+  `scripts/gitea-configure-api.sh` directly). `install -m 755
+  .../new-project-from-gitea.sh /usr/local/bin/ai-dev-switchboard-new-project-from-gitea.sh`
+  **is** installed system-wide (it's `create_project()`'s own privileged
+  hand-off, same as `new-project-from-upload.sh`).
+- **Sudoers**: the old `new-project.sh` rule is removed; a new
+  `$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-new-project-from-gitea.sh *`
+  rule is added, gated on `WITH_GIT_HOSTING` alongside the existing
+  `gitea-{up,down,status}.sh` rules 2a already added there.
+- The final install summary block's git-hosting section is rewritten:
+  drops the "the `git` user, `new-repo.sh`..." wording, and adds a pointer
+  to the new one-time step: "after creating Gitea's admin account (above),
+  run `scripts/gitea-configure-api.sh` once to let the web UI's '+ New
+  project' button create real repos."
+- **What "verified working" means given this environment's known
+  limitation**: 2a's own `docs/implementation.md` documents that this
+  sandbox has `docker` but not a working Compose plugin, so a real
+  `docker compose up` → API call → clone round trip could not be exercised
+  live in that session. This spec proceeds on the basis that "verified
+  working end-to-end" means *the strongest verification actually achievable
+  in whatever environment the reviewer's session has* — a full live round
+  trip (toggle Gitea on for real, run the bootstrap script against a real
+  container, create a project through the web UI, confirm a real clone
+  lands in `PROJECTS_DIR`, confirm a commit pushes back) if Docker + Compose
+  actually work there, or thorough monkeypatched-`urllib`/subprocess tests
+  plus close reading against Gitea's live docs (same technique this spec's
+  own research used) if they don't — honestly documented either way in
+  `docs/test-review.md`, not silently downgraded. See "Open questions."
 
-**Resolved default: purely additive.** `install.sh --with-git-hosting`
-keeps doing everything it does today, unchanged, and *also* installs +
-configures (but leaves off) the Gitea stack under the same flag. Reasoning:
-1. `docs/BACKLOG.md`'s "replace, not addition alongside" decision is about
-   the **end state of item 2 as a whole** (2a+2b+2c complete), not a
-   constraint on 2a's own intermediate commit — the multi-cycle plan
-   already has 2b doing the actual rewire.
-2. 2b hasn't shipped yet. `create_project()` still needs a *working*
-   git-hosting flow the moment this cycle lands — if 2a disabled or
-   warned against the old flow, that would break the web UI's "+ New
-   project" button for everyone between now and 2b shipping, for zero
-   benefit (Gitea can't create repos yet either way in 2a's scope).
-3. Precedent: 1a shipped Taiga fully additively, touching nothing existing.
-   Even though Gitea reuses the *same* flag name (not a new one), the
-   "replace" is scoped at the flag's behavior *over time* across 2a→2b→2c,
-   not at any single sub-spec's commit.
-4. `docs/BACKLOG.md`'s own wording — "Gitea install step folds into (or
-   replaces) `scripts/git-hosting-setup.sh` under the existing
-   `install.sh --with-git-hosting` flag" — the "folds into" phrasing
-   supports doing both side by side for now, not an immediate swap.
+### Owner model: single admin account, no orgs (resolved default)
+2a's Non-goals already settled that only one manually-created admin account
+exists. 2b's repos are created under that same account via `POST
+/user/repos` — no org-creation step, no per-developer Gitea accounts. This
+mirrors the old flow's own single shared `git` system-user model (nobody had
+their own git-hosting identity there either), so it's not a new
+simplification relative to what existed — just carried forward under
+Gitea's terms. Flagged explicitly as a resolved default, not an oversight,
+in case a future cycle wants real per-developer identity.
 
-Concretely: the existing `if [ "$WITH_GIT_HOSTING" -eq 1 ]; then ... fi`
-block in `install.sh` (currently lines ~403–420, running the old
-`git-hosting-setup.sh` + installing the old wrapper scripts) gets Gitea's
-new Docker Compose setup steps **appended inside the same block**, after
-the existing steps (preserves today's exact output ordering/behavior for
-anyone diffing install logs). No new top-level `if [ "$WITH_GITEA" ...]`
-block the way Taiga got one — Gitea shares the existing flag, so it shares
-the existing gate.
+### Token reuse and where it lives (resolved default, per user sign-off)
+One Gitea Personal Access Token, generated once by
+`scripts/gitea-configure-api.sh`, used for two purposes:
+1. **The `POST /user/repos` API call itself** — held by `app.py`
+   (`SVC_USER`), read from `switchboard.env` as `GITEA_API_TOKEN`.
+2. **Authenticating the initial `git clone`**, and everything that working
+   copy's `origin` remote does afterward (`git push`/`git pull` by whatever
+   agent session runs as `RUN_USER` in that project directory) — the token
+   stays embedded in the clone URL Gitea returns to the working copy's
+   `.git/config`, deliberately not stripped out after cloning.
 
-**Flagged for 2b's own spec, not decided here:** once 2b's rewire of
-`create_project()` is live and confirmed working end-to-end, retiring the
-old scripts/sudoers rules (`git-hosting-setup.sh`, `new-repo.sh`,
-`new-dev-instance.sh`, `new-project.sh`, `project-sync.sh`,
-`target-setup.sh`) becomes 2b's own explicit step, not automatic — don't
-let this get lost between cycles.
+This differs from `taiga-configure-push.sh`'s storage/ownership shape for a
+concrete, stated reason (per the user's explicit requirement that this not
+be a copy-paste): **`taiga_push_spec.py` is invoked by a human or agent, as
+`RUN_USER`, from an interactive shell** — its config file
+(`~/.config/ai-dev-switchboard/taiga-push.env`, 600, `RUN_USER`-owned) lives
+in the account that actually runs it. **`create_project()` is code inside
+`app.py`, which runs continuously as `SVC_USER`** (the systemd service
+account) — there is no `RUN_USER`-owned file `app.py` could read without
+crossing a privilege/account boundary just to fetch a credential, and
+`switchboard.env` (`/etc/ai-dev-switchboard/switchboard.env`, already
+`SVC_USER`-owned, mode 600, already read by `app.py` at process start via
+`os.environ`) is exactly the file this project already uses for every other
+`SVC_USER`-consumed secret (`TOTP_SECRET`, `HOST_CONTROL_KEY`). No new
+storage mechanism is introduced — `GITEA_API_TOKEN` is one more key in a
+file that already exists for this exact purpose.
 
-### `install.sh` changes
-Placed inside the existing `if [ "$WITH_GIT_HOSTING" -eq 1 ]` block
-(~line 403 today), after the existing `git-hosting-setup.sh` call, reusing
-this file's own `set_env`/`get_env`/`random_token`/`path_has_symlink`
-helpers exactly like the Taiga block does:
+Persisting the same token into each project's own `.git/config` (rather
+than stripping it after clone and requiring some separate ongoing
+credential mechanism for `RUN_USER`) is a deliberate simplification, not an
+oversight: `RUN_USER` already holds live credentials for everything else it
+touches (per `app.py`'s own docstring: "the spawned coding sessions...
+keep whatever access that account has for real agentic work"), the token is
+scope-limited to `write:repository` (not admin/full), and `PROJECTS_DIR`
+lives under `RUN_USER`'s own home directory, not readable by `SVC_USER` or
+other accounts. Building a credential-helper/rotation mechanism instead
+would be new complexity with no corresponding new security boundary, given
+this project's existing trust model — flagged as a Non-goal, not silently
+skipped.
 
-1. **Docker itself** — reuse, don't duplicate. Refactor the Taiga block's
-   inline Docker install/verify steps (today's lines 242–250) into a small
-   `ensure_docker()` shell function defined once near the top of the file
-   (alongside `set_env`/`get_env`), called from **both** the `--with-taiga`
-   and `--with-git-hosting` blocks. Pure refactor for the Taiga call site —
-   no behavior change there. This matters concretely once both flags are
-   used together in one install run (a real case now that two features
-   need Docker): Docker must only be installed/verified once, not twice.
-2. **Authoring the compose file directly** (no upstream repo to clone,
-   unlike `taiga-docker` — see "Background"). Ship
-   `config/gitea-docker-compose.yml` in this repo's own tree (new file,
-   ~20 lines: `server` + `db` services, following the exact shape verified
-   against `docs.gitea.com/installation/install-with-docker`), installed
-   via `install -m 644 "$REPO_DIR/config/gitea-docker-compose.yml"
-   "$GITEA_DIR/docker-compose.yml"` — **overwritten on every re-run**
-   (deterministic, like the sudoers file), since it's authored by this
-   project, not a user-editable checkout the way `$TAIGA_DIR` is. This
-   avoids Taiga's whole "don't clobber a manual `git pull`" concern
-   entirely — there's no upstream to pull from.
-   - `GITEA_DIR=/opt/ai-dev-switchboard-gitea` (parallel to `TAIGA_DIR`).
-   - **Loopback-only binding**, baked directly into this project's own
-     compose file (no override-file merge trick needed, unlike Taiga,
-     since this project authors the whole file): `server`'s ports map
-     `"127.0.0.1:${GITEA_PORT}:3000"` and `"127.0.0.1:${GITEA_SSH_PORT}:22"`.
-   - Exact env var names (`GITEA__database__*`, `GITEA__security__*`,
-     `GITEA__server__*`) must be re-verified against Gitea's live docs at
-     implementation time, not assumed frozen from this spec — see "Open
-     questions" (same caveat 1a flagged for `taiga-docker`'s `.env` keys).
-3. **Config / secrets** — a `$GITEA_DIR/.env` file, written via this
-   file's own `set_env` helper (generic, reusable across compose stacks,
-   same as Taiga's usage):
-   - `POSTGRES_PASSWORD`/Gitea's `GITEA__security__SECRET_KEY` and
-     `GITEA__security__INTERNAL_TOKEN` equivalents — generated once via
-     `random_token` on **first install only** (checked via `get_env`
-     returning empty, same idiom `TOTP_SECRET` already uses — simpler than
-     Taiga's "fresh clone" signal, since there's no clone step here to key
-     off of), never regenerated on re-run.
-   - `GITEA__security__INSTALL_LOCK=true` — always set (not conditional),
-     closing the "first visitor claims the public install wizard" race
-     described in "Background". This is what makes leaving Gitea installed
-     but off between now and 2b safe even if someone stumbles onto its URL
-     before an admin account exists — they hit a login page with nothing
-     to log into yet, not an open "configure this server for me" wizard.
-   - `GITEA__server__ROOT_URL` derived the same way Taiga's `TAIGA_DOMAIN`
-     is (`install.sh` ~278–285): from `PUBLISH_MODE`/`BASE_URL` already
-     resolved earlier in this same install run (the tailnet host in
-     `tailscale` mode, else `http://127.0.0.1:$GITEA_PORT`).
-   - `GITEA__database__DB_TYPE=postgres` + `HOST`/`NAME`/`USER`/`PASSWD` —
-     follows the officially-documented example directly (see "Open
-     questions" for the SQLite-vs-Postgres tradeoff this spec resolves in
-     favor of Postgres, and why).
-4. **Pre-pull images at install time** — `docker compose -f
-   "$GITEA_DIR/docker-compose.yml" pull`, warn-and-continue (not fatal) on
-   failure, identical reasoning and idiom to Taiga's step 5.
-5. **Wrapper scripts + sudoers** — see "Crossing the privilege boundary"
-   below; installed unconditionally once `WITH_GIT_HOSTING` is set,
-   alongside (not instead of) the existing old-flow wrapper scripts this
-   block already installs today.
-6. **`switchboard.env`** — `set_env "$ENV_FILE" GITEA_ENABLED 1`,
-   `GITEA_PORT` (default `3000`), `GITEA_SSH_PORT` (default `2222`, fixed
-   non-interactive default — same simplicity precedent as `TAIGA_PORT`, no
-   free-port scan), `GITEA_LABEL` (default `"Gitea"`), `GITEA_DIR`, and the
-   three `GITEA_UP_SCRIPT`/`GITEA_DOWN_SCRIPT`/`GITEA_STATUS_SCRIPT` paths
-   — same shape as Taiga's six keys.
-7. **Final summary block** — alongside Taiga's existing "installed but left
-   OFF" note, print Gitea's own version calibrated to its real footprint
-   (not copy-pasted Taiga's "3–5 GB" number): stays off until toggled;
-   uses well under 1 GB when running; before first use, create the first
-   admin account via `docker exec -it <gitea container> gitea admin user
-   create --admin --username ... --password ... --email ...` (one-time,
-   not automated — see Non-goals) — this pointer differs from Taiga's in
-   that it's a single scriptable command rather than an interactive
-   wizard, worth saying so in the printed text since it's genuinely easier
-   for the operator to actually run.
+**Passing the token to the privileged script never happens via argv** —
+see "The privileged registration script" below for why, and how it's
+avoided (the script reads it from `switchboard.env` itself, root can always
+read that file regardless of its 600/`SVC_USER` mode).
 
-### Crossing the privilege boundary
-Identical shape and identical reasoning to Taiga's (`docs/spec.md` at
-`ed84d73`, "Crossing the privilege boundary") — Docker-socket access is
-root-equivalent regardless of which user nominally owns a container, so
-there's no `RUN_USER`-scoped equivalent to reach for. Same mitigation:
-three tiny, fixed, zero-argument wrapper scripts, individually whitelisted
-in sudoers, each doing exactly one `docker compose` invocation against a
-hardcoded `$GITEA_DIR`:
-
-- `scripts/gitea-up.sh` → `/usr/local/bin/ai-dev-switchboard-gitea-up.sh`
-  → `cd "$GITEA_DIR" && docker compose up -d`
-- `scripts/gitea-down.sh` → `...gitea-down.sh` → `... down`
-- `scripts/gitea-status.sh` → `...gitea-status.sh` → prints `on`/`off` as
-  its first line (same single-line contract as `taiga-status.sh`/
-  `host-status.sh`), based on `docker compose ps server --format
-  '{{.State}}'` reporting `running` (verify the compose service name is
-  actually `server` at implementation time against the authored compose
-  file from step 2 above — it's this project's own file, so this is
-  self-consistent, just noting it explicitly).
-
-Sudoers additions (inside the existing sudoers-generation block,
-`install.sh` ~358–380, gated on `WITH_GIT_HOSTING` alongside the existing
-`new-project.sh` rule already gated there):
+### `scripts/gitea-configure-api.sh` (new) — one-time token bootstrap
+Run once, as **root** (`sudo scripts/gitea-configure-api.sh`), after 2a's
+own manual admin-account-creation step. Root, not `RUN_USER` (unlike
+`taiga-configure-push.sh`) — it needs `docker exec` access to the Gitea
+container and needs to write into `/etc/ai-dev-switchboard/switchboard.env`,
+which is not group/other-readable.
 ```
-$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-gitea-up.sh
-$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-gitea-down.sh
-$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-gitea-status.sh
+== Gitea API token bootstrap ==
+Run once, after Gitea's own admin account already exists (see install.sh's
+own printed instructions if you haven't done that yet).
+
+Gitea admin username [admin]: <prompt, same prompt()/prompt_secret() idiom
+                                install.sh itself uses — no password prompt,
+                                see below>
+Gitea container name [ai-dev-switchboard-gitea]: <prompt>
 ```
+1. Runs `docker exec --user git <container> gitea admin user
+   generate-access-token --username <admin> --token-name
+   ai-dev-switchboard --scopes write:repository --raw` and captures stdout
+   (the raw token, nothing else) — **no password is ever asked for or
+   handled by this script.**
+2. Writes `GITEA_API_TOKEN=<token>` into
+   `/etc/ai-dev-switchboard/switchboard.env` via the same `set_env`-shaped
+   idempotent upsert idiom `install.sh` itself uses (this script is
+   self-contained, does not source `install.sh`, but follows its exact
+   idiom, same precedent `taiga-configure-push.sh` set for not sourcing
+   `install.sh` either). File permissions are already 600/`SVC_USER`-owned
+   from `install.sh`'s own earlier `chown`/`chmod` — this script must not
+   loosen them (verify-and-warn if they're somehow already wrong, same
+   `_check_config_permissions`-shaped defense `taiga_push_spec.py` already
+   has for its own config file, adapted to warn-not-block since this file
+   holds more than just this one secret).
+3. Restarts the systemd service (`systemctl restart ai-dev-switchboard`) so
+   the new environment variable is actually picked up — `EnvironmentFile=`
+   is read once at process start, not live; skip this if Gitea's toggle
+   would need to be re-flipped anyway (developer's call whether to warn or
+   just do it — this is a one-time operator script, a service bounce is
+   fine to make automatic, matching this project's general "safe to re-run,
+   minimal manual steps" bias).
+4. **Verifies** the token actually works: a `GET /user` API call against
+   Gitea with the new token (same idiom as `taiga_push_spec.py --verify`),
+   printing the authenticated username on success or a clear failure
+   message (wrong container name, Gitea not running, `docker exec` failed,
+   etc.) — mirrors `taiga-configure-push.sh`'s own verify-before-declaring-
+   success discipline.
 
-### `app.py` backend changes
-New config reads (alongside `TAIGA_ENABLED` etc., ~line 123):
-`GITEA_ENABLED`, `GITEA_LABEL`, `GITEA_PORT`, `GITEA_UP_SCRIPT`,
-`GITEA_DOWN_SCRIPT`, `GITEA_STATUS_SCRIPT`. (`GITEA_SSH_PORT` is read by
-the wrapper scripts, not `app.py` — the web UI never touches the SSH port,
-per Non-goals.)
+### `app/app.py` changes
 
+New config reads (alongside the existing `GITEA_*` block, ~line 135):
 ```python
-def gitea_run(action: str) -> str:
-    assert action in ("up", "down", "status")
-    script = {"up": GITEA_UP_SCRIPT, "down": GITEA_DOWN_SCRIPT,
-              "status": GITEA_STATUS_SCRIPT}[action]
-    r = subprocess.run(["sudo", script], capture_output=True, text=True,
-                       timeout=(10 if action == "status" else 90))
-    return r.stdout.strip()
-
-GITEA_URL_PATH = "/gitea"  # fixed, singleton — same shape as TAIGA_URL_PATH
-
-def _gitea_display_url() -> str:
-    return f"{BASE_URL}{GITEA_URL_PATH}" if PUBLISH_MODE == "tailscale" \
-        else f"http://127.0.0.1:{GITEA_PORT}"
+GITEA_API_TOKEN = os.environ.get("GITEA_API_TOKEN", "")
+NEW_PROJECT_FROM_GITEA_SCRIPT = os.environ.get(
+    "NEW_PROJECT_FROM_GITEA_SCRIPT",
+    "/usr/local/bin/ai-dev-switchboard-new-project-from-gitea.sh")
 ```
-Toggle-on: `gitea_run("up")` then `_publish(GITEA_URL_PATH, GITEA_PORT)`.
-Toggle-off: `_unpublish(GITEA_URL_PATH)` then `gitea_run("down")`. Exactly
-Taiga's split (registration-time side effect vs. pure per-poll display
-string) for exactly the same reason: `_publish()` must not re-run on every
-4s `/status` poll.
+`NEW_PROJECT_SCRIPT` and the old `create_project()` body are removed
+entirely — no fallback to the legacy script.
 
-`/status` (`do_GET`): a `gitea_enabled`/`gitea`/`gitea_label`/`gitea_url`
-quadruplet, computed the same way as Taiga's — fresh `gitea_run("status")`
-call every poll, never an in-memory dict:
+**Local name → Gitea slug mapping** (new — the character-set mismatch
+`NAME_RE` vs. Gitea's own repo-name rules, see "Background"):
 ```python
-gitea_on, gitea_url = False, None
-if GITEA_ENABLED:
-    out = gitea_run("status").splitlines()
-    gitea_on = bool(out) and out[0] == "on"
-    gitea_url = _gitea_display_url() if gitea_on else None
+def _gitea_slug(name: str) -> str:
+    # NAME_RE already guarantees name starts with an alnum and is otherwise
+    # [A-Za-z0-9 _-]{0,59} -- the only translation Gitea's own
+    # [A-Za-z0-9_.-]+ rules require is turning spaces into '-'.
+    return re.sub(r"\s+", "-", name.strip())
 ```
+(Kept intentionally minimal — `NAME_RE`'s own character class is already a
+subset of Gitea's beyond the space issue, so nothing else needs stripping;
+verify this at implementation time against Gitea's actual validation, not
+just assumed — see "Open questions.")
 
-`do_POST`: a new branch, identical shape to the existing `taiga` branch,
-sitting after the shared TOTP gate:
+**The Gitea API call** — a small `urllib`-based helper following the exact
+idiom `pve_login()`/`_generate_description_bg()` already use elsewhere in
+this file (not a new dependency, not a copy of `taiga_push_spec.py`'s
+richer exception hierarchy, which is overkill for one call site with one
+caller):
 ```python
-elif parts[0] == "gitea" and len(parts) == 2 and parts[1] in ("on", "off"):
+def _gitea_api(method: str, path: str, body: dict = None) -> tuple[int, dict]:
+    """Returns (status, parsed_json_or_{}). Never raises for a non-2xx
+    HTTP status (the caller inspects `status`, e.g. 409 for a name
+    collision) -- only for a connection failure, which callers convert to
+    the same 'Gitea isn't reachable' message as the pre-flight status
+    check below."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{GITEA_PORT}/api/v1{path}", data=data, method=method,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"token {GITEA_API_TOKEN}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status, json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b"{}")
+        except ValueError:
+            return e.code, {}
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        raise ConnectionError("gitea unreachable")
+```
+Always `127.0.0.1:$GITEA_PORT` — this call is intra-box (`app.py` and
+Gitea's container both run on the same host), so it never goes through
+`tailscale serve`/`BASE_URL` at all, regardless of `PUBLISH_MODE`. Only the
+*clone URL* embedded for the working copy's own future pushes needs the
+`PUBLISH_MODE`-aware form (see "Proposed approach" for
+`_gitea_clone_url()` below) — actually, on reflection, the *clone done by
+the privileged script* is also intra-box (root/`RUN_USER` cloning on the
+same machine Gitea runs on), so it too always uses
+`http://127.0.0.1:$GITEA_PORT/...`, never `BASE_URL`. `BASE_URL`/
+`tailscale serve` only matters for an **external** git client (a developer's
+own laptop) reaching in — which is a real, supported case (see
+"Background"'s `tailscale serve` verification above) but isn't anything
+`create_project()` itself constructs; it's simply the same published
+`/gitea` mapping already visible in the Gitea row's own link. No code
+change needed to support it — it falls out of 2a's existing `_publish()`
+call for the Gitea toggle, plus Gitea's own web UI showing each repo's own
+clone URL once you're logged into it.
+
+**Rewritten `create_project()`**:
+```python
+def create_project(name: str) -> tuple[bool, str]:
+    if not NAME_RE.match(name or ""):
+        return False, "Use letters, numbers, spaces, - or _ (must start with a letter/number)."
+    if name in instance_names():
+        return False, f"'{name}' already exists."
     if not GITEA_ENABLED:
-        return self._json({"error": "gitea disabled"}, 404)
-    if parts[1] == "on":
-        gitea_run("up")
-        _publish(GITEA_URL_PATH, GITEA_PORT)
-    else:
-        _unpublish(GITEA_URL_PATH)
-        gitea_run("down")
-    self._json({"ok": True})
+        return False, ("Gitea isn't installed on this box (install.sh --with-git-hosting) "
+                       "-- or create " + f"{PROJECTS_DIR}/{name}" + " yourself (e.g. `git init`) "
+                       "and it'll show up here.")
+    if not GITEA_API_TOKEN:
+        return False, ("Gitea API token isn't configured yet -- run "
+                       "scripts/gitea-configure-api.sh once (see docs/GIT_HOSTING.md).")
+    status_out = gitea_run("status").splitlines()
+    if not status_out or status_out[0] != "on":
+        return False, "Gitea is installed but not running -- toggle it on first."
+
+    slug = _gitea_slug(name)
+    status, resp = _gitea_api("POST", "/user/repos",
+                               {"name": slug, "private": True, "auto_init": True,
+                                "default_branch": "main"})
+    if status in (409, 422):
+        return False, f"A Gitea repository named '{slug}' already exists -- pick a different name."
+    if status not in (200, 201):
+        return False, f"Gitea rejected the repo creation (HTTP {status})."
+    owner = resp.get("owner", {}).get("login", "")
+    repo_name = resp.get("name", slug)
+    if not owner:
+        return False, "Gitea's response didn't include an owner -- can't continue."
+
+    r = subprocess.run(["sudo", NEW_PROJECT_FROM_GITEA_SCRIPT, owner, repo_name, name],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        # Best-effort cleanup: the Gitea repo now exists but nothing landed
+        # in PROJECTS_DIR -- don't leave an orphaned repo behind silently.
+        # Failure of the cleanup itself is swallowed; the original error is
+        # what the user needs to see.
+        _gitea_api("DELETE", f"/repos/{owner}/{repo_name}")
+        return False, (r.stderr or r.stdout or "registration script failed").strip()[:300]
+    return True, ""
 ```
+(Exact error-message wording, exception-vs-return-value plumbing for the
+`ConnectionError` case, and the `timeout=30` value are developer's call,
+consistent with existing style; the pseudocode above fixes the *shape and
+order of operations*, not every literal string.)
 
-### Frontend — which precedent fits, and generalizing the toggle state machine
-**Row shape: Taiga's singleton pattern, not code-server's per-project
-pattern.** Gitea is one shared box-wide instance — even though it will
-eventually *hold* many repos (once 2b ships), the switchboard's own UI
-only ever needs one row for it, exactly like Taiga conceptually holding
-many backlog projects internally but still surfacing as a single row. This
-is a clean fit with the existing singleton precedent (`kind: 'taiga'`),
-not the per-project `kind: 'inst'` + `codeRow()` pattern, which exists
-because code-server is spawned fresh per project folder — Gitea isn't.
-
-`refresh()` gets a `gitea_enabled` branch alongside the existing `taiga`
-one, with its own resource badge text (calibrated to "well under 1 GB",
-not copy-pasted Taiga's "3–5 GB"). `actionPath()` gets one new line:
-`if (kind === 'gitea') return '/gitea/' + (on ? 'on' : 'off');`.
-
-**Required, not optional: generalize `taigaPending`/`taigaWasRunning`/
-`taigaOffPendingCount` into a per-kind state map before adding Gitea's
-copy.** Per this cycle's brief — a fresh Gitea toggle must learn from
-1a's history, not repeat it blind. Concretely:
-```js
-// One entry per singleton-toggle kind ('taiga', 'gitea', ...future ones).
-// Same {pending, wasRunning, offPendingCount} shape 1a's three review
-// rounds hardened for Taiga specifically — see docs/spec.md (this file)
-// "Background" for what each field is guarding against.
-let singletonToggleState = {
-  taiga: {pending: null, wasRunning: false, offPendingCount: 0},
-  gitea: {pending: null, wasRunning: false, offPendingCount: 0},
-};
+### The privileged registration script (`scripts/new-project-from-gitea.sh`, new)
+Same mechanical, narrow shape as `scripts/new-project-from-upload.sh` — no
+new pattern introduced:
 ```
-`refresh()`, `toggle()`, `handleActionResult()`, `cancelActionCode()`, and
-`submitActionCode()` (today's lines ~1182–1450) all currently branch on
-`kind === 'taiga'` and touch the three bare globals directly — each of
-those branches becomes `kind in singletonToggleState` (or an explicit
-`['taiga','gitea'].includes(kind)` check, developer's call on exact idiom)
-reading/writing `singletonToggleState[kind]` instead. Per-kind values that
-were hardcoded to Taiga's numbers (the 90s starting-timeout, the RAM badge
-text) become parameters keyed by `kind` too — a small config object is
-fine (`{taiga: {timeoutMs: 90000, badge: '⚠ ~3–5 GB RAM when running'},
-gitea: {timeoutMs: 90000, badge: '⚠ ~1 GB RAM when running'}}`; Gitea's
-stack starts meaningfully faster than Taiga's 9 containers in practice, so
-a shorter timeout would also be reasonable, but keeping the same safe
-upper bound is fine too — developer's call, not load-bearing for
-correctness). **This is a pure refactor for the already-shipped, already-
-reviewed Taiga behavior — no behavior change there, verified by re-running
-whatever technique the reviewer used to catch 1a's Defects 1 and 2, now
-against both kinds.** Exact visual placement of the Gitea row (order
-relative to Taiga/host rows, badge styling) is a `ux-designer` call for
-`docs/design.md`, not prescribed here — the functional contract above
-(singleton row, no engine picker, on/off + link, generalized state
-machine) is what this spec fixes.
+Usage: new-project-from-gitea.sh <owner> <gitea-repo-name> <name>
+```
+1. Sources `/etc/ai-dev-switchboard/switchboard.env` for `RUN_USER`,
+   `PROJECTS_DIR`, `GITEA_PORT`, `GITEA_API_TOKEN` — **this is why the token
+   never needs to travel via argv/`ps`-visible command line**: the script
+   runs as root (via sudoers), and root can always read a 600 file
+   regardless of its owning user, exactly the same sourcing pattern
+   `new-project-from-upload.sh` already uses for `RUN_USER`/`PROJECTS_DIR`
+   from this same file.
+2. Re-validates `<name>` against the same `NAME_RE`-shaped regex
+   `new-project-from-upload.sh` already re-validates with (defense in
+   depth — never trust the caller, even though `app.py` already checked).
+   Also validates `<owner>`/`<gitea-repo-name>` are non-empty and contain
+   only `[A-Za-z0-9_.-]` characters (cheap sanity check against a
+   compromised/buggy caller constructing a malicious clone target — this
+   script is about to run `git clone` as root-elevated-to-`RUN_USER`
+   against a URL it builds from these two arguments).
+3. `DEST="${PROJECTS_DIR}/${NAME}"`; atomic `mkdir "$DEST"` (fails loudly,
+   not silently-merges, if it already exists — same TOCTOU-closing idiom as
+   `new-project-from-upload.sh`), then `chown "$RUN_USER:$RUN_USER" "$DEST"`
+   immediately (so the clone below, run as `RUN_USER`, can actually write
+   into it).
+4. `CLONE_URL="http://oauth2:${GITEA_API_TOKEN}@127.0.0.1:${GITEA_PORT}/${OWNER}/${REPO}.git"`
+   (built here, never passed in — see above), then
+   `su "$RUN_USER" -s /bin/bash -c "git clone '$CLONE_URL' '$DEST'"` —
+   clones directly as `RUN_USER` into the now-`RUN_USER`-owned empty `DEST`
+   (no separate `cp -a` + recursive `chown` pass needed the way
+   `new-project-from-upload.sh` needs one, since `su` already writes as the
+   right user from the start).
+5. Prints `Ready: $DEST — will show up in the web UI now.` (same closing
+   line as both existing privileged scripts, for consistency).
 
-### `config/switchboard.env.example`
-New `## Optional: self-hosted Gitea (--with-git-hosting)` section,
-following the exact comment depth/style of the existing Taiga section —
-`GITEA_ENABLED`, `GITEA_PORT`, `GITEA_LABEL`, the three script-path
-variables, all marked "install.sh sets these for you when you pass
---with-git-hosting."
+### Sync-on-push — deferred to 2c, not built here (resolved default; flagged as a real close call)
+This is the one part of this cycle's brief explicitly flagged as needing a
+reasoned call, not a default assumption. Considered both ways:
+- **Argument for building it now**: `docs/GIT_HOSTING.md` advertises
+  "keeps the working copy synced on every future push, forever" as a
+  feature of `--with-git-hosting` today, and losing it silently would be a
+  regression for anyone relying on it.
+- **Argument for deferring (the resolved default)**: the old flow's version
+  of this feature exists because the *old* model expects the primary pusher
+  to be someone/something **other than** `PROJECTS_DIR/<name>` itself (see
+  "Background" — a developer's laptop, or CI, pushing in). Under the new
+  Gitea-backed model, `PROJECTS_DIR/<name>` **is** the primary working copy
+  an agent session commits and pushes from directly — the scenario the old
+  hook solved (an external push needs to be reflected locally) is now the
+  *minority* case (someone/something pushes to the same repo from
+  somewhere that isn't this working copy — another contributor via Gitea's
+  own web UI, a merged PR, a second agent session elsewhere), not the
+  common one. Building that specifically requires **new inbound surface
+  area** this project doesn't have yet: a webhook receiver endpoint in
+  `app.py` (Gitea's own webhook system, not a `post-receive` hook this
+  project controls directly the way the old bare-repo flow did), webhook
+  secret verification, and a decision about how to react to a webhook
+  concurrently with an agent possibly mid-edit in that same working copy
+  (a `git reset --hard` racing a live coding session is a materially
+  different risk than the old flow's read-mostly mirror). That's
+  meaningfully more architectural surface than "one more root-run wrapper
+  script," and it's the *same kind* of webhook infrastructure 2c's own
+  CI/CD auto-deploy needs to build anyway (2c already has to solve "Gitea
+  push happened, now do something automatically"). Building a one-off,
+  narrower version of that infrastructure in 2b just for this one hook,
+  ahead of 2c designing the general mechanism, risks two incompatible
+  webhook-handling code paths.
 
-### `install.sh`'s own top-of-file flag comment + `README.md`
-Update the `--with-git-hosting` one-line description at the top of
-`install.sh` (currently lines 15–16) to mention it now also installs
-Gitea, mirroring how `--with-taiga`'s own description block (lines 21–25)
-was added. Check `README.md`'s existing `--with-git-hosting` mentions
-(lines 79–82, 105–107, 156, 160) for anywhere a one-line addition noting
-"a self-hosted Gitea instance is also installed, off by default" is a
-natural fit — a small doc touch, not a rewrite of `docs/GIT_HOSTING.md`
-itself (that stays 2b's job, once the flow it documents actually changes).
+**Resolved default: defer. 2b ships without any auto-sync-on-external-push
+mechanism.** An agent or operator can always `git pull` manually in the
+working copy in the meantime. `docs/GIT_HOSTING.md`'s rewrite (see
+"Affected areas") must say this plainly rather than silently dropping the
+old claim. Flagged here explicitly per this cycle's brief, and again under
+"Open questions," in case the close call should go the other way.
+
+### `install.sh` / config docs — see "Sequencing" above for the concrete diff shape.
+`docs/GIT_HOSTING.md` gets a full rewrite (not a patch) describing: the new
+flow (create via web UI → Gitea API creates the repo → privileged script
+clones it into `PROJECTS_DIR`), the two one-time manual steps in order
+(2a's admin-account creation, then 2b's `gitea-configure-api.sh`), how an
+external git client reaches a repo (`tailscale serve`-published `/gitea`
+path, or loopback-only in `PUBLISH_MODE=none`), and an explicit callout that
+auto-sync-on-external-push is not (yet) a feature of the new flow (see
+above). `README.md`'s existing git-hosting mentions (the `git` user, "push a
+new project" framing) get updated to match — no more mentions of a
+restricted SSH-only `git` system user for new installs.
 
 ## Affected areas
-- `install.sh` — Docker-install logic factored into a shared
-  `ensure_docker()` helper (reused by both `--with-taiga` and
-  `--with-git-hosting`); new Gitea Compose config/secrets/pre-pull/wrapper-
-  script/sudoers/`switchboard.env` steps appended inside the existing
-  `WITH_GIT_HOSTING` block; updated flag-comment header; updated final
-  summary block.
-- `config/gitea-docker-compose.yml` — new file, authored directly by this
-  project (no upstream repo to clone/pin, unlike Taiga).
-- `scripts/gitea-up.sh`, `scripts/gitea-down.sh`, `scripts/gitea-status.sh`
-  — three new small root-run wrapper scripts, same shape as the Taiga ones.
-- `app/app.py` — new config reads, `gitea_run()`, `_gitea_display_url()`,
-  `/status` fields, new `do_POST` branch; frontend JS generalization of
-  the toggle state machine (`singletonToggleState`, replacing the
-  Taiga-only globals) plus the new Gitea row.
-- `config/switchboard.env.example` — new documented section.
-- `README.md` — small mentions-update, not a rewrite.
-- No data model / schema changes. No changes to existing endpoints'
-  request/response shapes beyond additive new `/status` fields and one new
-  `/gitea/{on,off}` route. `docs/GIT_HOSTING.md` and every existing
-  git-hosting script are **unchanged** (see Sequencing above).
-
-This is the same shape and comparable size to 1a's already-shipped Taiga
-spec (installer + a new privileged-script layer + app backend + frontend
-JS + config docs), which was accepted as a single cycle for the same
-reason — not splitting further.
+- `app/app.py` — `create_project()` rewritten; new `GITEA_API_TOKEN`/
+  `NEW_PROJECT_FROM_GITEA_SCRIPT` config reads; new `_gitea_slug()`,
+  `_gitea_api()` helpers. `NEW_PROJECT_SCRIPT` and its old code path
+  removed. No frontend/JS changes — the "+ New project" UI is unchanged
+  (same name input, same button, same `POST /projects` call shape).
+- `scripts/gitea-configure-api.sh` (new) — one-time token bootstrap.
+- `scripts/new-project-from-gitea.sh` (new) — privileged registration
+  script.
+- `scripts/git-hosting-setup.sh`, `scripts/new-repo.sh`,
+  `scripts/new-dev-instance.sh`, `scripts/new-project.sh`,
+  `scripts/project-sync.sh`, `scripts/target-setup.sh` — **deleted**, once
+  the new flow is verified (see "Sequencing").
+- `config/git-hosting.env.example` — **deleted** (nothing reads it once the
+  six scripts above are gone).
+- `install.sh` — `--with-git-hosting` block: legacy script installs +
+  `git-hosting-setup.sh` call + `git-hosting.env` setup + old sudoers rule
+  removed; new script install + sudoers rule + updated summary text added.
+- `config/switchboard.env.example` — new `NEW_PROJECT_FROM_GITEA_SCRIPT`
+  line; `GITEA_API_TOKEN` documented as a comment only (like other secrets
+  this file documents but never ships a real value for) with a pointer to
+  `gitea-configure-api.sh`; old `NEW_PROJECT_SCRIPT` references removed.
+- `docs/GIT_HOSTING.md` — full rewrite (see above).
+- `README.md` — mentions updated (see above).
+- `tests/test_gitea.py` — extended with tests for `_gitea_slug()`,
+  `_gitea_api()`, and the new `create_project()` body (mocking
+  `_gitea_api`/`gitea_run`/`subprocess.run`, following the same
+  monkeypatch-the-seam convention `test_taiga.py`/`test_gitea.py` already
+  use — not a real Docker/network call).
+- A new `tests/test_new_project_from_gitea.py` (or extending
+  `tests/test_new_project_from_upload.py`'s structure) covering the
+  privileged script's own argument validation and the mechanical
+  mkdir/chown/clone sequence, mirroring
+  `PrivilegedRegistrationTests`/`ArgumentValidationTests`'s shape in the
+  existing upload-script test file.
+- No data model / schema changes. One existing endpoint's *behavior*
+  changes (`POST /projects` → `create_project()`), not its request/response
+  shape.
 
 ## Edge cases
-- **Re-running `install.sh --with-git-hosting`** on a box that already has
-  Gitea installed: must not regenerate secrets (checked via `get_env`
-  returning a non-empty existing value), not restart already-stopped
-  containers, not duplicate sudoers lines, and must re-write
-  `docker-compose.yml`/`GITEA__server__ROOT_URL` deterministically every
-  run (the compose file and `ROOT_URL` are the two things this project
-  *does* want to keep current across `PUBLISH_MODE` changes, unlike the
-  once-only secrets).
-- **`--with-taiga` and `--with-git-hosting` both used in the same install
-  run (in either order)** — Docker is installed/verified exactly once
-  (shared `ensure_docker()`), both stacks get independently configured and
-  pre-pulled, two independent singleton rows appear with no port
-  collisions (`TAIGA_PORT=9000` vs `GITEA_PORT=3000`/`GITEA_SSH_PORT=2222`
-  vs the dynamic ttyd/code-server ranges starting at 7700/7900).
-- **Docker already present / Compose plugin missing / no network at
-  install time** — identical warn-and-continue handling to Taiga's, reused
-  verbatim via `ensure_docker()`.
-- **`app.py` restarts while Gitea is running** — `/status` must still
-  report `gitea: true` with a correct URL on the very next poll, no
-  re-toggle needed (state queried fresh, never trusted from memory).
-- **Rapid double-toggle / a poll landing mid-toggle-off** — the exact race
-  class 1a's three review rounds found for Taiga must not resurface for
-  Gitea; covered by construction via the generalized
-  `singletonToggleState` reuse (see "Proposed approach"), and must be
-  explicitly re-verified by the reviewer's testing pass for the `gitea`
-  kind specifically, not assumed safe by analogy alone.
-- **Old git-hosting's real sshd (host port 22) coexisting with Gitea's own
-  internal SSH server (host port 2222, loopback-only)** — no conflict,
-  different ports, different mechanisms (a real system sshd vs. a
-  container's own SSH implementation); worth noting explicitly since it's
-  a "two SSH-shaped things on one box" situation this project hasn't had
-  before, even though Gitea's SSH isn't reachable by anyone yet in 2a's
-  scope (see Non-goals).
-- **`GITEA_PORT`/`GITEA_SSH_PORT` colliding with a port already in active
-  use on the box** (e.g. an operator's own unrelated service already on
-  3000) — fixed defaults, no automated free-port scan, same accepted
-  limitation `TAIGA_PORT=9000` already has. Operator can hand-edit
-  `switchboard.env` + the compose file's ports and re-run.
-- **Someone reaches Gitea's URL before an admin account exists** (the
-  window between toggle-on and the operator manually running `gitea admin
-  user create`) — with `INSTALL_LOCK=true` baked in from install time,
-  this is a login page with no account to log into, not an open
-  configuration wizard; no data/config is at risk during that window.
-- **Toggling Gitea off has no data-loss implication in 2a's scope**, since
-  no real repos exist through it yet (registration is 2b) — Postgres's
-  data volume persists across a toggle-off/on cycle regardless (Compose
-  volumes aren't removed by `down` without `-v`), but this is currently
-  moot. Flagged explicitly as something a future 2b/2c cycle needs to
-  revisit once Gitea holds real, actively-pushed-to repos (e.g. whether
-  "off" should be blocked/warned against if a push could be in flight) —
-  not a 2a concern.
+- **Gitea installed but not currently toggled on** — `create_project()`
+  must check `gitea_run("status")` before attempting the API call and
+  return a clear "toggle it on first" message, not a raw connection
+  failure (see the rewritten `create_project()` above).
+- **Bootstrap script never run (`GITEA_API_TOKEN` empty)** — clear,
+  specific error message pointing at `gitea-configure-api.sh`, distinct
+  from "Gitea isn't installed at all."
+- **Gitea-side name collision that local-uniqueness didn't catch** — a
+  local name whose derived slug (`_gitea_slug()`) collides with an
+  *existing* Gitea repo even though no `PROJECTS_DIR` folder of that exact
+  name exists yet (e.g. two different local names both slugify to the same
+  string, or a repo was created directly through Gitea's own web UI
+  bypassing this project entirely) — handled via Gitea's own 409/422
+  response, not a separate pre-check (avoids a second TOCTOU race).
+- **Partial failure: Gitea repo created, but the privileged clone script
+  fails** (root out of disk, `PROJECTS_DIR` permissions wrong, `RUN_USER`
+  doesn't exist, network hiccup mid-clone) — best-effort `DELETE
+  /repos/{owner}/{repo}` cleanup so a failed "+ New project" click doesn't
+  leave an orphaned repo behind; the cleanup's own failure is swallowed
+  (logged, not surfaced) since the original error is what matters to the
+  user.
+- **Partial failure: clone script's `mkdir "$DEST"` succeeds but the
+  `git clone` itself fails** (e.g. Gitea became unreachable between the API
+  call and the clone) — `DEST` is left behind empty rather than auto-
+  removed; `create_project()`'s own Gitea-repo cleanup above still fires.
+  An empty leftover directory under `PROJECTS_DIR` blocks a same-named
+  retry (the existing `name in instance_names()` check would now say
+  "already exists" for a `create_project()` call that actually failed) —
+  worth a one-line note in `docs/GIT_HOSTING.md`'s troubleshooting section
+  that a failed "+ New project" attempt may need a manual `rmdir` before
+  retrying with the same name; not worth adding retry/cleanup logic to the
+  script itself for what should be a rare failure mode.
+- **`instance_names()` local-uniqueness check vs. Gitea-repo uniqueness are
+  two different namespaces** — see the collision case above; this is a
+  structural property of the new flow (the old flow had exactly one
+  namespace, the bare-repo directory name, that both checks implicitly
+  shared) worth calling out explicitly since it's new.
+- **Local name containing characters `NAME_RE` allows but that need mapping
+  for Gitea** (spaces, specifically) — handled by `_gitea_slug()`; verify at
+  implementation time that the mapping's output can never itself violate
+  Gitea's rules (e.g. two adjacent spaces collapsing correctly, a name that
+  is *only* whitespace-separated characters after `NAME_RE`'s own leading-
+  alnum requirement — should be structurally impossible given `NAME_RE`,
+  but worth an explicit test).
+- **`gitea-configure-api.sh` run before Gitea is toggled on, or before the
+  admin account exists, or against the wrong container name** — each must
+  fail with a specific, actionable message (`docker exec` itself failing
+  with "no such container," Gitea's own CLI failing because no admin user
+  exists yet, etc.) — same discipline `taiga-configure-push.sh`/
+  `taiga_push_spec.py --verify` already apply to their own failure modes.
+- **`gitea-configure-api.sh` run a second time** — must be safe to re-run
+  (generates a *new* token, overwrites `GITEA_API_TOKEN` via the same
+  idempotent-upsert idiom, restarts the service again) — useful if an
+  operator wants to rotate the token; not a special "already configured"
+  refusal.
+- **Re-running `install.sh --with-git-hosting` on a box that still has the
+  legacy `git` system user / sudoers rule from before 2b** (an existing
+  install upgrading in place) — per the Non-goals, nothing actively tears
+  that down; the new run simply stops re-asserting the old scripts/sudoers
+  lines it used to (they're gone from this codebase's `install.sh` now), so
+  they go stale but aren't forcibly removed. Worth a one-line note in the
+  install summary if the legacy `git-hosting-setup.sh`-created state is
+  detected (developer's call whether this is worth the extra detection
+  logic for this cycle, or a documentation-only note — not blocking).
+- **`PUBLISH_MODE=none`** — the clone URL an external client would use is
+  `http://127.0.0.1:$GITEA_PORT/...`, reachable only from the box itself,
+  same honesty-about-reachability precedent `_publish()` already documents
+  for every other feature in this mode.
 
 ## Acceptance criteria
-- [ ] Given a box with neither Docker nor Gitea installed, when
-  `install.sh --with-git-hosting` runs, then Docker is installed (skipped
-  if already present), the Gitea Compose stack (`server` + `db`, per
-  Gitea's own official example) is configured under `$GITEA_DIR` with both
-  ports bound to `127.0.0.1` only, images are pre-pulled, and the stack is
-  left stopped (`docker compose ps` shows nothing running) after install
-  completes.
-- [ ] Given `install.sh --with-git-hosting` has already run once, when it
-  is re-run, then no Gitea secrets are regenerated, no Gitea containers are
-  started, and no sudoers lines are duplicated.
-- [ ] Given install completed with `--with-git-hosting`, when the web UI
-  loads, then a new singleton "Gitea" row appears (same visual family as
-  the Taiga row — on/off toggle, resource badge, no engine picker), off by
-  default.
-- [ ] Given the Gitea row's toggle is switched on, when `/status` is
-  polled repeatedly, then it eventually reports `gitea: true` with a
-  working `gitea_url`, and opening that link reaches Gitea's own
-  login/first-run page (not a public "finish install" wizard, since
-  `INSTALL_LOCK=true` is pre-set).
-- [ ] Given the Gitea row's toggle is switched off, when `/status` is next
-  polled, then it reports `gitea: false` and `docker compose ps` confirms
-  the containers are actually stopped.
-- [ ] Given `app.py`/the systemd service restarts while Gitea's containers
-  are still running, when `/status` is polled afterward, then it correctly
-  reports `gitea: true` with no re-toggle needed.
-- [ ] Given two rapid, overlapping toggle-off requests for the Gitea row
-  (mirroring the exact race class 1a's three review rounds fixed for
-  Taiga), when both resolve, then the row settles on an accurate final
-  state — no stuck "starting…", no false "error", no incorrectly re-armed
-  "unexpectedly stopped" indicator.
-- [ ] Given the existing `--with-git-hosting` flow (the `git` user,
-  `new-project.sh`, the web UI's "+ New project" button), when
-  `install.sh --with-git-hosting` runs under 2a's changes, then all of it
-  continues to work completely unchanged — `create_project()` still calls
-  the existing `NEW_PROJECT_SCRIPT`, nothing about the old flow is
-  disabled, warned about, or altered.
-- [ ] Given a box with `--with-taiga` already installed, when
-  `--with-git-hosting` (2a) is installed afterward (or both flags are
-  passed in the same run), then Docker is not reinstalled/reconfigured a
-  second time, and the Taiga and Gitea singleton rows work independently
-  with no port collisions.
-- [ ] Given TOTP/simple auth is enabled, when the Gitea on/off toggle is
-  used, then it goes through the exact same shared TOTP gate as every
-  other `/*/{on,off}` action (428/403 behavior), with no special-casing.
+- [ ] Given Gitea is installed, toggled on, and `gitea-configure-api.sh` has
+  been run successfully, when the web UI's "+ New project" button is used
+  with a valid name, then a new private Gitea repository is created via the
+  API (`auto_init: true`, `default_branch: "main"`), and
+  `PROJECTS_DIR/<name>` is populated with a working clone of it, owned by
+  `RUN_USER`, showing up in the web UI immediately.
+- [ ] Given that same project, when a commit is made and `git push` is run
+  from `PROJECTS_DIR/<name>` (as `RUN_USER`), then it succeeds without any
+  additional credential prompt or setup, authenticating via the token
+  already embedded in that clone's `origin` remote.
+- [ ] Given Gitea is not installed on this box, when "+ New project" is
+  used, then `create_project()` returns a clear message saying so (not a
+  crash, not a reference to the old `NEW_PROJECT_SCRIPT`).
+- [ ] Given Gitea is installed but currently toggled off, when "+ New
+  project" is used, then it returns a clear "toggle it on first" message,
+  no Gitea API call is attempted.
+- [ ] Given Gitea is installed and on, but `gitea-configure-api.sh` has
+  never been run, when "+ New project" is used, then it returns a clear
+  message pointing at that script, no Gitea API call is attempted.
+- [ ] Given a name whose derived Gitea slug already exists as a repo (even
+  if the local `PROJECTS_DIR` name is available), when "+ New project" is
+  used, then it fails with a specific "already exists on Gitea" message,
+  and no `PROJECTS_DIR` directory is left behind.
+- [ ] Given the Gitea API call succeeds but the privileged clone script
+  fails for any reason, when that happens, then the just-created Gitea repo
+  is deleted (best-effort) and the original failure is returned to the
+  caller — no orphaned Gitea repo, no silently-swallowed top-level error.
+- [ ] Given `scripts/gitea-configure-api.sh` is run once, when it completes
+  successfully, then `switchboard.env` contains a `GITEA_API_TOKEN` line,
+  the service has been restarted, and a `GET /user` call against Gitea with
+  that token succeeds (the script's own `--verify`-shaped check).
+- [ ] Given `install.sh --with-git-hosting` is run fresh (after this
+  cycle's changes), when it completes, then none of the six legacy scripts,
+  `config/git-hosting.env`, or the legacy `git` system user are created —
+  only Gitea (per 2a) plus `new-project-from-gitea.sh` and its sudoers rule
+  are installed.
+- [ ] Given the full test suite (`python3 -m unittest discover -s tests`),
+  when it runs after this cycle's changes, then all tests pass, including
+  new coverage for `_gitea_slug()`, `_gitea_api()`, the rewritten
+  `create_project()`, and the new privileged script's argument validation —
+  with no real Docker/network calls made by any test (same monkeypatched-
+  seam convention as `test_taiga.py`/`test_gitea.py`).
 
 ## Open questions
-1. **DB choice: Postgres (this spec's default) vs. SQLite.** Gitea's own
-   officially documented example uses Postgres; SQLite would mean one
-   container instead of two and an even lighter footprint. This spec
-   defaults to Postgres because (a) it matches what's actually documented
-   as Gitea's official example rather than a hand-picked simplification,
-   and (b) 2c's CI/CD auto-deploy will add exactly the kind of
-   webhook/polling load Gitea's own docs say Postgres handles meaningfully
-   better than SQLite — picking Postgres now avoids a future forced DB
-   migration when 2c ships. This is a real tradeoff against this project's
-   general minimal-footprint bias (an extra container, a bit more RAM) —
-   flagging for confirmation rather than treating it as settled.
-2. **Git-over-SSH exposure is left undecided (loopback-only for now).**
-   2a keeps `GITEA_SSH_PORT` bound to `127.0.0.1`, meaning nobody off-box
-   can actually clone/push via SSH yet. This is fine for 2a (there's no
-   way to create a Gitea repo yet regardless), but 2b's own spec will need
-   to explicitly decide how developers reach Gitea for real git operations
-   — expose the SSH port on the tailnet/LAN, or route git-over-HTTPS
-   through the same loopback+`tailscale serve` path everything else here
-   already uses (avoiding a wholly new "raw TCP port on a non-loopback
-   interface" precedent this project has never needed before, since the
-   *existing* git-hosting flow's SSH exposure rides the box's own already-
-   externally-reachable sshd, not something `app.py`/`PUBLISH_MODE`
-   manages). Assumption stated so 2b doesn't have to rediscover this from
-   scratch.
-3. **Admin-account automation — closer call than Taiga's, still not
-   automated.** Unlike Taiga's interactive superuser prompt, Gitea's
-   `gitea admin user create --admin --username ... --password ... --email
-   ...` is a single non-interactive CLI command, meaning `install.sh`
-   genuinely *could* generate a password and run it automatically (the
-   `--yes` non-interactive-install objection that ruled this out for Taiga
-   doesn't apply the same way here). This spec still defaults to **not**
-   automating it, for symmetry with Taiga, to avoid this sub-spec making
-   an unreviewed credential-generation/display decision, and because the
-   generated-password-in-install-output pattern isn't established
-   elsewhere in this file for a *second* service in the same run. Worth
-   revisiting as a small, separately-scoped follow-up if the manual step
-   proves to be real friction once 2b makes Gitea actually useful.
-4. **Exact env var/service names must be re-verified at implementation
-   time**, not assumed frozen from this spec (`GITEA__database__*`,
-   `GITEA__security__*`, `GITEA__server__*`, the `server`/`db` service
-   names) — same caveat 1a flagged for `taiga-docker`'s `.env` keys, now
-   pointing at `docs.gitea.com`'s live docs instead of a cloned repo's
-   `.env.example`.
-5. **Fixed port defaults (`GITEA_PORT=3000`/`GITEA_SSH_PORT=2222`), no
-   free-port detection.** Same accepted-limitation precedent as
-   `TAIGA_PORT=9000` — flagged, not treated as a gap to close in this
-   cycle.
-6. **Whether an on/off toggle stays the right UX for Gitea long-term.**
-   Taiga is naturally used in bursts (backlog grooming sessions); Gitea,
-   once 2b/2c make it hold real, actively-pushed-to repos, is more of an
-   always-on service. This cycle's brief is explicit that 2a mirrors the
-   toggle pattern regardless, so that's what's specced — flagging for a
-   future cycle to revisit once there's real usage data, not blocking 2a.
+1. **What "verified working end-to-end" actually means for this session's
+   environment.** If the build/review cycle for 2b runs in an environment
+   with a real working Docker Compose plugin (unlike 2a's own session),
+   the reviewer should do a full live round trip before the six legacy
+   scripts are deleted, per the user's explicit requirement. If it doesn't
+   (same documented gap as 2a), retirement should still proceed based on
+   thorough mocked-test coverage plus close reading against Gitea's live
+   docs — this spec's own default — but `docs/test-review.md` must say so
+   plainly, the same way 2a's own implementation notes did, rather than
+   silently claiming a live verification that didn't happen. Flagging this
+   explicitly rather than assuming the review environment will differ from
+   2a's.
+2. **`tailscale serve --set-path=/gitea`'s prefix-stripping against Gitea's
+   own sub-path expectations** — researched and believed correct (see
+   "Background"), but never exercised against a real running Gitea +
+   Tailscale in this project's own environment. Worth an explicit manual
+   smoke test (clone through the published `/gitea` URL from an actual
+   external client) the first time this runs somewhere that has both
+   Docker and a real Tailscale node available — not blocking 2b's ship,
+   since the loopback-only path (`PUBLISH_MODE=none`, and `app.py`'s own
+   `create_project()`/clone script, which never route through
+   `tailscale serve` at all) is unaffected either way.
+3. **`_gitea_slug()`'s mapping is intentionally minimal** (spaces → `-`
+   only) on the assumption `NAME_RE`'s character class is otherwise a
+   subset of Gitea's. Worth a direct check against Gitea's actual repo-name
+   validation regex in its source (not just its docs) at implementation
+   time, in case there's a narrower restriction this spec's research
+   missed (e.g. reserved names, a max length shorter than `NAME_RE`'s 60).
+4. **Sync-on-push deferral (see "Proposed approach")** — flagged again here
+   since the brief explicitly called this a possible close call. If the
+   answer should be "no, build a narrow version now," the cheapest version
+   to reconsider would be: Gitea's own `post-receive`-equivalent (a
+   built-in "Mirror" push, or a minimal webhook receiver limited to exactly
+   this one project's repo) rather than waiting for 2c's general mechanism
+   — flagged as the fallback shape if this default is overridden.
+5. **Whether a failed-then-abandoned `PROJECTS_DIR/<name>` directory (see
+   "Edge cases") should be auto-cleaned by the privileged script itself**
+   rather than left for manual `rmdir`. Left as a developer's call / small
+   follow-up rather than specified here, since it's a narrow robustness
+   improvement, not a correctness requirement.
 
 ## Risk / rollback notes
-- Reuses an already-accepted risk category (Docker as a dependency, root-
-  run wrapper scripts narrowly scoped via sudoers) rather than introducing
-  a new one — the privilege-boundary reasoning was already reviewed and
-  approved for Taiga in 1a.
-- Nothing about the existing git-hosting flow is touched (see Sequencing),
-  so rolling back 2a specifically means: stop running the new Gitea steps
-  in `install.sh`, remove the three wrapper scripts + their sudoers lines
-  + `$GITEA_DIR` (containers/volumes), and revert the `app.py`/frontend
-  changes — the old git-hosting flow is unaffected either way, since 2a
-  never modifies it.
-- The one piece of this spec that touches already-shipped, reviewer-
-  approved code is generalizing the Taiga-only toggle globals into
-  `singletonToggleState`. This must be verified with the same rigor as any
-  refactor of tested logic — re-run (or adapt) whatever test technique the
-  reviewer used to catch 1a's Defects 1 and 2 against the *generalized*
-  code path for both `taiga` and `gitea`, not just spot-check Gitea in
-  isolation, before this is considered safe to ship.
+- The riskiest new piece is the privilege boundary: `GITEA_API_TOKEN` now
+  flows through two places that didn't need any secret before
+  (`switchboard.env` already handled secrets; the new privileged script now
+  also reads one). Mitigated by: never accepting the token via argv, always
+  reading it from the same already-600/`SVC_USER`-owned file `install.sh`
+  already protects, and scoping the token itself to `write:repository`
+  (not `all`) at generation time.
+- Retiring the six legacy scripts is the one irreversible-feeling part of
+  this cycle for *new* installs (existing installs are untouched per
+  Non-goals) — rollback if something's wrong post-ship: `git revert` the
+  commit that removed them from `install.sh`/deleted the script files (all
+  preserved in git history), no data loss, since nothing about `RUN_USER`'s
+  own project files is touched by this cycle either way.
+- If `gitea-configure-api.sh` or the API-based `create_project()` has a
+  bug post-ship, the fallback for an operator in the meantime is exactly
+  what `create_project()`'s own error messages already point at: create
+  `PROJECTS_DIR/<name>` by hand (`git init` or a manual clone) — same
+  fallback the pre-2b code already offered when `NEW_PROJECT_SCRIPT` wasn't
+  installed, preserved in spirit even though the exact old wording changes.
+- Best-effort Gitea-repo cleanup on partial failure (see "Edge cases") is
+  explicitly best-effort, not guaranteed — a truly wedged Gitea (e.g.
+  network partition right after the create call) could still leave an
+  orphaned repo; acceptable given this is a low-frequency, operator-visible
+  failure mode (the repo is visible in Gitea's own UI and can be deleted by
+  hand), not a security or data-loss issue.
