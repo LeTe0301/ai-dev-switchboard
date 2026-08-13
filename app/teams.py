@@ -33,10 +33,12 @@ Run with:
 import argparse
 import json
 import os
+import re
 import secrets
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -58,6 +60,11 @@ TEAM_HEADLESS_PROMPT_MAX_BYTES = int(os.environ.get("TEAM_HEADLESS_PROMPT_MAX_BY
 TEAM_HEADLESS_ARG_PROMPT_MAX_BYTES = int(os.environ.get("TEAM_HEADLESS_ARG_PROMPT_MAX_BYTES", "65536"))
 TEAM_HEADLESS_STDERR_TAIL_BYTES = int(os.environ.get("TEAM_HEADLESS_STDERR_TAIL_BYTES", "4096"))
 TEAM_HEADLESS_STALE_RUN_TTL_SECONDS = int(os.environ.get("TEAM_HEADLESS_STALE_RUN_TTL_SECONDS", "7200"))
+
+# Measures the UTF-8-encoded byte length of build_digest()'s own returned
+# string (the text actually seeded into a lead's system prompt), not the
+# size of any source file (docs/spec.md 6b §1).
+TEAM_GROUNDING_MAX_BYTES = int(os.environ.get("TEAM_GROUNDING_MAX_BYTES", "8000"))
 
 # Bash's own `$?` convention for a foreground child killed by signal N is
 # 128+N (POSIX, confirmed live for SIGTERM against `claude -p` during this
@@ -759,6 +766,394 @@ def agent_run(engine: str, workdir: str, prompt: str, *,
             subprocess.run(TMUX + ["kill-session", "-t", session], capture_output=True)
 
 
+# ─── grounding (docs/story.md §4.3; docs/spec.md 6b) ──────────────────────
+# Auto-discovers a project's own documentation, builds a hard-byte-capped
+# digest for a lead's system prompt, and answers fact_check(claim,
+# grounding) with matching passages or an explicit "no supporting passage
+# found". Pure reads only -- no function below this marker ever opens a
+# file in a write/append/create mode (neither via a write-mode `open()`
+# call nor via a write-capable `os.open()` flag combination) or calls a
+# mutating os/shutil function (see tests/test_teams_grounding.py's
+# runtime-monkeypatch and static-AST-scan assertions of exactly that).
+#
+# Every real file this section reads goes through exactly one
+# `os.open()`/read/`os.close()` per file -- see _open_grounding_candidate()
+# and _read_grounding_candidate() below for why that (rather than a
+# realpath()-then-open()-by-path-string pattern, possibly repeated) is what
+# actually closes a symlink-swap TOCTOU race, not just a faster re-check of
+# the same racy pattern (docs/test-review.md Defect 2, first round).
+
+# Fixed backstop on any single grounding-file read, independent of
+# TEAM_GROUNDING_MAX_BYTES -- deliberately not an env var (docs/spec.md 6b
+# §1): an operator misconfiguring the digest cap can never make a single
+# file read larger than this.
+_GROUNDING_READ_CAP_BYTES = 2 * 1024 * 1024
+
+# Defensive bound on the intermediate per-file heading list, independent of
+# build_digest()'s own byte truncation -- so a pathological file with
+# thousands of #-prefixed lines can't blow up an intermediate list before
+# truncation gets a chance to run.
+_GROUNDING_MAX_HEADINGS_PER_FILE = 20
+
+# Cap on fact_check()'s own returned match list.
+_GROUNDING_FACT_CHECK_MAX_MATCHES = 5
+
+# A specific, greppable sentence used when nothing was discovered -- not an
+# empty string a caller could mistake for "not yet loaded".
+_GROUNDING_NO_FILES_DIGEST = (
+    "No grounding files were found for this project (checked "
+    "docs/ARCHITECTURE.md, docs/BACKLOG.md, CLAUDE.md/AGENTS.md, README.md)."
+)
+
+# A small, built-in stopword list for fact_check()'s claim tokenizer
+# (docs/spec.md 6b §5) -- dropped before term-conjunction matching so a
+# claim built entirely from these (or the empty string) is treated as
+# having nothing meaningful to search for.
+_GROUNDING_STOPWORDS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "to", "of", "in",
+    "on", "and", "or", "that", "this", "it", "for", "with", "as", "at",
+    "by", "from", "not", "no", "do", "does", "did", "has", "have", "had",
+})
+
+_GROUNDING_TOKEN_RE = re.compile(r"[A-Za-z0-9_']+")
+
+
+def _under_workdir(path: str, workdir_real: str) -> bool:
+    """True iff path's realpath is workdir_real itself or lives strictly
+    beneath it. A cheap pre-check only -- see _open_grounding_candidate()'s
+    own docstring for why this alone is not sufficient as the containment
+    guarantee (docs/test-review.md Defect 2: a realpath()-then-open()
+    pattern split across two calls left a TOCTOU window). The actual
+    guarantee against that race rests on O_NOFOLLOW and the post-open fd
+    check below, each tied to the specific file that gets opened rather
+    than re-derived from this path string -- this pre-check's own job is
+    narrower: reject an out-of-bounds candidate before os.open() is ever
+    called on it at all, for the straightforward (non-racing) case."""
+    real = os.path.realpath(path)
+    return real == workdir_real or real.startswith(workdir_real + os.sep)
+
+
+def _open_grounding_candidate(path: str, workdir_real: str):
+    """
+    Opens `path` exactly once and returns a validated, open, read-only file
+    descriptor, or None if it's unusable for any reason -- the single
+    operation both discovery and content-reading are now built on (post-
+    review fix, docs/test-review.md Defects 1 and 2). Previously,
+    containment was checked once (via `_under_workdir` against the literal
+    path string) and the file was then read separately, sometimes twice
+    (once to decide "is this usable", once more for its kept content) --
+    each read a fresh, independent open() of the same literal path, with a
+    real window between "checked" and "read" for the file to be swapped
+    out from under the check (Defect 2, reproduced deterministically: an
+    in-bounds regular file replaced with a symlink to an out-of-bounds
+    target between two reads leaked that target's content). That class of
+    bug is closed here structurally, not by re-checking faster: containment
+    is verified against the fd's OWN resolved path (`/proc/self/fd/<fd>`,
+    which is pinned to the specific inode this fd refers to and cannot
+    change out from under it after `os.open()` returns) rather than by
+    re-resolving the original path string, and there is exactly one
+    open() call per real file read anywhere in this module's grounding
+    section -- nothing here ever validates a path and then reads it again
+    later through a second, independent open() of that same path.
+
+    `O_NOFOLLOW` rejects the final path component being a symbolic link
+    outright (`ELOOP`) -- a literal filesystem symlink candidate is now
+    categorically unusable, not "usable if it happens to resolve
+    in-bounds": this is what makes the fd-based check airtight against a
+    same-path swap-for-a-symlink landing in the gap between the cheap
+    `_under_workdir` pre-check and this function's own `os.open()` call --
+    if that swap happens, the open() itself fails instead of silently
+    following the new symlink. `O_NONBLOCK` prevents `open()` on a named
+    pipe with no writer from blocking forever (docs/test-review.md
+    Defect 1) -- the same single syscall this function already makes
+    handles both adversarial shapes, not two separate guards.
+
+    The `_under_workdir` pre-check above is not redundant with the
+    fd-based one: it is what lets an out-of-bounds candidate (e.g. an
+    `@../../../etc/hostname`-style indirection target, which involves no
+    symlink at all, so `O_NOFOLLOW` alone would not catch it) get rejected
+    *before* `os.open()` is ever called on it at all -- verified directly
+    by tests/test_teams_grounding.py wrapping `os.open` itself.
+    """
+    if not _under_workdir(path, workdir_real):
+        return None
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            os.close(fd)
+            return None
+        # Re-verify containment against the fd's OWN resolved path (tied to
+        # the specific open file description, not re-derived from `path`)
+        # -- this is what closes the actual TOCTOU window between the
+        # cheap `_under_workdir` pre-check above and this function's own
+        # `os.open()` call an instant later: a swap landing in that window
+        # (the file becoming a symlink, or an intermediate component like
+        # `docs/` becoming one) is caught here even in cases O_NOFOLLOW
+        # alone would not reject on its own (O_NOFOLLOW only constrains
+        # the *final* path component). Verified empirically during the
+        # post-review fix pass: removing either this check or O_NOFOLLOW
+        # alone still leaves the exact swap-for-a-symlink repro closed
+        # (each independently catches that specific shape); removing BOTH
+        # is what actually reproduces the original leak -- see
+        # tests/test_teams_grounding.py's PostReviewRegressionTests for the
+        # regression tests this reasoning is pinned by.
+        real = os.path.realpath(f"/proc/self/fd/{fd}")
+        if real != workdir_real and not real.startswith(workdir_real + os.sep):
+            os.close(fd)
+            return None
+        return fd
+    except OSError:
+        # Missing file, permission denied, a directory (see the fstat
+        # check above for the common case, but e.g. a race making it
+        # disappear entirely is still just an OSError here too),
+        # ELOOP (symlink final component, or a genuine symlink loop --
+        # O_NOFOLLOW turns a loop into an immediate ELOOP rather than the
+        # kernel chasing it), FIFO/device/socket already handled by the
+        # fstat check above without ever reaching read -- all reduce to
+        # the same "unusable" outcome here.
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        return None
+
+
+def _read_grounding_candidate(path: str, workdir_real: str,
+                              read_cap: int = _GROUNDING_READ_CAP_BYTES) -> str:
+    """
+    The one read of one real grounding file, start to finish: open once
+    (validated as above), read up to `read_cap` BYTES (not characters --
+    docs/test-review.md Defect 4: the module's original reliance on
+    app.py's `_read_head()`, which reads up to `limit` *characters* in text
+    mode, meant multi-byte-heavy content could be read up to ~4x past the
+    stated byte cap; reading raw bytes directly from the fd and decoding
+    only at the end fixes this as a consequence of the same restructuring,
+    not a separate patch) off the already-open fd, sniff those same bytes
+    for a NUL in the first 512 (the binary check -- no separate open() for
+    this anymore, since the bytes are already in hand), then decode as
+    UTF-8 with errors="ignore" (same tolerance app.py's `_read_head()`
+    itself uses for genuinely malformed-but-not-binary text). Returns ""
+    for any unusable candidate -- missing, wrong type, out-of-bounds,
+    symlink, binary, or empty -- the same unified "empty means skip" rule
+    as before, just now resting on one filesystem operation per file
+    instead of two or three.
+    """
+    fd = _open_grounding_candidate(path, workdir_real)
+    if fd is None:
+        return ""
+    try:
+        chunks = []
+        remaining = read_cap
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 1024 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(fd)
+    if b"\x00" in raw[:512]:
+        return ""
+    return raw.decode("utf-8", errors="ignore")
+
+
+def _discover_and_read(workdir: str, read_cap: int = _GROUNDING_READ_CAP_BYTES) -> list:
+    """
+    The one place that both decides which of the four candidate sources are
+    present *and* fetches their content -- every real underlying file is
+    opened and read exactly once here (see _open_grounding_candidate()'s
+    docstring for why that matters). `discover_grounding_files()` and
+    `load_grounding()` are both thin wrappers around this, so
+    `load_grounding()` never re-reads a path `discover_grounding_files()`
+    (or this function, on a separate call) already validated.
+    """
+    workdir_real = os.path.realpath(workdir)
+    entries = []
+
+    for relpath in ("docs/ARCHITECTURE.md", "docs/BACKLOG.md"):
+        path = os.path.join(workdir, relpath)
+        content = _read_grounding_candidate(path, workdir_real, read_cap)
+        if content:
+            entries.append({"label": relpath, "path": path, "content": content})
+
+    for name in ("CLAUDE.md", "AGENTS.md"):
+        path = os.path.join(workdir, name)
+        text = _read_grounding_candidate(path, workdir_real, read_cap)
+        if not text:
+            continue
+        stripped = text.strip()
+        if stripped.startswith("@") and len(stripped.splitlines()) == 1:
+            target_path = os.path.join(workdir, stripped[1:])
+            target_content = _read_grounding_candidate(target_path, workdir_real, read_cap)
+            if target_content:
+                entries.append({"label": name, "path": target_path, "content": target_content})
+                break
+            continue  # target missing/unusable/out-of-bounds
+        entries.append({"label": name, "path": path, "content": text})
+        break
+
+    for name in ("README.md", "Readme.md", "readme.md", "README"):
+        path = os.path.join(workdir, name)
+        content = _read_grounding_candidate(path, workdir_real, read_cap)
+        if content:
+            entries.append({"label": "README.md", "path": path, "content": content})
+            break
+
+    return entries
+
+
+def discover_grounding_files(workdir: str) -> list:
+    """
+    Finds whichever of docs/ARCHITECTURE.md, docs/BACKLOG.md,
+    CLAUDE.md/AGENTS.md (first found wins), README.md (casing variants,
+    first found wins) are present and usable under `workdir`, in that fixed
+    order. Mirrors app.py's _gather_project_context() matching rules in
+    full, including the one-line `@target` indirection for CLAUDE.md/
+    AGENTS.md (app/app.py:436) -- except the returned `path` for that case
+    is the resolved target, not the literal CLAUDE.md/AGENTS.md path
+    (docs/spec.md 6b §2), since that target is what's actually read and
+    what a fact_check file:line must point a human at. A standalone call to
+    this function reads each real file once, on its own, for its own
+    purpose (deciding inclusion) -- calling it before also calling
+    load_grounding() means the same file is read twice across the two
+    *separate* calls, but each read is independently a single, validated
+    open() (see _open_grounding_candidate()), so this is not the TOCTOU
+    class of bug Defect 2 was: load_grounding() below never chains off of
+    a call to this function's own result to avoid re-reading, it always
+    goes through _discover_and_read() directly, once, itself.
+    """
+    return [{"label": e["label"], "path": e["path"]} for e in _discover_and_read(workdir)]
+
+
+def _extract_headings(content: str) -> list:
+    """
+    Scans lines matching ^#{1,6}\\s+.+ (ATX headings), skipping any line
+    while inside a fenced code block (toggled by a line starting with
+    ``` or ~~~) so a shell comment or shebang inside a fenced example is
+    never mistaken for a heading. Capped at
+    _GROUNDING_MAX_HEADINGS_PER_FILE, independent of build_digest()'s own
+    later byte truncation (docs/spec.md 6b §3).
+    """
+    headings = []
+    in_fence = False
+    for line in content.splitlines():
+        fence_marker = line.strip()[:3]
+        if fence_marker in ("```", "~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if re.match(r"^#{1,6}\s+.+", line):
+            headings.append(line.strip())
+            if len(headings) >= _GROUNDING_MAX_HEADINGS_PER_FILE:
+                break
+    return headings
+
+
+def load_grounding(workdir: str, *, max_bytes: int = TEAM_GROUNDING_MAX_BYTES,
+                   read_cap: int = _GROUNDING_READ_CAP_BYTES) -> dict:
+    """
+    Builds one snapshot dict (docs/spec.md 6b §3 "Snapshot semantics") by
+    calling _discover_and_read() directly -- exactly one open+read per real
+    file, never a second read of a path some earlier call already
+    validated (docs/test-review.md Defect 2's fix). The same content is
+    both the source for headings/digest and the corpus a later
+    fact_check() call against this returned dict searches; nothing
+    re-reads from disk for that call.
+    """
+    files = []
+    for entry in _discover_and_read(workdir, read_cap):
+        content = entry["content"]
+        files.append({
+            "label": entry["label"],
+            "path": entry["path"],
+            "relpath": os.path.relpath(entry["path"], workdir),
+            "headings": _extract_headings(content),
+            "content": content,
+            "byte_count": len(content.encode("utf-8")),
+        })
+    return {
+        "workdir": workdir,
+        "loaded_at": _now_iso(),
+        "files": files,
+        "digest": build_digest(files, max_bytes),
+        "empty": files == [],
+    }
+
+
+def build_digest(files: list, max_bytes: int = TEAM_GROUNDING_MAX_BYTES) -> str:
+    """
+    Pure, no disk I/O -- assembles headings + a per-file snippet into one
+    text blob, then unconditionally hard-truncates the result to `max_bytes`
+    of UTF-8-encoded output (docs/spec.md 6b §4). The per-file share
+    (`per_file_budget`) is a fairness heuristic only; the final encode-
+    slice-decode step is the actual safety guarantee and runs every time,
+    regardless of file count/size or whether the heuristic above it is
+    "right".
+    """
+    if not files:
+        return _GROUNDING_NO_FILES_DIGEST
+    if max_bytes <= 0:
+        return ""
+
+    per_file_budget = max(200, max_bytes // len(files))
+    sections = []
+    for f in files:
+        section = f"## {f['label']}\n"
+        if f["headings"]:
+            section += "\n".join(f["headings"]) + "\n"
+        section += f["content"][:per_file_budget]
+        sections.append(section)
+    text = "\n\n".join(sections)
+
+    encoded = text.encode("utf-8")[:max_bytes]
+    return encoded.decode("utf-8", errors="ignore")
+
+
+def _significant_terms(claim: str) -> list:
+    """Lowercase, tokenize on [A-Za-z0-9_']+, drop stopwords and
+    single-character tokens (docs/spec.md 6b §5 step 1). Never treats
+    `claim` as a regex -- only as data fed to a fixed pattern we wrote."""
+    tokens = _GROUNDING_TOKEN_RE.findall(claim.lower())
+    return [t for t in tokens if t not in _GROUNDING_STOPWORDS and len(t) > 1]
+
+
+def fact_check(claim: str, grounding: dict, *,
+              max_matches: int = _GROUNDING_FACT_CHECK_MAX_MATCHES) -> dict:
+    """
+    Deterministic, precision-biased textual match against the FULL per-file
+    content grounding["files"][*]["content"] (not grounding["digest"]) --
+    docs/spec.md 6b §5. A line matches iff EVERY significant term of `claim`
+    is a case-insensitive substring of it -- a strict conjunctive match, no
+    scoring, no nearest-weak-match fallback: an empty `terms` list or zero
+    matching lines both simply return found=False, never an exception.
+    """
+    terms = _significant_terms(claim)
+    matches = []
+    if terms:
+        for f in grounding.get("files", []):
+            for lineno, line in enumerate(f.get("content", "").splitlines(), start=1):
+                lower = line.lower()
+                if all(term in lower for term in terms):
+                    matches.append({
+                        "label": f["label"],
+                        "path": f["path"],
+                        "relpath": f["relpath"],
+                        "line": lineno,
+                        "file_line": f"{f['label']}:{lineno}",
+                        "text": line.strip(),
+                    })
+                    if len(matches) >= max_matches:
+                        break
+            if len(matches) >= max_matches:
+                break
+    return {"claim": claim, "found": bool(matches), "matches": matches}
+
+
 # ─── CLI ────────────────────────────────────────────────────────────────
 def _tail_log_once(log_path: str, offset: int) -> int:
     try:
@@ -810,11 +1205,23 @@ def _cli_list_engines(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_grounding(args: argparse.Namespace) -> int:
+    print(json.dumps(load_grounding(args.workdir), indent=2))
+    return 0
+
+
+def _cli_fact_check(args: argparse.Namespace) -> int:
+    grounding = load_grounding(args.workdir)
+    print(json.dumps(fact_check(args.claim, grounding), indent=2))
+    return 0
+
+
 def _parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="teams.py",
-        description="Run a single headless engine turn, or list engines.d headless "
-                     "eligibility -- no server, no UI (backlog item 6a).",
+        description="Run a single headless engine turn, list engines.d headless "
+                     "eligibility, or inspect a project's grounding -- no server, "
+                     "no UI (backlog items 6a/6b).",
     )
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -831,6 +1238,13 @@ def _parse_args(argv=None) -> argparse.Namespace:
 
     sub.add_parser("list-engines", help="List engines.d entries and their headless eligibility.")
 
+    p_grounding = sub.add_parser("grounding", help="Print load_grounding() as JSON for a project directory.")
+    p_grounding.add_argument("workdir", help="Project directory to discover grounding files under.")
+
+    p_fact_check = sub.add_parser("fact-check", help="Print fact_check() as JSON for a claim.")
+    p_fact_check.add_argument("workdir", help="Project directory to discover grounding files under.")
+    p_fact_check.add_argument("claim", help="The claim text to fact-check against the project's grounding.")
+
     return p.parse_args(argv)
 
 
@@ -839,7 +1253,11 @@ def main(argv=None) -> int:
     try:
         if args.command == "run":
             return _cli_run(args)
-        return _cli_list_engines(args)
+        if args.command == "list-engines":
+            return _cli_list_engines(args)
+        if args.command == "grounding":
+            return _cli_grounding(args)
+        return _cli_fact_check(args)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

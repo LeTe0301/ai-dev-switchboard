@@ -1,89 +1,151 @@
-# Test & Review: Headless engine invocation (backlog item 6, sub-spec 6a)
+# Test & Review: Grounding — discovery, digest, and `fact_check` (backlog item 6, sub-spec 6b)
 
 ## Scope
-Covers `docs/spec.md`'s full acceptance-criteria list for `app/teams.py`'s
-`agent_run()` + CLI, `Engine`/`_parse_engine_file()`'s four new `HEADLESS_*`
-keys and the reserved `switchboard` name prefix, the tmux-hosted spawn/
-tail/cancel/cleanup machinery, and the `engines.d/*.engine` verification
-status. This is the fourth and final testing/review round. Round 1 found
-and fixed Defect 1 (uncaught `OSError` + rundir leak). Round 2 found and
-fixed Defect 2 (wrong ceiling modeled for the `arg`-mode byte cap; fixed by
-writing the script to a file). Round 3's review pass found Finding 1
-(uncaught exception on malformed-shape translator input), Finding 2 (stale
-mechanism docs), and Finding 3 (missing explicit `chmod` on `SVC_USER`-
-written files `RUN_USER` must read), plus a Q2 consolidation ask (trim
-incident-narrative source comments). **All four are now independently
-verified fixed.** No new blocking issue found this round despite deliberate
-adversarial re-testing beyond what was asked. **Verdict: approved.**
+Round 2. Round 1 (testing pass) found two blocking defects (a named-pipe
+hang, a TOCTOU race defeating symlink containment) plus two non-blocking
+should-fix items (negated-line false confirmation, byte-vs-character read
+cap). The developer's round-1 fix restructures file access around a single
+`os.open(O_RDONLY|O_NOFOLLOW|O_NONBLOCK)` → `os.fstat()` → fd-pinned
+`/proc/self/fd` containment re-check → single bounded read, replacing the
+original `app.py`-`_read_head()`-based double-read design. This round
+re-verifies both fixes at the class level (not just the original two
+repros), re-runs the full suite, confirms the 9 new tests are non-vacuous,
+answers the coordinator's in-bounds-symlink question, then — since testing
+came back clean — completes the review pass deferred from round 1.
 
-## Re-verification of round-3 fixes
+## Test cases — re-verification of round-1 fixes
 
 | # | Item | Method | Result | Evidence |
 |---|---|---|---|---|
-| 1 | Regression suite | `uv run --with pytest python -m pytest tests/ -q`, repeated | pass (see flake note below) | `372 passed` in 5 of 6 full-suite attempts (one flake, investigated — see below; one run cut off by an unrelated tool-harness timeout with zero leftover processes, not a hang) |
-| 2 | No pre-existing test modified | `git status --porcelain tests/`, `git diff --stat -- tests/*.py`, `git diff -- app/app.py` re-read in full | pass | only `tests/test_teams_headless.py`/`tests/fixtures/` new/untracked; `app/app.py`'s diff is byte-identical to round 1 (unchanged this round) |
-| 3 | **Finding 1 closed at the class level**, not just the 4 original shapes | wrote and ran a 47-case fuzz set against both `_translate_claude`/`_translate_codex` through `_translate_safely()`: deeply nested wrong types (dict-in-list-in-dict with `None`s), wrong scalar types (`int`/`float`/`bool`/`None` where a dict/list was expected), absent keys entirely, empty dicts/lists, unexpected top-level `type` values (`None`, int, list, dict, a made-up string), and the codex-side equivalents (`item`/`error`/`message` fields each tried as `None`/string/list/int) | pass | **0/94** boundary-wrapper calls raised (47 cases × 2 translators); the *raw* `_translate_claude`/`_translate_codex` are still allowed to raise (confirmed several do, by design — the guarantee lives at the boundary, not per-branch) |
-| 4 | Finding 1's fix is genuinely load-bearing (revert-and-watch-it-fail) | temporarily reverted `_translate_safely()` to a bare passthrough (no try/except), re-ran the developer's own `test_shape_crash_line_through_the_real_agent_run_path_does_not_raise` (the real-`agent_run()`-path regression test) | fails cleanly without the fix, passes with it restored | reverted version raised the exact `AttributeError` at `app/teams.py:212` through the full real-tmux path, confirming the test isn't vacuous; restored code confirmed byte-identical to pre-revert (`diff` clean) and full suite re-passed (372) afterward |
-| 5 | Judge the blanket `except Exception` at the boundary | read `_translate_safely()`'s full contract; checked (a) whether it can swallow a signal that should propagate, (b) whether it can mask *our own* bug vs. the engine's output, (c) whether it affects `ok`/`exit_code` | sound, no changes needed | (a) `except Exception` does not catch `SystemExit`/`KeyboardInterrupt`/`GeneratorExit` (all `BaseException`-only in Python) — real interrupts still propagate correctly; (b) the caught exception's `type(e).__name__: {e}` is preserved verbatim in `error_message` and durably appended to the `.jsonl` log as an `error` event (`docs/story.md`'s own "nothing lost" principle) — a bug in *our* code (e.g. a stray `NameError`) would still show up in the log with a recognizably different signature (`NameError: name 'x' is not defined`) than a shape-mismatch (`AttributeError: 'str' object has no attribute 'get'`), so diagnosability survives the broad catch even though the two aren't type-distinguished in code; (c) `ok`/`exit_code` are sourced entirely from `rc_path` (the wrapping shell's real exit code), never from translation success — a swallowed translation failure degrades event/text quality for that one line only, never silently misreports whether the run itself succeeded |
-| 6 | Findings 2/3 verified fixed | (Finding 2) `grep`-confirmed `docs/ADDING_AN_ENGINE.md`/`config/switchboard.env.example` no longer describe the "whole script as one argv element to `bash -lc`" mechanism, now correctly describe the engine's own final `exec()`; `docs/implementation.md`'s "Deviations from spec" section now explicitly names the file-based invocation as a deliberate deviation from spec §2's literal shape. (Finding 3) confirmed `os.chmod(prompt_path, 0o644)`/`os.chmod(script_path, 0o644)` present at the two write sites | pass | both fixed as described |
-| 7 | **The strict-umask test genuinely exercises the failure it claims to** | revert-and-watch-it-fail: temporarily removed both new `os.chmod()` calls, re-ran `test_run_sh_and_prompt_file_are_world_readable_under_a_strict_umask` in isolation | fails cleanly without the fix (`AssertionError: 0 is not true : run.sh not world-readable: 0o600`), passes with it restored | confirmed non-vacuous; restored code verified byte-identical to the pre-revert file via `diff` |
-| 8 | Q2 — is the consolidation sufficient? | re-read `_MAX_ARG_STRLEN`/`_ARG_SCRIPT_OVERHEAD_BYTES`'s comments, `_validate_prompt_size()`'s docstring, `_build_script()`'s docstring, and `agent_run()`'s script-writing block in full | sufficient | all now state current rationale concisely (what's modeled, why it's per-argv-element, why the check is a sound proxy) with no "round 1 did X, round 2 did Y" narrative left in the hot-path code; one single-line pointer remains in `_translate_claude()`'s `user`-branch comment (`docs/test-review.md Finding A`) as a deliberate, cheap breadcrumb to the fuller writeup, not narrative — reasonable to keep. No other patch-on-patch structure found: no dead code, no orphaned parameters, no duplicate/parallel logic paths from earlier rounds. |
-| 9 | Verification labels still accurate | independently re-ran `python3 app/teams.py run claude ...` against the **current** code (after Finding 1/3's changes) | pass | `claude` still runs end-to-end cleanly (`ok=True`, real event stream, no error) — Finding 1/3's changes (translation-boundary robustness, explicit chmod) don't touch engine invocation commands or the happy path, as expected; no label needs updating |
+| 1 | Regression suite | `pytest tests/ -q`, 3 separate runs this round | pass, no flake | `437 passed` every time (372 + 65) |
+| 2 | No pre-existing test modified, `app/app.py` untouched | `git diff --stat -- tests/`, `git diff -- app/app.py` | pass | tests/ diff empty (only the new/untracked file); app.py 0 diff lines |
+| 3 | 9 new tests genuinely fail against the pre-fix (round-1) module | swapped `app/teams.py` for the saved pre-fix version, ran the new/changed tests, restored | pass — non-vacuous | 7 explicit failures (the 2 not expected to fail as regressions — `test_defect2_intermediate_symlinked_directory_is_also_rejected` and `test_defect3_negated_line...` — correctly did **not** fail, since both already held/were already-accepted pre-fix, exactly as the developer's own writeup claims); the two FIFO-hang tests failed *cleanly* via their bounded `join(timeout=5)`, not by hanging the test run — confirms that design choice actually works |
+| 4 | Defect 1 fix (`O_NONBLOCK`) is load-bearing | my own revert-and-watch-it-fail: removed `O_NONBLOCK` only, re-ran the 3 Defect-1 tests | fails exactly as expected (FIFO hangs again, all 3 fail) | restored, byte-diff clean |
+| 5 | Defect 2 fix, `O_NOFOLLOW` + fd-recheck redundancy claim | my own revert-and-watch-it-fail: removed **both** `O_NOFOLLOW` and the `/proc/self/fd` recheck together | fails and reproduces the exact original leak (`content == "TOP SECRET HOST CONTENT THAT MUST NEVER LEAK"`) | restored, byte-diff clean, confirms the test is non-vacuous and at least one mechanism is load-bearing, matching the developer's own claim |
+| 6 | Defect 4 (byte vs. character read cap) fix | my own script, independent of the new test | pass | 3,000,000×`€` (3 bytes each) → `content` byte length `2,097,150` ≤ cap `2,097,152` (was `6,291,436` — ~3x over — against the pre-fix code in round 1) |
+| 7 | *(beyond the two original repros)* symlink-to-a-FIFO at a candidate path | my own script (real `os.mkfifo` + `os.symlink` to it), bounded thread join | pass — rejected via `O_NOFOLLOW` before the FIFO's blocking behavior is ever reached; no hang | `hung=False`, `empty=True` |
+| 8 | *(beyond spec)* Unix domain socket at a candidate path | my own script (`socket.bind()`), bounded thread join | pass — rejected via the `S_ISREG` `fstat` check; no hang | `hung=False`, `empty=True` |
+| 9 | *(beyond spec)* device node at a candidate path | not tested — creating a real device node requires `CAP_MKNOD`/root, unavailable in this sandbox | not directly tested, but same codepath as the socket case (`fstat` → `S_ISREG` check) would reject it the identical way; low-risk gap, noted, not blocking |
+| 10 | *(beyond spec)* symlink whose parent directory is itself a symlink | developer's own `test_defect2_intermediate_symlinked_directory_is_also_rejected`, independently re-read and reasoned through (caught by `_under_workdir`'s whole-path `realpath()`, not the fd check) | pass | ran as part of the full suite; reasoning double-checked against the code, correct |
+| 11 | *(beyond spec)* symlink created in the window **between `os.open()` succeeding and `os.fstat()` running** (narrower than the pre-check→open window Defect 2 fixed) | my own script: monkeypatched `os.fstat` to swap the path to a symlink-to-secret as a side effect on its first call, before delegating to the real `fstat` | pass — **not exploitable**, correctly returns the *original* file's content, not the swapped target's, confirming the file descriptor is pinned to the already-open inode and cannot be affected by a later path-level change (this is the Unix guarantee the fix's whole approach rests on) | `content` == the original real content, not `"SECRET"` |
+| 12 | *(beyond spec)* `/proc/self/fd` unavailable (e.g. a container without procfs mounted) | my own script: monkeypatched `os.path.realpath` to return the literal (unresolved) string for any `/proc/self/fd/...` argument, simulating an unresolvable procfs entry | **degrades silently to permanently-empty grounding for every project, no exception, no signal** — see Finding 3 below | `entries == []`, `g["empty"] == True` for a genuinely valid in-bounds file |
 
-### The one flake, investigated further
-One of the 6 full-suite attempts this round failed
-`test_run_sh_and_prompt_file_are_world_readable_under_a_strict_umask` on its
-final `results["r"]["ok"]` assertion (the file-permission assertions
-earlier in the same test passed even in that run — the fix itself wasn't
-in question). I did not accept the developer's "transient contention,
-not reproduced" characterization at face value and instead: (a) ran the
-same test in isolation 5× via pytest — clean every time; (b) extracted the
-test's exact logic into a standalone script and ran it in a tight loop 25×
-outside the full suite — **0/25 failures**; (c) re-ran the full suite 3
-more times afterward — clean every time (372 passed each). This pattern
-(never reproducible in isolation, only ever seen once amid a full ~34s,
-80+ real-tmux-session suite) is consistent with genuine environmental
-contention, not a logic defect — and this sandbox specifically has other,
-unrelated `tmux`/Claude sessions from other projects visibly running
-concurrently on the same box (`claude-birdiely`, `claude-ai-dev-switchboard`
-sessions, confirmed via `tmux list-sessions` and `ps aux` during this
-review), which is a plausible independent source of scheduling contention
-this module has no control over. **Non-blocking finding for the writeup**:
-`docs/implementation.md`'s "Known limitations" entry attributes the
-*original* round-2 flake specifically to "manual, ad-hoc tmux probing... in
-this same shell session" — my own observation of the same *symptom class*
-happened without any such manual probing on my end, so the note's causal
-attribution is narrower than the evidence now supports. Worth broadening
-the wording to "environmental/shared-resource contention" generally rather
-than the one specific cause identified during round 2's diagnosis — a
-wording nit, not something that changes the accepted, non-blocking
-disposition of the flake itself.
+## Regression check
+`/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q` — **437 passed**, 3 separate runs this round, no flake. `git diff --stat -- tests/` and `git diff -- app/app.py` both confirm no pre-existing file touched.
 
-## Answers to the coordinator's five questions
-1. **Finding 1 closed at the class level** — yes, per items 3–4 above: a 47-shape fuzz sweep (94 boundary-wrapper calls) produced zero crashes, and the fix's own regression test was confirmed non-vacuous via revert-and-watch-it-fail.
-2. **The blanket `except Exception` judgment** — sound as designed; see item 5's three-part reasoning (doesn't swallow real signals, preserves enough diagnostic detail to distinguish an internal bug from external shape drift, doesn't affect the run's actual success/failure classification).
-3. **Findings 2/3 verified, including that the strict-umask test really exercises the failure** — yes, both confirmed fixed; the umask test's genuineness confirmed via revert-and-watch-it-fail (item 7), not just re-reading its assertions.
-4. **Is the Q2 consolidation sufficient?** — yes; no further patch-on-patch structure found worth addressing before 6b builds on this module.
-5. **Verification labels still accurate** — yes, independently re-confirmed live against the current code this round (item 9); no update needed.
+## Answer to the coordinator's in-bounds-symlink question
+**Silent skipping is defensible but not the best outcome, and I'd call it a should-fix, not a blocker.** The module already treats "empty/missing/unusable" as one unified, deliberately-unobservable-in-detail category by design (this predates the fix — the original spec explicitly unifies missing/empty/permission-denied/directory/symlink-loop into the same outcome). Extending that same unification to "rejected because it's a symlink, even an in-bounds one" is consistent with that existing precedent and isn't a spec violation. But the module's own design already cares about *some* observability — `empty: bool` and `_GROUNDING_NO_FILES_DIGEST` exist specifically so "genuinely nothing found" is legible to a caller rather than silently indistinguishable from "not yet loaded." A symlinked `README.md` is a plausible real setup (a monorepo, a shared-docs template) and its rejection is invisible at every level: not in `files`, not in `empty`'s reasoning, no separate `skipped`/`rejected` list, no log line. An operator debugging "why is grounding empty for this project" has no path to discovering the cause without already knowing to suspect a symlink and going and checking by hand. Recommend a lightweight follow-up (not blocking this round): either a `skipped: [{"label":..., "reason": "symlink"}]` entry in the returned dict, or at minimum a one-line log/stderr note — something that turns "grounding is mysteriously empty" into "grounding found a symlinked README.md but can't use it." This is already honestly documented in `docs/implementation.md`'s "Known limitations," which is the right thing to have done even before deciding whether to build the visibility improvement.
 
 ## Spec coverage
-Unchanged from round 3's assessment (all acceptance criteria traced to a
-passing automated test or an independently-verified manual step) — this
-round added no new spec surface, only fixed the three findings and trimmed
-comments, all covered by the re-verification above.
+Re-checked against `docs/spec.md`'s full acceptance-criteria list (all 22 items from round 1, unchanged by this round's fix): every criterion still traces to a passing automated test, all still hold under the restructured implementation. No acceptance criterion requires in-bounds symlink support (confirmed by re-reading the criteria list directly, not just trusting the developer's own claim), so the deliberate behavior narrowing doesn't create a spec gap. No acceptance criterion covers named pipes, sockets, or the TOCTOU race either — both defects were found via testing beyond the literal list, as flagged in the original brief, and both are now closed with dedicated regression tests.
+
+## Findings (most severe first)
+
+### 1. `fact_check`'s single-line matching is a real, not just theoretical, usefulness constraint for this repo's actual documentation style — should-fix / strong recommendation, non-blocking
+- Tried 6 realistic claims a lead might plausibly generate against this
+  repo's own `docs/ARCHITECTURE.md` (a close paraphrase of an actual
+  sentence, several natural paraphrases of true architectural facts):
+  only 2/6 returned `found: True`, and one of those only because its
+  particular supporting text happened to fit on one unwrapped line. The
+  other 4 failures were not because the claims were false or the terms
+  didn't appear — every failure was `docs/ARCHITECTURE.md`'s own wrapped
+  bullet-point prose splitting the supporting text across two lines (e.g.
+  "runs as `SVC_USER`... an" / "unprivileged system account..." — a single
+  sentence, two lines), which single-line-only matching structurally
+  cannot join.
+- This is explicitly the spec's own known, accepted limitation ("Open
+  questions": join adjacent non-blank lines into one matchable unit, if
+  6c's real usage shows this is too conservative) — not a defect, and not
+  something I'm asking this round to fix. But my testing turns "if 6c's
+  real usage shows this" from a hypothetical into a concrete, repo-specific
+  measurement: for *this* project's actual prose style, single-line-only
+  matching fails the *majority* of natural true claims I tried, not a rare
+  edge case. Recommend the product-manager treat the paragraph-joining
+  follow-up as a near-term (not someday-maybe) item for 6c, and that 6c's
+  own acceptance testing include a similar realistic-claims exercise before
+  concluding the tool is useful enough to wire into the lead loop.
+
+### 2. In-bounds symlink rejection is invisible to the caller — should-fix, non-blocking
+See "Answer to the coordinator's in-bounds-symlink question" above.
+Recommend a `skipped`/reason list or a log line as a lightweight follow-up;
+not required by any acceptance criterion, already honestly documented as a
+known limitation.
+
+### 3. `/proc/self/fd` unavailability degrades to silent, total, unexplained emptiness — nit, non-blocking
+If `/proc` isn't mounted (some minimal containers, some restricted
+namespaces), `os.path.realpath("/proc/self/fd/<fd>")` returns the literal,
+unresolved string, which never matches `workdir_real`, so **every**
+candidate for **every** project gets rejected as "out of bounds" — silently,
+with no exception and no distinguishing signal from "this project genuinely
+has no docs." Given the module (and this whole app) is already
+Linux-only and `/proc` is virtually always present on Linux, this is low
+practical risk, but it's a real, defined-but-surprising failure mode worth
+a one-line comment or a startup sanity check (`os.path.exists("/proc/self/fd")`)
+producing a clearer signal than universal silent emptiness, especially
+since the switchboard's own install/deploy story already involves
+containerized/service contexts elsewhere in this repo.
+
+### 4. Device-node candidate not directly tested — nit, non-blocking
+Couldn't construct a real device node in this sandbox (needs
+`CAP_MKNOD`/root). The `fstat`-based `S_ISREG` check is the same mechanism
+already verified against a FIFO, a directory, and a Unix domain socket
+(3 distinct non-regular `st_mode` values, all correctly rejected without
+hanging), so I have high confidence a device node is handled identically,
+but it's not something I directly observed this round.
+
+## Follow-ups (non-blocking)
+- Findings 1–4 above, roughly in priority order for a near-term pass.
+- Defect 3 (negated-line false confirmation, from round 1) remains
+  deliberately unfixed and documented — re-confirmed still correctly pinned
+  by `test_defect3_negated_line_is_a_known_false_confirmation_documented_not_fixed`
+  and still listed in `docs/implementation.md`'s "Known limitations." No
+  change requested; carrying forward as a 6c-facing heads-up, same as the
+  developer already flagged it.
+
+## Complexity / simplicity assessment
+**Earns its complexity.** The three-function layering
+(`_open_grounding_candidate` → `_read_grounding_candidate` →
+`_discover_and_read`) is exactly what fd-based TOCTOU elimination requires
+— there's no simpler shape that closes the actual race (a faster
+`realpath()`-then-`open()` narrows but never eliminates the window, as the
+developer's own writeup correctly reasons through). No speculative
+generality found: no unused parameters, no hooks anticipating 6c's
+tool-calling shape, no configuration surface beyond what round 1 already
+had. **No patch-on-patch structure**: the old `_looks_binary`/
+`_candidate_usable`/`_has_grounding_content` helpers are fully removed
+(`grep` confirms zero remaining references outside historical-context
+comments/docstrings), not left behind as dead code alongside the new path;
+the AST scan's function-name list and the read-only runtime test were both
+properly updated to the new function set rather than patched around;
+`app.py`'s own `_read_head()` is untouched and still used by
+`_gather_project_context()` elsewhere, so dropping it from this module's
+own import line was a clean removal, not a fork. `discover_grounding_files()`
+is a genuinely thin (one-line) wrapper around `_discover_and_read()`, not a
+second implementation.
 
 ## Overall verdict
-**Approved.** Four rounds in: Defect 1 and Defect 2 (blocking, testing-pass
-failures) and Findings 1–3 plus the Q2 ask (review-pass findings) are all
-independently re-confirmed fixed this round, not just re-read against the
-developer's own summary — every fix that could reasonably be verified via a
-revert-and-watch-it-fail check was verified that way, and Finding 1's
-closure was additionally stress-tested against 43 shapes beyond the four
-originally found. The one test flake observed is real but non-reproducible
-in isolation (0/25) and consistent with genuine shared-environment
-contention rather than a defect in this diff; it doesn't warrant another
-round, though the "Known limitations" wording could be broadened slightly
-(non-blocking, noted above). No further issues found despite deliberately
-adversarial re-testing beyond the coordinator's own checklist. This build
-cycle is done — hand control back to the product-manager agent for the next
-iteration.
+**Approve with follow-ups.** Both round-1 blocking defects are independently
+re-verified fixed at the class level, not just against their original two
+repros — I additionally exercised a symlink-to-FIFO, a Unix domain socket,
+the open()-to-fstat() race window specifically (confirmed the fd-pinning
+property that the whole fix rests on actually holds), and the /proc-
+unavailable degradation mode, none of which were in the original two
+repros. The 9 new tests are confirmed non-vacuous (fail against the pre-fix
+module, including the FIFO tests failing *cleanly* via their own bounded
+join rather than hanging the suite). Regression suite is clean across 3
+consecutive runs (437/437, no flake). Spec coverage is complete — no
+acceptance criterion is unimplemented or untested, and the deliberate
+in-bounds-symlink behavior narrowing doesn't violate anything the spec
+pins down. The diff itself is clean: no dead code, no patch-on-patch
+structure, no unjustified complexity, `app/app.py` genuinely untouched.
+
+Four non-blocking findings are carried forward as follow-ups (most notable:
+Finding 1, which gives the product-manager/6c concrete, repo-specific
+evidence that single-line-only matching may need its near-term follow-up
+sooner rather than later for the feature to be *useful*, not just safe).
+None of the four block this round — none violate a spec requirement, and
+each is either already honestly self-documented by the developer or a low-
+practical-risk edge case.
+
+This build cycle is done — hand control back to the product-manager agent
+for the next iteration.
