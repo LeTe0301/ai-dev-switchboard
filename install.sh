@@ -14,6 +14,11 @@
 #                         instead of prompting (what ct/create.sh uses)
 #   --with-git-hosting    also set up private bare-repo hosting + the
 #                         "+ New project" button (see scripts/, docs/GIT_HOSTING.md)
+#                         -- and, additively, installs Docker + a self-hosted
+#                         Gitea Compose stack (server + db), left OFF until
+#                         toggled in the web UI — see docs/spec.md (backlog
+#                         item 2a). The existing git-hosting flow above is
+#                         untouched; Gitea is inert infrastructure only for now.
 #   --with-code-server    also install code-server (VS Code in the browser)
 #   --with-host-control   also install host-agent/ on THIS machine (see
 #                         host-agent/README.md — usually installed on a
@@ -99,6 +104,22 @@ get_env() {  # get_env <file> <KEY> -> value or empty
     grep "^${2}=" "$1" 2>/dev/null | tail -1 | cut -d= -f2- || true
 }
 random_token() { head -c "${1:-16}" /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c "${1:-16}"; }
+ensure_docker() {  # ensure_docker -> installs Docker if missing, verifies the
+    # Compose plugin, sets DOCKER_COMPOSE_OK=1/0. Idempotent (never touches a
+    # pre-existing Docker install, however it got there) and safe to call more
+    # than once in the same run — shared by both --with-taiga and
+    # --with-git-hosting (see docs/spec.md "install.sh changes" #1) so a
+    # single install using both flags only installs/checks Docker once.
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "Installing Docker (via Docker's own convenience script)..."
+        curl -fsSL https://get.docker.com | sh
+    fi
+    DOCKER_COMPOSE_OK=1
+    if ! docker compose version >/dev/null 2>&1; then
+        echo "WARNING: 'docker compose' (the Compose plugin, not the old standalone docker-compose v1 binary) isn't available. Continuing, but the Docker Compose stack(s) below will be installed without being functional until you install the Compose plugin yourself (https://docs.docker.com/compose/install/)." >&2
+        DOCKER_COMPOSE_OK=0
+    fi
+}
 path_has_symlink() {  # path_has_symlink <abs path> -> true if any component is a symlink
     local p="$1" check="" part
     local IFS=/
@@ -237,17 +258,13 @@ if [ "$WITH_TAIGA" -eq 1 ]; then
 
     # 1. Docker itself — same curl-pipe-sh precedent code-server's own
     # install already uses one block above, rather than the distro's often-
-    # stale docker.io apt package. Idempotent: never touch a pre-existing
-    # Docker install, however it got there.
-    if ! command -v docker >/dev/null 2>&1; then
-        echo "Installing Docker (via Docker's own convenience script)..."
-        curl -fsSL https://get.docker.com | sh
-    fi
-    TAIGA_COMPOSE_OK=1
-    if ! docker compose version >/dev/null 2>&1; then
-        echo "WARNING: 'docker compose' (the Compose plugin, not the old standalone docker-compose v1 binary) isn't available. Taiga will be installed but not functional until you install the Compose plugin yourself (https://docs.docker.com/compose/install/). Continuing." >&2
-        TAIGA_COMPOSE_OK=0
-    fi
+    # stale docker.io apt package. Factored into the shared ensure_docker()
+    # helper (defined near set_env/get_env above) so --with-git-hosting's own
+    # Gitea steps below can reuse it instead of a second copy-pasted block —
+    # pure refactor, no behavior change here (docs/spec.md "install.sh
+    # changes" #1).
+    ensure_docker
+    TAIGA_COMPOSE_OK=$DOCKER_COMPOSE_OK
 
     # 2. The taiga-docker checkout — pinned at whatever commit is first
     # cloned; never `git pull`'d on re-run (docs/spec.md "Open questions").
@@ -367,6 +384,13 @@ SUDOERS=/etc/sudoers.d/ai-dev-switchboard
     echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-new-project-from-upload.sh *"
     if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
         echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-new-project.sh *"
+        # Gitea's own toggle wrapper triplet (docs/spec.md "Crossing the
+        # privilege boundary") — same zero-argument narrowing as Taiga's rules
+        # below, added alongside (not instead of) the existing new-project.sh
+        # rule this same flag already gates.
+        echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-gitea-up.sh"
+        echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-gitea-down.sh"
+        echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-gitea-status.sh"
     fi
     if [ "$WITH_TAIGA" -eq 1 ]; then
         # Zero arguments (no trailing " *") — narrower than every other rule
@@ -417,6 +441,113 @@ if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
     set_env "$GH_ENV" PROJECTS_DIR "$PROJECTS_DIR"
     /usr/local/bin/ai-dev-switchboard-git-hosting-setup.sh
     set_env "$ENV_FILE" NEW_PROJECT_SCRIPT "/usr/local/bin/ai-dev-switchboard-new-project.sh"
+
+    # ── Self-hosted Gitea (folds into --with-git-hosting, not a new flag —
+    # docs/spec.md "Sequencing — additive, not a swap"). Appended inside this
+    # same block, after the existing steps above, so today's exact output
+    # ordering/behavior is preserved for anyone diffing install logs. Purely
+    # additive: nothing above this point is touched, removed, or warned
+    # against — Gitea is installed but left OFF, inert infrastructure only
+    # until a future cycle (2b) wires create_project() to use it.
+    echo "-- Self-hosted Gitea (part of --with-git-hosting) --"
+
+    # 1. Docker itself — shared with --with-taiga via ensure_docker() (see
+    # that helper's own definition above); a no-op re-check if --with-taiga
+    # already ran it earlier in this same install.
+    ensure_docker
+    GITEA_COMPOSE_OK=$DOCKER_COMPOSE_OK
+
+    # 2. Author the compose file directly — no upstream repo to clone/pin the
+    # way taiga-docker is for Taiga (docs/spec.md "Background" /
+    # "Authoring the compose file directly"). Overwritten deterministically
+    # on every re-run (like the sudoers file) since it's authored by this
+    # project, not a user-editable checkout.
+    GITEA_DIR=/opt/ai-dev-switchboard-gitea
+    GITEA_PORT=3000
+    GITEA_SSH_PORT=2222
+    GITEA_URL_PATH="/gitea"  # mirrors app.py's GITEA_URL_PATH constant
+    install -D -m 644 "$REPO_DIR/config/gitea-docker-compose.yml" "$GITEA_DIR/docker-compose.yml"
+    mkdir -p "$GITEA_DIR/gitea" "$GITEA_DIR/postgres"
+
+    # 3. Config / secrets — $GITEA_DIR/.env, via set_env (generic, reusable
+    # across compose stacks, same as Taiga's usage). Secrets generated once
+    # via random_token, checked via get_env returning empty (same idiom
+    # TOTP_SECRET already uses) — never regenerated on re-run. ROOT_URL/
+    # DOMAIN aren't secrets, so they're re-derived every run to track
+    # whatever PUBLISH_MODE/BASE_URL currently resolve to (same as Taiga's
+    # TAIGA_DOMAIN).
+    GITEA_ENV="$GITEA_DIR/.env"
+    GITEA_DB_PASSWORD="$(get_env "$GITEA_ENV" POSTGRES_PASSWORD)"
+    if [ -z "$GITEA_DB_PASSWORD" ]; then
+        GITEA_DB_PASSWORD="$(random_token 24)"
+        set_env "$GITEA_ENV" POSTGRES_PASSWORD "$GITEA_DB_PASSWORD"
+    fi
+    set_env "$GITEA_ENV" POSTGRES_USER "gitea"
+    set_env "$GITEA_ENV" POSTGRES_DB "gitea"
+    set_env "$GITEA_ENV" GITEA__database__DB_TYPE "postgres"
+    set_env "$GITEA_ENV" GITEA__database__HOST "db:5432"
+    set_env "$GITEA_ENV" GITEA__database__NAME "gitea"
+    set_env "$GITEA_ENV" GITEA__database__USER "gitea"
+    set_env "$GITEA_ENV" GITEA__database__PASSWD "$GITEA_DB_PASSWORD"
+
+    GITEA_SECRET_KEY="$(get_env "$GITEA_ENV" GITEA__security__SECRET_KEY)"
+    [ -n "$GITEA_SECRET_KEY" ] || set_env "$GITEA_ENV" GITEA__security__SECRET_KEY "$(random_token 32)"
+    GITEA_INTERNAL_TOKEN="$(get_env "$GITEA_ENV" GITEA__security__INTERNAL_TOKEN)"
+    [ -n "$GITEA_INTERNAL_TOKEN" ] || set_env "$GITEA_ENV" GITEA__security__INTERNAL_TOKEN "$(random_token 64)"
+    # Always set (not conditional) — closes the "first visitor claims the
+    # public install wizard" race (docs/spec.md "Background"): DB/config is
+    # already fully supplied above via env vars, so leaving Gitea installed
+    # but off is safe even before an admin account exists.
+    set_env "$GITEA_ENV" GITEA__security__INSTALL_LOCK "true"
+
+    if [ "$PUBLISH_MODE" = "tailscale" ] && [ -n "$BASE_URL" ]; then
+        GITEA_DOMAIN_VALUE="${BASE_URL#https://}"
+        GITEA_DOMAIN_VALUE="${GITEA_DOMAIN_VALUE#http://}"
+        GITEA_ROOT_URL_VALUE="${BASE_URL}${GITEA_URL_PATH}"
+    else
+        GITEA_DOMAIN_VALUE="127.0.0.1:$GITEA_PORT"
+        GITEA_ROOT_URL_VALUE="http://127.0.0.1:$GITEA_PORT"
+    fi
+    set_env "$GITEA_ENV" GITEA__server__DOMAIN "$GITEA_DOMAIN_VALUE"
+    set_env "$GITEA_ENV" GITEA__server__ROOT_URL "$GITEA_ROOT_URL_VALUE"
+    # GITEA_PORT/GITEA_SSH_PORT also live in this same .env (not just
+    # switchboard.env below) — Compose auto-loads .env from the project
+    # directory for variable substitution, which is what lets
+    # gitea-docker-compose.yml reference ${GITEA_PORT}/${GITEA_SSH_PORT}
+    # without the wrapper scripts needing to export anything themselves
+    # (same idiom as Taiga's own TAIGA_PORT in taiga-docker's .env).
+    set_env "$GITEA_ENV" GITEA_PORT "$GITEA_PORT"
+    set_env "$GITEA_ENV" GITEA_SSH_PORT "$GITEA_SSH_PORT"
+
+    # 4. Pre-pull images at install time, not first toggle — otherwise the
+    # first UI toggle-on blocks on pulling images over the network.
+    # Warn-and-continue (not fatal) if there's no network right now; the
+    # first toggle-on will simply be slow instead (identical reasoning and
+    # idiom to Taiga's own pre-pull step).
+    if [ "$GITEA_COMPOSE_OK" -eq 1 ]; then
+        echo "Pre-pulling Gitea's images..."
+        if ! ( cd "$GITEA_DIR" && docker compose pull ); then
+            echo "WARNING: pre-pulling Gitea's images failed (no network at install time?) — Gitea stays installed, just with uncached images; the first toggle-on will pull them then instead. Continuing." >&2
+        fi
+    fi
+
+    # 5. Wrapper scripts (root-run, zero arguments — see docs/spec.md
+    # "Crossing the privilege boundary"). Sudoers entries for these are added
+    # above, alongside every other sudoers rule this installer generates.
+    install -m 755 "$REPO_DIR/scripts/gitea-up.sh" /usr/local/bin/ai-dev-switchboard-gitea-up.sh
+    install -m 755 "$REPO_DIR/scripts/gitea-down.sh" /usr/local/bin/ai-dev-switchboard-gitea-down.sh
+    install -m 755 "$REPO_DIR/scripts/gitea-status.sh" /usr/local/bin/ai-dev-switchboard-gitea-status.sh
+
+    # 6. switchboard.env — GITEA_DIR is also recorded here (beyond what
+    # app.py itself reads) because the wrapper scripts above source this
+    # same file for it, exactly like TAIGA_DIR's usage above.
+    set_env "$ENV_FILE" GITEA_ENABLED 1
+    set_env "$ENV_FILE" GITEA_PORT "$GITEA_PORT"
+    set_env "$ENV_FILE" GITEA_LABEL "Gitea"
+    set_env "$ENV_FILE" GITEA_DIR "$GITEA_DIR"
+    set_env "$ENV_FILE" GITEA_UP_SCRIPT "/usr/local/bin/ai-dev-switchboard-gitea-up.sh"
+    set_env "$ENV_FILE" GITEA_DOWN_SCRIPT "/usr/local/bin/ai-dev-switchboard-gitea-down.sh"
+    set_env "$ENV_FILE" GITEA_STATUS_SCRIPT "/usr/local/bin/ai-dev-switchboard-gitea-status.sh"
 fi
 
 if [ "$WITH_HOST_CONTROL" -eq 1 ]; then
@@ -453,6 +584,20 @@ if [ "$WITH_TAIGA" -eq 1 ]; then
     echo "interactive — not automated by this installer):"
     echo "  cd $TAIGA_DIR && ./taiga-manage.sh createsuperuser"
     echo "(run that after the Taiga toggle is on and the stack has finished starting)."
+fi
+if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
+    echo ""
+    echo "Gitea: installed but left OFF — flip the 'Gitea' row's toggle in the"
+    echo "web UI to start it. A 2-container stack (Gitea + Postgres), well under"
+    echo "1 GB of RAM once turned on; toggling it back off frees that right away."
+    echo "The existing git-hosting flow ('+ New project', the git user, ${RUN_USER}'s"
+    echo "own repos) is completely unchanged and keeps working exactly as before —"
+    echo "Gitea doesn't do anything with real repos yet (see docs/spec.md)."
+    echo "Before first use, create Gitea's own admin account (one-time, a single"
+    echo "non-interactive command — not automated by this installer):"
+    echo "  docker exec -it --user git ai-dev-switchboard-gitea gitea admin user create \\"
+    echo "    --admin --username <name> --password <password> --email <email>"
+    echo "(run that after the Gitea toggle is on and the stack has finished starting)."
 fi
 echo ""
 echo "Next: log in as $RUN_USER and run your engine's CLI once interactively"

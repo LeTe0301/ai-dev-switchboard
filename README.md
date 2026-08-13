@@ -79,7 +79,9 @@ pipx install aider-chat                    # aider
 - **A private git-hosting box that also runs the agents.** With
   `--with-git-hosting`, "push a new project" and "start an agent on it" are
   two clicks total, including auto-sync back to disk on every future push
-  — see [`docs/GIT_HOSTING.md`](docs/GIT_HOSTING.md).
+  — see [`docs/GIT_HOSTING.md`](docs/GIT_HOSTING.md). The same flag also
+  installs a self-hosted Gitea instance (own singleton toggle row, off by
+  default) as inert infrastructure for a future cycle to actually wire up.
 
 ## What you get
 
@@ -107,6 +109,11 @@ pipx install aider-chat                    # aider
   [`--with-git-hosting`](docs/GIT_HOSTING.md): creates a private bare repo
   + a working copy in one step, kept in sync automatically on every future
   `git push`.
+- **A self-hosted Gitea singleton row** — optional, also installed (but left
+  off) by `--with-git-hosting`: a 2-container (Gitea + Postgres) Docker
+  Compose stack, well under 1 GB RAM once toggled on. Doesn't create/host
+  real repos yet in this cycle — see `docs/spec.md` (backlog item 2a); the
+  existing "+ New project" flow above keeps working unchanged either way.
 - **An optional extra row** for a persistent session on a *different*
   machine (e.g. the Proxmox host itself, outside any container) — see
   [`host-agent/README.md`](host-agent/README.md).

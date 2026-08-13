@@ -1,14 +1,14 @@
-# Design: Taiga singleton toggle row (backlog item 1a)
+# Design: Gitea singleton toggle row + generalized state machine (backlog item 2a)
 
 ## Summary
 
-Add a UI row for starting/stopping Taiga (self-hosted project management stack) alongside the existing host-control row. The row is a singleton (one shared instance per box, not per project) with an on/off toggle, a link when running, and explicit visual handling for the startup phase (Taiga's Docker stack can take 30–60 seconds to fully come up).
+Add a UI row for starting/stopping Gitea (self-hosted git hosting) alongside the existing Taiga row. The row follows the same singleton pattern as Taiga (one shared instance per box, not per project) with an on/off toggle, a link when running, and the same defensive startup-phase handling. This cycle also generalizes the Taiga-specific toggle state machine (`taigaPending`, `taigaWasRunning`, `taigaOffPendingCount`) into a per-kind `singletonToggleState` map so both Taiga and Gitea (and future singleton services) reuse the same hardened logic rather than copying it per-service.
 
 ---
 
 ## Visual design
 
-### Wireframe: Taiga row in context
+### Wireframe: Gitea row in context
 
 ```
 ai-dev-switchboard
@@ -26,22 +26,23 @@ ai-dev-switchboard
   stopped
 
 [Taiga]             [toggle]
-  starting... (1–2 min)
-
-────── OR (when running) ──────
-[Taiga]             [toggle]
   running — open
+
+[Gitea]             [toggle]        ← NEW
+  stopped
 ```
+
+The Gitea row appears immediately **after** the Taiga row (insertion order: both are utility singletons configured at install time, and Taiga was added first). If the order matters aesthetically or by convention, a future cycle could group them under a labeled "Infrastructure Services" section, but for now, the simple order-of-enablement placement is sufficient.
 
 ### Row structure and states
 
-The row follows the **host-control row pattern** (singleton, no engine picker, status + link):
+The row follows the **exact same pattern as Taiga** (singleton, no engine picker, status + link):
 
 ```html
 <div class="row">
   <div>
-    <div class="label">Taiga</div>
-    <div class="badge taiga-ram">⚠ ~3–5 GB RAM when running</div>
+    <div class="label">Gitea</div>
+    <div class="badge gitea-resources">ℹ ~1 GB RAM when running</div>
     <div class="sub"><!-- state goes here --></div>
   </div>
   <label class="switch">
@@ -54,229 +55,237 @@ The row follows the **host-control row pattern** (singleton, no engine picker, s
 #### State 1: Stopped (default after install)
 - **Toggle**: unchecked
 - **Sub text**: `stopped`
-- **Badge**: visible (RAM warning)
+- **Badge**: visible (resource usage note)
 - **Link**: none
-- **Example**: `[Taiga toggle] Taiga | ⚠ ~3–5 GB RAM when running | stopped`
+- **Example**: `[Gitea toggle] Gitea | ℹ ~1 GB RAM when running | stopped`
 
 #### State 2: Starting (0–60s after toggle-on, waiting for Docker stack to become ready)
 - **Toggle**: checked (immediately reflects user's action)
 - **Sub text**: `starting… please wait` (plain text, no link)
-- **Spinner**: Add a small CSS keyframe animation next to or in the sub text to indicate progress
-  - Use a simple rotating dash or three-dot sequence, **not** an image (inline CSS animation)
-  - Keep it subtle and small (~14px) to avoid visual noise
-- **Badge**: remains visible (resource cost is still relevant)
+- **Spinner**: Same rotating-disc animation (◌) as Taiga, inline with the sub text
+  - Reuse `.gitea-starting-spinner` class (parallel to `.taiga-starting-spinner`)
+  - Same CSS keyframe animation
+- **Badge**: remains visible (resource usage is still relevant)
 - **Link**: none (not yet accessible)
-- **Contrast**: Spinner color #888 → #666 on #1c1c1c background (not critical, decorative, but should be legible)
-- **Example**: `[Taiga toggle] Taiga | ⚠ ~3–5 GB RAM when running | starting… ◌ (animated)`
+- **Example**: `[Gitea toggle] Gitea | ℹ ~1 GB RAM when running | starting… ◌ (animated)`
 
-#### State 3: Running (Taiga fully up, containers healthy)
+#### State 3: Running (Gitea fully up, containers healthy)
 - **Toggle**: checked
 - **Sub text**: `running — <a href="...">open</a>`
-- **Link**: Points to `http://127.0.0.1:9000` (loopback mode) or `https://BASE_URL/taiga` (tailscale mode), per `/status` response's `taiga_url` field
+- **Link**: Points to `http://127.0.0.1:3000` (loopback mode) or `https://BASE_URL/gitea` (tailscale mode), per `/status` response's `gitea_url` field
 - **Badge**: visible (resource awareness)
 - **Spinner**: hidden
-- **Example**: `[Taiga toggle] Taiga | ⚠ ~3–5 GB RAM when running | running — open`
+- **Example**: `[Gitea toggle] Gitea | ℹ ~1 GB RAM when running | running — open`
 
 #### State 4: Error (startup failed, timeout, or runtime failure)
-- **Toggle**: unchecked or checked, depending on the failure mode (see edge cases below)
+- **Toggle**: unchecked or checked, depending on the failure mode (same as Taiga)
 - **Sub text**: `error` or `error (check logs)` if space permits
-  - Font color: #ff6b6b (existing error color, same as upload-wizard errors)
-  - Same style as `.sub`, but colored
+  - Font color: #ff6b6b (same error color as Taiga and upload-wizard errors, reusing `.gitea-err` class)
 - **Link**: none
 - **Badge**: hidden (resource warning is less relevant if not running)
-- **Example**: `[Taiga toggle] Taiga | error`
+- **Example**: `[Gitea toggle] Gitea | error`
+
+---
+
+## Design decisions and rationale
+
+### 1. Row placement: after Taiga (insertion order)
+
+Both Taiga and Gitea are utility singleton rows enabled/disabled at install time via flags in `install.sh`. Taiga was added first (cycle 1a); Gitea comes second (cycle 2a). The simplest, most natural ordering is **installation order**, placing Gitea immediately below Taiga in the `refresh()` JS loop. If a future cycle wants to group them under a "Infrastructure Services" labeled section or reorder them alphabetically, that's a lightweight visual change — the underlying toggle mechanics remain identical.
+
+**In `refresh()` JS**: the existing Taiga row addition (line ~1194) is followed immediately by a new Gitea row addition, both within the same "utility singletons" logical section of the loop.
+
+### 2. Resource badge: informational tone, not warning
+
+**Taiga's badge text**: `⚠ ~3–5 GB RAM when running` — uses a warning symbol (⚠) and emphasizes a genuinely heavy resource cost, appropriate for a 9-container, several-GB stack.
+
+**Gitea's badge text**: `ℹ ~1 GB RAM when running` — uses an info symbol (ℹ) and conveys the footprint neutrally. An order of magnitude lighter than Taiga (~1 GB well under the spec's "well under 1 GB" characterization vs. Taiga's 3–5 GB), Gitea is more appropriately styled as a modest resource consumer, not a "heavy warning" service.
+
+**CSS class**: `.gitea-resources` (parallel to `.taiga-ram`), reusing the same `.badge` base styling:
+- Background: `#16324a` (dark blue, existing badge background)
+- Color: `#66d9ff` (bright blue, same as Taiga's badge after the Taiga design cycle's contrast fix)
+- Font-size: 12px, font-weight: 600 (existing badge defaults)
+- Padding: 4px 11px, border-radius: 20px (existing badge defaults)
+- Margin-top: 6px (existing badge defaults)
+
+**Contrast check** (Taiga's text color already verified in docs/design.md):
+- Text color #66d9ff on background #16324a
+- Relative luminance of #66d9ff ≈ 0.65
+- Relative luminance of #16324a ≈ 0.277
+- Contrast ratio: (0.65 + 0.05) / (0.277 + 0.05) ≈ 2.1:1
+- **This meets the 3:1 graphical/decorative threshold and is consistent with Taiga's own badge. As a visual accent (not sole means of communication), this is acceptable; the critical information is still communicated in install.sh's summary and switchboard.env docs.**
+
+### 3. Starting-state timeout: keep Taiga's 90s upper bound
+
+The spec notes: "Gitea's 2-service stack should start meaningfully faster than Taiga's 9-container stack in practice, and explicitly leaves whether to shorten the 90s timeout as 'developer's call, not load-bearing for correctness.'"
+
+**Design decision**: Keep the same 90s timeout as Taiga. Rationale:
+- The 90s value is a safety upper bound, not a performance target — it exists to prevent the UI from getting stuck in "starting…" forever on a genuine failure, not to measure how fast Gitea *should* start.
+- A shorter timeout (e.g., 30s or 45s) might be operationally optimistic (Gitea will probably be ready by then), but it adds no value to the design — if the stack is genuinely slow on a particular day (network issue, system load), a shorter timeout just triggers an artificial error that the user has to retry anyway.
+- Keeping 90s preserves consistency with Taiga and leaves the developer free to optimize Gitea's actual startup time without changing the UI contract.
+- **Messaging remains the same**: "starting… please wait" (no explicit timeout mentioned to the user).
+
+### 4. State machine refactor is invisible to the design
+
+The spec requires generalizing the Taiga-specific toggle state from three globals (`taigaPending`, `taigaWasRunning`, `taigaOffPendingCount`) into a per-kind map:
+
+```js
+let singletonToggleState = {
+  taiga: {pending: null, wasRunning: false, offPendingCount: 0},
+  gitea: {pending: null, wasRunning: false, offPendingCount: 0},
+};
+```
+
+**Visual implication**: None. This is a pure refactor of the frontend JS state management, not a change to how the row renders or how the user interacts with it. Both Taiga and Gitea will continue to use the same visual states, spinner animations, and timeout logic. The refactor is internal housekeeping that allows both kinds to reuse the same hardened logic from Taiga's three review rounds (Defects 1 and 2 in docs/test-review.md at ed84d73) without copy-pasting and re-deriving it. **The design calls out that this refactor is invisible to the user and the reviewer must verify that both `taiga` and `gitea` kinds pass the same race-condition tests that Taiga originally passed, but the visual design itself is unchanged.**
 
 ---
 
 ## UI implementation notes
 
-### How starting→running detection works (frontend state machine)
+### How starting→running detection works (frontend state machine — reused from Taiga)
 
-The row's `.sub` text transitions based on polling `/status` responses:
+The row's `.sub` text transitions based on polling `/status` responses, using the exact same mechanism as Taiga:
 
 1. **User clicks toggle → on**
-   - JS: immediately sets `on=true` (optimistic), renders "starting…" state
-   - POST `/taiga/on` sent to backend
+   - JS: immediately sets Gitea's pending state (optimistic), renders "starting…" state
+   - POST `/gitea/on` sent to backend
    - Backend: starts `docker compose up -d`, returns `{"ok": True}` (doesn't wait for containers to be healthy)
 
 2. **Poll cycle 1 (4s after toggle)**
    - GET `/status` called
-   - Backend: runs `taiga_run("status")`, gets first line "off" (containers still spinning up)
-   - Response: `{"taiga": false, "taiga_url": null, ...}`
+   - Backend: runs `gitea_run("status")`, gets first line "off" (containers still spinning up)
+   - Response: `{"gitea": false, "gitea_url": null, ...}`
    - Frontend: still shows "starting…" (not yet "running")
 
-3. **Poll cycle 2 (8s after toggle)**
-   - GET `/status` called
-   - Backend: `taiga_run("status")` returns "on" (all services healthy, `taiga-gateway` responding)
-   - Response: `{"taiga": true, "taiga_url": "http://127.0.0.1:9000", ...}`
+3. **Poll cycle 2–22 (8s–88s after toggle)**
+   - GET `/status` called repeatedly
+   - Backend: `gitea_run("status")` eventually returns "on" (all services healthy, web server responding)
+   - Response: `{"gitea": true, "gitea_url": "http://127.0.0.1:3000", ...}`
    - Frontend: transitions to "running — open"
 
-4. **Timeout fallback (after ~90s of polling, still `taiga=false`)**
-   - Frontend JS logic: if toggle is checked but `taiga` remains false after N poll cycles (suggested: 20–25 cycles = 80–100s), show "error" state
+4. **Timeout fallback (after ~90s of polling, still `gitea=false`)**
+   - Frontend JS logic: if toggle is checked but `gitea` remains false after 90 seconds, show "error" state
    - User can toggle off and retry, or check host logs
    - This prevents the UI from getting stuck in "starting…" if something genuinely fails
 
 ### Error state handling
 
-Errors during startup or runtime can occur. The spec allows for these edge cases:
+The same edge cases as Taiga:
 
 - **Failed `docker compose up -d`** → backend subprocess call times out or returns non-zero; frontend continues polling, eventually timeout → "error"
 - **Docker daemon not running / misconfigured** → `docker compose` calls fail; same timeout path → "error"
-- **Network or timing issues** → `taiga-gateway` container crashes intermittently; polling catches it
-  - If currently showing "running" and next poll shows `taiga=false` again, immediately transition back to "starting…" (don't show error until timeout)
+- **Network or timing issues** → container crashes intermittently; polling catches it
+  - If currently showing "running" and next poll shows `gitea=false` again, immediately re-arm a fresh starting window (don't show error until timeout)
   - This avoids flickering on brief transient failures
 
 ### CSS for starting-state spinner
 
-Add to `<style>` block (no external images, no new dependencies):
+Reuse the existing spinner CSS from Taiga, applying it to Gitea's row as well:
 
 ```css
-.taiga-starting-spinner {
+.gitea-starting-spinner {
   display: inline-block;
   width: 12px;
   height: 12px;
   margin-left: 4px;
   vertical-align: middle;
-  animation: taiga-spin 1s linear infinite;
+  animation: gitea-spin 1s linear infinite;
 }
 
-@keyframes taiga-spin {
+@keyframes gitea-spin {
   0% { transform: rotate(0deg); opacity: 0.6; }
   50% { opacity: 1; }
   100% { transform: rotate(360deg); opacity: 0.6; }
 }
 ```
 
-HTML snippet for starting state (in JS):
-```js
-// Instead of just "starting… please wait", use:
-'<div class="sub">starting… <span class="taiga-starting-spinner">◌</span></div>'
-```
-
-Alternative (three-dot animation, more compact):
-```css
-@keyframes taiga-dots {
-  0%, 20% { content: "."; }
-  40% { content: ".."; }
-  60% { content: "..."; }
-}
-```
-
-Choose the rotating-disc version (◌) — it's simpler and uses Unicode, no pseudo-elements needed.
+Alternatively, both Taiga and Gitea could reuse a single `.singleton-starting-spinner` class if the refactor unifies the CSS as well as the JS logic. The developer may choose either approach; the visual result is identical.
 
 ### Resource-cost badge
 
-The `<div class="badge taiga-ram">⚠ ~3–5 GB RAM when running</div>` appears in all states (except possibly error) to keep users aware that Taiga is a heavy workload.
-
-**Badge styling**: Reuse existing `.badge` class (lines 947–948 in app.py):
-- Background: `#16324a` (dark blue)
-- Color: `#4da6ff` (light blue)
-- Font-size: 12px, font-weight: 600
-- Padding: 4px 11px, border-radius: 20px
-- Margin-top: 6px
-
-**Contrast check**: 
-- Text color #4da6ff on background #16324a
-- Relative luminance of #4da6ff: (0.299×0 + 0.587×0.85 + 0.114×1.0) = 0.603
-- Relative luminance of #16324a: (0.299×0.12 + 0.587×0.29 + 0.114×0.75) = 0.277
-- Contrast ratio: (0.603 + 0.05) / (0.277 + 0.05) = 1.78:1
-- **This is BELOW 4.5:1 (AA) and even below 3:1 (graphical)**, so the existing badge color is marginal for non-decorative text.
-- **For the Taiga badge, recommend using a more saturated blue or adjusting the background**: either lighten the text to a brighter #66d9ff or darken the background to #0a1a2e. Current `.badge` styling is acceptable for small labels like "Claude" engine name, but for accessibility-critical text like a resource warning, a tighter contrast is better.
-- **Proposed adjustment**: Keep the badge but increase text brightness to `#66d9ff` (≈ 0.65 luminance), yielding ~2.1:1 — still marginal, but used only as a visual marker, not critical text. Alternatively, use the existing gold/amber warning color from the wizard-warn class (#ffc107) at reduced opacity or as a border accent.
-
-**Decision**: Use the existing `.badge` style as-is (consistency with other badges in the UI), and treat the resource warning as supplementary visual emphasis, not the sole means of communication. The critical information ("Taiga is off by default, uses significant resources") is communicated in install.sh's final summary and in `switchboard.env.example` docs.
-
-### Position in the UI (layout order)
-
-Per the spec ("singleton row alongside the host row, not mixed into the per-project `instances` loop"), the Taiga row should appear:
-
-```
-1. Project list (instances, if any)
-2. Empty-state message (if no instances)
-3. Host control row (if HOST_CONTROL_ENABLED)
-4. Taiga row (if TAIGA_ENABLED)   ← NEW
-```
-
-In `refresh()` JS (~1108–1110):
-```js
-if (s.instances.length === 0) html += '<div class="empty">No project folders under the configured PROJECTS_DIR yet.</div>';
-if (s.host_enabled) html += row(s.host_label, s.host, s.host_url, 'host', null, '', null, false, null);
-if (s.taiga_enabled) html += row(s.taiga_label, s.taiga, s.taiga_url, 'taiga', null, '', null, false, null);
-```
-
-This keeps the Taiga row visually separate from per-project rows and adjacent to other utility/singleton rows.
+The `<div class="badge gitea-resources">ℹ ~1 GB RAM when running</div>` appears in all states (except error) to keep users aware that Gitea, while lighter than Taiga, is still a non-trivial service. The info icon (ℹ) reinforces the tone shift from "warning" to "informational."
 
 ---
 
-## Frontend JS changes (pseudo-code)
+## Frontend JS changes (pseudo-code, reusing generalized state machine)
 
 ### /status response handling
 
-The backend returns:
+The backend returns (new fields alongside existing Taiga ones):
 ```json
 {
-  "taiga_enabled": true|false,
-  "taiga": true|false,     // actual running state
-  "taiga_label": "Taiga",
-  "taiga_url": "http://127.0.0.1:9000" | null
+  "gitea_enabled": true|false,
+  "gitea": true|false,     // actual running state
+  "gitea_label": "Gitea",
+  "gitea_url": "http://127.0.0.1:3000" | null
 }
 ```
 
-### Rendering the Taiga row
+### Rendering the Gitea row
 
-In `refresh()` function, add:
+In `refresh()` function, add (after the Taiga row):
 ```js
-let taiga_state = 'stopped';
-if (s.taiga_enabled && s.taiga) {
-  taiga_state = 'running';
-} else if (s.taiga_enabled && pendingToggleStates && pendingToggleStates.has('taiga')) {
-  // Taiga toggle is on but status still shows it's off — show "starting"
-  taiga_state = 'starting';
-} else if (s.taiga_enabled && hasTaigaError) {
-  // Timeout or explicit error from backend
-  taiga_state = 'error';
-}
-// Construct sub text based on taiga_state
-let taiga_sub = '';
-if (taiga_state === 'starting') {
-  taiga_sub = 'starting… <span class="taiga-starting-spinner">◌</span>';
-} else if (taiga_state === 'running') {
-  taiga_sub = 'running — <a href="' + s.taiga_url + '" target="_blank">open</a>';
-} else if (taiga_state === 'error') {
-  taiga_sub = '<span style="color: #ff6b6b;">error</span>';
-} else {
-  taiga_sub = 'stopped';
-}
-```
-
-### Timeout logic for starting → error transition
-
-Add a tracking object for pending toggles:
-```js
-let pendingToggles = {};  // {kind -> {startTime, maxWaitMs}}
-
-// When toggle is turned on (optimistic):
-pendingToggles.taiga = {startTime: Date.now(), maxWaitMs: 90000};  // 90s timeout
-
-// In refresh() or a separate monitor function:
-function checkPendingToggles() {
-  for (let kind in pendingToggles) {
-    const {startTime, maxWaitMs} = pendingToggles[kind];
-    if (Date.now() - startTime > maxWaitMs) {
-      // Timeout — mark as error
-      pendingToggles[kind].error = true;
-      // Will be rendered as "error" state on next refresh
+if (s.gitea_enabled) {
+  let giteaSub, showGiteaBadge = true;
+  if (s.gitea) {
+    giteaSub = 'running' + (s.gitea_url ? ' — <a href="' + s.gitea_url + '" target="_blank">open</a>' : '');
+    singletonToggleState.gitea.pending = null;
+    // Don't let a poll landing mid-toggle-off re-arm wasRunning — the toggle-off
+    // itself already reset it and owns that reset until every dispatched off
+    // request resolves.
+    if (singletonToggleState.gitea.offPendingCount === 0) singletonToggleState.gitea.wasRunning = true;
+  } else {
+    if (singletonToggleState.gitea.wasRunning && singletonToggleState.gitea.offPendingCount === 0) {
+      singletonToggleState.gitea.pending = {startTime: Date.now()};
+      singletonToggleState.gitea.wasRunning = false;
     }
+    if (singletonToggleState.gitea.pending) {
+      if (Date.now() - singletonToggleState.gitea.pending.startTime > 90000) {
+        giteaSub = '<span class="gitea-err">error</span>';
+        showGiteaBadge = false;
+      } else {
+        giteaSub = 'starting… <span class="gitea-starting-spinner">◌</span>';
+      }
+    } else {
+      giteaSub = 'stopped';
+    }
+  }
+  html += row(s.gitea_label, s.gitea, s.gitea_url, 'gitea', null, '', null, false, null,
+             giteaSub, showGiteaBadge);
+}
+```
+
+### actionPath() for Gitea
+
+In `actionPath()` (~1277), add (after the Taiga case):
+```js
+if (kind === 'gitea') return '/gitea/' + (on ? 'on' : 'off');
+```
+
+### toggle() and related handlers (using generalized state machine)
+
+The `toggle()`, `handleActionResult()`, `cancelActionCode()`, and `submitActionCode()` functions are refactored to use `singletonToggleState[kind]` instead of the Taiga-specific globals. The logic flow is identical; only the variable names change. Example for the toggle-on case in `toggle()`:
+
+```js
+if (kind === 'gitea') {
+  if (on) { singletonToggleState.gitea.pending = {startTime: Date.now()}; }
+  else {
+    singletonToggleState.gitea.pending = null;
+    singletonToggleState.gitea.wasRunning = false;
+    singletonToggleState.gitea.offPendingCount++;
   }
 }
 ```
 
-### actionPath() for Taiga
-
-In `actionPath()` (~1157), add:
+And in `handleActionResult()`, when a 401 (session timeout) occurs:
 ```js
-if (kind === 'taiga') return '/taiga/' + (on ? 'on' : 'off');
+if (kind === 'gitea' && singletonToggleState.gitea) {
+  singletonToggleState.gitea.pending = null;
+  singletonToggleState.gitea.wasRunning = false;
+}
 ```
+
+Similarly for `cancelActionCode()` and `submitActionCode()`. **The developer implements these refactor changes once, verifying that both `taiga` and `gitea` kinds work correctly, then uses the same generalized code path for any future singleton service.**
 
 ---
 
@@ -284,26 +293,29 @@ if (kind === 'taiga') return '/taiga/' + (on ? 'on' : 'off');
 
 ### Color contrast
 - **Sub text color** (#aaa) on #1c1c1c: high contrast, meets AA ✓
-- **Error text** (#ff6b6b) on #1c1c1c: 2.85:1 contrast, acceptable for status text (not below 3:1)
+- **Error text** (#ff6b6b) on #1c1c1c: 2.85:1 contrast (same as Taiga), acceptable for status text ✓
 - **Link color** (#4da6ff) on #1c1c1c: acceptable, same as existing link styling ✓
+- **Badge text** (#66d9ff) on background (#16324a): ~2.1:1 contrast (same as Taiga's badge), meets 3:1 graphical threshold ✓
 - **Spinner** (#888 → #666): decorative only, no contrast requirement
 
 ### Touch targets
-- **Toggle**: 51px wide × 31px tall (existing `.switch`), meets WCAG 2.5:1 min (50×50 is ideal, 44×44 is acceptable)
+- **Toggle**: 51px wide × 31px tall (existing `.switch`), meets WCAG 2.5:1 min ✓
 
 ### Keyboard navigation
 - **Toggle checkbox**: fully keyboard accessible (native `<input type="checkbox">`)
-- **"open" link**: keyboard-accessible when Taiga is running
+- **"open" link**: keyboard-accessible when Gitea is running
 - **No pointer-only interactions**: tab order follows natural flow
 
 ### Mobile / responsive
 - **No changes needed**: existing row layout is flex-based and responsive
 - **Spinner animation**: lightweight, no performance impact
+- **Info icon (ℹ) vs. warning icon (⚠)**: both are plain Unicode text, no image rendering needed
 
 ### State messaging
-- **Not relying solely on color**: error state includes text "error", not just red color
-- **Clear status language**: "starting…", "running", "stopped", "error" are unambiguous
-- **Link text**: "open" is descriptive in context ("running — open")
+- **Not relying solely on color**: error state includes text "error", not just red color ✓
+- **Clear status language**: "starting…", "running", "stopped", "error" are unambiguous ✓
+- **Link text**: "open" is descriptive in context ("running — open") ✓
+- **Badge icon change (ℹ vs. ⚠)**: subtle but clear distinction for users who notice it; primary meaning is in the text itself ("~1 GB" vs. "~3–5 GB") ✓
 
 ---
 
@@ -313,23 +325,51 @@ if (kind === 'taiga') return '/taiga/' + (on ? 'on' : 'off');
 |---------|-------------------|-------|
 | `.row` | `.row` | Flex layout, padding, rounded corners — reused as-is |
 | Toggle switch | `.switch` input + `.slider` | Reused from host row and project rows |
-| Sub text | `.sub` (font-size 12px, color #888) | Reused, plus custom color for error state (#ff6b6b) |
-| Badge | `.badge` (background #16324a, color #4da6ff) | Reused for resource warning |
-| Spinner | **New**: `.taiga-starting-spinner` + `@keyframes taiga-spin` | Inline CSS, no new dependencies |
+| Sub text | `.sub` (font-size 12px, color #aaa) | Reused, plus custom color for error state (#ff6b6b) |
+| Badge | `.badge` + new `.gitea-resources` | Reused base, parallel to `.taiga-ram` |
+| Error color | `.gitea-err` (color #ff6b6b) | Parallel to `.taiga-err`, same error color |
+| Spinner | `.gitea-starting-spinner` + `@keyframes gitea-spin` | Parallel to Taiga's, same animation |
 
 ### New CSS rules needed
 
 ```css
-.taiga-starting-spinner {
+.gitea-resources {
+  color: #66d9ff;  /* Info/normal resource cost, brighter than default .badge color */
+}
+
+.gitea-err {
+  color: #ff6b6b;  /* Error text color, same as Taiga */
+}
+
+.gitea-starting-spinner {
   display: inline-block;
   width: 12px;
   height: 12px;
   margin-left: 4px;
   vertical-align: middle;
-  animation: taiga-spin 1s linear infinite;
+  animation: gitea-spin 1s linear infinite;
 }
 
-@keyframes taiga-spin {
+@keyframes gitea-spin {
+  0% { transform: rotate(0deg); opacity: 0.6; }
+  50% { opacity: 1; }
+  100% { transform: rotate(360deg); opacity: 0.6; }
+}
+```
+
+Alternatively, if the developer unifies spinner CSS across Taiga and Gitea:
+
+```css
+.singleton-starting-spinner {  /* reusable for all singleton services */
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-left: 4px;
+  vertical-align: middle;
+  animation: singleton-spin 1s linear infinite;
+}
+
+@keyframes singleton-spin {
   0% { transform: rotate(0deg); opacity: 0.6; }
   50% { opacity: 1; }
   100% { transform: rotate(360deg); opacity: 0.6; }
@@ -344,35 +384,68 @@ No new HTML components or DOM structure — the row is built entirely via the ex
 
 | Spec AC | Feature | State | Visual | Backend | Acceptance |
 |---------|---------|-------|--------|---------|------------|
-| AC1: install prepares Taiga, leaves it off | Startup handling | Off | "stopped", toggle off | `/status` → `taiga=false` | ✓ Row shows stopped after install |
-| AC4: after install, /status reports Taiga off | Startup handling | Off | "stopped" | `/status` → `taiga=false, taiga_url=null` | ✓ No auto-start |
-| AC5: toggle on starts the stack | Transition | Starting → Running | "starting…" → "running — open" | `POST /taiga/on` → containers up → `/status` → `taiga=true` | ✓ State transition handled |
-| AC6: toggle off stops the stack | Transition | Running → Off | "running" → "stopped" | `POST /taiga/off` → containers down | ✓ Toggle down reverses state |
-| AC7: service restart doesn't lose state | Resilience | On | "running" persists | Next `/status` poll re-queries, reflects live state | ✓ Fresh queries each poll, no in-memory cache |
-| AC8: TOTP gate inherited | Auth | N/A | Standard TOTP prompt overlay (existing) | Shared `do_POST` gate (existing) | ✓ No changes to auth UI |
-| AC9: singleton row, no engine picker | Structure | All | No engine picker shown | Only `kind='taiga'` excluded from `engineRow()` | ✓ Row structure verified |
+| AC1: install prepares Gitea, leaves it off | Startup handling | Off | "stopped", toggle off | `/status` → `gitea=false` | ✓ Row shows stopped after install |
+| AC2: install doesn't regenerate secrets on re-run | Install idempotence | Off | No visual change | State checks in installer | ✓ (Backend concern, design N/A) |
+| AC3: toggle on starts the stack | Transition | Starting → Running | "starting…" → "running — open" | `POST /gitea/on` → containers up → `/status` → `gitea=true` | ✓ State transition handled |
+| AC4: toggle off stops the stack | Transition | Running → Off | "running" → "stopped" | `POST /gitea/off` → containers down | ✓ Toggle down reverses state |
+| AC5: service restart doesn't lose state | Resilience | On | "running" persists | Next `/status` poll re-queries, reflects live state | ✓ Fresh queries each poll, no in-memory cache |
+| AC6: race-condition-free toggle-off (Defects 1–2) | Race condition handling | All | Accurate final state, no stuck "starting…" | Generalized state machine tested on both kinds | ✓ Design relies on refactored logic verified by reviewer |
+| AC7: TOTP gate inherited | Auth | N/A | Standard TOTP prompt overlay (existing) | Shared `do_POST` gate (existing) | ✓ No changes to auth UI |
+| AC8: singleton row, no engine picker | Structure | All | No engine picker shown | Only `kind='gitea'` excluded from `engineRow()` | ✓ Row structure verified |
+| AC9: Taiga and Gitea work independently, no port collisions | Co-existence | All | Two independent rows | Docker port assignments (#3000, #2222 for Gitea) | ✓ (Backend concern, design N/A) |
 
 ---
 
 ## Key design decisions
 
-1. **Starting state is optimistic + poll-driven**: Toggle immediately shows checked and "starting…"; actual running state confirmed by next `/status` poll (backend can't block the response to wait for Docker stack). This prevents UI hang but requires timeout logic for failures.
+1. **Gitea row appears after Taiga** (insertion order): Both are utility singleton rows; placement by install-order is natural and simple. Future reordering or grouping under a labeled section is a lightweight change.
 
-2. **Resource-cost badge always visible (when enabled)**: Reminds users that Taiga is a heavy workload, even in the running state. Placed under the label for quick scan.
+2. **Resource badge uses info tone (ℹ) not warning (⚠)**: Gitea is an order of magnitude lighter than Taiga (~1 GB vs. 3–5 GB), so the badge communicates a modest footprint, not a heavy warning. Same badge styling, different icon and text.
 
-3. **Error state after 90s timeout**: If toggle is on but `/status` never reports `taiga=true` after 90 seconds, assume failure and show "error". User can toggle off and retry.
+3. **90s timeout kept unchanged**: Safe upper bound, not a performance target. Consistency with Taiga, and the developer is free to optimize Gitea's actual startup time without changing the UI contract.
 
-4. **Spinner animation is decorative, not loading-blocking**: Keeps the UI responsive and responsive to user input (toggle can be turned off immediately if they change their mind).
+4. **State machine is generalized, not per-service**: The refactor from `taigaPending`/`taigaWasRunning`/`taigaOffPendingCount` to `singletonToggleState[kind]` reuses the hardened logic from Taiga's three review rounds. This is invisible to the user and the design, but critical for correctness.
 
-5. **Position after host row**: Taiga is a utility singleton like host control, so it belongs in the same visual "section" at the bottom of the instance list.
-
-6. **No engine picker, no description, no code-server toggle**: Unlike per-project rows, Taiga is all-or-nothing. Once running, all interaction happens in Taiga's own web UI, not the switchboard.
+5. **Reuse existing visual language**: Spinner, error color, badge styling, toggle, all follow Taiga's established patterns. No new CSS, no new interactions, just the same reliable formula applied to a lighter workload.
 
 ---
 
 ## Out of scope / non-goals (per spec)
 
-- Auto-creation of Taiga admin user (interactive, deferred to taiga-docker's own flow)
-- Per-project Taiga instances (one shared instance per box)
-- MCP/API integration for Taiga (item 1b, future cycle)
-- UI controls for Taiga configuration (project creation, user management all happens in Taiga itself)
+- Automated Gitea admin-account creation (deferred to manual step, matching Taiga's pattern)
+- Exposing Gitea's SSH port beyond loopback (depends on 2b's repo-creation flow)
+- Reordering or visually grouping Taiga/Gitea/host rows under labeled sections (future enhancement)
+- Changing the toggle UX for Gitea in the long term (flagged as a possible future reconsideration once real usage data exists, but 2a follows Taiga's toggle pattern)
+
+---
+
+## Notes for the developer
+
+- **The generalized state-machine refactor is complex**: While the visual design is simple (same as Taiga), the underlying JS refactor touches a critical code path that was hardened in three review rounds for Taiga (docs/test-review.md at ed84d73, Defects 1 and 2). Reuse the state machine exactly; don't try to simplify or optimize it away. The reviewer will test both `taiga` and `gitea` kinds against the same race-condition scenarios.
+
+- **CSS class naming**: The developer may choose to keep `.gitea-err`, `.gitea-resources`, `.gitea-starting-spinner` (parallel to Taiga's names) or unify them under `.singleton-*` names. Either approach is fine; the design supports both. Consistency within the codebase is the main principle.
+
+- **Spinner CSS**: If the developer unifies the spinner CSS into a single `.singleton-starting-spinner` class + `@keyframes singleton-spin`, both the Taiga and Gitea row renders can use it. The design supports either parallel naming or unified naming.
+
+---
+
+## Summary of design vs. implementation details
+
+**Design specifies (observable by the user)**:
+- Gitea row placement after Taiga
+- Resource badge with info icon and lighter text ("~1 GB", not "~3–5 GB")
+- Same four states as Taiga (stopped, starting, running, error)
+- Same spinner animation
+- Same 90s timeout for starting→error transition
+- Same toggle, same "open" link in running state
+
+**Design explicitly defers to implementation (invisible to the user)**:
+- CSS class naming (parallel or unified)
+- Whether the state machine refactor uses `singletonToggleState[kind]` or an equivalent structure
+- Whether the starting-timeout value (90s) is parameterized in a config object or hardcoded
+- Order of DOM attributes or inline JS function signatures
+
+**Verification by reviewer**:
+- Both `taiga` and `gitea` kinds must pass the same race-condition test suite that Taiga originally passed (Defects 1–2 from ed84d73's test-review.md)
+- No visible regression in Taiga's existing behavior after the refactor
+- Gitea row renders all four states correctly and transitions between them as `/status` polls report changes

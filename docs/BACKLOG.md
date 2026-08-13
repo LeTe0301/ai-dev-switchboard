@@ -68,6 +68,23 @@ projects or one per project folder.
 
 ## 2. Local git hosting UI + CI/CD (Gitea)
 
+**Status: 2a shipped (2026-08-13)** — `install.sh --with-git-hosting` now
+also installs Gitea (Postgres-backed, per user confirmation) via a
+directly-authored Docker Compose stack, off by default, plus a singleton
+toggle row in the web UI reusing (now generalized) the same toggle-state
+machine 1a's Taiga row hardened across three review rounds. Purely additive
+— the existing git-hosting flow (`new-project.sh`, `create_project()`) is
+completely untouched; the actual swap happens in 2b. Reviewer-approved
+after one fix round (a printed admin-account-creation command that failed
+as originally written). Full spec/design/implementation/test-review for
+**2a specifically** in `docs/spec.md` / `docs/design.md` /
+`docs/implementation.md` / `docs/test-review.md`. **2b (repo-creation/
+registration flow, rewiring `create_project()`) and 2c (CI/CD auto-deploy)
+are still open** — deliberately scoped out of 2a as separate future
+cycles; 2b is the moment `git-hosting-setup.sh`/`new-repo.sh`/
+`new-dev-instance.sh`/`new-project.sh`/`project-sync.sh`/`target-setup.sh`
+retirement actually happens, not automatic.
+
 **Decision:** Gitea, not full GitLab CE. GitLab's resource footprint (own
 Postgres, Redis, multiple worker processes, several GB RAM minimum) cuts
 against this project's stated philosophy of staying small and self-hosted

@@ -127,6 +127,18 @@ TAIGA_UP_SCRIPT = os.environ.get("TAIGA_UP_SCRIPT", "/usr/local/bin/ai-dev-switc
 TAIGA_DOWN_SCRIPT = os.environ.get("TAIGA_DOWN_SCRIPT", "/usr/local/bin/ai-dev-switchboard-taiga-down.sh")
 TAIGA_STATUS_SCRIPT = os.environ.get("TAIGA_STATUS_SCRIPT", "/usr/local/bin/ai-dev-switchboard-taiga-status.sh")
 
+# Self-hosted Gitea (backlog item 2a) — same singleton on/off toggle shape as
+# Taiga above, folded into --with-git-hosting rather than its own flag (see
+# docs/spec.md "Sequencing — additive, not a swap"). GITEA_SSH_PORT is read
+# by the wrapper scripts, not here — the web UI never touches the SSH port
+# (no way to create a Gitea repo yet in this cycle's scope).
+GITEA_ENABLED = os.environ.get("GITEA_ENABLED", "0") == "1"
+GITEA_LABEL = os.environ.get("GITEA_LABEL", "Gitea")
+GITEA_PORT = int(os.environ.get("GITEA_PORT", "3000"))
+GITEA_UP_SCRIPT = os.environ.get("GITEA_UP_SCRIPT", "/usr/local/bin/ai-dev-switchboard-gitea-up.sh")
+GITEA_DOWN_SCRIPT = os.environ.get("GITEA_DOWN_SCRIPT", "/usr/local/bin/ai-dev-switchboard-gitea-down.sh")
+GITEA_STATUS_SCRIPT = os.environ.get("GITEA_STATUS_SCRIPT", "/usr/local/bin/ai-dev-switchboard-gitea-status.sh")
+
 STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT_SECONDS", "45"))
 
 # This service runs as its own unprivileged user — tmux sessions must run as
@@ -959,6 +971,28 @@ def _taiga_display_url() -> str:
         else f"http://127.0.0.1:{TAIGA_PORT}"
 
 
+# ─── self-hosted Gitea (backlog item 2a) ───────────────────────────────────
+# Singleton, exactly like Taiga above — same "containers outlive app.py's own
+# process tree, so state is never trusted from memory" reasoning (see
+# taiga_run's own comment), just against Gitea's own two-service (server +
+# db) stack instead of Taiga's nine.
+def gitea_run(action: str) -> str:
+    assert action in ("up", "down", "status")
+    script = {"up": GITEA_UP_SCRIPT, "down": GITEA_DOWN_SCRIPT,
+              "status": GITEA_STATUS_SCRIPT}[action]
+    r = subprocess.run(["sudo", script], capture_output=True, text=True,
+                       timeout=(10 if action == "status" else 90))
+    return r.stdout.strip()
+
+
+GITEA_URL_PATH = "/gitea"  # fixed, singleton — same shape as TAIGA_URL_PATH
+
+
+def _gitea_display_url() -> str:
+    return f"{BASE_URL}{GITEA_URL_PATH}" if PUBLISH_MODE == "tailscale" \
+        else f"http://127.0.0.1:{GITEA_PORT}"
+
+
 PAGE_TEMPLATE = """<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -986,12 +1020,26 @@ PAGE_TEMPLATE = """<!doctype html>
      4.5:1 text-contrast threshold (~8.1:1) with real headroom, see
      docs/implementation.md for the contrast math. */
   .badge.taiga-ram { color: #66d9ff; }
+  /* Gitea's resource-cost badge reuses the exact same already-verified
+     color pairing as Taiga's above (#66d9ff on #16324a, ~8.14:1 contrast,
+     well above WCAG AA) — same badge styling, different tone (docs/design.md
+     "Resource badge: informational tone, not warning"). */
+  .badge.gitea-resources { color: #66d9ff; }
   .sub { font-size: 12px; color: #888; margin-top: 4px; word-break: break-all; }
   .taiga-err { color: #ff6b6b; }
+  .gitea-err { color: #ff6b6b; }
   .taiga-starting-spinner { display: inline-block; width: 12px; height: 12px;
                              margin-left: 4px; vertical-align: middle;
                              animation: taiga-spin 1s linear infinite; }
+  .gitea-starting-spinner { display: inline-block; width: 12px; height: 12px;
+                             margin-left: 4px; vertical-align: middle;
+                             animation: gitea-spin 1s linear infinite; }
   @keyframes taiga-spin {
+    0% { transform: rotate(0deg); opacity: 0.6; }
+    50% { opacity: 1; }
+    100% { transform: rotate(360deg); opacity: 0.6; }
+  }
+  @keyframes gitea-spin {
     0% { transform: rotate(0deg); opacity: 0.6; }
     50% { opacity: 1; }
     100% { transform: rotate(360deg); opacity: 0.6; }
@@ -1143,41 +1191,97 @@ document.getElementById('login-pass').addEventListener('keydown', e => { if (e.k
 let ENGINE_LABELS = {};
 let engineChoice = {};  // project name -> engine name, picked before starting
 
-// Taiga's row needs more visual states than the generic on/off rows above
-// (see docs/design.md "How starting→running detection works") — its Docker
-// stack can take 30-60s to come up, so a toggle-on doesn't mean "running"
-// yet the way it does for host-control's SSH-backed session. taigaPending
-// tracks an in-flight "waiting to see taiga:true" window (cleared once
-// /status confirms it, or after a 90s timeout — design.md's fallback so the
-// row never gets stuck showing "starting…" forever on a genuine failure).
-// taigaWasRunning lets a later poll tell "toggled off on purpose" apart from
-// "was running, suddenly isn't" (a transient container hiccup) — the latter
-// re-arms a fresh starting window instead of flashing "error" immediately.
-// taigaOffPendingCount covers the window between intentional toggle-off
-// request(s) being sent and them resolving — the backend blocks on `docker
-// compose down` for up to 90s, so a regular 4s /status poll can easily land
-// mid-flight and still (accurately) report taiga:true. Without tracking
-// this, that poll would re-set taigaWasRunning=true and clobber the
-// toggle-off's own reset, making refresh() misread the eventual real "off"
-// as an *unexpected* stop instead of the intentional one it actually is
-// (see docs/test-review.md Defect 1). While this count is > 0, refresh()
-// must not let a poll re-arm taigaWasRunning — only the toggle-off code
-// paths themselves increment/decrement it.
+// Singleton-toggle rows (Taiga, Gitea, ...future ones) need more visual
+// states than the generic on/off rows above (see docs/design.md "How
+// starting→running detection works") — their Docker stacks can take 30-90s
+// to come up, so a toggle-on doesn't mean "running" yet the way it does for
+// host-control's SSH-backed session. This state machine was hardened for
+// Taiga specifically across three real review rounds (docs/test-review.md
+// at ed84d73, Defects 1 and 2) before being generalized here to a per-kind
+// map so Gitea (backlog item 2a) reuses the exact same hardened logic
+// instead of a copy-pasted-and-renamed fork — see docs/spec.md
+// "Proposed approach: generalizing the toggle state machine".
 //
-// This is a count, not a boolean, because the toggle checkbox is never
-// disabled while an action is in flight and the row keeps re-rendering as
-// "on" (accurately) for as long as any prior off request is still running —
-// an impatient user can realistically fire a second, independent off
-// dispatch before the first resolves. A plain boolean that either off
-// request's own completion unconditionally clears to false would let the
-// *first* to resolve declare the coast clear while the *second* off
+// Per kind: `pending` tracks an in-flight "waiting to see <kind>:true"
+// window (cleared once /status confirms it, or after that kind's own
+// timeout — design.md's fallback so the row never gets stuck showing
+// "starting…" forever on a genuine failure). `wasRunning` lets a later poll
+// tell "toggled off on purpose" apart from "was running, suddenly isn't" (a
+// transient container hiccup) — the latter re-arms a fresh starting window
+// instead of flashing "error" immediately. `offPendingCount` covers the
+// window between intentional toggle-off request(s) being sent and them
+// resolving — the backend blocks on `docker compose down` for up to 90s, so
+// a regular 4s /status poll can easily land mid-flight and still
+// (accurately) report <kind>:true. Without tracking this, that poll would
+// re-set wasRunning=true and clobber the toggle-off's own reset, making
+// refresh() misread the eventual real "off" as an *unexpected* stop instead
+// of the intentional one it actually is (see docs/test-review.md Defect 1).
+// While this count is > 0, refresh() must not let a poll re-arm
+// wasRunning — only the toggle-off code paths themselves increment/
+// decrement it.
+//
+// offPendingCount is a count, not a boolean, because the toggle checkbox is
+// never disabled while an action is in flight and the row keeps
+// re-rendering as "on" (accurately) for as long as any prior off request is
+// still running — an impatient user can realistically fire a second,
+// independent off dispatch before the first resolves. A plain boolean that
+// either off request's own completion unconditionally clears to false would
+// let the *first* to resolve declare the coast clear while the *second* off
 // request is still genuinely outstanding, reopening Defect 1's exact false
 // starting…/error outcome via a different trigger (docs/test-review.md
 // Defect 2). Only treat "no off request in flight" as true once the count
 // reaches zero, i.e. every dispatched off request has resolved.
-let taigaPending = null;      // {startTime} | null
-let taigaWasRunning = false;
-let taigaOffPendingCount = 0;
+let singletonToggleState = {
+  taiga: {pending: null, wasRunning: false, offPendingCount: 0},
+  gitea: {pending: null, wasRunning: false, offPendingCount: 0},
+};
+// Per-kind values that used to be hardcoded to Taiga's own numbers/text
+// (the 90s starting-timeout, the resource badge) — see docs/design.md
+// "Resource badge: informational tone, not warning" for why Gitea's badge
+// uses a different symbol/tone/color-class than Taiga's, and "Starting-state
+// timeout" for why both kinds keep the same safe 90s upper bound rather than
+// tuning Gitea's down (a safety ceiling, not a performance target).
+const SINGLETON_TOGGLE_CONFIG = {
+  taiga: {timeoutMs: 90000, badgeText: '⚠ ~3–5 GB RAM when running',
+          badgeClass: 'taiga-ram', errClass: 'taiga-err', spinnerClass: 'taiga-starting-spinner'},
+  gitea: {timeoutMs: 90000, badgeText: 'ℹ ~1 GB RAM when running',
+          badgeClass: 'gitea-resources', errClass: 'gitea-err', spinnerClass: 'gitea-starting-spinner'},
+};
+// Computes a singleton-toggle row's sub-text (running/starting…/stopped/
+// error) AND updates that kind's own singletonToggleState entry as a side
+// effect — same single computation refresh() used to do inline for Taiga
+// alone, now shared by every kind in SINGLETON_TOGGLE_CONFIG. Returns
+// {sub, showBadge}.
+function singletonToggleSub(kind, on, url) {
+  const cfg = SINGLETON_TOGGLE_CONFIG[kind];
+  const st = singletonToggleState[kind];
+  let sub, showBadge = true;
+  if (on) {
+    sub = 'running' + (url ? ' — <a href="' + url + '" target="_blank">open</a>' : '');
+    st.pending = null;
+    // Don't let a poll landing mid-toggle-off re-arm wasRunning — the
+    // toggle-off itself already reset it and owns that reset until every
+    // dispatched off request resolves (see offPendingCount's declaration
+    // comment above).
+    if (st.offPendingCount === 0) st.wasRunning = true;
+  } else {
+    if (st.wasRunning && st.offPendingCount === 0) {
+      st.pending = {startTime: Date.now()};
+      st.wasRunning = false;
+    }
+    if (st.pending) {
+      if (Date.now() - st.pending.startTime > cfg.timeoutMs) {
+        sub = '<span class="' + cfg.errClass + '">error</span>';
+        showBadge = false;
+      } else {
+        sub = 'starting… <span class="' + cfg.spinnerClass + '">◌</span>';
+      }
+    } else {
+      sub = 'stopped';
+    }
+  }
+  return {sub, showBadge};
+}
 
 async function refresh() {
   const r = await fetch('/status');
@@ -1192,33 +1296,12 @@ async function refresh() {
   if (s.instances.length === 0) html += '<div class="empty">No project folders under the configured PROJECTS_DIR yet.</div>';
   if (s.host_enabled) html += row(s.host_label, s.host, s.host_url, 'host', null, '', null, false, null);
   if (s.taiga_enabled) {
-    let taigaSub, showTaigaBadge = true;
-    if (s.taiga) {
-      taigaSub = 'running' + (s.taiga_url ? ' — <a href="' + s.taiga_url + '" target="_blank">open</a>' : '');
-      taigaPending = null;
-      // Don't let a poll landing mid-toggle-off re-arm taigaWasRunning — the
-      // toggle-off itself already reset it and owns that reset until every
-      // dispatched off request resolves (see taigaOffPendingCount's
-      // declaration comment).
-      if (taigaOffPendingCount === 0) taigaWasRunning = true;
-    } else {
-      if (taigaWasRunning && taigaOffPendingCount === 0) {
-        taigaPending = {startTime: Date.now()};
-        taigaWasRunning = false;
-      }
-      if (taigaPending) {
-        if (Date.now() - taigaPending.startTime > 90000) {
-          taigaSub = '<span class="taiga-err">error</span>';
-          showTaigaBadge = false;
-        } else {
-          taigaSub = 'starting… <span class="taiga-starting-spinner">◌</span>';
-        }
-      } else {
-        taigaSub = 'stopped';
-      }
-    }
-    html += row(s.taiga_label, s.taiga, s.taiga_url, 'taiga', null, '', null, false, null,
-               taigaSub, showTaigaBadge);
+    const {sub, showBadge} = singletonToggleSub('taiga', s.taiga, s.taiga_url);
+    html += row(s.taiga_label, s.taiga, s.taiga_url, 'taiga', null, '', null, false, null, sub, showBadge);
+  }
+  if (s.gitea_enabled) {
+    const {sub, showBadge} = singletonToggleSub('gitea', s.gitea, s.gitea_url);
+    html += row(s.gitea_label, s.gitea, s.gitea_url, 'gitea', null, '', null, false, null, sub, showBadge);
   }
   document.getElementById('rows').innerHTML = html;
 }
@@ -1254,17 +1337,19 @@ function codeRow(name, codeOn, codeUrl) {
     (codeOn && codeUrl ? '<a href="' + codeUrl + '" target="_blank">open</a>' : '') +
     '</div>';
 }
-function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverride, showTaigaBadge) {
-  // subOverride lets the Taiga row (see refresh()) supply its own
-  // starting/running/stopped/error text instead of this generic on/off
-  // computation — every other kind (inst/host/code) omits it and keeps the
-  // plain behavior unchanged.
+function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverride, showBadge) {
+  // subOverride lets a singleton-toggle row (Taiga/Gitea — see refresh())
+  // supply its own starting/running/stopped/error text instead of this
+  // generic on/off computation — every other kind (inst/host/code) omits it
+  // and keeps the plain behavior unchanged. showBadge + SINGLETON_TOGGLE_CONFIG
+  // (keyed by kind) supply that row's own resource-cost badge text/class.
   const sub = subOverride != null ? subOverride :
     (on ? (url ? 'running — <a href="' + url + '" target="_blank">open</a>' : 'running') : 'stopped');
+  const cfg = SINGLETON_TOGGLE_CONFIG[kind];
   const arg = name ? "'" + kind + "','" + name + "'" : "'" + kind + "',null";
   return '<div class="row"><div><div class="label">' + esc(label) + '</div>' +
     (kind === 'inst' ? engineRow(name, on, engine) : '') +
-    (showTaigaBadge ? '<div class="badge taiga-ram">⚠ ~3–5 GB RAM when running</div>' : '') +
+    (showBadge && cfg ? '<div class="badge ' + cfg.badgeClass + '">' + cfg.badgeText + '</div>' : '') +
     (desc ? '<div class="desc">' + esc(desc) + '</div>' : '') +
     '<div class="sub">' + sub + '</div>' +
     (kind === 'inst' ? codeRow(name, codeOn, codeUrl) : '') +
@@ -1276,7 +1361,7 @@ let pendingToggle = null;  // {kind, name, on, checkboxEl} — only set while th
 
 function actionPath(kind, name, on) {
   if (kind === 'host') return '/host/' + (on ? 'on' : 'off');
-  if (kind === 'taiga') return '/taiga/' + (on ? 'on' : 'off');
+  if (kind in singletonToggleState) return '/' + kind + '/' + (on ? 'on' : 'off');
   if (kind === 'code') return '/instance/' + encodeURIComponent(name) + '/code/' + (on ? 'on' : 'off');
   if (kind === 'newproject') return '/projects/new';
   return '/instance/' + encodeURIComponent(name) + '/' + (on ? 'on' : 'off');
@@ -1304,7 +1389,10 @@ async function handleActionResult(r, ctx) {
   if (r.status === 401) {
     hideCodeOverlay();
     if (checkboxEl) checkboxEl.checked = !on;
-    if (kind === 'taiga') { taigaPending = null; taigaWasRunning = false; }
+    if (kind in singletonToggleState) {
+      singletonToggleState[kind].pending = null;
+      singletonToggleState[kind].wasRunning = false;
+    }
     showOverlay();
     return;
   }
@@ -1334,20 +1422,20 @@ async function handleActionResult(r, ctx) {
   setTimeout(refresh, 1500);
 }
 async function toggle(kind, name, on, checkboxEl) {
-  if (kind === 'taiga') {
+  if (kind in singletonToggleState) {
+    const st = singletonToggleState[kind];
     // Optimistic, ahead of the POST resolving (docs/design.md "Starting
     // state is optimistic + poll-driven") — refresh() picks this up on its
     // very next call, whether that's the setTimeout(refresh, 1500) below or
     // the regular 4s poll.
-    if (on) { taigaPending = {startTime: Date.now()}; }
+    if (on) { st.pending = {startTime: Date.now()}; }
     else {
-      taigaPending = null;
-      taigaWasRunning = false;
+      st.pending = null;
+      st.wasRunning = false;
       // Held until every dispatched off POST resolves — see
-      // taigaOffPendingCount's declaration comment for why this has to
-      // survive both concurrent polls and a second, overlapping off
-      // dispatch.
-      taigaOffPendingCount++;
+      // offPendingCount's declaration comment for why this has to survive
+      // both concurrent polls and a second, overlapping off dispatch.
+      st.offPendingCount++;
     }
   }
   const ctx = {kind, name, on, checkboxEl};
@@ -1359,7 +1447,9 @@ async function toggle(kind, name, on, checkboxEl) {
     // non-2xx status) must still release this — otherwise the counter leaks
     // permanently and silently disables the "unexpected stop while running"
     // detection for the rest of the page's life.
-    if (kind === 'taiga' && !on) { taigaOffPendingCount = Math.max(0, taigaOffPendingCount - 1); }
+    if (kind in singletonToggleState && !on) {
+      singletonToggleState[kind].offPendingCount = Math.max(0, singletonToggleState[kind].offPendingCount - 1);
+    }
   }
 }
 function toggleCode(name, currentlyOn) {
@@ -1394,11 +1484,11 @@ function cancelActionCode() {
   if (pendingToggle && pendingToggle.checkboxEl) {
     pendingToggle.checkboxEl.checked = !pendingToggle.on;
   }
-  if (pendingToggle && pendingToggle.kind === 'taiga') {
+  if (pendingToggle && pendingToggle.kind in singletonToggleState) {
     // Nothing actually started server-side — undo the optimistic marker
     // toggle() set before the code overlay ever showed up.
-    taigaPending = null;
-    taigaWasRunning = false;
+    singletonToggleState[pendingToggle.kind].pending = null;
+    singletonToggleState[pendingToggle.kind].wasRunning = false;
   }
   hideCodeOverlay();
 }
@@ -1422,14 +1512,14 @@ async function submitActionCode() {
   if (!pendingToggle) return;
   const {kind, name, on} = pendingToggle;
   const code = document.getElementById('action-code').value;
-  if (kind === 'taiga' && !on) {
+  if (kind in singletonToggleState && !on) {
     // This retry (after a 428 asked for a TOTP code) is the request that
-    // actually triggers taiga_run("down") server-side — the first attempt
+    // actually triggers <kind>_run("down") server-side — the first attempt
     // never touched anything. Re-arm the same intentional-off guard toggle()
-    // uses, since polls may have run (and correctly set taigaWasRunning back
-    // to true) during however long the user took to type the code.
-    taigaWasRunning = false;
-    taigaOffPendingCount++;
+    // uses, since polls may have run (and correctly set wasRunning back to
+    // true) during however long the user took to type the code.
+    singletonToggleState[kind].wasRunning = false;
+    singletonToggleState[kind].offPendingCount++;
   }
   try {
     const r = await performAction(kind, name, on, code);
@@ -1437,7 +1527,9 @@ async function submitActionCode() {
   } finally {
     // See toggle()'s matching comment: must release on a network-level
     // failure too, not just after a resolved response.
-    if (kind === 'taiga' && !on) { taigaOffPendingCount = Math.max(0, taigaOffPendingCount - 1); }
+    if (kind in singletonToggleState && !on) {
+      singletonToggleState[kind].offPendingCount = Math.max(0, singletonToggleState[kind].offPendingCount - 1);
+    }
   }
 }
 document.getElementById('action-code').addEventListener('keydown', e => { if (e.key === 'Enter') submitActionCode(); });
@@ -2284,6 +2376,11 @@ class Handler(BaseHTTPRequestHandler):
                 out = taiga_run("status").splitlines()
                 taiga_on = bool(out) and out[0] == "on"
                 taiga_url = _taiga_display_url() if taiga_on else None
+            gitea_on, gitea_url = False, None
+            if GITEA_ENABLED:
+                out = gitea_run("status").splitlines()
+                gitea_on = bool(out) and out[0] == "on"
+                gitea_url = _gitea_display_url() if gitea_on else None
             instances = []
             for n in instance_names():
                 engine = active_engine(n)
@@ -2299,7 +2396,9 @@ class Handler(BaseHTTPRequestHandler):
                        "host_enabled": HOST_CONTROL_ENABLED, "host_label": HOST_LABEL,
                        "host": host_on, "host_url": host_url,
                        "taiga_enabled": TAIGA_ENABLED, "taiga_label": TAIGA_LABEL,
-                       "taiga": taiga_on, "taiga_url": taiga_url})
+                       "taiga": taiga_on, "taiga_url": taiga_url,
+                       "gitea_enabled": GITEA_ENABLED, "gitea_label": GITEA_LABEL,
+                       "gitea": gitea_on, "gitea_url": gitea_url})
         else:
             self.send_response(404)
             self.end_headers()
@@ -2355,6 +2454,16 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 _unpublish(TAIGA_URL_PATH)
                 taiga_run("down")
+            self._json({"ok": True})
+        elif parts[0] == "gitea" and len(parts) == 2 and parts[1] in ("on", "off"):
+            if not GITEA_ENABLED:
+                return self._json({"error": "gitea disabled"}, 404)
+            if parts[1] == "on":
+                gitea_run("up")
+                _publish(GITEA_URL_PATH, GITEA_PORT)
+            else:
+                _unpublish(GITEA_URL_PATH)
+                gitea_run("down")
             self._json({"ok": True})
         elif parts[0] == "projects" and len(parts) == 2 and parts[1] == "new":
             ok, err = create_project((body.get("name") or "").strip())

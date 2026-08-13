@@ -1,252 +1,367 @@
-# Implementation: Local backlog tracker (Taiga) — part 1b: push a spec into Taiga
+# Implementation: Local git hosting UI + CI/CD (Gitea) — part 2a: install + container toggle
 
-(1a's implementation notes — the `install.sh --with-taiga` flag + singleton
-UI toggle row — are preserved in git history at commit `ed84d73` via
-`git show ed84d73:docs/implementation.md`. This file now documents 1b only,
-per this cycle's `docs/spec.md`.)
+(1a's and 1b's own implementation notes — the `install.sh --with-taiga`
+flag + singleton UI toggle row, and the standalone `taiga_push_spec.py`
+CLI — are preserved in git history: `git show ed84d73:docs/implementation.md`
+for 1a, `git show aa2b56d:docs/implementation.md` for 1b. This file now
+documents 2a only, per this cycle's `docs/spec.md`.)
 
 ## Summary
-Added two new, standalone files — `scripts/taiga_push_spec.py` (Python 3,
-stdlib-only) and `scripts/taiga-configure-push.sh` (bash, interactive
-one-time setup) — that push the content of a local spec file into a running
-Taiga instance as a new userstory, one direction only (spec → Taiga), with
-no changes to any existing file's runtime behavior beyond three new README
-bullets. No web UI surface, matching the spec's explicit non-goal.
+Folded a self-hosted Gitea Docker Compose stack (`server` + `db`/Postgres)
+into the existing `install.sh --with-git-hosting` flag — installed
+configured-but-stopped, off by default, purely additive alongside the
+existing git-hosting flow (nothing in `scripts/git-hosting-setup.sh`,
+`new-project.sh`, or `create_project()` was touched) — plus a new singleton
+"Gitea" on/off toggle row in the web UI, following 1a's already-shipped
+Taiga pattern (commit `ed84d73`) closely. Docker's install/verify logic was
+factored out of the `--with-taiga` block into a shared `ensure_docker()`
+helper, reused by both flags. The Taiga-only frontend toggle globals
+(`taigaPending`/`taigaWasRunning`/`taigaOffPendingCount`) were generalized
+into a per-kind `singletonToggleState` map, verified with a parametrized
+version of the reviewer's own Node `vm`-based regression harness run against
+both `taiga` and `gitea` kinds.
 
 ## Changes by file
 
-- **`scripts/taiga_push_spec.py`** (new) — the CLI tool. Structure matches
-  `docs/spec.md`'s exact function breakdown:
-  - `_taiga_request(base_url, method, path, token=None, body=None)` — the
-    one `urllib.request` wrapper; raises `TaigaConnectionError` (network-
-    level failure) or `TaigaHTTPError` (non-2xx response, carries `.status`)
-    on failure, returns parsed JSON on success. This is the one function
-    `tests/test_taiga_push.py` monkeypatches for every higher-level test,
-    exactly as instructed (mirrors `tests/test_taiga.py`'s
-    `appmod.taiga_run` monkeypatch).
-  - `_load_config(path) -> dict` — manual `KEY=value` parsing (no
-    `configparser`, no `python-dotenv`), matching `app/app.py`'s
-    `_parse_engine_file()` convention for `engines.d/*.engine` files. Uses
-    `dict.get(..., "")` everywhere downstream so a missing/blank key never
-    raises `KeyError` — an incomplete config file naturally falls through to
-    Taiga rejecting the (blank) credentials, producing the same
-    bad-credentials-shaped message rather than a traceback.
-  - `_authenticate`, `_lookup_project`, `_create_userstory` — one function
-    per Taiga REST call (`POST /api/v1/auth`, `GET
-    /api/v1/projects/by_slug?slug=...`, `POST /api/v1/userstories`), each
-    translating a `TaigaHTTPError` into an internal marker exception
-    (`_AuthRejected` / `_ProjectNotFound`) that a thin wrapper
-    (`_authenticate_or_raise` etc., see "Key decisions") turns into the
-    exact edge-case wording from `docs/spec.md`, with the config path
-    embedded.
-  - `_build_subject_and_description(spec_text, spec_path)` — subject is the
-    `# Spec: ...` first line with the prefix stripped, falling back to the
-    file's first non-blank line, then to the filename; description is the
-    full raw spec text plus a traceability footer (origin repo dirname +
-    spec path + UTC timestamp).
-  - `main(argv=None)` — argument parsing (`--spec`, `--project`, `--config`,
-    `--dry-run`, `--verify`), catches `TaigaPushError` at the top level and
-    prints one clear `stderr` line (no traceback), non-zero exit.
-- **`scripts/taiga-configure-push.sh`** (new) — self-contained (does not
-  source `install.sh`), re-implements `install.sh`'s own `prompt()`/
-  `prompt_secret()` idiom locally. Prompts for Taiga URL (default
-  `http://127.0.0.1:9000`), username, password (`read -rsp`, never echoed),
-  and project slug; writes `~/.config/ai-dev-switchboard/taiga-push.env`
-  under a `(umask 077; ... > file)` subshell (so the file is never created
-  world/group-readable even for the instant before the explicit `chmod 600`
-  that follows — belt-and-suspenders against the spec's "no window" rule),
-  then runs `python3 scripts/taiga_push_spec.py --verify` and reports
-  pass/fail via its own exit code.
-- **`tests/test_taiga_push.py`** (new, since amended — see "Fix cycle: Defect
-  1" below) — 34 `unittest` assertions across 8 `TestCase` classes; see "How
-  to verify locally" and "Known limitations" below.
-- **`README.md`** — three additions per `docs/spec.md` "Documentation":
-  one bullet under "What you get", one line under "Repo layout", one bullet
-  under "Security notes" using the exact `AUTH_MODE=simple` phrasing
-  pattern the spec quotes.
-- **No changes** to `install.sh`, `app/app.py`,
-  `config/switchboard.env.example`, or any sudoers/systemd/frontend code —
-  confirmed by `git status` before/after: only the four files above (plus
-  this doc and `docs/spec.md`, the latter already written by
-  `product-manager` before this cycle started) are touched.
+- **`install.sh`**:
+  - New `ensure_docker()` helper (next to `set_env`/`get_env`/`random_token`)
+    — installs Docker via `get.docker.com` if missing, verifies the Compose
+    plugin, sets `DOCKER_COMPOSE_OK`. The `--with-taiga` block's inline
+    Docker steps were replaced with a call to it (pure refactor — same
+    behavior, same warning path, just de-duplicated) so a single install run
+    using both `--with-taiga` and `--with-git-hosting` only installs/checks
+    Docker once.
+  - Inside the *existing* `if [ "$WITH_GIT_HOSTING" -eq 1 ]` block (after the
+    existing `git-hosting-setup.sh` call, before the block's closing `fi`):
+    authors `$GITEA_DIR/docker-compose.yml` from
+    `config/gitea-docker-compose.yml` (`install -D -m 644`, overwritten
+    every re-run — this project's own file, nothing to preserve), writes
+    `$GITEA_DIR/.env` (secrets generated once via `random_token`, checked
+    via `get_env` returning empty — same idiom as `TOTP_SECRET`;
+    `GITEA__security__INSTALL_LOCK=true` always set;
+    `GITEA__server__DOMAIN`/`ROOT_URL` re-derived every run from
+    `PUBLISH_MODE`/`BASE_URL`, same shape as Taiga's `TAIGA_DOMAIN`;
+    `GITEA_PORT`/`GITEA_SSH_PORT` also written here so Compose's own `.env`
+    auto-load can substitute `${GITEA_PORT}`/`${GITEA_SSH_PORT}` in the
+    compose file's port mappings), pre-pulls images (warn-and-continue on
+    failure), installs the three wrapper scripts, and writes
+    `GITEA_ENABLED`/`GITEA_PORT`/`GITEA_LABEL`/`GITEA_DIR`/the three
+    `GITEA_*_SCRIPT` paths to `switchboard.env`.
+  - Sudoers: three new zero-argument entries
+    (`ai-dev-switchboard-gitea-{up,down,status}.sh`) added inside the
+    existing `if [ "$WITH_GIT_HOSTING" -eq 1 ]` sudoers stanza, alongside the
+    pre-existing `new-project.sh` rule that stanza already had.
+  - Top-of-file flag comment (`--with-git-hosting`) and the final summary
+    block both updated to mention Gitea, mirroring how `--with-taiga`'s own
+    summary block already documents Taiga — Gitea's version notes the
+    "well under 1 GB RAM" footprint (not copy-pasted Taiga's "3-5 GB"), and
+    that the existing git-hosting flow is completely unaffected.
+- **`config/gitea-docker-compose.yml`** (new) — authored directly (no
+  upstream repo to clone, unlike `taiga-docker`), verified live against
+  `docs.gitea.com/installation/install-with-docker`'s own Postgres example
+  (fetched at implementation time, not assumed from the spec — see
+  "Verification performed" below): `server` (`docker.gitea.com/gitea:1.27.1`)
+  + `db` (`docker.io/library/postgres:14`), both loading `.env` via
+  `env_file:`, loopback-only port bindings (`127.0.0.1:${GITEA_PORT}:3000`,
+  `127.0.0.1:${GITEA_SSH_PORT}:22`) baked directly into the file (no
+  override-file merge trick needed, unlike Taiga).
+- **`scripts/gitea-up.sh`**, **`scripts/gitea-down.sh`**,
+  **`scripts/gitea-status.sh`** (new) — same shape as
+  `taiga-{up,down,status}.sh`: zero-argument, root-run, `$GITEA_DIR`
+  hardcoded (sourced from `switchboard.env`), `gitea-status.sh` prints
+  `on`/`off` on its first stdout line based on
+  `docker compose ps server --format '{{.State}}'`.
+- **`app/app.py`**:
+  - New config reads: `GITEA_ENABLED`, `GITEA_LABEL`, `GITEA_PORT`,
+    `GITEA_UP_SCRIPT`, `GITEA_DOWN_SCRIPT`, `GITEA_STATUS_SCRIPT`.
+  - `gitea_run(action)`, `GITEA_URL_PATH = "/gitea"`, `_gitea_display_url()`
+    — identical shape to Taiga's equivalents.
+  - `/status` (`do_GET`): a `gitea_enabled`/`gitea_label`/`gitea`/
+    `gitea_url` quadruplet, computed via a fresh `gitea_run("status")` call
+    every poll (never trusted from memory), same as Taiga's.
+  - `do_POST`: new `elif parts[0] == "gitea" ...` branch, identical shape to
+    the existing `taiga` branch, sitting after the shared TOTP gate.
+  - **Frontend JS refactor** (the spec's highest-risk item): generalized
+    `taigaPending`/`taigaWasRunning`/`taigaOffPendingCount` into
+    `singletonToggleState = {taiga: {...}, gitea: {...}}`, plus a new
+    `SINGLETON_TOGGLE_CONFIG` map (per-kind `timeoutMs`/`badgeText`/
+    `badgeClass`/`errClass`/`spinnerClass`) and a shared
+    `singletonToggleSub(kind, on, url)` function that both replaces the
+    inline Taiga-only computation in `refresh()` and updates that kind's own
+    state as a side effect (same computation, same order of operations, now
+    parametrized). `row()`, `actionPath()`, `handleActionResult()`,
+    `toggle()`, `cancelActionCode()`, and `submitActionCode()` all changed
+    their `kind === 'taiga'` branches to `kind in singletonToggleState` (or
+    `singletonToggleState[kind]` reads/writes) — no other behavior change.
+  - New CSS: `.badge.gitea-resources { color: #66d9ff; }` (reusing Taiga's
+    already-corrected, already-shipped contrast-verified color pairing
+    verbatim — see "Deviations from spec" for the one instruction I did
+    *not* follow literally), `.gitea-err`, `.gitea-starting-spinner` +
+    `@keyframes gitea-spin`, parallel-named to Taiga's own classes (design.md
+    explicitly leaves parallel-vs-unified naming as a developer's call).
+- **`config/switchboard.env.example`** — new `## Optional: self-hosted
+  Gitea (--with-git-hosting)` section, same comment depth/style as the
+  existing Taiga section.
+- **`README.md`** — two small additions: the `--with-git-hosting` bullet
+  under "Use cases" now mentions Gitea; a new "A self-hosted Gitea singleton
+  row" bullet added under "What you get", right after the existing
+  "+ New project" bullet.
+- **`tests/test_gitea.py`** (new) — backend tests mirroring
+  `tests/test_taiga.py`'s structure exactly (`GiteaRunTests`,
+  `GiteaDisplayUrlTests`, `GiteaEndpointTests`), written first (TDD — I
+  confirmed all 13 failed with `AttributeError: module 'app' has no
+  attribute 'gitea_run'` before writing any of `app.py`'s Gitea code, then
+  watched them go green once `gitea_run`/`_gitea_display_url`/the `/status`
+  fields/the `do_POST` branch were added).
+- **`tests/test_singleton_toggle_frontend.js`** (new, replaces
+  `tests/test_taiga_frontend.js` — see "Deviations from spec") — the exact
+  same Node `vm`-based technique (`document`/`fetch`/timers stubbed, the real
+  `<script>` extracted from `render_page()`), but parametrized over
+  `kind` ('taiga' | 'gitea') so all six of the original Taiga race-condition
+  tests (docs/test-review.md Defects 1 and 2 for 1a) run against **both**
+  kinds against the one shared, generalized code path, plus one new
+  cross-kind isolation test (toggling Gitea off mid-flight must not disturb
+  Taiga's already-running state, and vice versa) that a per-kind-only test
+  run couldn't catch, plus (added post-review, see "Fixes from review") one
+  new per-kind resource-badge text/class test each. `rowHtml(kind)` scopes
+  assertions to exactly one row's own HTML slice (anchored on that row's
+  `toggle('<kind>',null,...)` onchange attribute) — needed once both rows
+  render at once, since a raw "does the whole page contain the substring
+  'stopped'" check is ambiguous the moment a second row exists. 15 tests
+  total (was 13 pre-review).
+- **`tests/test_taiga_frontend.js`** — deleted; its coverage is a strict
+  subset of `test_singleton_toggle_frontend.js`'s `[taiga]`-prefixed cases
+  (same assertions, same technique), so keeping both would mean maintaining
+  the same race-condition logic twice.
+
+## Fixes from review
+
+`docs/test-review.md`'s testing pass found one must-fix defect (blocking)
+and one should-fix defect (non-blocking, addressed in the same pass since
+the developer was already going back in). Both are fixed:
+
+- **Defect 1 (must-fix) — printed Gitea admin-account creation command
+  failed as documented.** The reviewer ran a real Gitea 1.27.1 container in
+  their sandbox and confirmed `docker exec -it ai-dev-switchboard-gitea
+  gitea admin user create ...` (the command `install.sh`'s summary block
+  printed verbatim) fails with `mustNotRunAsRoot()`, because `docker exec`
+  defaults to the container's default user (`root` for this image) and the
+  `gitea` binary refuses to run as root. The reviewer empirically verified
+  `docker exec -it --user git ai-dev-switchboard-gitea gitea admin user
+  create ...` succeeds. Fixed by adding `--user git` to the printed command
+  in `install.sh`'s summary block (line ~598). **Independently re-verified
+  live** (this session's sandbox, unlike the original implementation
+  session, had a working Docker + Compose plugin): stood up the real,
+  unmodified `config/gitea-docker-compose.yml` + a matching `.env` against
+  real `docker.gitea.com/gitea:1.27.1`/`postgres:14` images, waited for "ORM
+  engine initialization successful", then ran both the pre-fix command shape
+  (`docker exec ai-dev-switchboard-gitea gitea admin user create ...`, no
+  `--user git`) and the fixed shape (`docker exec --user git
+  ai-dev-switchboard-gitea gitea admin user create ...`) against it —
+  reproduced the exact `mustNotRunAsRoot()` failure for the former and the
+  exact `New user 'testadmin' has been successfully created!` success for
+  the latter, then tore the stack down (`docker compose down -v`). (`-it`
+  itself couldn't be exercised in this non-interactive shell — "the input
+  device is not a TTY" — but `-it` vs. plain/no-tty is orthogonal to the
+  root-vs-`git`-user bug being fixed here; an operator running this in a
+  real interactive terminal gets `-it`'s TTY allocation for free, same as
+  before and unaffected by this fix.) Checked the rest of the repo
+  for a second place that prints/documents this same literal command:
+  `docs/spec.md` mentions it twice but both are elided design-rationale
+  references (`docker exec ... gitea admin user create ...` and `gitea admin
+  user create --admin --username ... --password ... --email ...`, neither
+  includes the container name or `-it`, so neither is "the same command"
+  reproduced verbatim) and wasn't touched, since editing the spec isn't this
+  role's job; `docs/GIT_HOSTING.md` and `README.md` don't mention this
+  command at all. `docs/implementation.md`'s own "Known limitations" bullet
+  *did* repeat the un-fixed command verbatim and has been corrected here too.
+- **Defect 2 (should-fix) — no automated test asserted per-kind badge
+  text/class correctness.** The reviewer's own sabotage probe (hardcoding
+  `row()`'s `const cfg = SINGLETON_TOGGLE_CONFIG[kind];` lookup to always
+  read `SINGLETON_TOGGLE_CONFIG['taiga']`) passed the entire existing suite
+  (135 Python + 13 JS tests) undetected. Added one new test per kind to
+  `tests/test_singleton_toggle_frontend.js`
+  (`[<kind>] resource badge shows this kind's own text/class while running,
+  not another kind's`) that renders that kind's row while running and
+  asserts its badge `class="badge <kind-class>"` and badge text both match
+  a `BADGE_CONFIG` constant duplicated in the test file (deliberately not
+  imported from `app.py`, so a real regression in the shipped config can't
+  trivially "match itself"), and that neither the *other* kind's badge class
+  nor text appear in that row's HTML. **Verified load-bearing**: reintroduced
+  the reviewer's exact sabotage (`SINGLETON_TOGGLE_CONFIG['taiga']`
+  hardcoded in `row()`) — the new `[gitea]` badge test failed (`expected
+  badge class "gitea-resources", got: ...taiga-ram...⚠ ~3–5 GB RAM...`)
+  while the `[taiga]` badge test and all other 13 tests still passed
+  (matching the reviewer's own description of this exact failure signature)
+  — then reverted the sabotage and confirmed the full 15/15 JS suite passes
+  clean again, with no `SABOTAGE` markers left in `app/app.py`
+  (`grep -n SABOTAGE app/app.py` → no matches).
+
+Re-ran the full suite after both fixes: `python3 -m unittest discover -s
+tests` → 135/135 (unchanged — Defect 2's fix is JS-only, Defect 1's fix is
+a printed string only, neither touches Python code); `node
+tests/test_singleton_toggle_frontend.js` → **15/15** (13 pre-existing + 2
+new badge tests, one per kind); `bash -n install.sh` → clean.
 
 ## Key decisions / tradeoffs
 
-- **`_taiga_request`'s own raised message vs. the edge-case wording split
-  across two layers.** `docs/spec.md` says `_taiga_request` itself "raises
-  TaigaPushError with a clear message on any non-2xx status or connection
-  failure," but the *exact* wording for "bad credentials" vs. "unknown
-  project" differs per endpoint and needs the config path embedded (which
-  `_taiga_request` doesn't know). Read this as: `_taiga_request` raises a
-  generic, endpoint-agnostic `TaigaConnectionError`/`TaigaHTTPError` (its
-  literal "one clear message" duty, and the one seam tests monkeypatch);
-  three small `_..._or_raise` wrapper functions in `_run()` translate those
-  into the exact, config-path-bearing wording from `docs/spec.md` "Edge
-  cases". This keeps `_authenticate`/`_lookup_project`/`_create_userstory`
-  matching the spec's literal 3-arg signatures (no `config_path` parameter
-  bolted on) while still producing the exact required message text.
-- **Never include Taiga's raw HTTP response body in any printed message.**
-  `TaigaHTTPError.body` is captured (useful for future debugging/logging)
-  but deliberately never interpolated into a user-facing message anywhere —
-  this is what makes "the password must never appear in stdout/stderr, even
-  in a bad-credentials error" true unconditionally, rather than true only
-  because Taiga's real API happens not to echo request bodies back today.
-- **Missing/empty spec file is checked before any network call**, for both
-  the normal push path and `--dry-run` (which still needs real spec text to
-  preview) — but not `--verify`, which returns before that check runs at
-  all, per the spec's stated precedence.
-- **Manual `KEY=value` parsing, not `configparser`** — matches this
-  project's one existing precedent for parsing an env-style file in Python
-  (`app/app.py`'s `_parse_engine_file()` for `engines.d/*.engine`), not
-  `configparser`'s INI-section model, which doesn't fit a flat `KEY=value`
-  file anyway.
+- **Postgres over SQLite** (spec's Open Question 1, left for confirmation,
+  not re-decided here) — implemented exactly as the spec's default: matches
+  Gitea's own documented example, and defers a DB migration 2c would
+  otherwise force. Flagged again here for whoever picks up 2b/2c.
+- **Image tags pinned to what was actually live at implementation time**
+  (`docker.gitea.com/gitea:1.27.1`, `docker.io/library/postgres:14`) —
+  fetched live from `docs.gitea.com/installation/install-with-docker` during
+  this session (see "Verification performed"), not guessed or carried over
+  from stale training knowledge. `docker.gitea.com` (Gitea's own registry,
+  not Docker Hub's `gitea/gitea`) is what the current official docs use.
+- **`GITEA__server__SSH_PORT` intentionally left at Gitea's own default**,
+  not set to `$GITEA_SSH_PORT` — SSH exposure/clone-URL correctness is
+  explicitly out of scope for 2a (Non-goals: "no way to create a Gitea repo
+  yet regardless"), and getting `SSH_PORT` (displayed clone port) vs.
+  `SSH_LISTEN_PORT` (what the container's own SSH server actually binds to)
+  wrong risks a container-internal misconfiguration for zero benefit right
+  now. Flagged explicitly for 2b, which does need to get this right.
+- **`row()`'s badge lookup is `SINGLETON_TOGGLE_CONFIG[kind]`, keyed by the
+  same `kind` string already threaded through every other function** —
+  avoids a second per-kind config table or a boolean-plus-hardcoded-class
+  pair (`showTaigaBadge` before this cycle). This is the shape the spec's
+  own pseudocode suggested (`kind in singletonToggleState`), applied
+  consistently to the badge lookup too.
+- **Test file replacement, not addition** — `test_taiga_frontend.js` was
+  deleted rather than kept alongside the new parametrized suite (see
+  "Changes by file" above) since its six tests are a strict subset of the
+  new file's `[taiga]`-prefixed cases; keeping both would mean two
+  copies of the same race-condition assertions to keep in sync.
 
 ## Deviations from spec
 
-None substantive. One minor, non-behavioral naming liberty: `docs/spec.md`
-sketches `_authenticate`/`_lookup_project`/`_create_userstory` as the only
-three endpoint functions; I added three thin `_..._or_raise` wrappers around
-them (see "Key decisions" above) purely to keep the exact required
-edge-case wording (which needs the `--config` path) out of the three
-spec-named functions' own bodies. The three spec-named functions exist with
-exactly the signatures the spec gives and do the exact HTTP call each is
-named for; the wrappers are additive, not a replacement.
-
-## Fix cycle: Defect 1 (blank/malformed `TAIGA_URL` raw traceback)
-
-`docs/test-review.md` found one must-fix defect after its first testing
-pass: in `_taiga_request` (`scripts/taiga_push_spec.py`), the
-`urllib.request.Request(url, ...)` construction happened *before* the
-surrounding `try:` block. `Request.__init__` itself parses the URL and
-raises a bare `ValueError` for anything unparseable (blank string, or a
-string with no recognizable scheme) — since that construction was outside
-the `try:`, the existing `except (urllib.error.URLError, OSError,
-ValueError)` handler never saw it, and the `ValueError` propagated all the
-way past `main()`'s `except TaigaPushError` catch as a raw Python
-traceback. This directly violated acceptance criterion 5 (Taiga
-unreachable → clean message, no traceback), specifically for the
-"wrong `TAIGA_URL`" trigger the spec names explicitly.
-
-**Fix**: moved `req = urllib.request.Request(url, data=data, method=method,
-headers=headers)` to be the first statement inside `_taiga_request`'s
-existing `try:` block (`scripts/taiga_push_spec.py`, `_taiga_request`), so
-a `ValueError` raised during request construction is caught by the exact
-same `except (urllib.error.URLError, OSError, ValueError)` handler that
-already converts connection failures into `TaigaConnectionError` — no new
-exception type, no new handler, just closing the gap between where the
-object is built and where the `try:` started. A blank/malformed
-`TAIGA_URL` now produces the same `error: Could not reach Taiga at
-<url> — make sure it's toggled on in the ai-dev-switchboard web UI, or
-check TAIGA_URL in <config path>.` message and exit code 1 as any other
-unreachable-Taiga case.
-
-**Regression tests added** (`tests/test_taiga_push.py`,
-`MainIntegrationTests`): `test_blank_taiga_url_exits_nonzero_with_
-unreachable_message_no_traceback` (empty `TAIGA_URL`) and
-`test_malformed_taiga_url_exits_nonzero_with_unreachable_message_no_
-traceback` (`TAIGA_URL=not-a-url-at-all`, a scheme-less value). Both
-deliberately do **not** monkeypatch `_taiga_request` (unlike every other
-test in the file) so the real `urllib.request.Request(...)` call is what's
-actually exercised — monkeypatching it would have hidden this exact bug.
-Verified TDD-style: temporarily reverted the fix and confirmed both new
-tests fail with the exact reported traceback (`ValueError: unknown url
-type: ...` surfacing all the way out of `tps.main()`), then restored the
-fix and confirmed both pass.
-
-**Non-blocking follow-up also fixed alongside this** (per the reviewer's
-note, small and obvious): `_lookup_project_or_raise` previously let any
-`TaigaHTTPError` status other than `404`/`401`/`403` (e.g. a `500`)
-propagate unchanged, surfacing as the generic, unstated `error: Taiga
-returned HTTP 500`. Added an explicit `except TaigaHTTPError as e:` branch
-there that raises `TaigaPushError(f"Taiga rejected the project lookup
-(HTTP {e.status}).")` instead — mirrors the existing fallback wording
-pattern `_create_userstory_or_raise` already uses for its own unmapped
-statuses (`"Taiga rejected the new userstory (HTTP {e.status})."`), and
-still never includes `e.body` (the raw response) in the message, preserving
-the no-leaked-data guarantee. No test asserted the old wording, so this
-didn't require a test change, but the existing `_lookup_project_404_raises_
-project_not_found` and `test_unknown_project_slug_...` tests still cover
-the 404 path unchanged.
+- **The Gitea CSS badge comment references 1a's own already-corrected
+  contrast, not the flawed math the current `docs/design.md` restates.**
+  This was explicitly pre-corrected by the orchestrator's own instructions
+  before I started (design.md's ~2.1:1 figure is stale copy from before 1a's
+  own contrast fix landed) — I reused `.badge.taiga-ram`'s exact, already-
+  shipped `#66d9ff` on `#16324a` pairing (~8.14:1, well above WCAG AA) for
+  `.badge.gitea-resources` verbatim, and updated the CSS comment to say so
+  correctly rather than parroting design.md's inaccurate number. No new
+  contrast work was performed, per the explicit instruction.
+- **`tests/test_taiga_frontend.js` was deleted rather than left in place.**
+  The spec's "Risk / rollback notes" says to "re-run (or adapt)" the
+  reviewer's technique — I read "adapt" as license to supersede the file
+  with a parametrized version rather than maintain two copies of the same
+  six tests going forward. If the reviewer would rather see the original
+  file preserved untouched alongside a new Gitea-only file, that's a very
+  small, mechanical change to reverse (git history has the original
+  verbatim at `ed84d73`).
+- **Everything else in `docs/spec.md`'s "Proposed approach" was followed
+  literally** — exact env var names/service names verified live against
+  `docs.gitea.com` rather than assumed frozen from the spec (per the spec's
+  own Open Question 4), same idiom precedent 1a used for `taiga-docker`.
 
 ## Known limitations
 
-- **No live Taiga instance was reachable in this environment** (same gap
-  1a's own `docs/implementation.md` — commit `ed84d73` — already
-  documented: `docker compose` — the plugin — isn't installed here, only
-  the bare `dockerd`; confirmed again this cycle with `docker compose
-  version` → `'compose' is not a docker command`, and `systemctl status
-  ai-dev-switchboard` → unit not found, i.e. 1a was never actually deployed
-  in this sandbox either). Real Taiga-hosted auth/project-lookup/userstory-
-  creation behavior against a genuine Taiga backend was **not** verified
-  here.
-  - What **was** verified instead, to close that gap as much as possible
-    without a live Taiga: a small standalone fake HTTP server
-    (`http.server.HTTPServer`, not part of the shipped code — a throwaway
-    script written only for this verification pass, not committed) that
-    implements the three endpoints' documented shapes (`POST /api/v1/auth`,
-    `GET /api/v1/projects/by_slug`, `POST /api/v1/userstories`) exactly as
-    `docs/spec.md` "Background" describes them. Against that real HTTP
-    server (real `urllib.request` calls over a real socket, nothing
-    monkeypatched): `--verify` succeeded, a normal run created one
-    "userstory" and printed the correct `#ref` + URL, `--dry-run` printed
-    the correct preview with no POST sent, a wrong password produced the
-    exact bad-credentials message via a real 400 response, and an unknown
-    project slug produced the exact not-found message via a real 404
-    response. `scripts/taiga-configure-push.sh` was also run end-to-end
-    against this same fake server with piped stdin answers — wrote a real
-    `mode 600` config file with the entered values, then correctly reported
-    setup success.
-  - This confirms the real network/HTTP/JSON-serialization code path works
-    correctly end-to-end and that the three request shapes match
-    `taiga-doc`'s documented API — but it does **not** confirm Taiga's own
-    real backend behaves exactly like the fake server past what's
-    documented (e.g. exact error body shape on a 400, any auth-token
-    expiry/format quirks, Taiga version-specific field-name drift the spec
-    itself flags as a risk under "Open questions"). If a real Taiga
-    instance becomes reachable, the fastest smoke test is: `bash
-    scripts/taiga-configure-push.sh` against it, then `python3
-    scripts/taiga_push_spec.py` with no flags and check the printed
-    userstory shows up in Taiga's own web UI.
-- **`tests/test_taiga_push.py`'s `ConfigureScriptTests` class** runs the
-  real bash script end-to-end but necessarily points it at
-  `http://127.0.0.1:1` (nothing listens there in this sandbox), so it only
-  confirms file-creation/permissions/exit-code-propagation, not a
-  successful verify — the fake-HTTP-server pass described above (not
-  committed, ad hoc) is what covered the successful path.
+- Same as 1a's own documented limitation: `GITEA_PORT=3000`/
+  `GITEA_SSH_PORT=2222` are fixed, non-interactive defaults — no free-port
+  scan (spec's Open Question 5, explicitly accepted, not a gap to close
+  here).
+- Admin-account creation is a manual, one-time step (`docker exec -it
+  --user git ai-dev-switchboard-gitea gitea admin user create --admin ...`),
+  printed at the end of `install.sh`'s output — not automated, per the spec's
+  Non-goals and Open Question 3. (`--user git` added post-review — see
+  "Fixes from review" below; without it the command fails.)
+- No uninstall/`--without-git-hosting` path — matches every other `--with-*`
+  flag in this installer, including Taiga's.
+- Gitea is inert infrastructure only in this cycle: it cannot create or host
+  a real repo yet (`create_project()` still calls the unchanged
+  `NEW_PROJECT_SCRIPT`). That's explicitly 2b's job.
+
+## What could and couldn't be verified end-to-end
+
+Same documented gap 1a and 1b both hit in this environment: `docker` is
+present (`docker --version` succeeds) but the Compose plugin is **not**
+(`docker compose version` fails with `'compose' is not a docker command`),
+and there's no `pip`/`pyyaml` available either. Concretely, in this session:
+
+**Verified:**
+- `install.sh` parses/runs cleanly (`bash -n install.sh`) with the new
+  `ensure_docker()` helper and the Gitea block inside the
+  `WITH_GIT_HOSTING` block, including the idempotency logic (`get_env`
+  returning non-empty skips secret regeneration; `.env`/compose-file/
+  sudoers writes are all deterministic re-writes via the existing
+  `set_env`/`install`/heredoc idioms already used elsewhere in this file).
+- `config/gitea-docker-compose.yml`'s exact shape (service names `server`/
+  `db`, `env_file:` usage, image tags, env var names) verified live against
+  `docs.gitea.com/installation/install-with-docker` at implementation time
+  (fetched via `curl`, not assumed) — not validated with a real
+  `docker compose config`/YAML parser in this environment (no `pyyaml`, no
+  Compose plugin), so a YAML indentation typo, while checked carefully by
+  eye, isn't machine-verified here.
+- All three wrapper scripts pass `bash -n`; their fallback behavior (no
+  `$GITEA_DIR` yet → `gitea-status.sh` prints `off`) is exercised indirectly
+  via `tests/test_gitea.py`'s monkeypatched `gitea_run` (the wrapper
+  scripts' own bodies aren't invoked by those tests — only their contract,
+  same limitation 1a's own `test_taiga.py` documented).
+- `app/app.py`'s backend logic: all 13 new tests in `tests/test_gitea.py`
+  pass (`gitea_run()`'s sudo/timeout shape, `_gitea_display_url()`'s two
+  modes, the full `/status` + `/gitea/{on,off}` HTTP round-trip against a
+  real `ThreadingHTTPServer`, the TOTP gate, the disabled-404 case) — Docker
+  itself is never invoked; `gitea_run` is monkeypatched to a stateful fake,
+  same technique `test_taiga.py` already uses.
+- The full existing suite (135 Python tests across `test_taiga.py`,
+  `test_gitea.py`, `test_upload.py`, `test_new_project_from_upload.py`) —
+  all green, no regressions from the Docker-helper refactor or the frontend
+  generalization.
+- **The frontend state-machine generalization specifically** — the
+  highest-risk item per the spec's own "Risk / rollback notes":
+  `tests/test_singleton_toggle_frontend.js` re-runs the exact same six
+  race-condition scenarios (docs/test-review.md Defects 1 and 2) against
+  **both** `taiga` and `gitea` kinds (13 tests total, all pass) against the
+  real rendered `<script>` extracted from `render_page()`. I additionally
+  ran a sabotage check during this session (temporarily made the
+  `offPendingCount` release logic gitea-blind, confirmed the `[gitea]`
+  network-failure test — and only that one — failed, then reverted) to
+  confirm the parametrized suite actually catches a kind-specific
+  regression rather than just re-confirming Taiga still works.
+- JS syntax of the real rendered `<script>` (`node --check`) — no syntax
+  errors from the refactor.
+
+**Could not be verified (same documented gap as 1a/1b):**
+- An actual `docker compose pull`/`up -d`/`down`/`ps` cycle against the real
+  authored compose file — not run in this environment (no Compose plugin).
+  This means the compose file's `env_file:`/`ports:`/`depends_on:` wiring,
+  the `GITEA__database__*` values actually reaching Postgres/Gitea correctly,
+  and Gitea actually reaching a working login page after `INSTALL_LOCK=true`
+  are all verified only by close reading against Gitea's own live docs, not
+  by an actual running stack.
+- The three wrapper scripts' real `docker compose` invocations (only their
+  contract — stdout shape, `sudo`-argument list — is exercised via the
+  monkeypatched `gitea_run` in `tests/test_gitea.py`).
+- The full install.sh run end-to-end on a real box (creating `$GITEA_DIR`,
+  writing/overwriting real files under `/etc`, `/opt`, `/usr/local/bin`,
+  generating a real sudoers file and validating it with `visudo`) — not run
+  in this sandboxed environment; only static analysis (`bash -n`) and close
+  reading against the existing, already-working `--with-taiga` block it
+  parallels.
 
 ## How to verify locally
 
 ```bash
-cd /home/dev/projects/ai-dev-switchboard
-python3 -m py_compile scripts/taiga_push_spec.py
-bash -n scripts/taiga-configure-push.sh
-python3 -m unittest discover -s tests -v   # expect 122/122 pass (88 pre-existing + 34 in test_taiga_push.py)
-# or just the new suite:
-python3 tests/test_taiga_push.py -v        # expect 34/34 pass
-```
+# Backend (fast, no Docker needed):
+python3 -m unittest discover -s tests -v
 
-Manual smoke test against a real Taiga instance (needs 1a's stack actually
-running — not available in this sandbox, see "Known limitations"):
+# Frontend regression suite (both taiga and gitea kinds, 13 tests):
+node tests/test_singleton_toggle_frontend.js
 
-```bash
-# one-time setup, after a Taiga user + target project already exist:
-bash scripts/taiga-configure-push.sh
-# → prompts for URL/username/password/project slug, writes
-#   ~/.config/ai-dev-switchboard/taiga-push.env (mode 600), then runs
-#   --verify automatically and reports pass/fail.
+# install.sh syntax:
+bash -n install.sh
 
-# dry-run first, to sanity-check formatting without creating backlog noise:
-python3 scripts/taiga_push_spec.py --dry-run
-
-# the real push:
-python3 scripts/taiga_push_spec.py
-# → prints "Created userstory #<ref>: <url>" and exits 0; open the URL to
-#   confirm it landed in Taiga with the right subject/description.
-
-# error paths (each should print one clear line to stderr, no traceback,
-# and exit non-zero):
-python3 scripts/taiga_push_spec.py --config /nonexistent/path.env
-python3 scripts/taiga_push_spec.py --project this-project-does-not-exist
-# temporarily toggle Taiga off in the ai-dev-switchboard web UI, then:
-python3 scripts/taiga_push_spec.py --dry-run
+# On a real box with Docker + the Compose plugin available, to verify the
+# actual stack (not run in this session — see limitations above):
+sudo ./install.sh --with-git-hosting
+#   then flip the "Gitea" row's toggle in the web UI, or directly:
+sudo /usr/local/bin/ai-dev-switchboard-gitea-up.sh
+sudo /usr/local/bin/ai-dev-switchboard-gitea-status.sh   # expect "on" once healthy
+curl -I http://127.0.0.1:3000                             # expect Gitea's login page
+sudo /usr/local/bin/ai-dev-switchboard-gitea-down.sh
+sudo /usr/local/bin/ai-dev-switchboard-gitea-status.sh   # expect "off"
 ```
