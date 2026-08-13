@@ -119,6 +119,53 @@ dependency, no break from "stdlib-only Python, one file". Ollama's
 OpenAI-compatible `/v1/chat/completions` supports `tools` (function calling)
 natively on tool-capable models (qwen3, llama4:scout, mistral, gemma).
 
+### 2.5 Spike: the lead runs remotely, and tier 1 works (2026-08-13)
+
+Run before specifying 6c, because its central premise — that a small local
+model can drive the four-tool loop — had never been tested.
+
+**The lead cannot run on the switchboard container.** Measured on the standard
+LXC container this project targets:
+
+```
+Mem:  total=2048MB  used=1332MB  available=715MB
+Swap: total=512MB   free=0MB          (already exhausted)
+      2 cores, no GPU
+```
+
+`qwen3:8b` needs roughly 5.5 GB — about 8x what is free. Even `llama3.2:1b`
+(~1 GB) does not fit. **No tool-capable model can run here**, so the earlier
+"`install.sh --with-ollama` installs Ollama natively" decision is dead.
+
+This is a deployment problem, not an architecture problem. `TEAM_LLM_BASE_URL`
+is a URL and was always allowed to point anywhere; `127.0.0.1:11434` was only
+the example value. `--with-ollama` therefore becomes a **link** step: prompt
+for an existing endpoint and model, validate reachability, write `TEAM_LLM_*`.
+Nothing is installed. This also mirrors the existing precedent for work that
+lives outside the container — `host-agent/` reaches the Proxmox host over a
+scoped SSH key rather than doing the work locally.
+
+**Tier 1 tool-calling works.** Against a real remote Ollama (a separate
+container on the tailnet) with `qwen3:8b`, driving the actual four-tool schema
+(`delegate` / `fact_check` / `ask_user` / `finish`) over
+`/v1/chat/completions`:
+
+```
+RESULT   9/10 well-formed correct tool calls (90%)
+         1x wrong_tool  (chose fact_check where ask_user was right)
+         0x prose_fallback   0x malformed_args   0x transport_error
+latency  mean 7.4s   max 20.8s
+```
+
+Zero prose fallbacks and zero malformed arguments across ten varied prompts.
+The single miss was a **judgment** error — a well-formed call to the wrong
+tool — not a format failure, so it is prompt-tunable rather than an
+adapter-level problem.
+
+Two things this pins down for 6c: the tier-1 adapter is viable as designed,
+and per-delegation latency is seconds, not sub-second — so the lead loop must
+be asynchronous and the UI must show a working state rather than blocking.
+
 ---
 
 ## 3. Settled decisions
@@ -134,7 +181,7 @@ natively on tool-capable models (qwen3, llama4:scout, mistral, gemma).
 | Grounding writes | **Read-only.** The lead never writes to the backlog or any grounding file | Same reasoning as deploy-is-manual-only: no agent mutates the project's source of truth unattended |
 | Escalation gate | Lead calls `ask_user` on its own judgment; `TEAM_MAX_ROUNDS` (default 8) forces escalation as a backstop | Adaptive where it matters, bounded against runaway spend |
 | Escalation shape | Structured question + 2–4 pickable options (§4.5), never a bare text prompt | Matches the pipeline's own `AskUserQuestion`; a good question with options is answerable in one tap from a phone |
-| Ollama install | `install.sh --with-ollama`, off by default, native (not Docker) | Matches `--with-taiga` / `--with-git-hosting` / `--with-deploy-target`; Ollama ships a one-line installer |
+| Ollama install | **Superseded 2026-08-13 — see §2.5.** `install.sh --with-ollama` **links** an existing remote Ollama; it does not install one locally | The standard container has 2 GB RAM with ~715 MB free and swap exhausted. No tool-capable model fits — `qwen3:8b` needs ~8x that. `TEAM_LLM_BASE_URL` is a URL, so remote works with zero code change |
 | Isolation | One git worktree per teammate | §2.3 |
 
 ### Non-goals for this story
@@ -401,8 +448,11 @@ orphaned worktrees, and stale state dirs.
   same discipline as the existing `_reap_dead_state()` contract.
 - Worktree creation failure (dirty tree, detached HEAD, non-git project)
   fails the start with a specific message and leaves nothing behind.
-- `install.sh --with-ollama` implemented, off by default, prompting for the
-  model to pull and writing `TEAM_LLM_*`.
+- `install.sh --with-ollama` implemented, off by default, as a **link** step
+  (§2.5): prompts for an existing endpoint URL and model name, validates the
+  endpoint is reachable and the model is present, writes `TEAM_LLM_*`.
+  Installs nothing locally, and refuses to point at an endpoint it cannot
+  reach rather than writing config that fails later at team start.
 
 ### 6e — Roster & composition UI
 
