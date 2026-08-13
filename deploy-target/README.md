@@ -5,13 +5,13 @@ Optional. Turns a machine into a **deploy receiver**: a dedicated low-priv
 destination path, or trigger one fixed restart of one named systemd
 service — nothing else, no shell, ever.
 
-This is the **receiver only**. Nothing here decides which project deploys
-to which target, or actually sends the push — that's a separate,
-not-yet-built switchboard-side piece (backlog item 2c, part 2b) that will
-build against this receiver. Everything in this directory is
-standalone-testable today with nothing but a manually-generated SSH keypair
-and the `ssh`/`rsync` CLIs — no switchboard/`app.py` code needs to exist or
-run.
+This is the **receiver only** — everything in this directory is
+standalone-testable with nothing but a manually-generated SSH keypair and
+the `ssh`/`rsync` CLIs, no switchboard/`app.py` code needs to exist or run.
+The switchboard-side piece that actually decides which project deploys to
+which target and sends the push (backlog item 2c, part 2b — a hand-edited
+`deploy-map.json` plus a "Deploy" button in the web UI) now exists too —
+see "Switchboard-side caller (2c part 2b)" below.
 
 ## Why a separate SSH channel instead of just another "project"
 
@@ -122,11 +122,31 @@ needs zero re-derivation:
    restart pairs — a future caller must serialize invocations for the same
    target rather than firing two deploys at once.
 
+## Switchboard-side caller (2c part 2b)
+
+The real caller against this receiver's "Protocol contract" above now
+exists: `app.py`'s `deploy_run()`, wired to a per-project "Deploy" button
+in the web UI. It's driven by a separate, hand-edited map file (default
+`/etc/ai-dev-switchboard/deploy-map.json`, one entry per switchboard
+project — see `config/deploy-map.json.example` for the exact schema and
+`docs/spec.md`'s 2c part 2b for the full design) naming which target each
+project deploys to and where its private key lives. This receiver's own
+setup above (steps 1-3) is unchanged and still exactly what you do first,
+on the target machine — the map file is the separate, switchboard-side step
+that then points a project at it. Deploy is manual-only: a push landing on
+a project's Gitea repo (2c part 1's poll/sync) never triggers a deploy by
+itself, only an explicit, confirmed click on the "Deploy" button does.
+
+Before the first click against a given target, make sure `SVC_USER` (the
+account `app.py` itself runs as) already trusts that target's host key —
+e.g. `sudo -u <SVC_USER> ssh -i <key> deploy@<target> true` once by hand.
+`deploy_run()` deliberately never sets `StrictHostKeyChecking=no` (same
+precedent host-control's own SSH channel already carries) — an untrusted
+host key fails the click loudly and immediately instead of either hanging
+or silently trusting an unverified host.
+
 ## What this cycle doesn't do
 
-- No switchboard-side wiring: no per-project target config, no UI, no
-  `app.py` dispatch. That's a separate future cycle (2c-2b) building
-  against this receiver.
 - No SSH keypair generation — you generate/place the key by hand (step 2
   above), same precedent as `host-agent`'s own setup.
 - No support for multiple deploy targets (multiple paths/services) on the

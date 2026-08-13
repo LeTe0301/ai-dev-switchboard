@@ -176,6 +176,16 @@ PROJECTS_DIR="/home/$RUN_USER/projects"
 mkdir -p "$PROJECTS_DIR"
 chown "$RUN_USER:$RUN_USER" "$PROJECTS_DIR"
 
+# Switchboard-side deploy dispatch (backlog item 2c, part 2b -- docs/spec.md).
+# Unconditional (no --with-* flag -- this feature has no install-time
+# on/off switch, only a data-presence gate: no project shows a Deploy
+# button until deploy-map.json has real hand-edited entries in it).
+# Permissions/ownership are reasserted every run (harmless, idempotent) --
+# never touches key *content*, the operator places keys here by hand.
+mkdir -p "$CONFIG_DIR/deploy-keys"
+chmod 700 "$CONFIG_DIR/deploy-keys"
+chown "$SVC_USER:$SVC_USER" "$CONFIG_DIR/deploy-keys"
+
 if [ "$WITH_CODE_SERVER" -eq 1 ]; then
     echo "-- code-server default theme --"
     CODE_SERVER_DIR="/home/$RUN_USER/.local/share/code-server"
@@ -375,6 +385,17 @@ chown "$SVC_USER:$SVC_USER" "$STATE_DIR/uploads"
 set_env "$ENV_FILE" NEW_PROJECT_FROM_UPLOAD_SCRIPT \
     "/usr/local/bin/ai-dev-switchboard-new-project-from-upload.sh"
 set_env "$ENV_FILE" UPLOAD_STAGING_TTL_SECONDS "1800"
+
+# Switchboard-side deploy dispatch (backlog item 2c, part 2b -- docs/spec.md
+# "Proposed approach" #7). Copy-if-absent ONLY -- unlike every set_env call
+# in this file, deploy-map.json is a hand-edited-by-the-operator JSON object
+# keyed per-project, not a KEY=VALUE file with single-key patch semantics,
+# so a re-run must never overwrite a real hand-edited map (deploy-keys/'s
+# permissions/ownership above are still reasserted every run; this file is
+# not).
+[ -f "$CONFIG_DIR/deploy-map.json" ] || echo '{}' > "$CONFIG_DIR/deploy-map.json"
+set_env "$ENV_FILE" DEPLOY_MAP_FILE "$CONFIG_DIR/deploy-map.json"
+set_env "$ENV_FILE" DEPLOY_KEYS_DIR "$CONFIG_DIR/deploy-keys"
 
 chown "$SVC_USER:$SVC_USER" "$ENV_FILE"
 chmod 600 "$ENV_FILE"

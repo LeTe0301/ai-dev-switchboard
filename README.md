@@ -155,13 +155,14 @@ don't even need that — they're re-read live).
 ```
 app/app.py              the web UI itself — stdlib-only Python, one file
 engines.d/               engine definitions (see docs/ADDING_AN_ENGINE.md)
-config/                  *.env.example reference configs
+config/                  *.env.example reference configs, deploy-map.json.example
 install.sh               installer — run on any existing box
 ct/create.sh             Proxmox-host wrapper: creates a container, then runs install.sh inside it
 scripts/                 optional git-hosting + project-scaffolding (docs/GIT_HOSTING.md);
                           also scripts/taiga_push_spec.py + taiga-configure-push.sh (docs/spec.md)
 host-agent/               optional persistent session on a separate machine (host-agent/README.md)
-deploy-target/           optional deploy receiver on a separate machine (deploy-target/README.md)
+deploy-target/           optional deploy receiver on a separate machine (deploy-target/README.md);
+                          the web UI's own per-project "Deploy" button calls this over SSH
 systemd/                 reference systemd unit for manual installs
 docs/                    architecture notes, engine format, git-hosting detail
 ```
@@ -185,9 +186,15 @@ docs/                    architecture notes, engine format, git-hosting detail
 - The optional deploy-target SSH channel (`--with-deploy-target`, run on a
   *separate* target machine) is restricted to write-only `rrsync` into one
   configured path or one exact, sudoers-scoped restart script — no shell,
-  no port/X11/agent forwarding, no pty. This is receiver-only
-  infrastructure with no switchboard UI consumer yet — see
-  [`deploy-target/README.md`](deploy-target/README.md).
+  no port/X11/agent forwarding, no pty — see
+  [`deploy-target/README.md`](deploy-target/README.md). The web UI's own
+  caller against it (a per-project "Deploy" button) is driven by a
+  hand-edited, never-UI-editable `deploy-map.json` and stores each target's
+  private key under a mode-700, service-user-owned directory
+  (`DEPLOY_KEYS_DIR`, default `/etc/ai-dev-switchboard/deploy-keys/`) — no
+  new privilege boundary, same account that already holds
+  `HOST_CONTROL_KEY`. Dispatch is manual-only: it never fires off a Gitea
+  push automatically, only an explicit, `confirm()`-gated click.
 - `scripts/taiga_push_spec.py` stores its password in plain text in
   `~/.config/ai-dev-switchboard/taiga-push.env` (file mode `600`, owned by
   `RUN_USER`).

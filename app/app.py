@@ -170,6 +170,19 @@ GITEA_REPO_MAP_FILE = os.environ.get(
 # env-overridable constant, same style as UPLOAD_STAGING_TTL_SECONDS.
 GITEA_POLL_INTERVAL_SECONDS = int(os.environ.get("GITEA_POLL_INTERVAL_SECONDS", "45"))
 
+# Switchboard-side deploy dispatch (backlog item 2c, part 2b -- docs/spec.md).
+# DEPLOY_MAP_FILE is a hand-edited, operator-maintained project -> deploy-
+# target mapping (host/port/user/deploy_path/service/key) -- unlike
+# GITEA_REPO_MAP_FILE above, app.py only ever *reads* this file, never writes
+# it (docs/spec.md "No UI for authoring deploy-map.json or placing keys").
+# DEPLOY_KEYS_DIR is the mode-700, SVC_USER-owned directory every map
+# entry's "key" path must resolve under (defense in depth against a
+# hand-edited map pointing somewhere unintended) -- see _load_deploy_map.
+DEPLOY_MAP_FILE = os.environ.get(
+    "DEPLOY_MAP_FILE", "/etc/ai-dev-switchboard/deploy-map.json")
+DEPLOY_KEYS_DIR = os.environ.get(
+    "DEPLOY_KEYS_DIR", "/etc/ai-dev-switchboard/deploy-keys")
+
 STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT_SECONDS", "45"))
 
 # This service runs as its own unprivileged user — tmux sessions must run as
@@ -731,6 +744,117 @@ def _gitea_poll_one(owner_repo: str, entry: dict) -> None:
     if not remote_sha or remote_sha == entry.get("remote_sha"):
         return  # nothing new since the last time this was checked
     _gitea_sync_bg(entry["name"], branch, owner_repo, remote_sha)
+
+
+# ─── switchboard-side deploy dispatch (backlog item 2c, part 2b) ──────────
+# See docs/spec.md "Proposed approach" and deploy-target/README.md's
+# "Protocol contract". DEPLOY_MAP_FILE is hand-edited by the operator (this
+# module never writes it, unlike GITEA_REPO_MAP_FILE above) -- loading
+# tolerates a missing/malformed file (-> {}) the same "never crash" way
+# _load_gitea_repo_map does, and additionally drops (never raises on) any
+# individual entry that's missing a required key or whose "key" path
+# resolves outside DEPLOY_KEYS_DIR, so one bad hand-edited entry can't take
+# down every other project's Deploy button.
+_DEPLOY_MAP_REQUIRED_KEYS = ("host", "deploy_path", "service", "key")
+
+
+def _load_deploy_map() -> dict:
+    try:
+        with open(DEPLOY_MAP_FILE) as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    keys_root = os.path.realpath(DEPLOY_KEYS_DIR)
+    out = {}
+    for name, entry in raw.items():
+        if not isinstance(entry, dict):
+            continue
+        if any(not entry.get(k) for k in _DEPLOY_MAP_REQUIRED_KEYS):
+            continue
+        key_path = os.path.realpath(entry["key"])
+        if key_path != keys_root and not key_path.startswith(keys_root + os.sep):
+            continue  # "key" escapes DEPLOY_KEYS_DIR -- treat as absent, not a crash
+        try:
+            port = int(entry.get("port") or 22)
+        except (TypeError, ValueError):
+            continue  # non-numeric "port" -- treat as absent, not a crash
+        out[name] = {"host": entry["host"], "port": port,
+                     "user": entry.get("user") or "deploy",
+                     "deploy_path": entry["deploy_path"], "service": entry["service"],
+                     "key": entry["key"]}
+    return out
+
+
+# Per-project non-blocking lock, same guarded-dict idiom as
+# _gitea_sync_lock_for -- a concurrent second deploy dispatch for the same
+# project is dropped (409), never queued (deploy-target's own receiver adds
+# no locking of its own, so this cycle's caller must serialize invocations
+# per target -- see deploy-target/README.md "Protocol contract" point 4).
+_deploy_locks_guard = threading.Lock()
+_deploy_locks = {}
+
+
+def _deploy_lock_for(name: str) -> threading.Lock:
+    with _deploy_locks_guard:
+        lock = _deploy_locks.get(name)
+        if lock is None:
+            lock = threading.Lock()
+            _deploy_locks[name] = lock
+        return lock
+
+
+def deploy_run(name: str) -> tuple:
+    """Synchronous, request-thread dispatch -- mirrors host_run()'s own
+    shape (not 2c part 1's background-thread-plus-poll one), since a
+    manually clicked one-shot action can and should just block the request
+    and return a real result. Follows deploy-target/README.md's "Protocol
+    contract" exactly: rsync push with a bare destination (rrsync has
+    already fixed it server-side to DEPLOY_PATH), then a second SSH
+    connection sending the literal "deploy-restart" command. Returns
+    (http_status, message) -- 404 no target configured, 409 already in
+    progress, 502 push or restart failed, 200 success."""
+    entry = _load_deploy_map().get(name)
+    if entry is None:
+        return 404, "no deploy target configured for this project"
+
+    lock = _deploy_lock_for(name)
+    if not lock.acquire(blocking=False):
+        return 409, "a deploy for this project is already in progress"
+    try:
+        key, host, port, user = entry["key"], entry["host"], entry["port"], entry["user"]
+        source = f"{PROJECTS_DIR}/{name}/"  # trailing slash: copy contents, not the dir itself
+        try:
+            push = subprocess.run(
+                ["rsync", "-e",
+                 f"ssh -i {key} -o BatchMode=yes -o ConnectTimeout=10 -p {port}",
+                 "-a", source, f"{user}@{host}:"],
+                capture_output=True, text=True, timeout=60)
+        except (subprocess.SubprocessError, OSError) as e:
+            return 502, f"push failed: {e}"
+        if push.returncode != 0:
+            return 502, f"push failed: {(push.stderr or '').strip()[-200:]}"
+
+        try:
+            restart = subprocess.run(
+                ["ssh", "-i", key, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                 "-p", str(port), f"{user}@{host}", "deploy-restart"],
+                capture_output=True, text=True, timeout=30)
+        except (subprocess.SubprocessError, OSError) as e:
+            return 502, f"push succeeded but restart failed: {e}"
+        if restart.returncode != 0:
+            # Surfaced distinctly from a push failure, per deploy-target/
+            # README.md's protocol contract: "a non-zero exit means the
+            # restart itself failed... surface that, don't swallow it" --
+            # an operator reading this needs to know the new code is
+            # already on the target even though the service didn't pick it
+            # up.
+            return 502, f"push succeeded but restart failed: {(restart.stderr or '').strip()[-200:]}"
+
+        return 200, "deployed"
+    finally:
+        lock.release()
 
 
 def create_project(name: str) -> tuple[bool, str]:
@@ -1296,6 +1420,17 @@ PAGE_TEMPLATE = """<!doctype html>
   .vscode-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
   .pill.code-pill { background: #2a2a2a; }
   .pill.code-pill.active { background: #4da6ff; color: #111; border-color: #4da6ff; }
+  /* Deploy dispatch (backlog item 2c, part 2b -- docs/design.md "Component
+     reuse and styling"). .deploy-btn reuses .new-project-row button's own
+     green/white/pill shape verbatim; .deploy-msg reuses .new-project-err's
+     shape, with .success/.error variants instead of a single fixed color. */
+  .deploy-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+  .deploy-btn { font-size: 14px; padding: 10px 16px; border-radius: 10px; border: none;
+                background: #34c759; color: #fff; font-weight: 600; cursor: pointer;
+                white-space: nowrap; }
+  .deploy-msg { font-size: 12px; color: #888; margin: 4px 0 0; min-height: 14px; word-break: break-all; }
+  .deploy-msg.success { color: #34c759; }
+  .deploy-msg.error { color: #ff6b6b; }
   .new-project-row { display: flex; gap: 8px; padding: 4px 0 16px; }
   .new-project-row input { flex: 1; font-size: 14px; padding: 10px 12px; border-radius: 10px;
                             border: 1px solid #333; background: #1c1c1c; color: #eee; }
@@ -1439,6 +1574,14 @@ document.getElementById('login-pass').addEventListener('keydown', e => { if (e.k
 
 let ENGINE_LABELS = {};
 let engineChoice = {};  // project name -> engine name, picked before starting
+// project name -> {host, deploy_path, service} from /status's per-instance
+// "deploy" field, refreshed every refresh() call -- doDeploy() looks a
+// project's target info up here instead of it being inlined into the
+// rendered onclick="..." attribute (docs/spec.md's own note: deploy.host/
+// deploy.service come from an operator-hand-edited JSON file and could in
+// principle contain quote characters, so they're never embedded directly
+// into HTML markup).
+let DEPLOY_TARGETS = {};
 
 // Singleton-toggle rows (Taiga, Gitea, ...future ones) need more visual
 // states than the generic on/off rows above (see docs/design.md "How
@@ -1537,10 +1680,12 @@ async function refresh() {
   if (r.status === 401) { showOverlay(); return; }
   const s = await r.json();
   ENGINE_LABELS = s.engines || {};
+  DEPLOY_TARGETS = {};
   let html = '';
   for (const inst of s.instances) {
+    if (inst.deploy) DEPLOY_TARGETS[inst.name] = inst.deploy;
     html += row(inst.name, inst.on, inst.url, 'inst', inst.name, inst.desc, inst.engine,
-               inst.code_on, inst.code_url, undefined, undefined, inst.gitea_sync);
+               inst.code_on, inst.code_url, undefined, undefined, inst.gitea_sync, inst.deploy);
   }
   if (s.instances.length === 0) html += '<div class="empty">No project folders under the configured PROJECTS_DIR yet.</div>';
   if (s.host_enabled) html += row(s.host_label, s.host, s.host_url, 'host', null, '', null, false, null);
@@ -1596,7 +1741,20 @@ function gitSyncSuffix(gitSync) {
   if (gitSync.state === 'skipped-diverged') return ' · sync skipped: local commits ahead';
   return '';
 }
-function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverride, showBadge, gitSync) {
+// Manual, one-click, human-confirmed deploy dispatch (backlog item 2c, part
+// 2b — docs/spec.md/docs/design.md). Rendered only when deploy is present
+// (a deploy-map.json entry exists for this project) — no "disabled" state,
+// the row/button/message just don't exist at all otherwise. Reused-message
+// slot (.deploy-msg) is always rendered empty here; doDeploy() fills it in
+// after the POST resolves, and it's gone again on the next refresh() (no
+// persisted history — docs/spec.md non-goals).
+function deployRow(name, deploy) {
+  if (!deploy) return '';
+  return '<div class="deploy-row"><button class="deploy-btn" onclick="doDeploy(' +
+    "'" + name + "'" + ')">Deploy</button></div>' +
+    '<div class="deploy-msg" id="deploy-msg-' + esc(name) + '"></div>';
+}
+function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverride, showBadge, gitSync, deploy) {
   // subOverride lets a singleton-toggle row (Taiga/Gitea — see refresh())
   // supply its own starting/running/stopped/error text instead of this
   // generic on/off computation — every other kind (inst/host/code) omits it
@@ -1613,6 +1771,7 @@ function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverr
     (desc ? '<div class="desc">' + esc(desc) + '</div>' : '') +
     '<div class="sub">' + sub + '</div>' +
     (kind === 'inst' ? codeRow(name, codeOn, codeUrl) : '') +
+    (kind === 'inst' ? deployRow(name, deploy) : '') +
     '</div>' +
     '<label class="switch"><input type="checkbox" ' + (on ? 'checked' : '') +
     ' onchange="toggle(' + arg + ', this.checked, this)"><span class="slider"></span></label></div>';
@@ -1624,6 +1783,7 @@ function actionPath(kind, name, on) {
   if (kind in singletonToggleState) return '/' + kind + '/' + (on ? 'on' : 'off');
   if (kind === 'code') return '/instance/' + encodeURIComponent(name) + '/code/' + (on ? 'on' : 'off');
   if (kind === 'newproject') return '/projects/new';
+  if (kind === 'deploy') return '/instance/' + encodeURIComponent(name) + '/deploy';
   return '/instance/' + encodeURIComponent(name) + '/' + (on ? 'on' : 'off');
 }
 function actionBody(kind, name, on, code) {
@@ -1659,6 +1819,7 @@ async function handleActionResult(r, ctx) {
   if (r.status === 428) {
     pendingToggle = ctx;
     document.getElementById('code-overlay-label').textContent =
+      kind === 'deploy' ? 'Deploying: ' + (name || 'this') :
       (on ? 'Turning on: ' : 'Turning off: ') + (name || 'this');
     document.getElementById('action-code').value = '';
     document.getElementById('err-code').textContent = '';
@@ -1675,6 +1836,20 @@ async function handleActionResult(r, ctx) {
     hideCodeOverlay();
     if (checkboxEl) checkboxEl.checked = !on;
     document.getElementById('new-project-err').textContent = err.error || 'Could not create project.';
+    return;
+  }
+  if (kind === 'deploy') {
+    // Its own inline result slot (docs/design.md States 4-8) — never the
+    // generic setTimeout(refresh, 1500) below, since that would wipe the
+    // message almost immediately instead of letting it "persist until next
+    // refresh()" per spec.
+    hideCodeOverlay();
+    const data = await r.json().catch(() => ({}));
+    const msgEl = document.getElementById('deploy-msg-' + name);
+    if (msgEl) {
+      msgEl.textContent = r.ok ? 'Deployed successfully' : 'Deploy failed: ' + (data.message || 'unknown error');
+      msgEl.className = 'deploy-msg ' + (r.ok ? 'success' : 'error');
+    }
     return;
   }
   if (kind === 'newproject') document.getElementById('new-project-name').value = '';
@@ -1714,6 +1889,22 @@ async function toggle(kind, name, on, checkboxEl) {
 }
 function toggleCode(name, currentlyOn) {
   toggle('code', name, !currentlyOn, null);
+}
+// Manual dispatch (backlog item 2c, part 2b — docs/design.md "Confirmation
+// via native confirm() dialog"): a deliberate, lightweight confirmation
+// step before anything is sent, then a thin wrapper around the same
+// toggle()/performAction()/handleActionResult() machinery every other
+// action already uses — including the shared TOTP code-overlay retry path
+// (a 428 mid-flow reuses that existing overlay, not a new one).
+function doDeploy(name) {
+  const deploy = DEPLOY_TARGETS[name];
+  if (!deploy) return;
+  if (!confirm('Deploy latest ' + name + ' to ' + deploy.host + ' and restart ' + deploy.service + '?')) {
+    return;
+  }
+  const msgEl = document.getElementById('deploy-msg-' + name);
+  if (msgEl) { msgEl.textContent = 'Deploying…'; msgEl.className = 'deploy-msg'; }
+  toggle('deploy', name, true, null);
 }
 function startNewProject() {
   const name = document.getElementById('new-project-name').value.trim();
@@ -2651,6 +2842,11 @@ class Handler(BaseHTTPRequestHandler):
             # style instance_names() itself already uses -- to attach an
             # optional gitea_sync field to each row below, when present.
             gitea_sync_by_name = {e.get("name"): e for e in _load_gitea_repo_map().values()}
+            # Read once per /status call, same reasoning as _load_deploy_map's
+            # own docstring: the file is tiny, hand-edited rarely, and this
+            # avoids any staleness question after an operator edits it (no
+            # caching -- docs/spec.md "Loading").
+            deploy_map = _load_deploy_map()
             instances = []
             for n in instance_names():
                 engine = active_engine(n)
@@ -2665,6 +2861,15 @@ class Handler(BaseHTTPRequestHandler):
                 if sync_entry is not None:
                     inst["gitea_sync"] = {"state": sync_entry.get("sync_state"),
                                           "at": sync_entry.get("sync_at")}
+                deploy_entry = deploy_map.get(n)
+                if deploy_entry is not None:
+                    # "key" (and port/user) deliberately excluded -- the
+                    # private key path never needs to reach the client, and
+                    # port/user aren't needed for the confirm-dialog text
+                    # (docs/spec.md "/status response addition").
+                    inst["deploy"] = {"host": deploy_entry["host"],
+                                      "deploy_path": deploy_entry["deploy_path"],
+                                      "service": deploy_entry["service"]}
                 instances.append(inst)
             self._json({"instances": instances,
                        "engines": {name: e.label for name, e in engines.items()},
@@ -2774,6 +2979,12 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 _code_stop(name)
             self._json({"ok": True})
+        elif parts[0] == "instance" and len(parts) == 3 and parts[2] == "deploy":
+            name = parts[1]
+            if name not in instance_names():
+                return self._json({"error": "unknown instance"}, 404)
+            status, msg = deploy_run(name)
+            self._json({"ok": status == 200, "message": msg}, status)
         else:
             self.send_response(404)
             self.end_headers()

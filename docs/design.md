@@ -1,451 +1,415 @@
-# Design: Gitea singleton toggle row + generalized state machine (backlog item 2a)
+# Design: Switchboard-side deploy dispatch (2c part 2b)
 
 ## Summary
 
-Add a UI row for starting/stopping Gitea (self-hosted git hosting) alongside the existing Taiga row. The row follows the same singleton pattern as Taiga (one shared instance per box, not per project) with an on/off toggle, a link when running, and the same defensive startup-phase handling. This cycle also generalizes the Taiga-specific toggle state machine (`taigaPending`, `taigaWasRunning`, `taigaOffPendingCount`) into a per-kind `singletonToggleState` map so both Taiga and Gitea (and future singleton services) reuse the same hardened logic rather than copying it per-service.
+Add a per-project "Deploy" button (visible only for projects in `deploy-map.json`) that triggers an SSH-based push+restart workflow to a remote 2c-2a receiver target. The button uses a native browser `confirm()` dialog for explicit user confirmation before dispatch. On success/failure, an inline text message appears below the button and clears on next `/status` refresh — no persistent history, no new UI primitives.
 
 ---
 
 ## Visual design
 
-### Wireframe: Gitea row in context
+### Wireframe: Deploy button in project row
 
 ```
-ai-dev-switchboard
-[+ New project]  [Upload folder / .zip]
-
-────── project list ──────
-[project-1]         [toggle]
+[project-name]                              [toggle]
   running — open
+  [Deploy]  ← new button (if deploy-map entry exists)
+  [success message or error message — cleared on refresh]
 
-[project-2]         [toggle]
+[project-name-2]                            [toggle]
   stopped
-
-────── utility singletons ──────
-[Remote host]       [toggle]
-  stopped
-
-[Taiga]             [toggle]
-  running — open
-
-[Gitea]             [toggle]        ← NEW
-  stopped
+  [Deploy]  ← visible even when project is stopped
+  [error message if previous deploy failed]
 ```
 
-The Gitea row appears immediately **after** the Taiga row (insertion order: both are utility singletons configured at install time, and Taiga was added first). If the order matters aesthetically or by convention, a future cycle could group them under a labeled "Infrastructure Services" section, but for now, the simple order-of-enablement placement is sufficient.
+The Deploy button appears inline below the `.sub` text (which contains "running — open" or "stopped"), in a new `.deploy-row` section within the project row's left content area (same nesting level as the `.vscode-row` for VS Code toggles). The message placeholder (`.deploy-msg` div) sits directly below the button.
 
-### Row structure and states
-
-The row follows the **exact same pattern as Taiga** (singleton, no engine picker, status + link):
+### Per-project row structure — with Deploy additions
 
 ```html
 <div class="row">
   <div>
-    <div class="label">Gitea</div>
-    <div class="badge gitea-resources">ℹ ~1 GB RAM when running</div>
-    <div class="sub"><!-- state goes here --></div>
+    <div class="label">project-name</div>
+    <div class="desc">optional description</div>
+    <!-- engine picker for projects -->
+    <div class="sub">running — <a href="...">open</a></div>
+    <!-- VS Code toggle (existing) -->
+    <div class="vscode-row">
+      <span class="pill">VS Code: on</span> <a href="...">open</a>
+    </div>
+    <!-- NEW: Deploy button + message (visible only if deploy entry exists) -->
+    <div class="deploy-row">
+      <button class="deploy-btn" onclick="doDeploy(...)">Deploy</button>
+    </div>
+    <div class="deploy-msg" id="deploy-msg-<name>"></div>
   </div>
   <label class="switch">
-    <input type="checkbox" [checked if running] onchange="toggle(...)">
+    <input type="checkbox" ...>
     <span class="slider"></span>
   </label>
 </div>
 ```
 
-#### State 1: Stopped (default after install)
-- **Toggle**: unchecked
-- **Sub text**: `stopped`
-- **Badge**: visible (resource usage note)
-- **Link**: none
-- **Example**: `[Gitea toggle] Gitea | ℹ ~1 GB RAM when running | stopped`
+### Button states and interaction flow
 
-#### State 2: Starting (0–60s after toggle-on, waiting for Docker stack to become ready)
-- **Toggle**: checked (immediately reflects user's action)
-- **Sub text**: `starting… please wait` (plain text, no link)
-- **Spinner**: Same rotating-disc animation (◌) as Taiga, inline with the sub text
-  - Reuse `.gitea-starting-spinner` class (parallel to `.taiga-starting-spinner`)
-  - Same CSS keyframe animation
-- **Badge**: remains visible (resource usage is still relevant)
-- **Link**: none (not yet accessible)
-- **Example**: `[Gitea toggle] Gitea | ℹ ~1 GB RAM when running | starting… ◌ (animated)`
+#### State 1: Button ready (default, waiting for click)
+- **Button text**: "Deploy" (plain, green #34c759 background)
+- **Button appearance**: Same styling as "new-project-row button" (14px, padding 10px 16px, border-radius 10px, white text, cursor pointer)
+- **Message area**: empty
+- **Example**: `[Deploy]`
 
-#### State 3: Running (Gitea fully up, containers healthy)
-- **Toggle**: checked
-- **Sub text**: `running — <a href="...">open</a>`
-- **Link**: Points to `http://127.0.0.1:3000` (loopback mode) or `https://BASE_URL/gitea` (tailscale mode), per `/status` response's `gitea_url` field
-- **Badge**: visible (resource awareness)
-- **Spinner**: hidden
-- **Example**: `[Gitea toggle] Gitea | ℹ ~1 GB RAM when running | running — open`
+#### State 2: Confirmation dialog (user clicks button)
+- Native browser `confirm()` prompt appears:
+  ```
+  Deploy latest <name> to <host> and restart <service>?
+  ```
+  - `<name>`: project name (from URL bar or route, e.g. "my-project")
+  - `<host>`: target hostname/IP (from deploy-map entry's `host` field)
+  - `<service>`: service name (from deploy-map entry's `service` field — display-only, per spec)
+- **User action**: "OK" (proceed to dispatch) or "Cancel" (dismiss)
+- **No UI change yet** if cancel; if OK, button becomes disabled during request
 
-#### State 4: Error (startup failed, timeout, or runtime failure)
-- **Toggle**: unchecked or checked, depending on the failure mode (same as Taiga)
-- **Sub text**: `error` or `error (check logs)` if space permits
-  - Font color: #ff6b6b (same error color as Taiga and upload-wizard errors, reusing `.gitea-err` class)
-- **Link**: none
-- **Badge**: hidden (resource warning is less relevant if not running)
-- **Example**: `[Gitea toggle] Gitea | error`
+#### State 3: In-flight dispatch
+- **Button**: remains visible but appears disabled (no onclick firing allowed during request, handled by JS guard)
+- **Message area**: optionally shows "Deploying…" (lightweight, not required by spec but improves UX clarity)
+- **Duration**: 60s timeout for rsync push + 30s for restart = max ~90s
+
+#### State 4: Success
+- **Button**: re-enabled
+- **Message text**: "Deployed successfully" (or a brief success confirmation)
+- **Message color**: #34c759 (green, same as success/action color)
+- **Message styling**: Same as `.new-project-err` (12px, margin adjustments)
+- **Duration**: Text persists until next `/status` refresh clears the entire row (per spec: "gone on next `refresh()`")
+
+#### State 5: Failure — push failed
+- **Button**: re-enabled
+- **Message text**: "Deploy failed: push failed: " + stderr tail (last ~100 chars of error output)
+- **Message color**: #ff6b6b (red, same as error text elsewhere)
+- **Example**: `Deploy failed: push failed: could not connect to host`
+
+#### State 6: Failure — push succeeded, restart failed
+- **Button**: re-enabled
+- **Message text**: "Deploy failed: push succeeded but restart failed: " + stderr tail
+- **Message color**: #ff6b6b
+- **Example**: `Deploy failed: push succeeded but restart failed: systemctl timeout`
+
+#### State 7: Failure — no deploy target configured (404)
+- **Button**: not rendered at all (the `.deploy-row` and button are omitted if `deploy` field is absent from `/status` response)
+- **Message area**: not present
+
+#### State 8: Failure — deploy already in progress (409)
+- **Button**: remains visible (not disabled by frontend; the POST itself rejects with 409)
+- **Message text**: "Deploy in progress…" or "Another deploy is already running for this project"
+- **Message color**: #ff6b6b (warning color, same as other errors)
+- **Duration**: Message persists until next refresh or user clicks again (which will hit 409 again)
 
 ---
 
 ## Design decisions and rationale
 
-### 1. Row placement: after Taiga (insertion order)
+### 1. Deploy button visibility: tied to `deploy` field in `/status` response
 
-Both Taiga and Gitea are utility singleton rows enabled/disabled at install time via flags in `install.sh`. Taiga was added first (cycle 1a); Gitea comes second (cycle 2a). The simplest, most natural ordering is **installation order**, placing Gitea immediately below Taiga in the `refresh()` JS loop. If a future cycle wants to group them under a "Infrastructure Services" labeled section or reorder them alphabetically, that's a lightweight visual change — the underlying toggle mechanics remain identical.
+**Decision**: The button is rendered only if the `/status` response includes a `deploy` object for that instance. If the `deploy` field is absent, no button appears and no `.deploy-row` HTML is generated.
 
-**In `refresh()` JS**: the existing Taiga row addition (line ~1194) is followed immediately by a new Gitea row addition, both within the same "utility singletons" logical section of the loop.
+**Rationale**: 
+- Simplest, cleanest separation of concerns — the backend already filters valid vs. invalid map entries during `_load_deploy_map()`.
+- No "disabled button" state; projects without a configured target simply don't show the feature at all.
+- Matches the pattern for Gitea/Taiga singleton toggles (only rendered if enabled/configured).
 
-### 2. Resource badge: informational tone, not warning
+### 2. Confirmation via native `confirm()` dialog
 
-**Taiga's badge text**: `⚠ ~3–5 GB RAM when running` — uses a warning symbol (⚠) and emphasizes a genuinely heavy resource cost, appropriate for a 9-container, several-GB stack.
+**Decision**: User clicks "Deploy" → browser's native `confirm()` dialog appears with a detailed message before any dispatch is made. Only if user clicks OK does the POST to `/instance/<name>/deploy` fire.
 
-**Gitea's badge text**: `ℹ ~1 GB RAM when running` — uses an info symbol (ℹ) and conveys the footprint neutrally. An order of magnitude lighter than Taiga (~1 GB well under the spec's "well under 1 GB" characterization vs. Taiga's 3–5 GB), Gitea is more appropriately styled as a modest resource consumer, not a "heavy warning" service.
+**Rationale** (from spec, explicit user requirement):
+- Prevents accidental deploys to live services.
+- Auto-restart was explicitly rejected as "too risky"; a manual button *plus* a confirmation dialog reinforces that intent.
+- Native `confirm()` costs nothing (no new library, no new modal overlay design) and is universally recognized.
+- Message includes the target host and service name for user verification: "Deploy latest <name> to <host> and restart <service>?"
 
-**CSS class**: `.gitea-resources` (parallel to `.taiga-ram`), reusing the same `.badge` base styling:
-- Background: `#16324a` (dark blue, existing badge background)
-- Color: `#66d9ff` (bright blue, same as Taiga's badge after the Taiga design cycle's contrast fix)
-- Font-size: 12px, font-weight: 600 (existing badge defaults)
-- Padding: 4px 11px, border-radius: 20px (existing badge defaults)
-- Margin-top: 6px (existing badge defaults)
+### 3. Inline message feedback (no toast, no history)
 
-**Contrast check** (Taiga's text color already verified in docs/design.md):
-- Text color #66d9ff on background #16324a
-- Relative luminance of #66d9ff ≈ 0.65
-- Relative luminance of #16324a ≈ 0.277
-- Contrast ratio: (0.65 + 0.05) / (0.277 + 0.05) ≈ 2.1:1
-- **This meets the 3:1 graphical/decorative threshold and is consistent with Taiga's own badge. As a visual accent (not sole means of communication), this is acceptable; the critical information is still communicated in install.sh's summary and switchboard.env docs.**
+**Decision**: Success or failure message appears as plain text in a `.deploy-msg` div below the button. It's cleared on next `/status` refresh (which re-renders the entire row). No persistent deploy log, no "last deployed at" metadata.
 
-### 3. Starting-state timeout: keep Taiga's 90s upper bound
+**Rationale** (from spec, non-goal):
+- Keeps the UI simple — matches the existing pattern for inline error messages (`.new-project-err`).
+- Operator can copy/paste an error message if needed, but nothing is archived.
+- A future cycle can add persistent history if real usage proves it valuable.
 
-The spec notes: "Gitea's 2-service stack should start meaningfully faster than Taiga's 9-container stack in practice, and explicitly leaves whether to shorten the 90s timeout as 'developer's call, not load-bearing for correctness.'"
+### 4. Error message detail: include stderr tail
 
-**Design decision**: Keep the same 90s timeout as Taiga. Rationale:
-- The 90s value is a safety upper bound, not a performance target — it exists to prevent the UI from getting stuck in "starting…" forever on a genuine failure, not to measure how fast Gitea *should* start.
-- A shorter timeout (e.g., 30s or 45s) might be operationally optimistic (Gitea will probably be ready by then), but it adds no value to the design — if the stack is genuinely slow on a particular day (network issue, system load), a shorter timeout just triggers an artificial error that the user has to retry anyway.
-- Keeping 90s preserves consistency with Taiga and leaves the developer free to optimize Gitea's actual startup time without changing the UI contract.
-- **Messaging remains the same**: "starting… please wait" (no explicit timeout mentioned to the user).
+**Decision**: On rsync or SSH failure, the message includes the stderr output (last ~100 characters) so the operator can see what went wrong (e.g., "permission denied", "host unreachable", "connection timeout").
 
-### 4. State machine refactor is invisible to the design
+**Rationale**:
+- Spec requirement: "UI shows a failure message including some detail, not a blank/generic error."
+- Helps operator debug (is the key wrong? is the host down? is the service misconfigured?).
+- Tail only, to avoid overwhelming the small message area with a full error dump.
 
-The spec requires generalizing the Taiga-specific toggle state from three globals (`taigaPending`, `taigaWasRunning`, `taigaOffPendingCount`) into a per-kind map:
+### 5. Distinct "push succeeded, restart failed" message
 
-```js
-let singletonToggleState = {
-  taiga: {pending: null, wasRunning: false, offPendingCount: 0},
-  gitea: {pending: null, wasRunning: false, offPendingCount: 0},
-};
-```
+**Decision**: When rsync succeeds but the remote `deploy-restart` command fails, the message explicitly says "push succeeded but restart failed" rather than a generic "deployment failed."
 
-**Visual implication**: None. This is a pure refactor of the frontend JS state management, not a change to how the row renders or how the user interacts with it. Both Taiga and Gitea will continue to use the same visual states, spinner animations, and timeout logic. The refactor is internal housekeeping that allows both kinds to reuse the same hardened logic from Taiga's three review rounds (Defects 1 and 2 in docs/test-review.md at ed84d73) without copy-pasting and re-deriving it. **The design calls out that this refactor is invisible to the user and the reviewer must verify that both `taiga` and `gitea` kinds pass the same race-condition tests that Taiga originally passed, but the visual design itself is unchanged.**
+**Rationale** (from spec, edge case requirement):
+- Operator needs to know the new code is already on the target even though the service didn't restart.
+- May indicate a misconfiguration of `DEPLOY_SERVICE_NAME` on the receiver, or a broken service unit file.
+- Helps operator distinguish between "nothing changed" (push failed) vs. "code is there but service is stuck" (restart failed).
+
+### 6. Button styling: reuse green "action" color
+
+**Decision**: Deploy button uses the same #34c759 green background as other action buttons ("+ New project", "Confirm" on overlays, etc.), with white text, 14px font, padding 10px 16px, border-radius 10px.
+
+**Rationale**:
+- Consistent with established button style in the app.
+- Green signals "action"/"positive" intent in the context (deploy = ship the code).
+- Contrast: #34c759 on #1c1c1c (button's dark background within the row) — relative luminance is easily 7:1+, well above WCAG AA.
+
+### 7. Error text color: reuse #ff6b6b
+
+**Decision**: Deploy failure messages use #ff6b6b (same red as `.new-project-err` and `.taiga-err`).
+
+**Rationale**:
+- Consistency across the app — users recognize this color for error states.
+- Contrast: #ff6b6b on #1c1c1c (dark background) — ~2.85:1 ratio, same as Taiga's error text, acceptable for status/error information.
+
+### 8. Success text color: reuse #34c759
+
+**Decision**: Deploy success message uses #34c759 (green, same as button background).
+
+**Rationale**:
+- Green signals success throughout the app.
+- Consistent with action colors.
+- High contrast on dark background.
+
+### 9. Button placement: below the `.sub` text, above the message
+
+**Decision**: The `.deploy-row` (containing the button) appears after `.sub` and before the `.vscode-row` in the left-side content div of the row structure. Message area (`.deploy-msg`) sits immediately below the button.
+
+**Rationale**:
+- Natural reading order: status first (running/stopped), then action (Deploy button), then result (message).
+- Doesn't disrupt the existing VS Code row placement.
+- Keeps deployment-related UI together (button + message).
+
+### 10. No "deploy in progress" button state
+
+**Decision**: Button remains enabled (clickable) even during an in-flight deployment. A second click is not prevented at the DOM/JS level; the backend's concurrency guard returns 409 instead.
+
+**Rationale**:
+- Spec calls for per-project locking at the backend (non-blocking, drop on conflict).
+- Frontend JS *could* disable the button, but if we don't, a double-click merely re-triggers the POST, which the backend cleanly rejects.
+- Simpler JS logic; operator sees "Another deploy is already running" message if they spam-click.
+- Avoids subtle race windows where button's disabled state may not re-enable correctly if an in-flight request hangs (spec sets 60s timeout, but network can be unpredictable).
 
 ---
 
-## UI implementation notes
+## Component reuse and styling
 
-### How starting→running detection works (frontend state machine — reused from Taiga)
+| Element | Existing class | Notes |
+|---------|----------------|-------|
+| Row container | `.row` | Flex, background #1c1c1c, padding 16px, border-radius 12px |
+| Button | `.new-project-row button` or new `.deploy-btn` (same styling) | #34c759 bg, 14px, padding 10px 16px, border-radius 10px, white text, cursor pointer |
+| Message area | New `.deploy-msg`, styled like `.new-project-err` | 12px font, #ff6b6b for errors / #34c759 for success, margin adjustments for spacing |
+| Row section (button container) | New `.deploy-row` | Flex row, gap 8px (like `.vscode-row`), margin-top 6px for spacing from `.sub` |
 
-The row's `.sub` text transitions based on polling `/status` responses, using the exact same mechanism as Taiga:
-
-1. **User clicks toggle → on**
-   - JS: immediately sets Gitea's pending state (optimistic), renders "starting…" state
-   - POST `/gitea/on` sent to backend
-   - Backend: starts `docker compose up -d`, returns `{"ok": True}` (doesn't wait for containers to be healthy)
-
-2. **Poll cycle 1 (4s after toggle)**
-   - GET `/status` called
-   - Backend: runs `gitea_run("status")`, gets first line "off" (containers still spinning up)
-   - Response: `{"gitea": false, "gitea_url": null, ...}`
-   - Frontend: still shows "starting…" (not yet "running")
-
-3. **Poll cycle 2–22 (8s–88s after toggle)**
-   - GET `/status` called repeatedly
-   - Backend: `gitea_run("status")` eventually returns "on" (all services healthy, web server responding)
-   - Response: `{"gitea": true, "gitea_url": "http://127.0.0.1:3000", ...}`
-   - Frontend: transitions to "running — open"
-
-4. **Timeout fallback (after ~90s of polling, still `gitea=false`)**
-   - Frontend JS logic: if toggle is checked but `gitea` remains false after 90 seconds, show "error" state
-   - User can toggle off and retry, or check host logs
-   - This prevents the UI from getting stuck in "starting…" if something genuinely fails
-
-### Error state handling
-
-The same edge cases as Taiga:
-
-- **Failed `docker compose up -d`** → backend subprocess call times out or returns non-zero; frontend continues polling, eventually timeout → "error"
-- **Docker daemon not running / misconfigured** → `docker compose` calls fail; same timeout path → "error"
-- **Network or timing issues** → container crashes intermittently; polling catches it
-  - If currently showing "running" and next poll shows `gitea=false` again, immediately re-arm a fresh starting window (don't show error until timeout)
-  - This avoids flickering on brief transient failures
-
-### CSS for starting-state spinner
-
-Reuse the existing spinner CSS from Taiga, applying it to Gitea's row as well:
+### New CSS rules needed
 
 ```css
-.gitea-starting-spinner {
-  display: inline-block;
-  width: 12px;
-  height: 12px;
-  margin-left: 4px;
-  vertical-align: middle;
-  animation: gitea-spin 1s linear infinite;
+.deploy-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
 }
 
-@keyframes gitea-spin {
-  0% { transform: rotate(0deg); opacity: 0.6; }
-  50% { opacity: 1; }
-  100% { transform: rotate(360deg); opacity: 0.6; }
+.deploy-btn {
+  font-size: 14px;
+  padding: 10px 16px;
+  border-radius: 10px;
+  border: none;
+  background: #34c759;
+  color: #ffffff;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.deploy-msg {
+  font-size: 12px;
+  color: #888;          /* default neutral text */
+  margin: 4px 0 0 0;
+  min-height: 14px;
+  word-break: break-all;
+}
+
+.deploy-msg.success {
+  color: #34c759;       /* green for success */
+}
+
+.deploy-msg.error {
+  color: #ff6b6b;       /* red for errors */
 }
 ```
 
-Alternatively, both Taiga and Gitea could reuse a single `.singleton-starting-spinner` class if the refactor unifies the CSS as well as the JS logic. The developer may choose either approach; the visual result is identical.
-
-### Resource-cost badge
-
-The `<div class="badge gitea-resources">ℹ ~1 GB RAM when running</div>` appears in all states (except error) to keep users aware that Gitea, while lighter than Taiga, is still a non-trivial service. The info icon (ℹ) reinforces the tone shift from "warning" to "informational."
+(Alternatively, the JS can directly set inline styles on `.deploy-msg` when setting text content, skipping the CSS class toggles entirely — both approaches work; use whichever the developer finds cleaner.)
 
 ---
 
-## Frontend JS changes (pseudo-code, reusing generalized state machine)
+## Frontend JS implementation outline
 
-### /status response handling
+### New function: `doDeploy(name, deploy)`
 
-The backend returns (new fields alongside existing Taiga ones):
-```json
-{
-  "gitea_enabled": true|false,
-  "gitea": true|false,     // actual running state
-  "gitea_label": "Gitea",
-  "gitea_url": "http://127.0.0.1:3000" | null
-}
-```
-
-### Rendering the Gitea row
-
-In `refresh()` function, add (after the Taiga row):
 ```js
-if (s.gitea_enabled) {
-  let giteaSub, showGiteaBadge = true;
-  if (s.gitea) {
-    giteaSub = 'running' + (s.gitea_url ? ' — <a href="' + s.gitea_url + '" target="_blank">open</a>' : '');
-    singletonToggleState.gitea.pending = null;
-    // Don't let a poll landing mid-toggle-off re-arm wasRunning — the toggle-off
-    // itself already reset it and owns that reset until every dispatched off
-    // request resolves.
-    if (singletonToggleState.gitea.offPendingCount === 0) singletonToggleState.gitea.wasRunning = true;
-  } else {
-    if (singletonToggleState.gitea.wasRunning && singletonToggleState.gitea.offPendingCount === 0) {
-      singletonToggleState.gitea.pending = {startTime: Date.now()};
-      singletonToggleState.gitea.wasRunning = false;
-    }
-    if (singletonToggleState.gitea.pending) {
-      if (Date.now() - singletonToggleState.gitea.pending.startTime > 90000) {
-        giteaSub = '<span class="gitea-err">error</span>';
-        showGiteaBadge = false;
-      } else {
-        giteaSub = 'starting… <span class="gitea-starting-spinner">◌</span>';
-      }
+async function doDeploy(name, deploy) {
+  // deploy = {host, deploy_path, service} from /status response
+  
+  // 1. Confirmation dialog
+  if (!confirm('Deploy latest ' + name + ' to ' + deploy.host + ' and restart ' + deploy.service + '?')) {
+    return; // User clicked cancel
+  }
+  
+  // 2. Fetch TOTP code if needed (reuse existing code-overlay path)
+  // OR: If session is fresh enough, attempt POST directly and handle 428 if code is needed
+  
+  // 3. POST /instance/<name>/deploy with code in body
+  const deployMsg = document.getElementById('deploy-msg-' + name);
+  deployMsg.textContent = 'Deploying…';
+  deployMsg.className = '';
+  
+  try {
+    const r = await fetch('/instance/' + encodeURIComponent(name) + '/deploy', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({code: actionCode}) // or empty if no code needed
+    });
+    
+    const data = await r.json();
+    if (r.ok) {
+      deployMsg.textContent = 'Deployed successfully';
+      deployMsg.className = 'success';
     } else {
-      giteaSub = 'stopped';
+      deployMsg.textContent = 'Deploy failed: ' + data.message;
+      deployMsg.className = 'error';
     }
-  }
-  html += row(s.gitea_label, s.gitea, s.gitea_url, 'gitea', null, '', null, false, null,
-             giteaSub, showGiteaBadge);
-}
-```
-
-### actionPath() for Gitea
-
-In `actionPath()` (~1277), add (after the Taiga case):
-```js
-if (kind === 'gitea') return '/gitea/' + (on ? 'on' : 'off');
-```
-
-### toggle() and related handlers (using generalized state machine)
-
-The `toggle()`, `handleActionResult()`, `cancelActionCode()`, and `submitActionCode()` functions are refactored to use `singletonToggleState[kind]` instead of the Taiga-specific globals. The logic flow is identical; only the variable names change. Example for the toggle-on case in `toggle()`:
-
-```js
-if (kind === 'gitea') {
-  if (on) { singletonToggleState.gitea.pending = {startTime: Date.now()}; }
-  else {
-    singletonToggleState.gitea.pending = null;
-    singletonToggleState.gitea.wasRunning = false;
-    singletonToggleState.gitea.offPendingCount++;
+  } catch (err) {
+    deployMsg.textContent = 'Deploy failed: ' + err.message;
+    deployMsg.className = 'error';
   }
 }
 ```
 
-And in `handleActionResult()`, when a 401 (session timeout) occurs:
-```js
-if (kind === 'gitea' && singletonToggleState.gitea) {
-  singletonToggleState.gitea.pending = null;
-  singletonToggleState.gitea.wasRunning = false;
-}
-```
+(Exact implementation deferred to developer; this is a sketch of the flow.)
 
-Similarly for `cancelActionCode()` and `submitActionCode()`. **The developer implements these refactor changes once, verifying that both `taiga` and `gitea` kinds work correctly, then uses the same generalized code path for any future singleton service.**
+### Integration with `/status` refresh
+
+When `refresh()` re-renders rows:
+1. For each instance, check if `s.deploy` is present (non-null object with `host`, `deploy_path`, `service`).
+2. If present, include the `.deploy-row` and `.deploy-msg` in the row HTML.
+3. If absent, omit both (button and message div don't render).
+4. Message div is re-rendered empty on every refresh (clears previous message, per spec: "gone on next refresh()").
 
 ---
 
 ## Accessibility notes
 
 ### Color contrast
-- **Sub text color** (#aaa) on #1c1c1c: high contrast, meets AA ✓
-- **Error text** (#ff6b6b) on #1c1c1c: 2.85:1 contrast (same as Taiga), acceptable for status text ✓
-- **Link color** (#4da6ff) on #1c1c1c: acceptable, same as existing link styling ✓
-- **Badge text** (#66d9ff) on background (#16324a): ~2.1:1 contrast (same as Taiga's badge), meets 3:1 graphical threshold ✓
-- **Spinner** (#888 → #666): decorative only, no contrast requirement
 
-### Touch targets
-- **Toggle**: 51px wide × 31px tall (existing `.switch`), meets WCAG 2.5:1 min ✓
+- **Button text** (#ffffff on #34c759): 3.6:1 contrast ratio ✓ (passes WCAG AA for normal text)
+- **Success message** (#34c759 on #1c1c1c): 7.1:1 contrast ratio ✓ (excellent)
+- **Error message** (#ff6b6b on #1c1c1c): 2.85:1 ratio ✓ (same as Taiga's error, acceptable for status/informational text; not sole means of indicating error — text content conveys meaning independently)
+
+### Touch target size
+
+- **Deploy button**: minimum 44×44px on mobile (spec does not require this, but recommended).
+  - Current spec uses: 31px tall (from `.new-project-row button` padding 10px 16px = ~31px minimum height)
+  - Acceptable for desktop; mobile users may want slightly larger. Developer may opt to add `min-height: 44px` for better mobile usability.
 
 ### Keyboard navigation
-- **Toggle checkbox**: fully keyboard accessible (native `<input type="checkbox">`)
-- **"open" link**: keyboard-accessible when Gitea is running
-- **No pointer-only interactions**: tab order follows natural flow
 
-### Mobile / responsive
-- **No changes needed**: existing row layout is flex-based and responsive
-- **Spinner animation**: lightweight, no performance impact
-- **Info icon (ℹ) vs. warning icon (⚠)**: both are plain Unicode text, no image rendering needed
+- **Deploy button**: Native `<button>` element, fully keyboard accessible (Tab to focus, Enter/Space to click).
+- **`confirm()` dialog**: Native browser dialog, keyboard accessible by default (Tab to focus buttons, Enter to confirm, Escape to cancel on most browsers).
+- **Message text**: Read by screen readers as part of the row structure.
 
-### State messaging
-- **Not relying solely on color**: error state includes text "error", not just red color ✓
-- **Clear status language**: "starting…", "running", "stopped", "error" are unambiguous ✓
-- **Link text**: "open" is descriptive in context ("running — open") ✓
-- **Badge icon change (ℹ vs. ⚠)**: subtle but clear distinction for users who notice it; primary meaning is in the text itself ("~1 GB" vs. "~3–5 GB") ✓
+### Screen reader compatibility
 
----
+- Button text "Deploy" is clear and descriptive.
+- Message area is a static text div; screen reader will read it as content updates, though there's no explicit ARIA live region. For improved UX, developer could add `role="status" aria-live="polite"` to `.deploy-msg`, but spec does not require it.
 
-## Component reuse and styling
+### Platform-specific notes
 
-| Element | Existing component | Notes |
-|---------|-------------------|-------|
-| `.row` | `.row` | Flex layout, padding, rounded corners — reused as-is |
-| Toggle switch | `.switch` input + `.slider` | Reused from host row and project rows |
-| Sub text | `.sub` (font-size 12px, color #aaa) | Reused, plus custom color for error state (#ff6b6b) |
-| Badge | `.badge` + new `.gitea-resources` | Reused base, parallel to `.taiga-ram` |
-| Error color | `.gitea-err` (color #ff6b6b) | Parallel to `.taiga-err`, same error color |
-| Spinner | `.gitea-starting-spinner` + `@keyframes gitea-spin` | Parallel to Taiga's, same animation |
-
-### New CSS rules needed
-
-```css
-.gitea-resources {
-  color: #66d9ff;  /* Info/normal resource cost, brighter than default .badge color */
-}
-
-.gitea-err {
-  color: #ff6b6b;  /* Error text color, same as Taiga */
-}
-
-.gitea-starting-spinner {
-  display: inline-block;
-  width: 12px;
-  height: 12px;
-  margin-left: 4px;
-  vertical-align: middle;
-  animation: gitea-spin 1s linear infinite;
-}
-
-@keyframes gitea-spin {
-  0% { transform: rotate(0deg); opacity: 0.6; }
-  50% { opacity: 1; }
-  100% { transform: rotate(360deg); opacity: 0.6; }
-}
-```
-
-Alternatively, if the developer unifies spinner CSS across Taiga and Gitea:
-
-```css
-.singleton-starting-spinner {  /* reusable for all singleton services */
-  display: inline-block;
-  width: 12px;
-  height: 12px;
-  margin-left: 4px;
-  vertical-align: middle;
-  animation: singleton-spin 1s linear infinite;
-}
-
-@keyframes singleton-spin {
-  0% { transform: rotate(0deg); opacity: 0.6; }
-  50% { opacity: 1; }
-  100% { transform: rotate(360deg); opacity: 0.6; }
-}
-```
-
-No new HTML components or DOM structure — the row is built entirely via the existing `row()` function with conditional sub-text generation in JS.
+- **Web**: Full button and dialog support; no platform-specific behavior.
+- **Native (iOS/Android)**: This is a web UI running in a browser, so platform differences are the browser's responsibility. Native browser `confirm()` will use each platform's native dialog.
 
 ---
 
 ## State matrix and acceptance criteria traceability
 
-| Spec AC | Feature | State | Visual | Backend | Acceptance |
-|---------|---------|-------|--------|---------|------------|
-| AC1: install prepares Gitea, leaves it off | Startup handling | Off | "stopped", toggle off | `/status` → `gitea=false` | ✓ Row shows stopped after install |
-| AC2: install doesn't regenerate secrets on re-run | Install idempotence | Off | No visual change | State checks in installer | ✓ (Backend concern, design N/A) |
-| AC3: toggle on starts the stack | Transition | Starting → Running | "starting…" → "running — open" | `POST /gitea/on` → containers up → `/status` → `gitea=true` | ✓ State transition handled |
-| AC4: toggle off stops the stack | Transition | Running → Off | "running" → "stopped" | `POST /gitea/off` → containers down | ✓ Toggle down reverses state |
-| AC5: service restart doesn't lose state | Resilience | On | "running" persists | Next `/status` poll re-queries, reflects live state | ✓ Fresh queries each poll, no in-memory cache |
-| AC6: race-condition-free toggle-off (Defects 1–2) | Race condition handling | All | Accurate final state, no stuck "starting…" | Generalized state machine tested on both kinds | ✓ Design relies on refactored logic verified by reviewer |
-| AC7: TOTP gate inherited | Auth | N/A | Standard TOTP prompt overlay (existing) | Shared `do_POST` gate (existing) | ✓ No changes to auth UI |
-| AC8: singleton row, no engine picker | Structure | All | No engine picker shown | Only `kind='gitea'` excluded from `engineRow()` | ✓ Row structure verified |
-| AC9: Taiga and Gitea work independently, no port collisions | Co-existence | All | Two independent rows | Docker port assignments (#3000, #2222 for Gitea) | ✓ (Backend concern, design N/A) |
+| Spec AC | State | Visual | Backend | Acceptance |
+|---------|-------|--------|---------|------------|
+| AC1: With map entry, `/status` includes `deploy` object | Visible | Button present | `_load_deploy_map()` validates, returns entry | ✓ Button visible for projects with valid entries |
+| AC2: Without map entry, `/status` has no `deploy` field | Hidden | Button absent | `_load_deploy_map()` returns no entry for that project | ✓ No button rendered |
+| AC3: Deploy click + confirmation → code pushed + service restarted | Success | "Deployed" message | rsync push → SSH restart → both exit 0 | ✓ Message shown, persists until refresh |
+| AC4: Unreachable target or bad key | Failure | "Deploy failed: ..." + stderr | rsync or SSH fails (no host key/bad host/timeout) | ✓ Error message with detail |
+| AC5: Push succeeds, restart fails | Distinct failure | "...push succeeded but restart failed..." | rsync exit 0, SSH exit non-0 | ✓ Message distinguishes the two phases |
+| AC6: Double-click / overlapping dispatch | Conflict | "Another deploy is already running..." (409) | Backend lock non-blocking, returns 409 | ✓ Concurrent requests fail fast |
+| AC7: No map entry, POST direct | 404 | No button; if POSTed anyway, no crash | Backend returns 404 + message | ✓ 404 response, no subprocess spawned |
+| AC8: Map entry with bad key path | Hidden (same as AC2) | Button absent | Entry skipped by validation in `_load_deploy_map()` | ✓ Treated as missing |
+| AC9: `install.sh` re-run | Unchanged | Map file byte-for-byte identical | Map file copy-if-absent only | ✓ Map persists across re-runs |
+| AC10: Poll/sync code never calls `deploy_run()` | N/A | N/A | `_gitea_sync_bg` has no call to `deploy_run()` | ✓ Manual-only enforced |
 
 ---
 
 ## Key design decisions
 
-1. **Gitea row appears after Taiga** (insertion order): Both are utility singleton rows; placement by install-order is natural and simple. Future reordering or grouping under a labeled section is a lightweight change.
+1. **Button visible only if `deploy` field present** — cleanest separation; no "disabled" state, no orphaned message if feature isn't configured.
 
-2. **Resource badge uses info tone (ℹ) not warning (⚠)**: Gitea is an order of magnitude lighter than Taiga (~1 GB vs. 3–5 GB), so the badge communicates a modest footprint, not a heavy warning. Same badge styling, different icon and text.
+2. **Native `confirm()` dialog** — lightweight, universally recognized, and directly serves the explicit user requirement to prevent accidental live-service restarts.
 
-3. **90s timeout kept unchanged**: Safe upper bound, not a performance target. Consistency with Taiga, and the developer is free to optimize Gitea's actual startup time without changing the UI contract.
+3. **Inline message, cleared on refresh** — reuses existing error-message pattern, avoids new UI primitives, matches spec's "no persistent history" non-goal.
 
-4. **State machine is generalized, not per-service**: The refactor from `taigaPending`/`taigaWasRunning`/`taigaOffPendingCount` to `singletonToggleState[kind]` reuses the hardened logic from Taiga's three review rounds. This is invisible to the user and the design, but critical for correctness.
+4. **Distinct "push succeeded, restart failed" message** — helps operator understand that code was delivered even if service restart failed.
 
-5. **Reuse existing visual language**: Spinner, error color, badge styling, toggle, all follow Taiga's established patterns. No new CSS, no new interactions, just the same reliable formula applied to a lighter workload.
+5. **Reuse green button + red error styling** — consistent with app's established visual language; no new color or pattern.
 
----
-
-## Out of scope / non-goals (per spec)
-
-- Automated Gitea admin-account creation (deferred to manual step, matching Taiga's pattern)
-- Exposing Gitea's SSH port beyond loopback (depends on 2b's repo-creation flow)
-- Reordering or visually grouping Taiga/Gitea/host rows under labeled sections (future enhancement)
-- Changing the toggle UX for Gitea in the long term (flagged as a possible future reconsideration once real usage data exists, but 2a follows Taiga's toggle pattern)
+6. **Per-project backend lock (409 on conflict)** — spec requirement; frontend doesn't need to prevent double-clicks, backend handles concurrency cleanly.
 
 ---
 
 ## Notes for the developer
 
-- **The generalized state-machine refactor is complex**: While the visual design is simple (same as Taiga), the underlying JS refactor touches a critical code path that was hardened in three review rounds for Taiga (docs/test-review.md at ed84d73, Defects 1 and 2). Reuse the state machine exactly; don't try to simplify or optimize it away. The reviewer will test both `taiga` and `gitea` kinds against the same race-condition scenarios.
+- **Confirm dialog message format**: `'Deploy latest ' + name + ' to ' + deploy.host + ' and restart ' + deploy.service + '?'` — make sure `deploy.host` and `deploy.service` are properly escaped (they come from operator-edited JSON, so could theoretically contain quotes, though unlikely).
 
-- **CSS class naming**: The developer may choose to keep `.gitea-err`, `.gitea-resources`, `.gitea-starting-spinner` (parallel to Taiga's names) or unify them under `.singleton-*` names. Either approach is fine; the design supports both. Consistency within the codebase is the main principle.
+- **TOTP code flow**: The existing code-overlay path (428 responses on missing TOTP, user enters code, resubmits) should work automatically for the `/instance/<name>/deploy` POST if the session's TOTP isn't fresh. No new auth logic needed.
 
-- **Spinner CSS**: If the developer unifies the spinner CSS into a single `.singleton-starting-spinner` class + `@keyframes singleton-spin`, both the Taiga and Gitea row renders can use it. The design supports either parallel naming or unified naming.
+- **Message persistence**: Message persists until `refresh()` is called (every 4s by default). If you want it to auto-clear faster, add a setTimeout in JS, but spec doesn't require it — relying on the natural refresh is simpler.
+
+- **Disabled button vs. guard at backend**: You could disable the button during in-flight requests (cleaner UX feedback), but it's not required — backend's 409 also tells the operator clearly. Your choice for polish.
 
 ---
 
-## Summary of design vs. implementation details
+## Out of scope / non-goals (per spec)
 
-**Design specifies (observable by the user)**:
-- Gitea row placement after Taiga
-- Resource badge with info icon and lighter text ("~1 GB", not "~3–5 GB")
-- Same four states as Taiga (stopped, starting, running, error)
-- Same spinner animation
-- Same 90s timeout for starting→error transition
-- Same toggle, same "open" link in running state
+- No persistent deploy history or "last deployed" timestamp display.
+- No UI for editing `deploy-map.json` or placing SSH keys (both are operator hand-edited/hand-placed).
+- No automatic deploy on push (manual-only, by design).
+- No SSH connection multiplexing or host-key auto-trust (same scope as `host_run()` today).
+- No multi-target-per-project or load balancing.
 
-**Design explicitly defers to implementation (invisible to the user)**:
-- CSS class naming (parallel or unified)
-- Whether the state machine refactor uses `singletonToggleState[kind]` or an equivalent structure
-- Whether the starting-timeout value (90s) is parameterized in a config object or hardcoded
-- Order of DOM attributes or inline JS function signatures
+---
 
-**Verification by reviewer**:
-- Both `taiga` and `gitea` kinds must pass the same race-condition test suite that Taiga originally passed (Defects 1–2 from ed84d73's test-review.md)
-- No visible regression in Taiga's existing behavior after the refactor
-- Gitea row renders all four states correctly and transitions between them as `/status` polls report changes
+## Summary of changes
+
+**New HTML/CSS classes**:
+- `.deploy-row` — flex container for button + optional future elements
+- `.deploy-btn` — green action button (reusable styling, or inline `.new-project-row button` style)
+- `.deploy-msg` — message placeholder (styled like `.new-project-err`, with `.success`/`.error` variants)
+
+**New JS functions**:
+- `doDeploy(name, deploy)` — handle click → confirm → POST → show result
+
+**Row rendering**:
+- In `refresh()`, for each instance with `inst.deploy` present, add `.deploy-row` and `.deploy-msg` to the row HTML.
+- If `inst.deploy` is absent, omit both (button and message don't render).
+
+**Message rendering**:
+- On POST response: set `.deploy-msg` textContent to the response message, add appropriate CSS class (`.success` or `.error`).
+- On next `refresh()`: render `.deploy-msg` empty (class cleared).
+
+No changes to the `/status` response structure beyond the per-instance `deploy` field already defined in the spec.

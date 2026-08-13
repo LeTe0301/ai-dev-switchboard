@@ -103,10 +103,28 @@ could silently kill polling for every other project in that pass) — fixed
 directly, verified load-bearing, 215/215 tests pass. Full
 spec/implementation/test-review for **2c part 1 specifically** in the
 current `docs/spec.md` / `docs/implementation.md` / `docs/test-review.md`.
-**2c part 2 (CI/CD auto-deploy to a separate target machine) is still
-open** — deliberately scoped out as a separate future cycle that reuses
-part 1's poll-detected-a-change dispatch point rather than building its own
-detection mechanism.
+**2c part 2 shipped (2026-08-13), in two sub-parts, both manual-trigger —
+NOT the auto-deploy-off-the-poll shape "Shape of the work" below originally
+described.** Per an explicit user decision made when part 2 was picked up:
+a push landing (part 1's poll/sync) never itself deploys anything; deploy
+only ever fires from a human clicking a button. **2c part 2a**
+(`deploy-target/`) is a receiver-only install (`install.sh
+--with-deploy-target`, run on a *separate* target machine): a narrowly
+scoped `deploy` system user whose forced-command SSH key can only
+write-only-`rsync` into one pre-configured path or trigger one fixed
+`systemctl restart` of one named service — no shell, ever. **2c part 2b**
+(`app.py`) is the switchboard-side caller against that receiver: a
+hand-edited, operator-maintained `deploy-map.json` (project name → target
+host/path/service/key, never written by `app.py`, only read), a
+`deploy_run()` dispatch function that pushes `PROJECTS_DIR/<name>` via
+`rsync` and triggers the target's restart over a second SSH connection
+(synchronous, request-thread, mirrors `host_run()`'s own shape), and a
+per-project "Deploy" button in the web UI gated behind a native
+`confirm()` dialog. Full spec/implementation/test-review for **2c part 2b
+specifically** in the current `docs/spec.md` / `docs/implementation.md` /
+`docs/test-review.md`; 2c part 2a's own versions of those files (plus
+`deploy-target/README.md`) are preserved in git history at commit
+`63db0a7`.
 
 **Decision:** Gitea, not full GitLab CE. GitLab's resource footprint (own
 Postgres, Redis, multiple worker processes, several GB RAM minimum) cuts
@@ -123,23 +141,27 @@ it — avoids maintaining two parallel git-hosting stories.
 **Shape of the work:**
 - Gitea install step folds into (or replaces) `scripts/git-hosting-setup.sh`
   under the existing `install.sh --with-git-hosting` flag.
-- Auto-deploy: Gitea Actions (or a `post-receive`-equivalent webhook) does
+- ~~Auto-deploy: Gitea Actions (or a `post-receive`-equivalent webhook) does
   the job the current `project-sync.sh` + `post-receive` hook combo does
   today — push to `main` → rsync/deploy to target → target restarts its
-  service. Read `docs/GIT_HOSTING.md`'s "How the pieces fit together"
-  section closely when planning this; several of today's scripts
-  (`new-repo.sh`, `new-dev-instance.sh`, `new-project.sh`,
-  `project-sync.sh`, `target-setup.sh`) will need Gitea-shaped
-  equivalents or adaptation, not a ground-up rewrite.
+  service.~~ **Superseded by 2c part 2's actual shipped shape (see status
+  note above): deploy is manual-only, triggered by a web UI button click,
+  never automatic off a push/poll/webhook.** The old
+  `new-repo.sh`/`new-dev-instance.sh`/`new-project.sh`/`project-sync.sh`/
+  `target-setup.sh` script combo this bullet originally pointed at was
+  retired outright by 2b (backlog item 2, above), not adapted.
 - The web UI's "+ New project" button (`create_project()` in `app.py`)
   needs to call whatever replaces `new-project.sh`.
 - **"Own page in Container"**: Gitea's own web UI gets a row/link the same
   way code-server does today.
-- CI/CD auto-deploy as an explicit **setup step**: surfaced as an install
+- ~~CI/CD auto-deploy as an explicit **setup step**: surfaced as an install
   prompt (target machine, target path, service name) rather than a manual
-  `target-setup.sh` invocation after the fact — worth deciding whether to
-  keep it a separate post-install script (current pattern) or fold it into
-  the interactive installer.
+  `target-setup.sh` invocation after the fact.~~ **Partially superseded:**
+  2c part 2a's `install.sh --with-deploy-target` *does* prompt for target
+  path/service/pubkey, but that only provisions the receiver — the
+  project→target *mapping* (`deploy-map.json`) is deliberately
+  hand-edited/hand-placed by the operator, not an install-time prompt (2c
+  part 2b's explicit non-goal — see status note above).
 
 **Open for the future session:** whether existing git-hosting users get a
 migration path or this is additive-only for new installs; how much of the

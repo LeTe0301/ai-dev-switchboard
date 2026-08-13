@@ -1,0 +1,10 @@
+{
+  "my-project": {
+    "host": "10.0.0.5",
+    "port": 22,
+    "user": "deploy",
+    "deploy_path": "/opt/myapp",
+    "service": "myapp.service",
+    "key": "/etc/ai-dev-switchboard/deploy-keys/myapp_ed25519"
+  }
+}

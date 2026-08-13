@@ -1,188 +1,300 @@
-# Implementation: deploy-target receiver (backlog item 2c, part 2, cycle 2a)
+# Implementation: switchboard-side deploy dispatch (2c part 2b)
 
 ## Summary
-Added a new `deploy-target/` directory and an `install.sh --with-deploy-target`
-flag that together provision a receiver-only deploy target on a *separate*
-machine from the switchboard: a low-priv `deploy` system user whose SSH key
-can only write-only-rsync into one configured path (via `rrsync`) or trigger
-one fixed, sudoers-scoped `systemctl restart` of one named service — nothing
-else, no shell, ever. No switchboard-side wiring exists yet (that's a future
-cycle, 2c-2b); this cycle is standalone-testable with nothing but a manually
-generated SSH keypair and the `ssh`/`rsync` CLIs, and was exercised for real
-end-to-end (real sshd, real throwaway system users, real sudo, real systemd
-units) rather than only unit-tested.
+Adds a hand-edited `deploy-map.json` (project name → target host/port/user/
+deploy_path/service/key), a new `deploy_run(name)` dispatch function in
+`app.py` that pushes `PROJECTS_DIR/<name>` to a 2c-2a `deploy-target`
+receiver via `rsync` and then triggers its restart over SSH, and a
+per-project "Deploy" button in the web UI (visible only when a project has
+a map entry) gated behind a native `confirm()` dialog. Deploy is
+manual-only: nothing added this cycle calls `deploy_run()` from 2c part 1's
+poll/sync path — a push landing on Gitea never triggers a deploy by itself.
 
 ## Root cause
 N/A — new feature, not a bugfix.
 
+## Post-review bugfix
+The reviewer's boundary testing found that `_load_deploy_map()`
+(`app/app.py`) coerced `entry.get("port")` with a bare `int(...)`, which
+raised an uncaught `ValueError` — crashing `/status` for *every* project,
+not just the malformed one — when an operator hand-edited a non-numeric
+`port` value into one `deploy-map.json` entry. This violated the spec's
+explicit "one malformed hand-edited entry must not take down every other
+project's Deploy button" requirement (the rest of `_load_deploy_map()`
+already had this tolerant per-entry drop-and-continue discipline; this one
+coercion was missed). Fixed by wrapping the `int()` coercion in
+`try/except (TypeError, ValueError): continue`, same as every other
+per-entry validation failure in that function (`app/app.py`,
+`_load_deploy_map()`).
+
+Added regression tests:
+- `tests/test_deploy_dispatch.py`
+  `DeployMapLoadTests.test_entry_with_non_numeric_port_is_dropped_not_raised`
+  and `.test_one_entry_with_non_numeric_port_does_not_affect_others` (unit
+  level — loader behavior).
+- `tests/test_deploy_dispatch.py`
+  `DeployEndpointTests.test_status_survives_non_numeric_port_and_keeps_other_projects_intact`
+  (endpoint level — reproduces the reviewer's exact live repro: `/status`
+  returns 200 with the malformed project's `deploy` field simply absent and
+  the other project's `deploy` field intact).
+
+Also folded in the reviewer's two non-blocking follow-ups, since both were
+cheap:
+- `tests/test_deploy_dispatch.py`
+  `DeployNeverCalledFromPollSyncTests.test_sha_change_drives_sync_but_never_deploy_run`
+  — AC10 now has an automated regression guard: drives the real
+  `_gitea_poll_one` → `_gitea_sync_bg` chain through a SHA change (subprocess
+  and `_gitea_api` mocked, `deploy_run` monkeypatched to a call-recording
+  stub) and asserts `deploy_run` is never invoked. Uses the same
+  "poll the per-owner_repo lock until the background thread releases it"
+  wait technique `tests/test_gitea_poll.py`'s
+  `GiteaSyncBgConcurrencyTests` already established.
+- `tests/test_deploy_frontend.js` — new test "a quote-containing
+  host/service value renders safely and still dispatches to the right
+  target": asserts a `"`/`'`-containing `host`/`service` never appears in
+  the rendered row HTML at all (confirming `DEPLOY_TARGETS`'s JSON-in,
+  never-touches-`innerHTML` design is injection-safe regardless of field
+  content) and that `doDeploy` still dispatches to the correct project.
+
+Full suite re-run after these changes: `python3 -m unittest discover -s
+tests -v` → **287/287 pass** (283 baseline + 4 new: 3 for the port-crash
+fix, 1 for AC10). `node tests/test_deploy_frontend.js` → **9/9 pass** (8
+baseline + 1 quote-safety test). `node
+tests/test_singleton_toggle_frontend.js` → 15/15 pass (unrelated regression
+check, still green).
+
 ## Changes by file
-- `deploy-target/deploy-target.env.example` (new) — documents `DEPLOY_PATH`
-  and `DEPLOY_SERVICE_NAME`, mirrors `host-agent/host.env.example`'s shape.
-- `deploy-target/deploy-wrapper.sh` (new) — the `authorized_keys` forced
-  command. Branches on `$SSH_ORIGINAL_COMMAND` via a literal `case` match
-  only (never `eval`s it): `rsync --server*` → validates `DEPLOY_PATH` is
-  set and absolute, then `exec /usr/bin/rrsync -wo "$DEPLOY_PATH"` (hardcoded
-  absolute path, not PATH-resolved); the literal string `deploy-restart` →
-  `exec sudo -n /usr/local/bin/ai-dev-switchboard-deploy-restart.sh`;
-  anything else (including no command) → error to stderr, exit 1.
-- `deploy-target/deploy-restart.sh` (new) — the one script `deploy` may run
-  as root. Re-validates `DEPLOY_SERVICE_NAME` against
-  `^[A-Za-z0-9@_.-]+$` (defense in depth against a hand-edited config), then
-  `systemctl restart -- "$DEPLOY_SERVICE_NAME"` under `set -euo pipefail` —
-  a restart failure propagates as a non-zero SSH exit, never swallowed.
-- `deploy-target/README.md` (new) — setup steps, the `/bin/sh`-not-`nologin`
-  rationale, a manual verification walkthrough, the protocol contract for a
-  future 2c-2b caller, and removal/rollback steps.
-- `install.sh` — new `--with-deploy-target` flag (flag-list comment,
-  `WITH_DEPLOY_TARGET` variable, parsing case arm) and a new provisioning
-  block placed immediately after the existing `WITH_HOST_CONTROL` block:
-  prompts for `DEPLOY_PATH`/`DEPLOY_SERVICE_NAME`/`DEPLOY_PUBKEY`, verifies
-  `/usr/bin/rrsync` exists (skips only this block, not the whole run, if
-  missing), idempotently creates the `deploy` user (`/bin/sh` shell),
-  creates/chowns `DEPLOY_PATH` if supplied, installs
-  `/etc/ai-dev-switchboard/deploy-target.env` (copy-once-then-`set_env`,
-  only overwriting keys actually supplied this run), installs the two
-  scripts to `/usr/local/bin/ai-dev-switchboard-deploy-{wrapper,restart}.sh`,
-  writes `authorized_keys` deterministically if a pubkey was supplied (else
-  prints hand-add instructions), writes and `visudo -cf`-validates
-  `/etc/sudoers.d/ai-dev-switchboard-deploy-target` (zero-argument
-  `NOPASSWD` grant), and prints a summary.
-- `README.md` (top-level) — added `deploy-target/` to the repo-layout tree
-  and one new security-notes bullet describing the SSH-key restriction,
-  explicitly noting this is receiver-only infrastructure with no
-  switchboard UI consumer yet.
-- `tests/test_deploy_target.py` (new) — see "How to verify locally".
+
+- `app/app.py`
+  - New env vars `DEPLOY_MAP_FILE` (default
+    `/etc/ai-dev-switchboard/deploy-map.json`) and `DEPLOY_KEYS_DIR`
+    (default `/etc/ai-dev-switchboard/deploy-keys`), declared next to
+    `GITEA_REPO_MAP_FILE`.
+  - New `_load_deploy_map()`: mirrors `_load_gitea_repo_map()`'s
+    "missing/malformed file → `{}`, never crash" tolerance, plus per-entry
+    validation — drops (never raises on) any entry missing a required key
+    (`host`/`deploy_path`/`service`/`key`) or whose `key` path resolves
+    (via `os.path.realpath`) outside `DEPLOY_KEYS_DIR`. Applies
+    `port` (default `22`) and `user` (default `"deploy"`) defaults. No
+    caching — re-read on every call, same as spec's "Loading" section
+    requires.
+  - New `_deploy_locks`/`_deploy_lock_for(name)`: per-project non-blocking
+    `threading.Lock` dict, same guarded-dict idiom as
+    `_gitea_sync_lock_for`.
+  - New `deploy_run(name) -> (int, str)`: looks up the map entry (404 if
+    absent), acquires the per-project lock non-blocking (409 if already
+    held), runs `rsync -e "ssh -i <key> ... -p <port>" -a
+    PROJECTS_DIR/<name>/ <user>@<host>:` (bare destination, per
+    `deploy-target/README.md`'s protocol contract), and on success runs
+    `ssh -i <key> ... <user>@<host> deploy-restart`. Returns `(502, "push
+    failed: ...")`, `(502, "push succeeded but restart failed: ...")`, or
+    `(200, "deployed")`. Both subprocess calls are wrapped in
+    `try/except (subprocess.SubprocessError, OSError)` so a hang/timeout/
+    missing-binary surfaces as a clean 502 instead of an unhandled
+    exception (a security/correctness hygiene addition beyond the spec's
+    literal pseudocode, to avoid ever returning a raw 500 with a stack
+    trace to the client). Lock always released in `finally`.
+  - New `do_POST` branch: `POST /instance/<name>/deploy` — 404 for an
+    unknown instance, otherwise `self._json({"ok": status == 200,
+    "message": msg}, status)`. Added after the existing TOTP gate, same as
+    every other mutating route.
+  - `/status`: `_load_deploy_map()` read once per call; each instance gets
+    `inst["deploy"] = {"host", "deploy_path", "service"}` when a valid map
+    entry exists (`key`/`port`/`user` deliberately excluded from the
+    client payload).
+  - `PAGE_TEMPLATE` (embedded HTML/CSS/JS):
+    - CSS: `.deploy-row`, `.deploy-btn` (green `#34c759`, reuses
+      `.new-project-row button`'s shape), `.deploy-msg` +
+      `.deploy-msg.success`/`.deploy-msg.error` (`#34c759`/`#ff6b6b`).
+    - New `let DEPLOY_TARGETS = {}` (project name → `{host, deploy_path,
+      service}`), refreshed every `refresh()` call.
+    - New `deployRow(name, deploy)`: renders the button + an empty
+      `.deploy-msg` slot when `deploy` is present, nothing otherwise.
+    - `row()` gained a 13th `deploy` parameter; `refresh()` passes
+      `inst.deploy` through and populates `DEPLOY_TARGETS`.
+    - `actionPath()` gained a `'deploy'` case
+      (`/instance/<name>/deploy`).
+    - `handleActionResult()` gained a `kind === 'deploy'` branch: writes
+      the response's `message` into that row's `.deploy-msg` element
+      (`success`/`error` class), and — unlike every other kind — never
+      calls `setTimeout(refresh, 1500)`, since that would wipe the message
+      almost immediately instead of leaving it in place until the next
+      *natural* `/status` poll (spec's "gone on next refresh()"). The
+      428 code-overlay label also gets a `Deploying: <name>` variant.
+    - New `doDeploy(name)`: looks the project's target info up in
+      `DEPLOY_TARGETS`, shows the `confirm()` dialog, sets the message
+      slot to "Deploying…", then calls `toggle('deploy', name, true,
+      null)` — a thin wrapper around the exact same
+      `toggle`/`performAction`/`handleActionResult`/`pendingToggle`
+      machinery every other action already uses, so the shared TOTP
+      code-overlay retry path (a 428 mid-flow) works with no new auth
+      logic, per the design doc's own note.
+
+- `config/deploy-map.json.example` (new) — the exact single-entry schema
+  from `docs/spec.md`.
+- `config/switchboard.env.example` — new commented-out
+  `#DEPLOY_MAP_FILE=...` / `#DEPLOY_KEYS_DIR=...` section, same style as
+  the existing `#GITEA_REPO_MAP_FILE=...` line.
+- `install.sh` — two small, unconditional (no new `--with-*` flag)
+  additions:
+  - Near the `SVC_USER`/`PROJECTS_DIR` setup: `mkdir -p
+    "$CONFIG_DIR/deploy-keys"; chmod 700 ...; chown "$SVC_USER:$SVC_USER"
+    ...` — reasserted every run.
+  - Near the `ENV_FILE` writing block: `[ -f
+    "$CONFIG_DIR/deploy-map.json" ] || echo '{}' >
+    "$CONFIG_DIR/deploy-map.json"` (copy-if-absent **only** — never
+    touched again on re-run, unlike every `set_env`-patched value in this
+    file) plus `set_env ... DEPLOY_MAP_FILE ...` /
+    `set_env ... DEPLOY_KEYS_DIR ...`.
+- `deploy-target/README.md` — updated the stale "switchboard-side wiring
+  doesn't exist yet" language in the intro and "What this cycle doesn't
+  do", and added a new "Switchboard-side caller (2c part 2b)" section
+  pointing at `deploy-map.json`/`config/deploy-map.json.example` and
+  restating the known-hosts trust bootstrapping step. The "Protocol
+  contract" section itself is untouched, per the spec's own note that it
+  was "already written to be exactly what this cycle needed."
+- `README.md` — repo-layout tree note for `config/deploy-map.json.example`
+  and that `deploy-target/`'s receiver now has a real caller; "Security
+  notes" bullet updated to describe `DEPLOY_KEYS_DIR` and the manual-only
+  dispatch (previously said "no switchboard UI consumer yet").
+- `docs/BACKLOG.md` — item 2's status note and two "Shape of the work"
+  bullets updated to reflect that 2c part 2 shipped in two sub-parts
+  (2a receiver, 2b this cycle's caller) and that deploy is manual-only,
+  not the original auto-deploy-off-the-poll framing.
+- `tests/test_deploy_dispatch.py` (new) — `DeployMapLoadTests` (loader
+  validation), `DeployRunTests` (dispatch logic, `subprocess.run` mocked),
+  `DeployEndpointTests` (real `ThreadingHTTPServer`, login/TOTP flow,
+  `/status` + `/instance/<name>/deploy`), `InstallShDeployMapBlockTests`
+  (install.sh's two new blocks extracted verbatim and run standalone, no
+  sudo needed), and `PrivilegedDeployRunEndToEndTests` (gated on
+  passwordless sudo + local sshd, like `test_deploy_target.py`'s own
+  `PrivilegedEndToEndTests`) — provisions a real throwaway
+  `deploy-target` receiver and calls the real `deploy_run()`, with
+  `subprocess.run` **not** mocked, over real `ssh`/`rsync` against
+  `127.0.0.1`. 41 new Python tests total (38 + 3 added in the post-review
+  bugfix pass) plus a new `DeployNeverCalledFromPollSyncTests` class (1
+  more test) for the AC10 follow-up — 42 in this file overall.
+- `tests/test_deploy_frontend.js` (new) — extracts the real rendered
+  `<script>` from `render_page()` (same technique as
+  `tests/test_singleton_toggle_frontend.js`) and drives `doDeploy`/
+  `deployRow`/`row`/`handleActionResult` against stubbed `document`/
+  `fetch`/`confirm`: button visibility, the `confirm()` cancel path, all
+  four result-message shapes (success/push-failed/restart-failed/409),
+  and the 428→code-overlay→retry flow. 8 tests (9 after the post-review
+  quote-safety test was added).
 
 ## Key decisions / tradeoffs
-- **Followed `host-agent`'s shape, not the deleted `target-setup.sh`'s**, per
-  the spec: dedicated low-priv user, forced-command/no-shell SSH
-  restriction, a fixed zero-argument sudoers rule — no systemd `.path`-unit
-  inotify trigger.
-- **`/bin/sh`, not `nologin`, for `deploy`'s shell** — `nologin` ignores its
-  `-c` argument and never runs the forced command at all; carried forward
-  from the deleted `target-setup.sh`'s own documented reasoning.
-- **No hand-parsing of the rsync wire protocol** — the wrapper only ever
-  does a literal string `case` match on `$SSH_ORIGINAL_COMMAND`; all actual
-  path-restriction enforcement is delegated to `rrsync` itself.
-- **Real end-to-end testing over unit testing wherever possible** — this is
-  security-sensitive surface (SSH forced commands, sudoers scoping,
-  `rrsync` path restriction), so `tests/test_deploy_target.py` provisions
-  real throwaway system users, a real sudoers rule, and a real systemd unit,
-  and drives them over real `ssh`/`rsync` against this machine's own
-  already-running sshd, rather than mocking any of that away. See "How to
-  verify locally" for the three test tiers.
-- **`install.sh`'s own `--with-deploy-target` block is tested by extracting
-  and running its literal source**, not by re-implementing equivalent logic
-  in Python and not by running the *entire* `install.sh` (which would also
-  do apt-get installs, create `RUN_USER`/`SVC_USER`, and start a second real
-  switchboard systemd service — too invasive for a test and inconsistent
-  with the fact that no other `--with-*` flag has an `install.sh`-level
-  test in this repo either). The extraction includes `install.sh`'s own
-  `prompt()`/`set_env()`/`get_env()` helpers verbatim, so a future edit to
-  the block's logic is exercised for real, not against a stale copy.
-- **Discovered `prompt()` reads from `/dev/tty`, not stdin** (deliberate, so
-  a `curl | bash` install still prompts interactively) — a plain
-  stdin-piped `subprocess.run()` therefore always sees `prompt()`'s
-  non-interactive branch and returns only the empty default, regardless of
-  what's piped in. `tests/test_deploy_target.py` drives `install.sh`'s block
-  through a real pty (`pty.fork()`) instead, exactly like a human typing at
-  a terminal — this actually caught the harness silently not exercising
-  the values I intended in an early draft of these tests (see below).
+
+- **`doDeploy(name)` takes only a name, not `(name, deploy)`.** The design
+  doc's own sketch was `doDeploy(name, deploy)` with the target object
+  inlined into the rendered `onclick="..."` attribute (e.g.
+  `onclick="doDeploy('proj', {"host":...})"`). `deploy.host`/
+  `deploy.service` come from an operator-hand-edited JSON file and the
+  design doc's own "Notes for the developer" flags that they "could
+  theoretically contain quotes." Embedding an arbitrary JSON blob into an
+  HTML attribute correctly (surviving both HTML-attribute-quoting and
+  JS-string-literal-quoting at once) is exactly the kind of thing this
+  codebase's existing `esc()` helper does *not* do (it only escapes
+  `&`/`<`/`>` for text-node content, not attribute quotes) — so instead of
+  hand-rolling a second escaping scheme, `doDeploy` takes just the
+  (already-charset-validated) project `name` and looks the target info up
+  in a small module-level `DEPLOY_TARGETS` map populated straight from the
+  already-JSON-parsed `/status` response, the same pattern `ENGINE_LABELS`
+  already uses. Functionally identical UX; strictly safer. Documented here
+  since it's a literal signature deviation from the design doc.
+- **`handleActionResult`'s `kind === 'deploy'` branch skips
+  `setTimeout(refresh, 1500)`.** Every other action calls this to
+  optimistically re-render soon after a successful mutation. For deploy,
+  doing that would clear the just-written result message in ~1.5s instead
+  of the spec's "persists until next `/status` refresh." Deliberately
+  left to the existing 4-second poll interval instead.
+- **Deploy is wired through the existing `toggle()`/`performAction()`
+  machinery** rather than a bespoke fetch+overlay implementation, so the
+  TOTP code-overlay retry path (428 → prompt → retry with `code`) works
+  for free, exactly as the design doc's "Notes for the developer" asked
+  for ("No new auth logic needed").
+- **Both `subprocess.run` calls in `deploy_run()` are wrapped in
+  `try/except`**, even though the spec's own pseudocode doesn't show this
+  — `BatchMode=yes`/`ConnectTimeout` cover most failure shapes, but a
+  missing `rsync`/`ssh` binary, or a timeout past `ConnectTimeout` (DNS
+  resolution on some `ssh` builds isn't covered by `ConnectTimeout`),
+  would otherwise raise and produce a raw 500 with no JSON body — a
+  security/correctness hygiene fix beyond the literal spec text, folded in
+  without a separate discussion since it's strictly a robustness
+  improvement with no behavior change on the happy or already-specified
+  error paths.
 
 ## Deviations from spec
-- **The spec's own "Protocol contract" / acceptance-criteria example command
-  (`rsync -e "ssh -i <key>" -a ./somefile deploy@target:<DEPLOY_PATH>/`) does
-  not work as literally written against real `rrsync`.** Verified directly:
-  `rrsync` treats any destination arg starting with `/` as relative to its
-  own restricted root and prepends that root to it (see `/usr/bin/rrsync`'s
-  `validated_arg()`), so repeating the absolute `DEPLOY_PATH` in the client
-  command causes rsync to try to `mkdir` a doubled/nested path that doesn't
-  exist, and the push fails (`rsync: [Receiver] mkdir "...deploydest/tmp/
-  .../deploydest" failed`). The **correct**, verified-working form leaves
-  the destination bare (`deploy@target:`, no path at all) — the server has
-  already fixed the destination via `command="... rrsync -wo $DEPLOY_PATH"`.
-  I corrected the example commands in `deploy-target/README.md` and
-  `install.sh`'s own printed summary to the verified-working bare form, and
-  left a note in the README explaining why. `docs/spec.md` itself still has
-  the original (non-working-as-written) example; flagging it here since I
-  can't edit the spec, but the *design intent* (push lands under
-  `DEPLOY_PATH`) is unaffected — only the exact command syntax needed
-  correcting.
-- **The spec's path-escape acceptance criterion says "rrsync refuses"**
-  (implying an error) for an escape attempt like `deploy@target:/etc/`.
-  In practice `rrsync` doesn't error on this — it silently re-roots the
-  absolute path underneath `DEPLOY_PATH` (so `/etc/` becomes
-  `DEPLOY_PATH/etc/`), and the rsync call reports success (exit 0). The
-  actual, load-bearing security property — **nothing is ever written
-  outside `DEPLOY_PATH`** — holds regardless, and that's what
-  `tests/test_deploy_target.py`'s
-  `test_path_escape_attempt_rejected_no_file_written_outside` asserts
-  directly (plus confirming the file landed re-rooted at
-  `DEPLOY_PATH/etc/escapefile`, proving this was `rrsync`'s remapping and
-  not some unrelated failure). No code changed because of this — it's a
-  property of `rrsync` itself, working as upstream-designed — but it's
-  worth the reviewer knowing the exit-code framing in `docs/spec.md`
-  doesn't match `rrsync`'s actual behavior.
-- Everything else in the spec's "Proposed approach" (file layout, script
-  responsibilities, `install.sh` step-by-step provisioning, sudoers/
-  `authorized_keys` exact line shapes, edge cases) was implemented as
-  written; no other deviations.
+- `doDeploy`'s signature (`(name)` instead of `(name, deploy)`) — see "Key
+  decisions" above. Behavior matches the spec/design exactly; only the
+  internal JS function signature differs.
+- No other deviations. `deploy_run()`'s rsync/ssh argv, the map schema and
+  its validation rules, the route shape, the `/status` field shape, and
+  `install.sh`'s two blocks all match `docs/spec.md`'s "Proposed approach"
+  verbatim (confirmed by `DeployRunTests.
+  test_success_returns_200_and_runs_push_then_restart_with_exact_argv`,
+  which asserts the exact argv list, and
+  `InstallShDeployMapBlockTests`/`InstallShTemplateTests`, which run/grep
+  `install.sh`'s own real source rather than a re-implementation of it).
 
 ## Known limitations
-- Matches the spec's own "Open questions": one `deploy` user / one path /
-  one service per target machine (no multiplexing multiple projects onto
-  one target machine yet); no locking between overlapping push+restart
-  pairs (a future caller must serialize); `deploy-restart` is a fixed
-  protocol keyword, not a secret; restart is `systemctl restart` only, not
-  a general command-runner. None of these are addressed here — they're
-  explicitly out of scope for this cycle per the spec.
-- No switchboard-side wiring exists yet (by design — that's 2c-2b). Nothing
-  in `app/app.py`, `config/switchboard.env.example`, or the switchboard's
-  own sudoers/systemd assets changed.
-- `install.sh`'s interactive prompts for `DEPLOY_PATH`/`DEPLOY_SERVICE_NAME`/
-  `DEPLOY_PUBKEY` have no non-interactive (`--yes`/env-var) override — same
-  as every other prompt-driven value already in `install.sh` (e.g.
-  `RUN_USER`, `PVE_HOST`); not a gap introduced by this cycle.
+- **Known-hosts trust bootstrapping is a real one-time manual step**, not
+  automated (spec's own "Open questions", carried over from `host_run()`'s
+  existing precedent): the operator must get `SVC_USER`'s `known_hosts` to
+  trust each target host before the first click, or the first deploy fails
+  fast with a clear 502 (not a hang, since `BatchMode=yes` refuses an
+  interactive host-key prompt). Documented in
+  `deploy-target/README.md`'s new section.
+- **No interlock with 2c part 1's in-flight Gitea sync** — a deploy click
+  racing a background `git fetch`/`merge --ff-only` is not defended
+  against this cycle (spec's own accepted low-probability/low-impact
+  assumption).
+- **`deploy_path`/`service` in the map are display-only** — never
+  cross-checked against the target's own real `deploy-target.env` values,
+  so a mismatch between what the map says and what's actually configured
+  on the target is possible and silent (spec's own flagged, accepted
+  limitation).
+- **No persisted deploy history/status** — the UI's only feedback is the
+  one synchronous POST's own result, gone on the next `/status` refresh
+  (spec non-goal, not a limitation introduced by this implementation).
 
 ## How to verify locally
-```
-cd /home/dev/projects/ai-dev-switchboard
-python3 -m unittest tests.test_deploy_target -v      # this cycle's suite (30 tests)
-python3 -m unittest discover -s tests -v              # full repo suite (245 tests)
-bash -n install.sh                                     # syntax check
-```
-`tests/test_deploy_target.py` has three tiers (see its own module
-docstring for the reasoning behind each):
-1. `WrapperBranchingTests` / `RestartValidationTests` / `InstallShTemplateTests`
-   — no root needed; branching/validation logic exercised directly, with
-   fake `rrsync`/`sudo` stand-ins on `PATH` recording their own argv where
-   that's meaningful (the wrapper's `rrsync` call uses a hardcoded absolute
-   path deliberately, so that branch is instead verified against the real
-   `/usr/bin/rrsync`).
-2. `PrivilegedEndToEndTests` — gated on passwordless `sudo` and a reachable
-   local sshd (both present in this dev sandbox); provisions a real
-   throwaway system user (not literally `deploy`, to avoid colliding with a
-   genuine `deploy` account on whatever box runs this suite), a real
-   sudoers rule, and a real systemd unit, then drives all of it over real
-   `ssh`/`rsync` against `127.0.0.1` — covers every "Acceptance criteria"
-   bullet in `docs/spec.md` directly (push lands correctly; path-escape
-   attempt never lands outside `DEPLOY_PATH`; arbitrary command / bare
-   interactive attempt rejected with no shell; `deploy-restart` genuinely
-   restarts the service with no password prompt; a nonexistent service
-   fails loudly; unset/malformed `DEPLOY_PATH` fails closed; the sudoers
-   grant can't be used for anything else).
-3. `InstallScriptDeployTargetBlockTests` — gated on passwordless `sudo`;
-   extracts and runs `install.sh`'s actual `--with-deploy-target` block
-   verbatim (plus its own `prompt()`/`set_env()`/`get_env()` helpers) via a
-   real pty, using the literal `deploy` username — covers the
-   install-flow-specific acceptance criteria (full provisioning shape,
-   blank-pubkey handling, re-run-with-different-values not accumulating,
-   and running alongside `--with-host-control` with no conflicting state).
 
-All tests clean up their own throwaway state (`useradd -r`/`rm -f`/
-`systemctl stop` + unit-file removal); verified clean after a full run via
-`id deploy`, `ls /etc/ai-dev-switchboard`, `ls /usr/local/bin/
-ai-dev-switchboard-*`, `ls /etc/sudoers.d/`.
+Backend + install.sh tests (Python, stdlib `unittest`):
+```
+python3 -m unittest discover -s tests -v
+```
+This runs the full suite (287 tests as of this cycle including the
+post-review bugfix pass, all passing), including
+`tests/test_deploy_dispatch.py`. The privileged classes inside
+it (`PrivilegedDeployRunEndToEndTests`, and `test_deploy_target.py`'s own
+`InstallScriptDeployTargetBlockTests`/`PrivilegedEndToEndTests`) need
+passwordless `sudo` and a local `sshd` on `127.0.0.1:22` — they
+self-skip cleanly if either is unavailable. To run only this cycle's own
+file:
+```
+python3 -m unittest tests.test_deploy_dispatch -v
+```
 
-Manual walkthrough (what the tests above automate) is documented in
-`deploy-target/README.md`'s "Verifying the restriction" section.
+Frontend tests (Node, stdlib `vm`, no dependencies):
+```
+node tests/test_deploy_frontend.js
+node tests/test_singleton_toggle_frontend.js   # regression check — unrelated to this cycle, still green
+```
+
+Manual end-to-end check (mirrors the acceptance criteria):
+1. On a second machine: `sudo ./install.sh --with-deploy-target`
+   (see `deploy-target/README.md`).
+2. On the switchboard box: `sudo ./install.sh` (re-run is safe/idempotent)
+   — creates `/etc/ai-dev-switchboard/deploy-keys/` (mode 700) and an
+   empty `deploy-map.json` if one doesn't already exist.
+3. Generate a keypair, place the private half under `deploy-keys/`, the
+   public half in the target's `authorized_keys` (per
+   `deploy-target/README.md` step 2/3).
+4. `sudo -u <SVC_USER> ssh -i <key> deploy@<target> true` once, to seed
+   `known_hosts` (see "Known limitations" above).
+5. Hand-edit `/etc/ai-dev-switchboard/deploy-map.json` with a real entry
+   for one of your projects, pointing `key` at the file placed in step 3.
+6. Reload the web UI — the project's row should now show a "Deploy"
+   button. Click it, confirm the dialog, and watch the inline result
+   message (success, or a specific failure reason).
