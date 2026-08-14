@@ -582,6 +582,34 @@ and the only sub-spec with no new backend concepts.
 - A saved composition persists across service restarts.
 - Starting with an empty teammate list is rejected with a clear reason.
 
+**Status: done** (reviewer-approved, commit `738f274`). 40 changed test cases
+across `tests/test_team_routes.py` (+18) and `tests/test_team_frontend.js`
+(+~35 net across the cycle); `docs/design.md` gained its own "Roster &
+composition UI (sub-spec 6e)" section (appended, not a rewrite of 6d part
+2a's). One post-review fix, re-approved in the same commit before merge:
+`GET /status` previously collapsed every `default_team_composition()`
+refusal reason into `composition: null`, which made a tier-3-only roster
+with no saved composition indistinguishable from a genuinely empty one and
+permanently disabled the picker -- breaking this cycle's own headline goal
+("every roster member must be pickable as lead, including tier 3, never
+blocked"). Fixed by sending `{"lead": null, "members": []}` whenever the
+roster is non-empty but the automatic default declines to auto-pick (see
+`app/app.py`'s `/status` handler, the `elif roster:` branch), reserving
+`composition: null` for a truly empty roster. Carried forward, none
+blocking:
+
+- **The single-tier-3-engine-only roster still cannot complete a team
+  start** (pick that engine as lead, zero teammates remain) -- not a
+  defect, the same structural "a team needs a lead AND at least one
+  teammate" rule every roster shape has always been subject to
+  (`validate_composition()`/`default_team_composition()`). Recorded here
+  only so it is not later mistaken for the tier-3-picker-blocked bug this
+  cycle actually fixed.
+- **No per-teammate `--allowedTools`/`--sandbox` scoping mechanism was
+  added** (`docs/story.md` §7's own open question, resolved in this
+  cycle's spec as "stays where it already lives, in each engine's static
+  `HEADLESS_CMD`" -- a deliberate non-goal, not a gap).
+
 ### 6f — Overwatch feed + escalation inbox
 
 **Deliverable.** The Teams page: one merged, filterable timeline over all
@@ -601,6 +629,23 @@ agents' `.jsonl` logs, colour-coded per agent, with a compact status strip
 - A long-running team's feed stays responsive — logs are tailed with a bound,
   not read whole on every poll.
 - TOTP gating matches every other state-changing action in the UI.
+
+**Split into two build cycles** (product-manager's call, 2026-08-14, same
+"read the whole diff in one pass" reasoning as 6d's own split): **part 1**
+is the backend API surface only -- three new routes (`GET .../team/events`,
+`GET .../team/inbox`, `POST .../team/resolve`) plus one additive `/status`
+field (`waiting_on_you`) -- zero HTML/CSS/JS, so it skips the ux-designer
+step entirely (same precedent as 6d part 1, which also shipped with no
+`docs/design.md` section). **Part 2** is the Teams page itself (merged
+timeline rendering, colour-coding, per-agent filter, status strip,
+escalation panel with its free-text "Other") built against part 1's
+already-shipped, already-tested contract. Rationale: part 1 alone is
+comparable in size/risk to 6b (grounding) or 6d part 1 (backend-only,
+CLI/route-testable); folding a new multi-file tailing/cursor protocol
+*and* a brand-new page's worth of frontend into one dispatch is exactly
+the "DB-migration-plus-several-screens" shape the product-manager's own
+load-balanced-decomposition skill exists to catch. `docs/spec.md` currently
+holds part 1 only; part 2 gets its own spec once part 1 is reviewer-approved.
 
 ---
 
