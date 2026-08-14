@@ -1399,6 +1399,228 @@ class CliTeamInterjectTests(_StateTestCase):
         self.assertEqual(rc, 1)
 
 
+# ─── Tier 1: add_team_member()'s own validation (backlog item 21 part 1) --
+# every case here is REJECTED before add_team_member() ever reaches
+# _create_worktree()/tmux, so no real git/tmux is needed to exercise it (the
+# accept-and-actually-create-worktree-and-window path is Tier 3, real tmux,
+# tests/test_teams_lifecycle.py) ─────────────────────────────────────────
+class _AddTeamMemberTestCase(_StateTestCase):
+    """_StateTestCase's own projdir/state_dir scratch, extended with a
+    scratch ENGINES_DIR so add_team_member()'s own roster()-backed
+    validation (docs/spec.md 'Proposed approach' §1 step 3) has real
+    engines.d entries to validate against -- same combined-fixture
+    technique tests/test_teams_composition.py's ValidateCompositionTests
+    already establishes for validate_composition()'s own roster()-backed
+    checks."""
+
+    def setUp(self):
+        super().setUp()
+        self.engines_dir = tempfile.mkdtemp(prefix="switchboard-addmember-engines-")
+        self._orig_engines_dir = appmod.ENGINES_DIR
+        self._orig_base = teamsmod.TEAM_LLM_BASE_URL
+        self._orig_model = teamsmod.TEAM_LLM_MODEL
+        self._orig_max_members = teamsmod.TEAM_MAX_MEMBERS
+        appmod.ENGINES_DIR = self.engines_dir
+        teamsmod.TEAM_LLM_BASE_URL = "http://x:11434/v1"
+        teamsmod.TEAM_LLM_MODEL = "qwen3:8b"
+        _write_engine_file(self.engines_dir, "codex.engine", """\
+            LABEL=Codex
+            CMD=unused
+            HEADLESS_CMD=codex -p {resume}
+            HEADLESS_FORMAT=plain
+            HEADLESS_PROMPT=arg
+            """)
+        _write_engine_file(self.engines_dir, "aider.engine", """\
+            LABEL=Aider
+            CMD=unused
+            HEADLESS_CMD=aider -p {resume}
+            HEADLESS_FORMAT=plain
+            HEADLESS_PROMPT=arg
+            """)
+
+    def tearDown(self):
+        appmod.ENGINES_DIR = self._orig_engines_dir
+        teamsmod.TEAM_LLM_BASE_URL = self._orig_base
+        teamsmod.TEAM_LLM_MODEL = self._orig_model
+        teamsmod.TEAM_MAX_MEMBERS = self._orig_max_members
+        shutil.rmtree(self.engines_dir, ignore_errors=True)
+        super().tearDown()
+
+
+class AddTeamMemberValidationTests(_AddTeamMemberTestCase):
+    def test_unknown_run_id_returns_shaped_error(self):
+        result = teamsmod.add_team_member("does-not-exist", "codex")
+        self.assertEqual(result, {"ok": False, "error": "no such run_id: does-not-exist"})
+
+    def test_terminal_statuses_rejected(self):
+        for status in ("finished", "error", "escalated_max_rounds", "stopped"):
+            run_id = f"run-term-{status}"
+            state = teamsmod._new_state(run_id, self.projdir, self._lead(), ["codex"], "task")
+            state["status"] = status
+            teamsmod._persist(state)
+            result = teamsmod.add_team_member(run_id, "aider")
+            self.assertFalse(result["ok"], status)
+            self.assertFalse(
+                os.path.exists(teamsmod._membership_log_path(run_id)), status)
+
+    def test_unknown_engine_name_rejected(self):
+        state = teamsmod._new_state("run-unknown", self.projdir, self._lead(), [], "task")
+        teamsmod._persist(state)
+        result = teamsmod.add_team_member("run-unknown", "nosuchengine")
+        self.assertFalse(result["ok"])
+        self.assertIn("nosuchengine", result["error"])
+
+    def test_ollama_entry_rejected_not_delegate_capable(self):
+        state = teamsmod._new_state(
+            "run-ollama", self.projdir, {"kind": "engine", "name": "codex", "tier": 3}, [], "task")
+        teamsmod._persist(state)
+        result = teamsmod.add_team_member("run-ollama", "qwen3:8b")
+        self.assertFalse(result["ok"])
+
+    def test_agent_is_the_current_engine_lead_rejected(self):
+        state = teamsmod._new_state(
+            "run-leadeq", self.projdir, {"kind": "engine", "name": "codex", "tier": 3}, [], "task")
+        teamsmod._persist(state)
+        result = teamsmod.add_team_member("run-leadeq", "codex")
+        self.assertFalse(result["ok"])
+
+    def test_agent_already_a_member_rejected(self):
+        state = teamsmod._new_state("run-dup", self.projdir, self._lead(), ["codex"], "task")
+        teamsmod._persist(state)
+        result = teamsmod.add_team_member("run-dup", "codex")
+        self.assertFalse(result["ok"])
+        self.assertIn("already", result["error"])
+
+    def test_at_cap_rejected_naming_the_max_no_side_effects(self):
+        teamsmod.TEAM_MAX_MEMBERS = 1
+        state = teamsmod._new_state("run-cap", self.projdir, self._lead(), ["codex"], "task")
+        teamsmod._persist(state)
+        result = teamsmod.add_team_member("run-cap", "aider")
+        self.assertFalse(result["ok"])
+        self.assertIn("1", result["error"])
+        self.assertFalse(os.path.exists(teamsmod._worktree_path(self.projdir, "aider")))
+        self.assertFalse(
+            os.path.exists(teamsmod._membership_log_path("run-cap")))
+
+    def test_blocked_ask_user_and_blocked_board_write_do_not_hit_the_status_check(self):
+        # These two statuses are ALLOWED by add_team_member()'s own status
+        # gate (mirrors interject()'s accepted set) -- proven here by
+        # showing they reach a LATER validation error (unknown engine),
+        # never the status-rejection message itself, without needing any
+        # real git/tmux to reach that later check.
+        for status in ("blocked_ask_user", "blocked_board_write"):
+            run_id = f"run-blocked-{status}"
+            state = teamsmod._new_state(run_id, self.projdir, self._lead(), [], "task")
+            state["status"] = status
+            teamsmod._persist(state)
+            result = teamsmod.add_team_member(run_id, "nosuchengine")
+            self.assertFalse(result["ok"], status)
+            self.assertIn("nosuchengine", result["error"], status)
+
+
+# ─── Tier 1: team_step()'s membership.jsonl drain checkpoint (backlog item
+# 21 part 1) -- mirrors TeamStepDrainInterjectTests above exactly ─────────
+class TeamStepDrainMembershipTests(_StateTestCase):
+    def _queue_member_joined(self, run_id, agent, worktree=None):
+        envelope = {"ts": teamsmod._now_iso(), "agent": agent,
+                   "seq": teamsmod._next_membership_seq(run_id), "kind": "member_joined",
+                   "worktree": worktree}
+        path = teamsmod._membership_log_path(run_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(envelope) + "\n")
+
+    def test_drain_appends_member_to_state_and_never_calls_the_lead(self):
+        state = teamsmod._new_state("run-mdrain", self.projdir, self._lead(), ["codex"], "task")
+        teamsmod._persist(state)
+        self._queue_member_joined("run-mdrain", "aider", worktree="/x/proj.teams/aider")
+
+        def fail_call_lead(*a, **kw):
+            self.fail("_call_lead() was called on a round that only drained membership")
+
+        orig = teamsmod._call_lead
+        teamsmod._call_lead = fail_call_lead
+        try:
+            teamsmod.team_step(state)
+        finally:
+            teamsmod._call_lead = orig
+
+        self.assertIn("aider", state["members"])
+        self.assertEqual(state["worktrees"]["aider"], "/x/proj.teams/aider")
+        self.assertEqual(len(state["history"]), 1)
+        entry = state["history"][0]
+        self.assertEqual(entry["tool"], "team_member_joined")
+        self.assertIn("aider", entry["outcome_summary"])
+        self.assertGreater(state["membership_cursor"], 0)
+        self.assertEqual(state["membership_cursor"],
+                         os.path.getsize(teamsmod._membership_log_path("run-mdrain")))
+
+    def test_membership_drain_runs_before_human_drain_same_round_poll(self):
+        state = teamsmod._new_state("run-mdrain2", self.projdir, self._lead(), [], "task")
+        teamsmod._persist(state)
+        self._queue_member_joined("run-mdrain2", "aider")
+        teamsmod.interject("run-mdrain2", "hello")
+
+        def fail_call_lead(*a, **kw):
+            self.fail("_call_lead() was called while events were still queued")
+
+        orig = teamsmod._call_lead
+        teamsmod._call_lead = fail_call_lead
+        try:
+            teamsmod.team_step(state)  # round 1: membership drain only
+            self.assertEqual(state["history"][0]["tool"], "team_member_joined")
+            teamsmod.team_step(state)  # round 2: human drain only
+            self.assertEqual(state["history"][1]["tool"], "human_interject")
+        finally:
+            teamsmod._call_lead = orig
+
+    def test_idempotent_against_a_stale_cursor_replay(self):
+        # Defensive guard mirroring _recover_in_progress()'s own shape (docs/
+        # spec.md "Proposed approach" §2): draining the SAME event twice (a
+        # theoretical crash/resume replay from a stale membership_cursor)
+        # must not append "aider" to state["members"] a second time.
+        state = teamsmod._new_state("run-mdrain3", self.projdir, self._lead(), [], "task")
+        state["members"].append("aider")
+        state["worktrees"]["aider"] = "/x/proj.teams/aider"
+        teamsmod._persist(state)
+        self._queue_member_joined("run-mdrain3", "aider", worktree="/x/proj.teams/aider")
+
+        def fail_call_lead(*a, **kw):
+            self.fail("_call_lead() was called on a round that only drained membership")
+
+        orig = teamsmod._call_lead
+        teamsmod._call_lead = fail_call_lead
+        try:
+            teamsmod.team_step(state)
+        finally:
+            teamsmod._call_lead = orig
+
+        self.assertEqual(state["members"].count("aider"), 1)
+
+
+# ─── CLI: team-add-member (backlog item 21 part 1) ─────────────────────────
+class CliTeamAddMemberTests(_AddTeamMemberTestCase):
+    def test_parses_run_id_and_agent_positionals(self):
+        args = teamsmod._parse_args(["team-add-member", "abc", "aider"])
+        self.assertEqual(args.command, "team-add-member")
+        self.assertEqual(args.run_id, "abc")
+        self.assertEqual(args.agent, "aider")
+
+    def test_unknown_run_id_prints_error_exits_nonzero(self):
+        rc = teamsmod.main(["team-add-member", "no-such-run", "aider"])
+        self.assertEqual(rc, 1)
+
+    def test_rejection_prints_error_exits_nonzero_no_side_effect(self):
+        state = teamsmod._new_state("run-cli-cap", self.projdir, self._lead(), ["codex"], "task")
+        teamsmod._persist(state)
+        teamsmod.TEAM_MAX_MEMBERS = 1
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rc = teamsmod.main(["team-add-member", "run-cli-cap", "aider"])
+        self.assertEqual(rc, 1)
+        self.assertIn("error:", buf.getvalue())
+
+
 # ─── Tier 1: persistence + crash recovery ──────────────────────────────────
 class PersistRoundTripPromptReconstructionTests(_StateTestCase):
     def setUp(self):

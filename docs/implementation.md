@@ -2926,3 +2926,350 @@ node tests/test_singleton_toggle_frontend.js
 node tests/test_upload_frontend.js
 # ALL PASS (8/8)
 ```
+
+# Implementation: Backlog item 21 part 1 -- grow a running team with an added teammate (backend)
+
+## Summary
+Adds `teams.add_team_member(run_id, agent)` (+ `POST /projects/<name>/team/
+add-member` and a `team-add-member <run_id> <agent>` CLI subcommand) so a
+human can add one more teammate engine to an already-launched, still-live
+team run -- new git worktree, new tmux dashboard window in the already-live
+`team-<project>` session, and a queued announcement the lead picks up at its
+next round boundary, exactly per `docs/spec.md`. Also adds a new
+`TEAM_MAX_MEMBERS` cap (default 6), enforced in three places: the new
+`add_team_member()`, `validate_composition()` (explicit picker composition,
+hard rejection), and `default_team_composition()` (auto-picked default,
+deterministic truncation). Backend + CLI only, per the spec's own explicit
+scope -- the "+" button UI is a separate part 2. No design doc (this cycle
+skipped ux-designer, per the spec's own framing).
+
+## Changes by file
+- `app/teams.py`:
+  - `TEAM_MAX_MEMBERS` -- new constant, next to `TEAM_MAX_ROUNDS`:
+    `int(os.environ.get("TEAM_MAX_MEMBERS", "6"))`.
+  - `_membership_log_path(run_id)` -- new, next to `_human_log_path()`:
+    `<rundir>/membership.jsonl`, deliberately a NEW/separate file from
+    `human.jsonl` (see "Key decisions" below).
+  - `_new_state()` -- adds `"membership_cursor": 0` (additive; existing
+    persisted runs read it back as `0` via
+    `state.get("membership_cursor", 0)`, same precedent `human_cursor`
+    itself established).
+  - `_next_membership_seq(run_id)` -- new, next to `_next_human_seq()`, same
+    "count existing lines" idiom scoped to `membership.jsonl`.
+  - `add_team_member(run_id, agent)` -- new, placed immediately after
+    `stop_team()`. Loads state fresh; rejects a non-`running`/
+    `blocked_ask_user`/`blocked_board_write` status (same three-status set
+    `interject()` already accepts); validates `agent` against `roster()`
+    (must be a `kind="engine"` entry -- rejects unknown names and the Ollama
+    lead entry the same way `validate_composition()` already does), rejects
+    if `agent` equals the current engine lead, rejects if already a member,
+    rejects at `TEAM_MAX_MEMBERS`. On success: `_create_worktree()`
+    (unchanged, reused verbatim), pre-touches + chmods the new agent's log
+    file (same ordering `launch_team()` uses -- before the window, so no
+    `tail -F` ever races file creation), `tmux new-window` into the
+    already-live `team-<project>` session (byte-for-byte the same per-member
+    window command `_create_team_session()`'s own loop uses), rolling back
+    the worktree via `_remove_worktree()` if the session is gone. Appends
+    one `{"ts", "agent", "seq", "kind": "member_joined", "worktree"}`
+    envelope to `membership.jsonl` -- the only persisted-state write this
+    function ever makes; never calls `_persist()`, never touches `run.json`
+    directly, mirroring `interject()`'s own race-avoidance design (its own
+    docstring documents why). Returns `{"ok": True, "agent", "worktree"}` /
+    `{"ok": False, "error"}`.
+  - `team_step()` -- new membership drain checkpoint, structured identically
+    to the existing `human.jsonl` drain, placed BEFORE it (membership drain
+    runs first, then human -- each check happens on its OWN call: draining
+    membership returns immediately if anything was queued, so a round that
+    has both a queued member and a queued human message drains one event
+    kind per `team_step()` call, same as today's single-file drain
+    behavior). For each drained `member_joined` event, appends the agent to
+    `state["members"]`/`state["worktrees"]` (guarded by `agent not in
+    state["members"]`, idempotent against a theoretical double-drain --
+    same defensive shape `_recover_in_progress()` elsewhere in this module
+    already favors) plus one `tool="team_member_joined"` history entry
+    (`transcript_entries=[]`, same "already durably recorded in its own
+    file" reasoning the human drain uses); advances and persists
+    `membership_cursor`; returns without calling `_call_lead()`. Docstring
+    extended in place to document both drains together.
+  - `validate_composition()` -- one new check, after the existing
+    duplicate/lead-in-members checks: `if len(names) > TEAM_MAX_MEMBERS:
+    return f"too many teammates: {len(names)} exceeds the configured
+    maximum of {TEAM_MAX_MEMBERS}"`.
+  - `default_team_composition()` -- `members` list truncated to
+    `members[:TEAM_MAX_MEMBERS]` (already sorted by name via `roster()`,
+    deterministic) right before returning; docstring extended to document
+    the truncation (never a refusal, unlike `validate_composition()`'s hard
+    rejection of an explicit oversized pick).
+  - `_cli_team_add_member(args)` -- new, next to `_cli_team_interject()`.
+    Calls `add_team_member()`; prints `added '<agent>' to run <run_id>
+    (worktree: <path>)` and exits 0 on success, `error: <reason>` to stderr
+    and exit 1 on failure. Does NOT call `_drive_and_report()` -- same
+    reasoning `_cli_team_interject()` already documents (there may already
+    be a live driver elsewhere).
+  - `team-add-member <run_id> <agent>` subparser (two positionals) +
+    dispatch arm in `main()`, next to `team-interject`'s own.
+- `app/app.py`:
+  - New `POST /projects/<name>/team/add-member` branch in `do_POST`,
+    immediately after `/team/interject`, same shape/order: unknown-project
+    404, `run_id` resolution (explicit body value validated against
+    `teams._RUN_ID_RE` before any load/path-join per item 11(b), or
+    `latest_run_for_project()` when omitted), cross-project-ownership 400,
+    `agent = (body.get("agent") or "").strip()` with a 400 if empty, then
+    `teams.add_team_member(run_id, agent)` -- `{"error": ...}, 400` on
+    failure, else `{"ok": True, "run_id": run_id, "agent": agent}`. Status
+    checking is delegated entirely to `add_team_member()` itself (not
+    duplicated at the route layer, since the allowed-status set here is
+    identical to `interject()`'s own). No background thread spun up --
+    same reasoning `/team/interject` already documents (this never resumes
+    a stopped loop). Reached through the same shared TOTP gate every other
+    `/team/*` route already sits behind.
+- `config/switchboard.env.example`: new commented `#TEAM_MAX_MEMBERS=6`
+  line right after the existing `#TEAM_MAX_ROUNDS=8`.
+- New tests:
+  - `tests/test_teams_composition.py`: `ValidateCompositionTests` extended
+    with 2 new cases (at-the-cap accepted, over-the-cap rejected naming
+    count and max); new `DefaultTeamCompositionTruncationTests` (3) --
+    truncated-to-the-cap, deterministic across calls, under-the-cap
+    unaffected.
+  - `tests/test_teams_lead.py`: new `_AddTeamMemberTestCase` (shared
+    fixture: `_StateTestCase`'s own projdir/state_dir scratch + a scratch
+    `ENGINES_DIR`, same combined-fixture technique
+    `ValidateCompositionTests` establishes); `AddTeamMemberValidationTests`
+    (8) -- every rejection path that never needs real git/tmux (unknown
+    run_id, terminal statuses, unknown engine name, Ollama entry rejected,
+    agent-equals-lead, already-a-member, at-cap with no side effects,
+    `blocked_ask_user`/`blocked_board_write` proven to reach a LATER
+    validation error rather than the status gate); `TeamStepDrainMembershipTests`
+    (3) -- drain appends to state and never calls the lead, membership
+    drains before human in the same round-poll, idempotent against a stale
+    cursor replay; `CliTeamAddMemberTests` (3) -- argparse parsing, unknown
+    run_id exit code, rejection prints to stderr with no side effect.
+  - `tests/test_teams_lifecycle.py`: new `_AddTeamMemberRealTmuxTestCase`
+    (extends `_RealTmuxTeamLifecycleTestCase` with a scratch `ENGINES_DIR`,
+    needed because -- unlike `launch_team()`'s own `--members`, which are
+    never checked against `roster()` -- `add_team_member()` DOES validate
+    the requested agent against `roster()`); `AddTeamMemberRealTmuxTests`
+    (3) -- real worktree+window creation with the queued envelope asserted,
+    the drain-at-next-round-boundary acceptance criterion (proves
+    `_lead_tools()`/`_validate_lead_action()` both accept the new agent
+    with zero code change in either), and the tmux-session-gone rollback
+    path; `CliTeamAddMemberSubprocessTests` (2) -- real, separate-process
+    `team-launch` then `team-add-member` via the actual CLI (mirrors
+    `CliTeamLifecycleSubprocessTests`'s own technique -- no TMUX
+    monkeypatch, relies on the real `sudo -u $RUN_USER tmux` path that
+    class's own docstring already proved works in this environment).
+  - `tests/test_team_routes.py`: new `TeamAddMemberEndpointTests` (10),
+    placed right after `TeamInterjectEndpointTests` -- mirrors that class's
+    own structure closely (unknown project, no run at all, cross-project
+    run_id, path-traversal run_id with the planted-file-never-opened proof,
+    malformed non-traversal run_id, empty agent with a call-count double on
+    `teams.add_team_member`, terminal status rejected, `run_id` omitted
+    defaults to `latest_run_for_project`, the success path asserting the
+    real worktree/queued envelope with no background thread started, and
+    the over-the-cap 400 asserting no worktree was created).
+
+## Key decisions / tradeoffs
+- **`add_team_member()` never calls `_persist(state)` and never mutates
+  `run.json` directly** -- exactly the same race-avoidance reasoning
+  `interject()`'s own docstring documents: a naive "load state, append to
+  `state['members']`, persist" implementation would very likely be
+  clobbered by the driving thread's own next round-end `_persist(state)`
+  call. Writing only to `membership.jsonl` (a file the driving thread never
+  otherwise touches mid-round) leaves nothing for that last-writer-wins
+  race to clobber; `team_step()`'s own drain is what actually delivers the
+  new member into `state["members"]`, on the driving thread itself, at the
+  next round boundary.
+- **`membership.jsonl` is a new, separate file from `human.jsonl`**, even
+  though the drain mechanics are byte-for-byte identical --
+  `_membership_log_path()`'s own docstring records why: every event source
+  in this module already gets its own file (`transcript.jsonl`, one
+  `<agent>.jsonl` per teammate, `human.jsonl` for human chat), and item 19
+  part 2's already-shipped UI hard-codes "human filter pill = human.jsonl,
+  agent='human'" -- conflating a system-generated `member_joined` event
+  into that file/agent value would be a foot-gun for that UI, not a reuse
+  of the module's own one-file-per-source convention.
+- **`TEAM_MAX_MEMBERS` is enforced differently at the three call sites, on
+  purpose**: `add_team_member()` and `validate_composition()` both hard-
+  reject (an explicit human action -- growing a running team, or picking an
+  explicit composition -- gets a clear refusal, never a silent
+  substitution), while `default_team_composition()` truncates
+  deterministically instead of refusing, consistent with that function's
+  own pre-existing character as a best-effort auto-pick, never a hard
+  refusal for a situation the human didn't explicitly create.
+- **Membership drains before human in `team_step()`'s own checkpoint
+  order** -- arbitrary but deterministic, per docs/spec.md: a new teammate
+  becoming available is the more "structural" of the two events to surface
+  first if both are queued in the same round-poll. Each drain still fully
+  owns its own `team_step()` call (returns immediately after draining, same
+  as the pre-existing human drain) -- a round with BOTH a queued member and
+  a queued human message drains one event kind per call, exactly the same
+  "one file per call, next call gets the other" behavior a second
+  sequential drain-only file already implies.
+- **Reused `roster()`/`by_key` lookup verbatim from `validate_composition()`'s
+  own shape** (`(kind, name)` tuple keys, `kind="engine"` required, Ollama
+  entry excluded by construction) rather than inventing a second roster-
+  lookup helper -- `add_team_member()`'s own validation is a proper subset
+  of `validate_composition()`'s rules (single agent, not a full
+  lead+members pair), so it reads the same `entries`/`by_key` pattern
+  directly rather than factoring out a shared helper neither call site
+  actually needs beyond this reuse.
+
+## Deviations from spec
+None. Implemented per `docs/spec.md`'s own literal function/route/CLI
+shapes, error strings, and constant default -- `add_team_member()`'s return
+shape and every rejection message, the route's validation order and error
+strings, the CLI's exact `added '<agent>' to run <run_id> (worktree: <path>)`
+output, the `TEAM_MAX_MEMBERS` default (6) and its three enforcement points,
+and `team_step()`'s membership-drain-before-human ordering are all copied
+verbatim from the spec's "Proposed approach".
+
+## Known limitations
+Every "Non-goal"/"Edge case" `docs/spec.md` itself already documents as an
+accepted, narrow tradeoff is carried forward unchanged (not re-litigated
+here): the "+" button UI is out of scope (part 2); shape (2), independent
+non-team parallel instances, is explicitly rejected, not deferred; shrinking
+a running team is not built; concurrent/parallel delegation to multiple
+teammates is unrelated and unchanged; an already-running team started
+before `TEAM_MAX_MEMBERS` existed is never retroactively trimmed; a
+`member_joined` event is delivered only at the next round boundary, never
+mid-in-flight-tool-call (same tradeoff item 19 part 1 already accepted for
+human interjects); two concurrent `add_team_member()` calls for the exact
+same requested agent name can produce one false-positive "still has
+uncommitted changes" error for the second, legitimately-losing caller (the
+spec's own accepted, narrow first-mover race, same class
+`_create_team_session()`'s own documented session-name race already
+carries) -- not exercised by an automated test here (would require two
+genuinely concurrent `add_team_member()` calls racing on the exact same new
+worktree path, the same class of test this codebase's own precedent
+(`SessionCreationRaceRealTmuxTests`) shows is possible to build but wasn't
+asked for by this spec's acceptance criteria, which cover the single-caller
+success/rejection paths and the tmux-session-gone rollback instead). No new
+limitation was introduced beyond what `docs/spec.md` already scoped.
+
+## How to verify locally
+```
+# This cycle's new backend tests:
+python3 -m unittest tests.test_teams_composition.ValidateCompositionTests \
+  tests.test_teams_composition.DefaultTeamCompositionTruncationTests \
+  tests.test_teams_lead.AddTeamMemberValidationTests \
+  tests.test_teams_lead.TeamStepDrainMembershipTests \
+  tests.test_teams_lead.CliTeamAddMemberTests \
+  tests.test_teams_lifecycle.AddTeamMemberRealTmuxTests \
+  tests.test_teams_lifecycle.CliTeamAddMemberSubprocessTests \
+  tests.test_team_routes.TeamAddMemberEndpointTests -v
+# Ran 47 tests ... OK
+
+# Full test_teams_composition.py / test_teams_lead.py / test_teams_lifecycle.py
+# / test_team_routes.py, including this cycle's new tests:
+python3 -m unittest tests.test_teams_composition tests.test_teams_lead \
+  tests.test_teams_lifecycle tests.test_team_routes
+# Ran 356 tests ... OK
+
+# Full existing suite:
+python3 -m unittest discover -s tests
+# Ran 1188 tests in 158.937s ... OK
+
+# Manual smoke test against a real project (no lead/teammate subprocess
+# needed for any of these):
+#   1. Start the app.py server, log in, start a team run against a project
+#      with at least one teammate not already on the team.
+#   2. `curl` (with a valid session cookie + TOTP code)
+#      `-d '{"agent": "codex", "code": "<code>"}'
+#      /projects/<name>/team/add-member` -> {"ok": true, "run_id": "...",
+#      "agent": "codex"}.
+#   3. `tmux list-windows -t team-<project>` shows a new "codex" window;
+#      `git -C <project> worktree list` shows a new `<project>.teams/codex`
+#      entry.
+#   4. `python3 app/teams.py team-status <run_id>` -- once the driving
+#      thread completes its current round, a new "team_member_joined" entry
+#      appears in state["history"] and "codex" is now in state["members"].
+#   5. `python3 app/teams.py team-add-member <run_id> <agent>` -- prints
+#      `added '<agent>' to run <run_id> (worktree: <path>)`, exits 0, does
+#      not block.
+```
+
+---
+
+# Implementation: BACKLOG item 21 part 1 follow-up -- close `blocked_ask_user` test-coverage gap
+
+## Summary
+Closes the sole non-blocking follow-up from `docs/test-review.md`'s "Test &
+Review: Backlog item 21 part 1" section (verdict: Approve with follow-ups,
+Finding 1). The reviewer's testing pass confirmed the behavior is already
+correct (via a throwaway test written, run, and discarded that session) but
+found no automated test in the shipped diff actually reaches the real
+worktree/window/drain path for `add_team_member()` while a run is
+`blocked_ask_user` -- the existing
+`AddTeamMemberValidationTests::test_blocked_ask_user_and_blocked_board_
+write_do_not_hit_the_status_check` (`tests/test_teams_lead.py`) only proves
+the status *gate* accepts this status, by using a deliberately-unknown
+engine name so it fails at a later, unrelated check, without ever calling
+`_create_worktree()`/`tmux new-window`. No production code changed; this is
+a permanent regression test added to close that gap.
+
+## Changes by file
+- `tests/test_teams_lifecycle.py`: added
+  `AddTeamMemberRealTmuxTests::test_add_member_while_blocked_ask_user_
+  succeeds_immediately_and_drain_waits_for_resume`, real-tmux/real-git,
+  mirroring the class's own existing
+  `test_add_member_creates_worktree_and_window_queues_event` almost
+  exactly per the reviewer's own recommendation. Launches a team, forces
+  `state["status"] = "blocked_ask_user"` and persists it, then calls
+  `add_team_member(run_id, "aider")` and asserts: the call succeeds with
+  the same `{"ok": True, "agent", "worktree"}` shape; the worktree exists
+  on disk and shows up in `git worktree list`; the tmux window exists
+  alongside `lead`/`codex` in the live session; and one `member_joined`
+  envelope is queued to `membership.jsonl`. Then reloads state fresh and
+  asserts `"aider"` is NOT yet in `state["members"]`/`state["worktrees"]`
+  while the run is still `blocked_ask_user`. Finally simulates a resume
+  (flips `status` back to `"running"` on the in-memory state) and calls
+  `team_step()` once -- stubbing `_call_lead()` to fail the test if invoked,
+  same technique the class's own
+  `test_drain_at_next_round_boundary_makes_agent_delegate_eligible` already
+  uses -- and asserts `"aider"` is now in `state["members"]` and
+  `state["worktrees"]["aider"]` is the expected path, proving the queued
+  event only drains on/after resume, never before.
+
+## Key decisions / tradeoffs
+- Placed the new test in `tests/test_teams_lifecycle.py`'s
+  `AddTeamMemberRealTmuxTests` (not `test_teams_lead.py`) because the
+  criterion under test is specifically the *success* path (real worktree +
+  window creation), which requires the same real-tmux/real-git fixture
+  (`_AddTeamMemberRealTmuxTestCase`) the class's other tests already use --
+  `test_teams_lead.py`'s `AddTeamMemberValidationTests` deliberately avoids
+  real tmux/git by using validation failures that short-circuit before any
+  side effect, which is exactly the gap being closed here.
+- Set `state["status"]` directly and persisted it before calling
+  `add_team_member()`, matching the exact pattern
+  `test_teams_lead.py`'s own `test_terminal_statuses_rejected` and
+  `test_blocked_ask_user_and_blocked_board_write_do_not_hit_the_status_
+  check` already use, rather than reaching for `_force_ask_user()` (a
+  heavier helper meant for the driving thread's own ask_user framing, not
+  needed here since the test only cares about the status value itself).
+- Reused the existing `_call_lead`-stub-that-fails-the-test technique from
+  `test_drain_at_next_round_boundary_makes_agent_delegate_eligible` for the
+  resume step, rather than inventing a new assertion style, so a future
+  regression where the drain accidentally called the lead on a
+  drain-only round would be caught the same way it already is for the
+  unblocked case.
+
+## Deviations from spec / design
+None -- this is a test-only addition per the reviewer's own non-blocking
+follow-up recommendation, not new product behavior.
+
+## Known limitations
+None new. The reviewer's other follow-up (the two-concurrent-callers race)
+remains explicitly out of scope, unchanged from the prior cycle.
+
+## How to verify locally
+```
+python3 -m unittest tests.test_teams_lifecycle.AddTeamMemberRealTmuxTests -v
+# Ran 4 tests ... OK
+
+python3 -m unittest tests.test_teams_composition tests.test_teams_lead \
+  tests.test_teams_lifecycle tests.test_team_routes
+# Ran 357 tests ... OK
+
+python3 -m unittest discover -s tests
+# Ran 1189 tests in 158.9s ... OK
+```

@@ -6224,6 +6224,46 @@ class Handler(BaseHTTPRequestHandler):
             if not result["ok"]:
                 return self._json({"error": result["error"]}, 400)
             self._json({"ok": True, "run_id": run_id})
+        elif (parts[0] == "projects" and len(parts) == 4 and parts[2] == "team"
+              and parts[3] == "add-member"):
+            # Add one more teammate engine to an already-running team
+            # (backlog item 21 part 1, docs/spec.md "Proposed approach" §5)
+            # -- same shape/order/run_id-resolution as /team/interject
+            # above; the allowed-status set is identical to interject()'s
+            # own and is more naturally owned by teams.add_team_member()
+            # itself, not duplicated at this route layer (unlike /team/
+            # resolve's own status check). No background thread spun up
+            # here either -- same reasoning /team/interject already
+            # documents: this never resumes a stopped loop, so there is
+            # nothing to (re-)drive. Reached through the same shared TOTP
+            # gate every other /team/* route already sits behind.
+            name = parts[1]
+            if name not in instance_names():
+                return self._json({"error": "unknown project"}, 404)
+            run_id = (body.get("run_id") or "").strip() or None
+            if run_id:
+                # docs/BACKLOG.md item 11(b): same validation, same intake-
+                # point placement, as /team/interject|resolve|board-resolve above.
+                if not teams._RUN_ID_RE.match(run_id):
+                    return self._json({"error": "no run found for this project"}, 400)
+                try:
+                    state = teams._load_state(run_id)
+                except (OSError, ValueError):
+                    return self._json({"error": "no run found for this project"}, 400)
+                if state.get("project_name") != name:
+                    return self._json({"error": "this run belongs to a different project"}, 400)
+            else:
+                state = teams.latest_run_for_project(name)
+                if state is None:
+                    return self._json({"error": "no run found for this project"}, 400)
+                run_id = state["run_id"]
+            agent = (body.get("agent") or "").strip()
+            if not agent:
+                return self._json({"error": "agent is required"}, 400)
+            result = teams.add_team_member(run_id, agent)
+            if not result["ok"]:
+                return self._json({"error": result["error"]}, 400)
+            self._json({"ok": True, "run_id": run_id, "agent": agent})
         elif (parts[0] == "projects" and len(parts) == 3 and parts[2] == "smoke-check"):
             # HTTP-level smoke check (backlog item 18, docs/spec.md) -- new
             # /projects/<name>/... sub-resource route (not the older
