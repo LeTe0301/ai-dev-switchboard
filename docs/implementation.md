@@ -1803,3 +1803,206 @@ subprocess.run(['tmux', 'kill-session', '-t', session], capture_output=True)
 print(f'{lost}/20 trials: winner session destroyed (expect 0 against the fixed code)')
 "
 ```
+
+---
+
+# Implementation: Test-isolation fix for real-tmux `switchboard-headless-*` tests (story/multi-agent-teams)
+
+## Summary
+
+Test-only change. `run_id` (and therefore every `switchboard-headless-<run_id>`
+tmux session name derived from it) was an unscoped value — a global machine
+property no single test process owns. Two concurrent test processes (or a
+foreign process holding an unrelated `switchboard-headless-*` session) could
+trip each other's "no leftover session" assertions, and worse, `tearDown`'s
+own belt-and-braces sweep in several real-tmux test classes killed *any*
+matching session name, including another concurrent process's still-live
+one. Fixed by scoping every `run_id` this test suite generates with a
+per-process token (`p<pid>`) and filtering/sweeping only on that scoped
+prefix, following a diagnosis and fix shape supplied by the requester.
+
+## Root cause
+
+Not a production defect — `app/teams.py`'s own `_run_id()` and
+`switchboard-headless-{run_id}` session-naming are correct and untouched.
+The bug was entirely in the test suite's own assertions/sweeps operating on
+the bare `"switchboard-headless-"` prefix, a namespace shared by every
+concurrent process on the machine (a second real `python3 -m unittest`
+invocation of the same file, or literally any other tmux user). This is why
+`test_run_sh_and_prompt_file_are_world_readable_under_a_strict_umask` had
+been failing roughly 2 runs in 17 while always passing in isolation, and was
+misattributed as mysterious unrelated flakiness for four review cycles: a
+concurrently-running second test process's `tearDown` (or the belt-and-
+braces sweep in `RealTmuxHeadlessTests.tearDown`) would kill that test's
+still-live tmux session out from under it mid-run, well before that test's
+own assertions ever got a chance to run cleanly. It looked like an
+unrelated, hard-to-reproduce flake in *that* test specifically only because
+the umask test happens to hold its tmux session open the longest (a 5s
+`sleep` script plus explicit mid-run file assertions), giving a concurrent
+sweep the widest window to land a kill. Confirmed on this pass: tmux
+teardown latency is not a factor (not re-litigated here, per the requester's
+own prior 0/40 finding for both `kill-session` and fast natural exit) — this
+is a namespace-collision/cross-process-sabotage bug, not a timing bug.
+
+## Changes by file
+
+- **`tests/test_teams_headless.py`** — added `_RUN_ID_SCOPE = f"p{os.getpid()}"`,
+  `_SESSION_PREFIX = f"switchboard-headless-{_RUN_ID_SCOPE}"`, and a
+  `_scope_run_ids(testcase)` helper that wraps `teamsmod._run_id` so every
+  run_id produced for the duration of a test carries this process's scope
+  token. `RealTmuxHeadlessTests.setUp` now calls it. Both the belt-and-braces
+  sweep and `_no_leftover_sessions()` in that class now filter on
+  `_SESSION_PREFIX` instead of the bare prefix. The four tests that
+  monkeypatch `teamsmod._run_id` directly with a fixed id (bypassing the
+  wrapper) now embed the scope token in the fixed id itself:
+  `fixedid-forcekill`, `fixedid-external-term`, `fixedid-umasktest`,
+  `fixedid-permtest` all become `f"{_RUN_ID_SCOPE}-fixedid-..."`.
+  Two additional sites were found beyond the specified list, in this same
+  file, using the identical `switchboard-headless-<literal>` naming scheme
+  but never going through `_run_id()` at all (so the scoping wrapper alone
+  didn't reach them) — fixed the same way, by embedding `_RUN_ID_SCOPE` into
+  the literal id: `ActiveEngineHeadlessCollisionTests.
+  test_live_headless_session_never_reported_as_project_engine`'s
+  `run_id = "R"`, and `RealTmuxHeadlessTests.
+  test_sweep_kills_live_session_for_an_aged_dir_and_removes_it`'s
+  `stale_run_id = "stale-with-live-session"`. Both create a real tmux
+  session with that literal name directly (`tmux new-session -s
+  switchboard-headless-<literal>`), which collides outright across two
+  concurrent processes (a real name clash, not a sweep/assertion issue) —
+  confirmed by reproducing it (see "Concurrent-run evidence" below).
+
+- **`tests/test_teams_cancel.py`** — same `_RUN_ID_SCOPE`/`_SESSION_PREFIX`/
+  `_scope_run_ids()` helpers added (duplicated per this project's own
+  established per-file-helper convention, not factored into a shared
+  module). `_scope_run_ids(self)` called from
+  `RealTmuxCancelEventAgentRunTests.setUp` and
+  `RealTmuxMidDelegateAndMidLeadCallCancelTests.setUp`. The module-level
+  `_no_leftover_headless_sessions()` helper, both classes' `tearDown` kill
+  sweeps, and the two inline leftover-session checks inside
+  `test_stop_mid_delegate_terminates_real_subprocess_and_records_stopped`/
+  `test_stop_mid_lead_call_terminates_real_subprocess_and_records_stopped`
+  all now filter on `_SESSION_PREFIX`.
+
+- **`tests/test_team_routes.py`** — same helpers added.
+  `_scope_run_ids(self)` called from `_RealHTTPTeamTestCase.setUp` (the
+  shared base class for `TeamStartEndpointTests`, `TeamStopEndpointTests`,
+  `ServiceRestartSimulationTests`), covering every `switchboard-headless-*`
+  session any of those classes create via `agent_run()`'s own internal
+  `_run_id()` call. The inline leftover-session filter in
+  `test_stop_mid_delegate_terminates_real_subprocess_promptly` now uses
+  `_SESSION_PREFIX`. Also narrowed the module-level
+  `_kill_leftover_team_sessions()` helper's `"switchboard-"` branch (a
+  broader literal than the `"switchboard-headless-"` the requester's grep
+  targeted, so it wasn't in the original 8-site list, but it is the same
+  sabotage pattern for the same session family, reachable from every
+  `_RealHTTPTeamTestCase` subclass's `tearDown`) to `_SESSION_PREFIX`. Its
+  separate `"team-"` branch (see "Known limitations") was left unchanged —
+  fixing it is out of scope, see below.
+
+## Deviations from spec
+
+None from the requester's diagnosis for the specified 8 sites — implemented
+as given. Two categories of deviation from the *stated scope* (not the
+diagnosis itself, which was correct as far as it went):
+
+1. **Additive, in-family, in-scope-file fixes beyond the listed 8 sites**
+   (documented above): two literal `switchboard-headless-<id>` sessions in
+   `tests/test_teams_headless.py` that don't go through `_run_id()` at all,
+   and narrowing `_kill_leftover_team_sessions()`'s `"switchboard-"` branch
+   in `tests/test_team_routes.py`. All three are the exact same bug
+   (unscoped `switchboard-headless-*` naming), in one of the three assigned
+   files, and were necessary for the "two full suites concurrently, zero
+   `switchboard-headless-*`-related failures" property to actually hold —
+   without them, concurrent runs of `test_teams_headless.py` alone still
+   failed. See "Concurrent-run evidence".
+2. **NOT fixed — out of scope, reported instead of silently done or silently
+   ignored**: see "Known limitations".
+
+## Known limitations
+
+Running two full `python3 -m unittest discover -s tests` processes
+concurrently is **not fully green**, even after this fix — but every
+remaining failure is attributable to bugs entirely outside the diagnosed
+`switchboard-headless-*` mechanism and outside the specified 3 files:
+
+1. **`team-<project_name>` tmux session name collisions** — a *different*
+   session-naming scheme (`teamsmod._team_session_name()`, `f"team-
+   {project_name}"`), not derived from `run_id` at all. Many tests across
+   `tests/test_team_routes.py` (fixed project name `"proj"`) and
+   `tests/test_teams_lifecycle.py` (fixed project names `"atomicdemo"`,
+   `"failchain"`, `"failchain2"`, `"sessionrace"`, `"myproj"`) use the exact
+   same literal project name, so two concurrent processes race to create a
+   tmux session with the identical literal name — a real name clash, not a
+   sweep/assertion defect, and not fixable by scoping `run_id`. Reproduced
+   directly: `test_team_routes.ServiceRestartSimulationTests.
+   test_stop_after_simulated_restart_still_tears_down_real_session_and_worktrees`
+   and `test_team_routes.TeamStartEndpointTests.
+   test_happy_path_tier2_default_lead_persisted_correctly` both failed this
+   way under real concurrency (see evidence below).
+2. **`tests/test_teams_lifecycle.py` was not part of the specified scope**,
+   but has the identical `"team-"`/bare-`"switchboard-"` broad `tearDown`
+   sweep pattern (its own module-level helper, around line 127-130) plus a
+   third, unrelated naming scheme (`"switchboard-worktree-op-"`, around line
+   460) that is also unscoped. Left untouched — fixing it would mean
+   touching a fourth file and a different naming family not in the
+   requester's diagnosis, and (per `team-<project_name>`, above) would still
+   need a project-name-scoping fix that's a substantially larger change than
+   this task's stated scope.
+3. **`tests/test_deploy_target.py`/`tests/test_deploy_dispatch.py`'s
+   `PrivilegedEndToEndTests`/`PrivilegedDeployRunEndToEndTests`** fail under
+   concurrency too, but for a reason with no relationship to tmux/teams at
+   all — real SSH/rsync against a shared `127.0.0.1` deploy target,
+   contended when two processes hit it at once. Unrelated subsystem, not
+   investigated further (out of scope for a tmux test-isolation fix).
+
+None of the above are new defects introduced by this change — they were
+already latent in the suite; concurrent execution simply was not previously
+attempted by anyone as a way to surface them. They're recorded here because
+the task asked for an honest "two full suites concurrently both green" demo,
+and that demo does not fully succeed for reasons outside this fix's
+diagnosed scope.
+
+**Weakening check**: no assertion was weakened. Every "no leftover session"
+check still asserts an empty list; the list is now correctly scoped to
+sessions this process itself could have created, which is a stricter,
+more correct definition of "leftover" than the previous accidental
+machine-wide one (previously a foreign session made the assertion
+over-broad in one direction — a false failure — while simultaneously
+letting `tearDown` under-check in the other — killing a session it had no
+business touching).
+
+## How to verify locally
+
+Baseline (matches the requester's cited counts):
+```
+python3 -m unittest discover -s tests            # 674 tests, OK
+node tests/test_team_frontend.js                 # 17/17 ALL PASS
+node tests/test_deploy_frontend.js                # 9/9 ALL PASS
+node tests/test_singleton_toggle_frontend.js      # 15/15 ALL PASS
+node tests/test_upload_frontend.js                # 8/8 ALL PASS
+```
+
+Targeted before/after reproduction of the exact diagnosed bug (foreign
+session both trips the assertion AND gets killed by `tearDown`, pre-fix;
+neither happens, post-fix):
+```
+tmux new-session -d -s switchboard-headless-foreignproc-test123 -- sleep 300
+python3 -m unittest tests.test_teams_headless.RealTmuxHeadlessTests.test_success_stream_end_to_end -v
+tmux list-sessions | grep foreignproc   # still alive post-fix; gone (killed) pre-fix
+```
+
+Concurrent-run evidence (the property actually being fixed):
+```
+# The two files fully contained to the diagnosed switchboard-headless-*
+# mechanism -- 3/3 iterations clean, zero leftover sessions:
+python3 -m unittest tests.test_teams_headless tests.test_teams_cancel &
+python3 -m unittest tests.test_teams_headless tests.test_teams_cancel &
+wait
+
+# Full suite, both processes -- NOT fully green (see "Known limitations"),
+# but zero failures are switchboard-headless-*-related:
+python3 -m unittest discover -s tests &
+python3 -m unittest discover -s tests &
+wait
+```
+```

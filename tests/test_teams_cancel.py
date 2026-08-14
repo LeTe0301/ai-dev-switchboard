@@ -69,6 +69,24 @@ def _patch_tmux(testcase, argv):
     testcase.addCleanup(_restore)
 
 
+# Test-isolation: run_id (and therefore every switchboard-headless-<run_id>
+# tmux session name derived from it) is otherwise a bare, unscoped value --
+# a global machine property this process does not own. Concurrent test
+# processes would then both see and, worse, sweep each other's live
+# sessions in tearDown. Scoping every run_id with this process's own pid
+# makes every "no leftover switchboard-headless-*" assertion/sweep concern
+# only sessions this process could have created. Same technique tests/
+# test_teams_headless.py's own _scope_run_ids()/_SESSION_PREFIX establish.
+_RUN_ID_SCOPE = f"p{os.getpid()}"
+_SESSION_PREFIX = f"switchboard-headless-{_RUN_ID_SCOPE}"
+
+
+def _scope_run_ids(testcase):
+    orig = teamsmod._run_id
+    testcase.addCleanup(lambda: setattr(teamsmod, "_run_id", orig))
+    teamsmod._run_id = lambda: f"{_RUN_ID_SCOPE}-{orig()}"
+
+
 def _write_engine_file(dirpath, filename, body):
     with open(os.path.join(dirpath, filename), "w") as f:
         f.write(textwrap.dedent(body))
@@ -97,7 +115,7 @@ def _dummy_agent_result(**overrides):
 
 def _no_leftover_headless_sessions(testcase):
     r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True)
-    leftover = [n for n in r.stdout.splitlines() if n.startswith("switchboard-headless-")]
+    leftover = [n for n in r.stdout.splitlines() if n.startswith(_SESSION_PREFIX)]
     testcase.assertEqual(leftover, [], f"leftover tmux sessions: {leftover}")
 
 
@@ -385,6 +403,7 @@ class RealTmuxCancelEventAgentRunTests(unittest.TestCase):
         teamsmod.TEAM_HEADLESS_POLL_SECONDS = 0.1
         teamsmod.TEAM_HEADLESS_KILL_GRACE_SECONDS = 1.0
         _patch_tmux(self, ["tmux"])
+        _scope_run_ids(self)
         self.workdir = os.path.join(self.projects_dir, "proj")
         os.makedirs(self.workdir)
 
@@ -400,7 +419,7 @@ class RealTmuxCancelEventAgentRunTests(unittest.TestCase):
         _no_leftover_headless_sessions_ignore = subprocess.run(
             ["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True)
         for name in _no_leftover_headless_sessions_ignore.stdout.splitlines():
-            if name.startswith("switchboard-headless-"):
+            if name.startswith(_SESSION_PREFIX):
                 subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
 
     def test_cancel_event_set_from_second_thread_mid_flight_terminates_and_reports_stopped(self):
@@ -526,6 +545,7 @@ class RealTmuxMidDelegateAndMidLeadCallCancelTests(unittest.TestCase):
         teamsmod.TEAM_HEADLESS_POLL_SECONDS = 0.1
         teamsmod.TEAM_HEADLESS_KILL_GRACE_SECONDS = 1.0
         _patch_tmux(self, ["tmux"])
+        _scope_run_ids(self)
 
     def tearDown(self):
         appmod.ENGINES_DIR = self._orig_engines_dir
@@ -538,7 +558,7 @@ class RealTmuxMidDelegateAndMidLeadCallCancelTests(unittest.TestCase):
         shutil.rmtree(self.scripts_dir, ignore_errors=True)
         r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True)
         for name in r.stdout.splitlines():
-            if name.startswith("switchboard-headless-"):
+            if name.startswith(_SESSION_PREFIX):
                 subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
 
     def _write_slow_engine(self, name):
@@ -582,7 +602,7 @@ class RealTmuxMidDelegateAndMidLeadCallCancelTests(unittest.TestCase):
         self.assertEqual(entry["outcome_summary"], "stopped by request (delegation interrupted)")
         # Real subprocess actually gone, not just marked in state.
         r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True)
-        leftover = [n for n in r.stdout.splitlines() if n.startswith("switchboard-headless-")]
+        leftover = [n for n in r.stdout.splitlines() if n.startswith(_SESSION_PREFIX)]
         self.assertEqual(leftover, [])
 
     def test_stop_mid_lead_call_terminates_real_subprocess_and_records_stopped(self):
@@ -604,7 +624,7 @@ class RealTmuxMidDelegateAndMidLeadCallCancelTests(unittest.TestCase):
         self.assertEqual(entry["outcome_summary"],
                          "stopped by request before this round's action executed")
         r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True)
-        leftover = [n for n in r.stdout.splitlines() if n.startswith("switchboard-headless-")]
+        leftover = [n for n in r.stdout.splitlines() if n.startswith(_SESSION_PREFIX)]
         self.assertEqual(leftover, [])
 
 

@@ -68,6 +68,30 @@ def _fixture(name):
     return os.path.join(FIXTURES_DIR, name)
 
 
+# Test-isolation: run_id (and therefore every switchboard-headless-<run_id>
+# tmux session name derived from it) is otherwise a bare, unscoped value --
+# a global machine property this process does not own. Concurrent test
+# processes (this file run twice at once, or alongside another suite that
+# spawns headless sessions) would then both see and, worse, sweep each
+# other's live sessions in tearDown. Scoping every run_id with this
+# process's own pid makes every "no leftover switchboard-headless-*
+# session" assertion/sweep concern only sessions this process could have
+# created.
+_RUN_ID_SCOPE = f"p{os.getpid()}"
+_SESSION_PREFIX = f"switchboard-headless-{_RUN_ID_SCOPE}"
+
+
+def _scope_run_ids(testcase):
+    """Wraps teamsmod._run_id() so every run_id it produces for the
+    duration of testcase carries this process's own scope token. Tests
+    that monkeypatch teamsmod._run_id directly with a fixed id (see the
+    RealTmuxHeadlessTests fixed_run_id cases below) bypass this wrapper --
+    those fixed ids must embed _RUN_ID_SCOPE themselves."""
+    orig = teamsmod._run_id
+    testcase.addCleanup(lambda: setattr(teamsmod, "_run_id", orig))
+    teamsmod._run_id = lambda: f"{_RUN_ID_SCOPE}-{orig()}"
+
+
 def _patch_tmux(testcase, argv):
     """Patches TMUX in both app.py (which tmux_has()/active_engine() read
     from their own module namespace) and teams.py (which built its own name
@@ -249,7 +273,7 @@ class ActiveEngineHeadlessCollisionTests(unittest.TestCase):
         shutil.rmtree(self.projects_dir, ignore_errors=True)
 
     def test_live_headless_session_never_reported_as_project_engine(self):
-        run_id = "R"
+        run_id = f"{_RUN_ID_SCOPE}-R"
         session = f"switchboard-headless-{run_id}"
         project_name = f"headless-{run_id}"
         os.makedirs(os.path.join(self.projects_dir, project_name))
@@ -896,6 +920,7 @@ class RealTmuxHeadlessTests(unittest.TestCase):
         teamsmod.TEAM_HEADLESS_POLL_SECONDS = 0.1
         teamsmod.TEAM_HEADLESS_KILL_GRACE_SECONDS = 1.5
         _patch_tmux(self, ["tmux"])
+        _scope_run_ids(self)
         self.workdir = os.path.join(self.projects_dir, "proj")
         os.makedirs(self.workdir)
 
@@ -909,16 +934,18 @@ class RealTmuxHeadlessTests(unittest.TestCase):
         shutil.rmtree(self.state_dir, ignore_errors=True)
         shutil.rmtree(self.scripts_dir, ignore_errors=True)
         # Belt-and-braces: nothing in this test class should leave a
-        # switchboard-headless-* session running, but sweep just in case a
-        # failure left one behind.
+        # switchboard-headless-<this process's scope>-* session running,
+        # but sweep just in case a failure left one behind. Scoped to
+        # _SESSION_PREFIX so a concurrent test process's own live sessions
+        # are never touched here.
         r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True)
         for name in r.stdout.splitlines():
-            if name.startswith("switchboard-headless-"):
+            if name.startswith(_SESSION_PREFIX):
                 subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
 
     def _no_leftover_sessions(self):
         r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True)
-        leftover = [n for n in r.stdout.splitlines() if n.startswith("switchboard-headless-")]
+        leftover = [n for n in r.stdout.splitlines() if n.startswith(_SESSION_PREFIX)]
         self.assertEqual(leftover, [], f"leftover tmux sessions: {leftover}")
 
     def _no_leftover_rundir(self):
@@ -1117,7 +1144,7 @@ class RealTmuxHeadlessTests(unittest.TestCase):
             HEADLESS_FORMAT=plain
             HEADLESS_PROMPT=arg
             """)
-        fixed_run_id = "fixedid-forcekill"
+        fixed_run_id = f"{_RUN_ID_SCOPE}-fixedid-forcekill"
         orig_run_id = teamsmod._run_id
         teamsmod._run_id = lambda: fixed_run_id
         self.addCleanup(lambda: setattr(teamsmod, "_run_id", orig_run_id))
@@ -1163,7 +1190,7 @@ class RealTmuxHeadlessTests(unittest.TestCase):
             HEADLESS_FORMAT=plain
             HEADLESS_PROMPT=arg
             """)
-        fixed_run_id = "fixedid-external-term"
+        fixed_run_id = f"{_RUN_ID_SCOPE}-fixedid-external-term"
         orig_run_id = teamsmod._run_id
         teamsmod._run_id = lambda: fixed_run_id
         self.addCleanup(lambda: setattr(teamsmod, "_run_id", orig_run_id))
@@ -1238,7 +1265,7 @@ class RealTmuxHeadlessTests(unittest.TestCase):
             HEADLESS_FORMAT=plain
             HEADLESS_PROMPT=file
             """)
-        fixed_run_id = "fixedid-umasktest"
+        fixed_run_id = f"{_RUN_ID_SCOPE}-fixedid-umasktest"
         orig_run_id = teamsmod._run_id
         teamsmod._run_id = lambda: fixed_run_id
         self.addCleanup(lambda: setattr(teamsmod, "_run_id", orig_run_id))
@@ -1291,7 +1318,7 @@ class RealTmuxHeadlessTests(unittest.TestCase):
             HEADLESS_FORMAT=plain
             HEADLESS_PROMPT=arg
             """)
-        fixed_run_id = "fixedid-permtest"
+        fixed_run_id = f"{_RUN_ID_SCOPE}-fixedid-permtest"
         orig_run_id = teamsmod._run_id
         teamsmod._run_id = lambda: fixed_run_id
         self.addCleanup(lambda: setattr(teamsmod, "_run_id", orig_run_id))
@@ -1344,7 +1371,7 @@ class RealTmuxHeadlessTests(unittest.TestCase):
         self.assertEqual(called, [])  # age < TTL -- never even checked tmux for it
 
     def test_sweep_kills_live_session_for_an_aged_dir_and_removes_it(self):
-        stale_run_id = "stale-with-live-session"
+        stale_run_id = f"{_RUN_ID_SCOPE}-stale-with-live-session"
         stale_dir = os.path.join(self.state_dir, "_headless", stale_run_id)
         os.makedirs(stale_dir)
         old = time.time() - teamsmod.TEAM_HEADLESS_STALE_RUN_TTL_SECONDS - 100

@@ -454,3 +454,61 @@ that exceeds the selected model's context.
 (item 6/6f) or gets its own surface; whether review output is persisted
 locally as well as posted to Gitea; token/rate cost of reviewing every
 tagged PR against a hosted model versus the local Ollama one.
+
+---
+
+## 9. Privileged tests mutate real host state and can't run concurrently
+
+**Found 2026-08-14**, while diagnosing a long-running "unrelated flake" during
+the multi-agent story (item 6). Not a product feature — a test-infrastructure
+debt item, recorded because it cost several cycles of misattributed failures
+and produced one genuine near-miss.
+
+**What's wrong:**
+- `tests/test_deploy_target.py` and `tests/test_deploy_dispatch.py` run
+  privileged real-SSH/rsync tests that mutate **real host state**: they
+  create and delete a system `deploy` user, write `/etc/sudoers.d/`
+  entries, provision `/home/deploy/.ssh/authorized_keys`, and contend on a
+  real `127.0.0.1` deploy target. They are guarded (`setUp` skips if a real
+  `deploy` user already exists, `tearDown` runs `userdel -r`), so the design
+  intent is sound — but the guards only hold on a *clean* exit.
+- **An interrupted run orphans state that then breaks later runs.** Observed
+  concretely: an interrupted test loop left `/home/deploy` behind
+  (root-owned, its `.ssh` owned by a bare numeric uid with no account), while
+  `userdel` had already removed the user. `setUp`'s "does a real deploy user
+  exist?" guard then finds none, proceeds, and the run fails on a stale
+  `authorized_keys` — presenting as a mysterious failure with no connection
+  to its cause. Recovery is a manual `rm -rf /home/deploy`.
+- **They cannot run concurrently**, with themselves or anything else, since
+  the contended resources are singleton host objects, not per-process ones.
+
+**The near-miss worth recording:** while diagnosing this, an agent attempted
+`sudo truncate -s 0 /home/deploy/.ssh/authorized_keys` to clear the stale
+state. A sandbox classifier blocked it. On a host where `/home/deploy` *is*
+real deploy infrastructure rather than orphaned scaffolding, that command
+wipes a live target's SSH access. The path alone doesn't tell you which case
+you're in — the distinguishing evidence was that no `deploy` account existed
+and the directory was created minutes earlier by the test run itself.
+
+**Shape of the work:**
+- Provision an isolated fixture (a uniquely-named throwaway user and home
+  directory per test process) instead of the literal `deploy` account and
+  `/home/deploy`, so nothing contends and an interrupted run orphans only
+  namespaced state.
+- Failing that, at minimum make the guard detect orphaned state, not just a
+  live account — `setUp` should skip when `/home/deploy` exists at all, not
+  only when the user does.
+
+**Related, same class, found at the same time** (tmux session naming in the
+teams tests): `tests/test_teams_lifecycle.py` and `tests/test_team_routes.py`
+build `team-<project>` session names from **fixed literal project names**
+(`proj`, `atomicdemo`, `failchain`, `sessionrace`), and
+`tests/test_teams_lifecycle.py` also uses an unscoped
+`switchboard-worktree-op-` prefix plus a broad `tearDown` sweep. These clash
+directly across concurrent test processes, the same way the
+`switchboard-headless-*` sweep did before it was scoped per-process
+(commit for item 6d part 2a's follow-up). Fixing those is the same one-line-
+per-site change: scope the name to the process.
+
+**Open for the future session:** whether the privileged deploy tests should
+run in CI at all, or be marked as an explicitly opt-in local-only suite.

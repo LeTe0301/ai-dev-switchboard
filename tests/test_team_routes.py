@@ -96,10 +96,28 @@ def _init_repo(path):
     _git(path, "commit", "-q", "-m", "init")
 
 
+# Test-isolation: run_id (and therefore every switchboard-headless-<run_id>
+# tmux session name derived from it) is otherwise a bare, unscoped value --
+# a global machine property this process does not own. Concurrent test
+# processes would then both see and, worse, sweep each other's live
+# sessions in tearDown. Scoping every run_id with this process's own pid
+# makes every "no leftover switchboard-headless-*" assertion/sweep concern
+# only sessions this process could have created. Same technique tests/
+# test_teams_headless.py's own _scope_run_ids()/_SESSION_PREFIX establish.
+_RUN_ID_SCOPE = f"p{os.getpid()}"
+_SESSION_PREFIX = f"switchboard-headless-{_RUN_ID_SCOPE}"
+
+
+def _scope_run_ids(testcase):
+    orig = teamsmod._run_id
+    testcase.addCleanup(lambda: setattr(teamsmod, "_run_id", orig))
+    teamsmod._run_id = lambda: f"{_RUN_ID_SCOPE}-{orig()}"
+
+
 def _kill_leftover_team_sessions():
     r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True)
     for name in r.stdout.splitlines():
-        if name.startswith("team-") or name.startswith("switchboard-"):
+        if name.startswith("team-") or name.startswith(_SESSION_PREFIX):
             subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
 
 
@@ -248,6 +266,7 @@ class _RealHTTPTeamTestCase(unittest.TestCase):
         appmod._team_reap_last_at = time.time()
         appmod._team_threads.clear()
         _patch_tmux(self, ["tmux"])
+        _scope_run_ids(self)
 
     def tearDown(self):
         appmod.PROJECTS_DIR = self._orig_projects_dir
@@ -573,7 +592,7 @@ class TeamStopEndpointTests(_RealHTTPTeamTestCase):
         self.assertEqual(state["status"], "stopped")
         # Real subprocess actually gone.
         r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True)
-        leftover = [n for n in r.stdout.splitlines() if n.startswith("switchboard-headless-")]
+        leftover = [n for n in r.stdout.splitlines() if n.startswith(_SESSION_PREFIX)]
         self.assertEqual(leftover, [])
 
     def test_status_maps_every_run_status_to_the_coarse_label(self):
