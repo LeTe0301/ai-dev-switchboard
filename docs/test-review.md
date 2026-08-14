@@ -1,292 +1,195 @@
-# Test & Review: test-infrastructure isolation (BACKLOG item 9)
+# Test & Review: 6f part 2 follow-ups (BACKLOG item 12)
 
 ## Scope
-Covers `docs/spec.md`'s 6 acceptance criteria (committed `5503d24`) for the
-uncommitted, test-only diff on `backlog/test-isolation-9`:
-`tests/test_deploy_target.py` (Part A: orphan detection + tearDown backstop),
-`tests/test_teams_lifecycle.py` and `tests/test_team_routes.py` (Part B:
-per-process tmux session scoping). Reviewed against `docs/implementation.md`'s
-own claims, re-derived independently (own concurrent-process run, own planted
-foreign sessions, own revert-and-rewatch-it-fail checks) rather than trusted
-from the developer's report.
+Covers all three items in `docs/spec.md` (BACKLOG item 12): **A** — permanent
+regression test for the escalation-panel "already answered" race branch,
+**B** — the ARIA attributes `docs/design.md`'s existing 6f part 2
+"Accessibility & platform notes" section specifies (`role="log"`/
+`aria-live="polite"`, `aria-pressed`, `<fieldset>`/`<legend>`), **C** — a
+transient "pending classification" rendering state for the fact_check-vs-
+finish poll-boundary edge case. Frontend-only (`app/app.py`'s `PAGE_TEMPLATE`
+JS/CSS, `tests/test_team_frontend.js`); no Python file touched, confirmed by
+`git diff --name-only` against the working tree.
 
 ## Test cases
 
 | # | Criterion / case | Method | Result | Evidence |
 |---|---|---|---|---|
-| 1 | Orphan `/home/deploy` (no `deploy` user, directory present) causes `InstallScriptDeployTargetBlockTests` to be **skipped**, not run against stale state | Automated (`DeployTargetOrphanDetectionTests`, ran as-is) + my own revert check: reverted just `setUp`'s guard back to "user exists only", reran the same test in isolation | pass (as shipped); **as-shipped test correctly fails when the fix is reverted**, proving it's discriminating | `python3 -m unittest tests.test_deploy_target.DeployTargetOrphanDetectionTests -v` → OK with fix in place; same command with `setUp` reverted → `FAILED (failures=1)`, `AssertionError: 0 != 1: InstallScriptDeployTargetBlockTests must be skipped...` |
-| 2 | `tearDown`'s backstop actually removes `/home/deploy` after a forced mid-test failure, so the *next* run's `setUp` sees clean state | Automated (`DeployTargetTearDownBackstopTests`, ran as-is) + my own revert check: reverted only the `sudo rm -rf /home/deploy` backstop line (kept `userdel -r deploy`), reran the same test in isolation | **FAIL — see Defect 1** | See Defect 1 below |
-| 3 | Two full runs of `test_team_routes.py`/`test_teams_lifecycle.py`'s real-tmux classes launched **concurrently** (two separate processes), both pass, zero session-name collisions | Automated — launched two genuinely separate background `python3 -m unittest` processes myself (not reusing the developer's report) | pass | Both processes: `Ran 136 tests ... OK`, 18.5s/18.7s respectively; `tmux list-sessions` afterward showed zero leftover `team-*`/`switchboard-*` sessions |
-| 4 | No test in either file still creates a session literally named `team-demo`/`team-proj`/`team-atomicdemo`/`team-failchain`/`team-sessionrace`/`team-clidemo` | Automated grep of both files post-fix, done independently (not trusting the diff description) | pass | `grep -n '"team-demo"\|"team-proj"\|"team-atomicdemo"\|"team-failchain"\|"team-sessionrace"\|"team-clidemo"'` against both files: zero matches. Broader sweep of every remaining bare project-name literal (`"demo"`, `"proj"`, etc.) confirmed the only unscoped survivors are in `NewStateAdditiveFieldsTests`/`SweepDeadTeamsPureTests`, which are pure/mocked (`tmux_has` monkeypatched, no real tmux touched) — correctly out of the criterion's own scope ("not synthetic/mocked ones") |
-| 5 | `switchboard-worktree-op-` sweep in `test_teams_lifecycle.py`'s `tearDown` only targets this process's own scoped prefix — a concurrent process's own sessions survive | Automated — planted my own foreign sessions (a superset of the developer's own proof: `switchboard-worktree-op-8888888888-cafebabe0001`, `team-otherproj-p8888888`, and an additional `switchboard-headless-p8888888-somehow`), ran the full lifecycle+routes suite, confirmed survival | pass | All 3 planted sessions confirmed alive via `tmux list-sessions` both before and after `python3 -m unittest tests.test_teams_lifecycle tests.test_team_routes -q` (`Ran 136 tests ... OK`) |
-| 6 | Full existing suite passes with no regression (Python 790 baseline + 2 new = 792, Node 84) | Automated, ran myself | pass | `python3 -m unittest discover -s tests -v` → `Ran 792 tests in 137.553s`, `OK`; all 4 Node suites: 15/15, 8/8, 52/52, 9/9 = 84/84 |
-
-Additional verification performed (not a spec bullet, but part of the dispatch):
-- Read `app/teams.py:2931-3052` (`_run_run_user_command()`) directly. Confirmed
-  the entire body from session creation through completion sits inside a
-  single `try`/`finally` (finally at lines 3049-3052: `shutil.rmtree(rundir,
-  ignore_errors=True)` then `if tmux_has(session): kill-session`) — this
-  really is unconditional self-cleanup independent of success/failure/
-  timeout, so dropping `test_teams_lifecycle.py`'s own `"switchboard-"` sweep
-  branch (rather than scoping it) is a correct, verified call, not merely an
-  asserted one.
-- Confirmed `PrivilegedEndToEndTests` (fixed `TEST_USER = "aidswbtest"`,
-  `tests/test_deploy_target.py:762+`) is untouched by this diff, and re-read
-  `docs/spec.md`'s Background/Non-goals/acceptance-criteria sections myself:
-  the concurrency acceptance criterion (bullet 3) names only
-  `test_team_routes.py`/`test_teams_lifecycle.py`; Part A's Background and
-  acceptance criteria (bullets 1-2) are scoped specifically to
-  `InstallScriptDeployTargetBlockTests`'s `deploy`/`/home/deploy` fixture.
-  Nothing in scope asks this cycle to make `PrivilegedEndToEndTests`
-  concurrency-safe. The developer's "known limitation, out of scope" framing
-  is accurate — not a spec gap being waved away.
-- `tests/test_deploy_dispatch.py`, named in spec's Non-goals as sharing the
-  same risk class but explicitly out of scope beyond confirming it's
-  unaffected: `git diff --stat -- tests/test_deploy_dispatch.py` shows no
-  changes, and it's part of the 792 that passed clean.
+| 1 | Permanent test proves the "already answered" branch (`waiting_on_you: true` cached + fresh `/team/inbox` `{"pending": false}`) renders distinct copy, no submit form | Automated, `tests/test_team_frontend.js` | pass | `node tests/test_team_frontend.js` → `PASS - waiting_on_you true but a fresh /team/inbox already reports pending:false renders "already answered", no form` |
+| 2 | "Already answered" is distinct from the normal question-form state | Automated, reviewer-written adversarial test (same run_id family, `cached.pending: true`) | pass | scratch harness run, `PASS - [ADVERSARIAL] "already answered" is distinct from the normal question-form state` |
+| 3 | "Already answered" is distinct from a genuine `/team/inbox` fetch failure | Automated, reviewer-written adversarial test (500 response → `cached === null`) | pass | scratch harness run, `PASS - [ADVERSARIAL] "already answered" is distinct from a genuine /team/inbox fetch failure (500)` |
+| 4 | `.team-feed-list` carries `role="log"` and `aria-live="polite"` in real rendered markup | Automated + manual extraction, real `<script>` from `app.render_page()` | pass | `node tests/test_team_frontend.js` → `PASS - the event feed list container carries role="log" and aria-live="polite"`; manual `grep` on `render_page()` output confirms `role="log" aria-live="polite"` on the template string |
+| 5 | Filter pills carry `aria-pressed`, value toggles on selection change | Automated (2-pill toggle) + reviewer adversarial (3-pill, exactly-one-true invariant) | pass | `PASS - per-agent filter pills carry aria-pressed, toggling true/false as the selected pill changes`; `PASS - [ADVERSARIAL] filter pills with 3 agents: only the actually-selected pill is aria-pressed=true, all others false` |
+| 6 | Escalation option group wrapped in `<fieldset>`/`<legend>`, legend text is the question, options inside the fieldset | Automated, regex + slice-between-tags assertion on real markup | pass | `PASS - the escalation option group is wrapped in <fieldset>/<legend>, legend text is the question` |
+| 7 | Trailing empty-meta `tool_use` (last lead event) while `status === 'running'` renders transient state, not finish/fact_check | Automated | pass | `PASS - a trailing tool_use with empty meta renders a transient pending state while team.status is still "running"` |
+| 8 | Transient state resolves to fact_check once paired `tool_result` arrives on a later poll | Automated | pass | `PASS - the transient pending state resolves to fact_check once the paired tool_result arrives on a later poll` |
+| 9 | Transient state resolves to finish once a terminal status arrives on a later poll | Automated | pass | `PASS - the transient pending state resolves to finish once a terminal status arrives on a later poll` |
+| 10 | Renamed test (`status: 'running'` → `'finished'`) is a legitimate adaptation, not weakened coverage | Reviewer trace: called `teamFeedEventKindClass`/`teamFeedEventBody` directly against the real extracted script with the OLD test's exact input (`status: 'running'`) | pass | `status=running -> kindClass=pending-classification, body="⋯ pending…"` (old assertion `[Finish summary]` now provably false under the old scenario — genuinely intercepted, not cosmetic); `status=finished -> kindClass=finish, body="[Finish summary] All done: summary text"` (renamed scenario genuinely hits finish) |
+| 11 | Adversarial: trailing empty-meta `tool_use` (last lead event) while `status === 'blocked'` (not running, not terminal) | Reviewer-written adversarial test | pass (see Findings #1 for the resulting observation) | `PASS - [ADVERSARIAL] trailing empty-meta tool_use with team.status "blocked" ... falls to finish, per the literal status==="running" gate` |
+| 12 | `aria-checked` resolution ("applies nowhere") matches `docs/design.md`'s literal text | Manual re-read of `docs/design.md` lines 991-994 | pass | Quoted below in Review pass |
+| 13 | `<fieldset>`/`<legend>` placement choice is reasonable and documented | Manual re-read of `docs/design.md` line 994 + `docs/implementation.md` "Key decisions" | pass | See Review pass |
 
 ## Regression check
-Full suite run by me: `python3 -m unittest discover -s tests -v` → 792/792,
-`OK`. All 4 Node suites run individually → 84/84 total. No regressions
-outside the two files under test.
+- `tests/test_team_frontend.js`: `node tests/test_team_frontend.js` → `ALL PASS (59/59)` (52 baseline + 7 new, matches `docs/implementation.md`'s own count).
+- Full Node suite: `test_deploy_frontend.js` 9/9, `test_singleton_toggle_frontend.js` 15/15, `test_team_frontend.js` 59/59, `test_upload_frontend.js` 8/8 → **91/91**, no regressions in the three unchanged files.
+- Full Python suite: `python3 -m unittest discover -s tests` → **`Ran 792 tests ... OK`**, unchanged (no Python file touched; re-ran anyway per this cycle's own convention). The "duplicate session: team-sessionrace-p4079817" lines in the output are pre-existing log noise from an unrelated test, not new failures.
+- Working-tree diff confirmed scoped to exactly `app/app.py`, `docs/implementation.md`, `tests/test_team_frontend.js` (`git status --porcelain`) — no other file touched, satisfying `docs/spec.md`'s Non-goals ("No new UI surface, no new route, no backend change").
 
-## Defects found
-
-### Defect 1: `DeployTargetTearDownBackstopTests` does not actually prove the backstop does anything — it passes identically with the backstop line removed
-- **File**: `tests/test_deploy_target.py`, new class `DeployTargetTearDownBackstopTests`
-  (test method `test_teardown_backstop_removes_home_deploy_after_a_forced_mid_test_failure`),
-  exercising the `tearDown()` backstop added at line ~444
-  (`subprocess.run(["sudo", "rm", "-rf", "/home/deploy"])`).
-- **Repro** (exactly the "prove the test is real" technique this project's
-  own review history uses, applied here for real):
-  1. With the diff as-shipped: `python3 -m unittest
-     tests.test_deploy_target.DeployTargetTearDownBackstopTests -v` → `OK`.
-  2. Temporarily removed *only* the new `sudo rm -rf /home/deploy` backstop
-     line from `tearDown()` (kept everything else, including the existing
-     `userdel -r deploy` immediately above it — i.e. reverted to
-     pre-BACKLOG-item-9 `tearDown()` exactly).
-  3. Re-ran the identical command: `python3 -m unittest
-     tests.test_deploy_target.DeployTargetTearDownBackstopTests -v` →
-     **still `OK`** (1/1 pass). `/home/deploy` and the `deploy` account were
-     both confirmed gone afterward regardless.
-  4. Restored the file to the original diff (`diff` against the pre-edit
-     copy confirmed byte-identical).
-- **Root cause**: the test's forced-failure body
-  (`_ForcedFailureAfterFixtureCreated.test_forced_failure_after_fixture_created`)
-  calls `self.run_block(...)`, asserts `r.returncode == 0` (i.e. the full
-  `--with-deploy-target` block, including `useradd deploy`, completed
-  successfully) *before* raising. By the time `tearDown()` runs, a fully,
-  successfully provisioned `deploy` account genuinely exists. `sudo userdel
-  -r deploy` (the pre-existing line, immediately above the new backstop)
-  already removes `/home/deploy` as a normal side effect of `-r` whenever the
-  account exists and removal succeeds — which it always does here, since
-  nothing in the harness spawns a long-running process owned by `deploy`
-  (`service="myapp.service"` is never actually started; `pkill -9 -u deploy`
-  is a no-op) that could cause `userdel` to fail. So the assertion
-  `self.assertFalse(os.path.exists("/home/deploy"))` is satisfied by the
-  *pre-existing* `userdel -r` line alone, and the new backstop line
-  contributes nothing observable in this specific scenario.
-  The test's own docstring claim — "only `tearDown()`'s own unconditional
-  backstop is what can remove it" — is factually false for the scenario it
-  actually constructs.
-- **Why this matters**: `docs/spec.md`'s acceptance criterion 2 ("`tearDown`'s
-  backstop actually removes `/home/deploy` even when simulating a failure
-  partway through the privileged test body... test this by forcing an
-  exception after the fixture is created but before normal cleanup would
-  run") is reported as verified in `docs/implementation.md` but is not
-  actually exercised by any test in this diff: if a future edit silently
-  broke or deleted the backstop line, this regression test would not catch
-  it, as long as `userdel -r` kept working normally. The scenario the
-  backstop genuinely protects against (per `docs/spec.md`'s own "Background"
-  — an interrupted run where `userdel` either already ran with nothing to
-  remove, or where a partially-provisioned `/home/deploy` exists with no
-  matching account at all) is structurally different from — and not
-  covered by — what this test constructs. `DeployTargetOrphanDetectionTests`
-  (criterion 1) does cover the "directory with no account" shape for
-  `setUp()`'s guard, but nothing in this diff isolates and proves the
-  `tearDown()` backstop's own contribution.
-- **Severity**: must-fix (uncovered/falsely-claimed acceptance criterion —
-  the test needs to construct a scenario where the pre-existing `userdel -r`
-  line would *not* already clean up `/home/deploy` on its own, e.g. forcing
-  the failure before `useradd` ever completes so no `deploy` account exists
-  for `userdel` to act on while `/home/deploy` is already on disk, or making
-  `userdel` itself fail/no-op for the duration of the test).
-
-## Overall verdict (first pass)
-**Blocked.** Criteria 1, 3, 4, 5, 6 are independently verified and pass.
-Criterion 2 (`tearDown` backstop) is not — the only test written for it does
-not discriminate between the backstop being present or absent, so it does
-not actually prove the acceptance criterion. Per process, the review pass
-was not performed since the testing pass did not come back clean; routing
-back to the developer to fix `DeployTargetTearDownBackstopTests` so it
-constructs a scenario where `userdel -r deploy` alone would not already
-remove `/home/deploy`, then re-verify with the same revert-and-rewatch-it-
-fail check before resubmitting.
+No defects found in the testing pass — proceeding to the review pass.
 
 ---
 
-## Re-review (after developer's "Review fix" in `docs/implementation.md`)
+## Spec coverage
 
-### Re-verification of Defect 1's fix
+| Acceptance criterion (`docs/spec.md`) | Implemented | Tested | Notes |
+|---|---|---|---|
+| Permanent test for "already answered" race branch | Yes (test only; production code pre-existing) | Yes (#1 above, plus reviewer's #2/#3 for the three-way distinctness) | Full coverage |
+| `role="log"`/`aria-live="polite"` on feed list, verified via real rendered markup | Yes | Yes (#4) | Attributes on `.team-feed-list` specifically, not the outer wrapper — matches design.md's intent (the element that actually gains new rows) |
+| Filter pills carry the ARIA state attribute(s) design.md specifies, with a toggle test | Yes (`aria-pressed` only — see `aria-checked` resolution below) | Yes (#5, incl. reviewer's 3-pill invariant test) | |
+| Escalation option group wrapped in `<fieldset>`/`<legend>` | Yes | Yes (#6) | |
+| Transient state for trailing empty-meta `tool_use` while `status === 'running'` | Yes | Yes (#7) | |
+| Transient state resolves correctly once resolved by a later poll | Yes | Yes (#8, #9) | Both resolution paths (fact_check and finish) independently tested |
+| Full existing suite passes, no regression | Yes | Yes | Python 792/792, Node 91/91 |
 
-Read the reworked `DeployTargetTearDownBackstopTests`
-(`tests/test_deploy_target.py:699-762`) directly rather than trusting the
-developer's own revert-and-fail proof in `docs/implementation.md`. The
-class now:
-- constructs `/home/deploy/.ssh/authorized_keys` directly (`sudo mkdir -p`
-  + a stale key), the same shape `DeployTargetOrphanDetectionTests` already
-  uses, and deliberately never runs `useradd`/`run_block()`;
-- asserts `id deploy` returns non-zero (no account) before raising, so the
-  scenario's shape is verified inline, not merely assumed;
-- runs a real `_ForcedFailureWithNoDeployUser` subclass of
-  `InstallScriptDeployTargetBlockTests` through `unittest`'s own
-  `TestCase.run()`, which raises `RuntimeError` after constructing the
-  fixture, then relies on the inherited, unmodified `tearDown()` running
-  normally.
+All seven acceptance criteria are implemented and independently verified by tests I ran myself this session (developer's tests plus my own adversarial constructions). No gaps.
 
-Own repro, performed independently in this session (host confirmed clean
-before and after — `id deploy` → no such user, `/home/deploy` absent):
-1. `python3 -m unittest
-   tests.test_deploy_target.DeployTargetTearDownBackstopTests -v` (as
-   shipped) → `OK` (1/1).
-2. Backed up the file, then edited only the backstop line out of
-   `InstallScriptDeployTargetBlockTests.tearDown()` (removed
-   `subprocess.run(["sudo", "rm", "-rf", "/home/deploy"])`, line 444;
-   left the pre-existing `userdel -r deploy` call in place, immediately
-   above).
-3. Re-ran the identical command → **genuine failure**:
-   ```
-   AssertionError: True is not false : tearDown's backstop must remove
-   /home/deploy even when no 'deploy' user ever existed for userdel -r
-   to clean it up as a side effect
-   FAILED (failures=1)
-   ```
-   This is the same test, same command, only the production-of-test-fixture
-   line removed — and it now fails with a message that names the backstop
-   directly, unlike the prior round where the identical revert produced a
-   silent pass. This is the discriminating result Defect 1 required.
-4. Cleaned up the `/home/deploy` this proof run left behind (`sudo rm -rf
-   /home/deploy` — the reverted `tearDown()` had no way to do this itself,
-   by design of the experiment), restored the file from the backup
-   (`diff` against the pre-edit copy: byte-identical), reran the same
-   command → `OK` (1/1) again.
+## Review pass
 
-Defect 1 is resolved. Verdict: **fix confirmed independently, not just
-trusted from the developer's report.**
+### `aria-checked` resolution vs. `docs/design.md`'s literal text
+`docs/design.md` line 993: *"Filter pills should be `<button>` or
+`<input type="radio">` with `aria-pressed="true"` / `aria-checked="true"` for
+selected pill."* This is one sentence pairing `aria-pressed`/`aria-checked`
+with the two *alternative* implementations of the same element (filter
+pills as `<button>` vs. as `<input type="radio">`), not two different UI
+elements. `app/app.py`'s `renderTeamFeed()` renders pills as
+`<button class="team-feed-pill">` — confirmed directly in the diff and in
+the extracted rendered markup — so `aria-pressed` is the attribute that
+applies, and `aria-checked` correctly does not appear anywhere. Separately,
+design.md's escalation-specific line 994 ("`<fieldset>` for radio/checkbox
+groups with `<legend>` for the question") never mentions `aria-checked` for
+the escalation inputs either. The developer's reading in
+`docs/implementation.md` "Key decisions" is accurate to design.md's literal
+wording, not a favorable paraphrase — confirmed by reading the design doc
+directly rather than trusting the summary.
 
-### Scope of this round's diff
-`git diff --stat` shows all three test files still modified (expected —
-nothing has been committed yet on this branch; the whole cycle's diff
-remains uncommitted pending this approval). Confirmed this fix round itself
-only touched `tests/test_deploy_target.py`:
-- File mtimes: `tests/test_team_routes.py` and `tests/test_teams_lifecycle.py`
-  both last modified *before* this file's first review pass completed
-  (`docs/test-review.md`'s own mtime), while `tests/test_deploy_target.py`'s
-  mtime is later than both — consistent with only the deploy-target file
-  being touched after the first review round.
-- `git diff --stat` sizes for `test_team_routes.py` (306 lines) and
-  `test_teams_lifecycle.py` (120 lines) match what was already verified in
-  the first pass; no new edits to reconcile.
-- Read the current `test_deploy_target.py` diff in full: the only
-  substantive change from the first-pass version is the body of
-  `DeployTargetTearDownBackstopTests` (renamed inner class
-  `_ForcedFailureAfterFixtureCreated` → `_ForcedFailureWithNoDeployUser`,
-  fixture construction swapped from `run_block()` to direct
-  `mkdir`/`authorized_keys`). `InstallScriptDeployTargetBlockTests.setUp`/
-  `tearDown` and `DeployTargetOrphanDetectionTests` are unchanged from what
-  was already verified and passed in the first round.
+### `<fieldset>`/`<legend>` placement
+`docs/spec.md` explicitly left this to the developer's judgment. The chosen
+approach — the `<legend class="team-escalation-question">` *replaces* the
+previously-separate `.team-escalation-question` div (same class, same text,
+CSS-reset to look identical) rather than duplicating the question text —
+avoids a visually duplicated line while still giving the fieldset its
+required screen-reader association. Verified in the diff
+(`app/app.py`: the old `<div class="team-escalation-question">` line is
+deleted, its class/content moved onto the new `<legend>`) and confirmed
+structurally correct by test #6's slice-between-`</legend>`-and-`</fieldset>`
+assertion (radios are genuinely inside the fieldset, after the legend, not
+just present somewhere in the row).
 
-### Full suite re-run (this session)
-- `python3 -m unittest tests.test_deploy_target -v` → `Ran 32 tests ... OK`.
-- `python3 -m unittest discover -s tests -v` → `Ran 792 tests in 136.171s`,
-  `OK`.
-- Node, run individually: `test_singleton_toggle_frontend.js` 15/15,
-  `test_upload_frontend.js` 8/8, `test_team_frontend.js` 52/52,
-  `test_deploy_frontend.js` 9/9 — 84/84 total.
+### Correctness
+- The `status === 'running'` gate for the transient state is applied
+  literally as `docs/spec.md`'s Background/Proposed-approach text specifies.
+  Test #11 (reviewer-constructed) confirms that a `status: 'blocked'` value
+  with the same trailing empty-meta event does **not** get the transient
+  treatment — it falls straight to `'finish'`, same as pre-cycle behavior.
+  This is not a bug against this cycle's spec (which explicitly scopes the
+  fix to `status === 'running'` and to a race the reviewer already
+  documented as practically unreachable), but it's worth flagging as a
+  should-fix-in-a-later-cycle observation — see Findings below — since the
+  underlying rendering ambiguity (a trailing empty-meta `tool_use` with no
+  paired `tool_result` yet) is equally present, in principle, whenever the
+  run hasn't reached a truly terminal status, not just while `running`.
+- `e.agent === 'lead'` guard in the transient-state condition: confirmed
+  necessary and correctly scoped — without it, a non-lead agent's own
+  (hypothetical) empty-meta `tool_use` would also match `!next` (since
+  `findNextLeadEvent` only searches `leadEvents`, `indexOf` returns `-1` for
+  non-lead events, always yielding `next === null`), which would have
+  incorrectly extended new behavior beyond the spec's literal "last
+  lead-agent event" wording. The guard prevents that.
+- Renamed test is a genuine adaptation, not weakened coverage — confirmed
+  via direct function-level trace (#10 above): the old scenario's inputs,
+  re-run against the real post-diff script, now produce
+  `pending-classification`, provably falsifying the old test's original
+  assertion under the old inputs. The rename is not cosmetic.
 
-No regressions. Testing pass is now clean — proceeding to the review pass.
+### Security
+No new user input handling introduced. `esc(cached.question)` is correctly
+applied to the new `<legend>` content (same escaping already used
+throughout this file for LLM-authored / operator-authored text). No new
+routes, no new fetch targets, no new SQL/shell/command surfaces. Nothing in
+this diff touches authn/authz or secrets.
 
-### Review pass
+### Simplicity / scope
+The diff is minimal and proportionate to the three-item spec: no new
+abstractions, no speculative generality. Threading a third `status`
+parameter through `teamFeedEventKindClass`/`teamFeedEventBody`/
+`renderTeamFeedEvent` is the smallest change that satisfies part C without
+introducing global state. The CSS resets for `<fieldset>`/`<legend>` are
+scoped narrowly (only the two new selectors) and exist specifically to keep
+the visual layout unchanged, which is a reasonable, minimal tradeoff for
+adding required a11y structure without a visual regression — appropriately
+flagged in `docs/implementation.md`'s "Known limitations" as not
+manually/visually verified, consistent with this file's existing
+markup-presence-only testing convention.
 
-**Spec-to-code traceability** (`docs/spec.md` acceptance criteria, all six):
-1. Orphan `/home/deploy` (no user, directory present) → class skipped:
-   covered by `DeployTargetOrphanDetectionTests`, unchanged from the first
-   pass, independently verified there. **Met.**
-2. `tearDown` backstop removes `/home/deploy` after a forced mid-body
-   failure: now genuinely covered by the reworked
-   `DeployTargetTearDownBackstopTests`, independently re-verified above via
-   revert-and-fail. **Met.**
-3. Two full concurrent runs of the real-tmux classes in both files, zero
-   collisions: unchanged from the first pass (already independently
-   verified with two of my own separate background processes). **Met.**
-4. No test creates a session literally named `team-demo`/`team-proj`/etc.:
-   unchanged from the first pass (already independently grepped). **Met.**
-5. `switchboard-worktree-op-` sweep only targets this process's own scope:
-   unchanged from the first pass (already independently verified by
-   planting foreign sessions). **Met.**
-6. Full existing suite passes with no regression: re-run fresh this round,
-   792/792 Python, 84/84 Node. **Met.**
+## Findings (most severe first)
 
-All six acceptance criteria are implemented and covered by a test that
-actually discriminates pass/fail on the behavior in question — no gaps.
+### 1. Transient "pending classification" gate is scoped to `status === 'running'` only, not to "run hasn't reached a terminal status" — should-fix (follow-up, not blocking)
+- File: `app/app.py`, `teamFeedEventKindClass()`, the
+  `if (!next && e.agent === 'lead' && status === 'running') return 'pending-classification';`
+  line.
+- Issue: the condition matches `docs/spec.md`'s literal wording exactly, but
+  the wording itself only anticipated the `running` case. A trailing
+  empty-meta `tool_use` from the lead with no paired `tool_result` yet, and
+  `team.status === 'blocked'` (e.g. the lead is mid-way through emitting a
+  fact_check tool_use/tool_result pair right as an `ask_user` escalation
+  from a **different**, in-flight round gets appended and flips status to
+  `blocked` before the pair completes — a narrower but structurally similar
+  poll-boundary race to the one this cycle already fixed for `running`)
+  still falls through to `'finish'`, i.e. the exact assumed-finish bug this
+  cycle was written to eliminate, just gated to a status this cycle didn't
+  cover.
+- Failure scenario: `team.status: 'blocked'`, last lead event is an
+  empty-meta `tool_use` with no next lead event yet — renders
+  `[Finish summary] ...` instead of the transient state, even though the
+  run has not actually finished (confirmed empirically, test case #11
+  above).
+- This does not block approval: `docs/spec.md`'s own Non-goals disclaim
+  "attempting to make the poll-boundary race... provably unreachable," and
+  the implementation matches the spec's literal, deliberately-narrow scope
+  exactly — this is a spec-scoping observation for a future cycle, not an
+  implementation defect against this cycle's spec.
 
-**Correctness.** The reworked test correctly isolates the variable under
-test: by never creating a `deploy` account, the pre-existing `userdel -r
-deploy` call in the inherited `tearDown()` genuinely has nothing to act on
-(a no-op), so only the new backstop line can be responsible for removing
-`/home/deploy` — confirmed by the revert-and-fail check both the developer
-and I ran independently, with matching results. The test still satisfies
-the literal acceptance-criterion wording ("forcing an exception after the
-fixture is created but before normal cleanup would run") — the "fixture"
-here is `/home/deploy` itself, which is what's actually under test; the
-account-creation step was never load-bearing for what criterion 2 asks to
-be proven, only incidental to how the first-pass version of the test
-happened to construct it.
+### 2. No visual/manual accessibility smoke test performed — nit
+- File: `docs/implementation.md` "Known limitations" (already
+  self-disclosed).
+- Issue: no real screen reader or browser was used to confirm the
+  `aria-live="polite"` region announces correctly, or that the
+  `<fieldset>`/`<legend>` CSS reset actually renders pixel-identical to the
+  pre-cycle layout in a real browser (only markup-presence assertions and a
+  `grep` on the rendered template were used).
+- Not blocking: this matches the same level of rigor every other test in
+  `tests/test_team_frontend.js` already uses (this codebase has no browser/
+  screen-reader test harness), and `docs/spec.md`'s Non-goals explicitly
+  scope this cycle to implementing already-specified attributes, not a full
+  accessibility audit.
 
-One asymmetry worth noting but not blocking: `DeployTargetOrphanDetectionTests`
-registers `self.addCleanup(lambda: subprocess.run(["sudo", "rm", "-rf",
-"/home/deploy"]))` for its own directly-created fixture, but
-`DeployTargetTearDownBackstopTests`'s outer test method has no equivalent
-`addCleanup` — it relies entirely on the inner subclass's own `tearDown()`
-(the very thing under test) to clean up. If the backstop were ever broken
-again, this specific test would leave `/home/deploy` on disk after failing.
-This isn't a false-pass risk (the test would still fail, correctly), and
-the consequence is fail-safe rather than fail-dangerous: any subsequent
-test run would trip the criterion-1 orphan guard in `setUp()` and skip
-cleanly rather than run against dirty state, exactly as designed. Noted as
-a should-fix / nice-to-have, not a blocker.
+## Follow-ups (non-blocking)
+- Consider widening the transient-classification gate from
+  `status === 'running'` to `status !== 'finished' && status !== 'error'`
+  (or equivalent "non-terminal" check) in a future cycle, per Finding #1.
+- A manual screen-reader/browser smoke test of the new `role="log"`/
+  `aria-live`/`fieldset`/`legend` markup would be a reasonable low-cost
+  addition whenever this codebase's first browser-based test harness (if
+  ever added) lands — not warranted as a one-off for this cycle.
 
-**Security.** No new production code. All new `subprocess.run()` calls in
-this round use fixed argument lists or hardcoded shell strings with no
-interpolated external input — no injection surface. Real host mutation
-(`/home/deploy` creation/removal) remains gated behind
-`HAVE_PASSWORDLESS_SUDO` and the class's own `setUp()` pre-flight checks,
-consistent with the rest of the file's existing convention.
-
-**Simplicity / scope.** The fix is a minimal, surgical rework of exactly
-the one test method Defect 1 named — no other test, no production file,
-touched. Matches `docs/spec.md`'s non-goals (test-only diff) and doesn't
-introduce any new abstraction or generalization beyond what's needed to
-isolate the fixture-construction step.
-
-## Findings (ranked)
-
-1. **Should-fix (non-blocking):** `DeployTargetTearDownBackstopTests`
-   (`tests/test_deploy_target.py:702-762`) doesn't `addCleanup` its own
-   directly-constructed `/home/deploy` fixture the way
-   `DeployTargetOrphanDetectionTests` does. Low-value but consistent hygiene
-   fix — wrap the fixture creation with the same `self.addCleanup(lambda:
-   subprocess.run(["sudo", "rm", "-rf", "/home/deploy"]))` pattern used two
-   classes above it, so a future regression in the backstop doesn't also
-   leave state dirty on this test's own failure path. No functional impact
-   given the fail-safe interaction with the criterion-1 orphan guard.
-
-No must-fix findings. No nits beyond the above.
-
-## Overall verdict (this round)
-**Approved.** All six acceptance criteria in `docs/spec.md` are implemented
-and independently, discriminately verified (including a from-scratch
-revert-and-fail re-check of the specific fix this round addresses). Full
-regression suite is clean (792/792 Python, 84/84 Node). One should-fix
-follow-up noted above (test cleanup hygiene) — does not block approval.
-Ready to hand back to product-manager for the next iteration.
+## Overall verdict
+**Approve.** All seven acceptance criteria are implemented and verified by
+tests I ran myself this session (the developer's new tests plus my own
+adversarial constructions covering the three-way "already answered"
+distinctness, the 3-pill `aria-pressed` invariant, the `blocked`-status
+edge case, and a direct function-level trace proving the renamed test is a
+genuine adaptation). Full regression suite is clean: Python 792/792, Node
+91/91. The `aria-checked` and `<fieldset>`/`<legend>`-placement developer
+calls both check out against `docs/design.md`'s literal text. One
+should-fix-later observation (Finding #1) and one pre-existing, self-
+disclosed nit (Finding #2) — neither blocks this cycle.

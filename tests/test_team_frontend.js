@@ -812,6 +812,54 @@ test('a running team\'s feed panel defaults open ("Hide live feed") and shows "N
   assert.ok(html.includes('No events yet.'));
 });
 
+// Backlog item 12, part B: docs/design.md "Accessibility & platform notes"
+// -- "Event list items should be in an <article> or similar container with
+// role="log" and aria-live="polite" to announce new events to screen
+// readers." Asserted on the .team-feed-list scrollable container itself
+// (the element that actually gains new child rows on each poll), extracted
+// from the real rendered markup like every other assertion in this file.
+test('the event feed list container carries role="log" and aria-live="polite"', async () => {
+  const c = await setupCase([inst('proj', { status: 'running', run_id: 'run-aria-log' })]);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(/<div class="team-feed-list"[^>]*\brole="log"/.test(html),
+    'expected role="log" on .team-feed-list, got: ' + html);
+  assert.ok(/<div class="team-feed-list"[^>]*\baria-live="polite"/.test(html),
+    'expected aria-live="polite" on .team-feed-list, got: ' + html);
+});
+
+// docs/design.md: "Filter pills should be <button> ... with
+// aria-pressed="true" ... for selected pill." This codebase's filter pills
+// are rendered as <button> elements (not <input type="radio">), so
+// aria-pressed -- not aria-checked -- is the attribute that applies here;
+// see docs/implementation.md "Deviations from spec" for the full
+// aria-checked ambiguity resolution. Asserts the value actually toggles
+// between pills, not just that the attribute is present on one of them.
+test('per-agent filter pills carry aria-pressed, toggling true/false as the selected pill changes', async () => {
+  const instances = [inst('proj', {
+    status: 'running', run_id: 'run-aria-pressed', composition: { lead: null, members: ['helper'] },
+  })];
+  const c = await setupCase(instances);
+  const events = [
+    { ts: '2026-08-14T12:00:00Z', agent: 'lead', seq: 1, kind: 'message', text: 'lead line', meta: {} },
+    { ts: '2026-08-14T12:00:01Z', agent: 'helper', seq: 1, kind: 'message', text: 'helper line', meta: {} },
+  ];
+  await openFeedAndDeliverEvents(c, 'proj', events);
+  await rerenderRow(c, instances);
+  let html = c.instanceRowHtml('proj');
+  assert.ok(/<button class="team-feed-pill active" aria-pressed="true"[^>]*>All</.test(html),
+    'expected the default-selected "All" pill to carry aria-pressed="true", got: ' + html);
+  assert.ok(/<button class="team-feed-pill" aria-pressed="false"[^>]*>helper</.test(html),
+    'expected the unselected "helper" pill to carry aria-pressed="false", got: ' + html);
+
+  c.call('setTeamFeedFilter', 'proj', 'helper');
+  await drainTriggeredRefresh(c, instances);
+  html = c.instanceRowHtml('proj');
+  assert.ok(/<button class="team-feed-pill" aria-pressed="false"[^>]*>All</.test(html),
+    'expected "All" to flip to aria-pressed="false" once deselected, got: ' + html);
+  assert.ok(/<button class="team-feed-pill active" aria-pressed="true"[^>]*>helper</.test(html),
+    'expected "helper" to flip to aria-pressed="true" once selected, got: ' + html);
+});
+
 test('idle renders no status-strip/feed/escalation UI (unchanged from 6d/6e)', async () => {
   const c = await setupCase([inst('proj', null)]);
   const html = c.instanceRowHtml('proj');
@@ -839,6 +887,30 @@ test('waiting_on_you fetches the inbox once and renders question/header/options/
   assert.ok(html.includes('type="radio"'), 'single_select must render radios');
 });
 
+// Backlog item 12, part B: docs/design.md "Accessibility & platform notes"
+// -- "Escalation form: <fieldset> for radio/checkbox groups with <legend>
+// for the question." The legend text is the pending question's own text
+// (docs/spec.md part B; see docs/implementation.md for the developer's
+// choice of question over header, documented there).
+test('the escalation option group is wrapped in <fieldset>/<legend>, legend text is the question', async () => {
+  const instances = [inst('proj', { status: 'blocked', run_id: 'run-fs', waiting_on_you: true })];
+  const c = await setupCase(instances);
+  await deliverTeamInbox(c, 'proj', 'run-fs', instances, {
+    pending: true, run_id: 'run-fs', question: 'Is the analysis correct?', header: 'from lead',
+    options: [{ label: 'Yes' }, { label: 'No' }], multi_select: false,
+  });
+  const html = c.instanceRowHtml('proj');
+  assert.ok(/<fieldset[^>]*>[\s\S]*<legend[^>]*>Is the analysis correct\?<\/legend>/.test(html),
+    'expected a <fieldset> whose <legend> is the question text, got: ' + html);
+  // The options themselves must be inside the fieldset, after the legend.
+  const fsIdx = html.indexOf('<fieldset');
+  const legendCloseIdx = html.indexOf('</legend>', fsIdx);
+  const fsCloseIdx = html.indexOf('</fieldset>', legendCloseIdx);
+  assert.ok(fsIdx !== -1 && legendCloseIdx !== -1 && fsCloseIdx !== -1);
+  const insideFieldset = html.slice(legendCloseIdx, fsCloseIdx);
+  assert.ok(insideFieldset.includes('type="radio"'), 'expected the radio options inside the fieldset, got: ' + html);
+});
+
 test('multi_select renders checkboxes; zero options still renders the always-present free-text input', async () => {
   const instances = [inst('proj', { status: 'blocked', run_id: 'run-2', waiting_on_you: true })];
   const c = await setupCase(instances);
@@ -860,6 +932,25 @@ test('escalated_max_rounds (waiting_on_you=false) never fetches /team/inbox', as
   await tick();
   assert.ok(!c.pendingFetches.some((f) => f.url.indexOf('/team/inbox') !== -1),
     'must never poll the inbox just to light the "waiting on you" indicator');
+});
+
+// Backlog item 12, part A: the "already answered" race (docs/spec.md
+// "Background" item A) -- a cached /status snapshot still says
+// waiting_on_you: true (a moment-in-time read), but the freshly-fetched
+// GET .../team/inbox -- fetched a beat later, e.g. another operator/tab
+// just answered it -- already reports {"pending": false} (the real
+// backend's own exact shape for a non-blocked_ask_user state, see
+// app/app.py's _handle_team_inbox()). renderEscalationPanel()'s
+// `!cached.pending` branch must render distinct "already answered" copy,
+// not the normal question/options form and not the fetch-failure copy.
+test('waiting_on_you true but a fresh /team/inbox already reports pending:false renders "already answered", no form', async () => {
+  const instances = [inst('proj', { status: 'blocked', run_id: 'run-late', waiting_on_you: true })];
+  const c = await setupCase(instances);
+  await deliverTeamInbox(c, 'proj', 'run-late', instances, { pending: false });
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('already answered'), 'expected the distinct "already answered" copy, got: ' + html);
+  assert.ok(!html.includes('team-escalation-form'), 'must not render the normal question/options submit form');
+  assert.ok(!html.includes('Could not load the pending question'), 'must not be conflated with the fetch-failure copy');
 });
 
 test('selecting a single-select option and submitting sends {answer: "<label>"} via team-resolve', async () => {
@@ -1047,8 +1138,13 @@ test('fact_check found:false renders an explicit "no supporting passage found"',
   assert.ok(html.includes('no supporting passage found'), 'expected the explicit non-match text, got: ' + html);
 });
 
-test('a tool_use with empty meta and no following lead event renders as the finish summary, not a fact_check claim', async () => {
-  const instances = [inst('proj', { status: 'running', run_id: 'run-finish' })];
+// team.status === 'finished' (a genuinely terminal poll, not "running" --
+// see the "poll-boundary" tests below for the running/transient case this
+// cycle, backlog item 12 part C, adds) -- there is no ambiguity left to
+// resolve: the run is over, so a trailing tool_use with empty meta and no
+// following lead event is unambiguously the finish summary.
+test('a tool_use with empty meta and no following lead event renders as the finish summary once the run has ended', async () => {
+  const instances = [inst('proj', { status: 'finished', run_id: 'run-finish' })];
   const c = await setupCase(instances);
   const events = [
     { ts: '2026-08-14T12:00:00Z', agent: 'lead', seq: 1, kind: 'tool_use', text: 'All done: summary text', meta: {} },
@@ -1059,6 +1155,79 @@ test('a tool_use with empty meta and no following lead event renders as the fini
   assert.ok(html.includes('[Finish summary]'), 'expected the finish-summary rendering, got: ' + html);
   assert.ok(html.includes('All done: summary text'));
   assert.ok(!html.includes('fact_check:'), 'must not be mistaken for a fact_check claim');
+});
+
+// ─── Poll-boundary fact_check-vs-finish disambiguation (backlog item 12,
+// part C) ────────────────────────────────────────────────────────────────
+//
+// docs/spec.md "Background" item C / "Proposed approach" §C: a `tool_use`
+// event with empty `meta` that is the event buffer's own LAST lead-agent
+// event, while `team.status === 'running'` (the paired `tool_result` or a
+// terminal status simply hasn't shown up on a poll yet), must render a
+// transient "pending classification" state instead of assuming it's the
+// finish summary -- this is the exact scenario the now-renamed "...once
+// the run has ended" test above used to (mis)cover with `status: 'running'`.
+
+test('a trailing tool_use with empty meta renders a transient pending state while team.status is still "running"', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-pending' })];
+  const c = await setupCase(instances);
+  const events = [
+    { ts: '2026-08-14T12:00:00Z', agent: 'lead', seq: 1, kind: 'tool_use', text: 'All done: summary text', meta: {} },
+  ];
+  await openFeedAndDeliverEvents(c, 'proj', events);
+  await rerenderRow(c, instances);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('kind-pending-classification'), 'expected the transient pending-classification class, got: ' + html);
+  assert.ok(!html.includes('[Finish summary]'), 'must not assume finish while still running, got: ' + html);
+  assert.ok(!html.includes('fact_check:'), 'must not assume fact_check either, got: ' + html);
+});
+
+test('the transient pending state resolves to fact_check once the paired tool_result arrives on a later poll', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-resolve-fc' })];
+  const c = await setupCase(instances);
+  const firstBatch = [
+    { ts: '2026-08-14T12:00:00Z', agent: 'lead', seq: 1, kind: 'tool_use', text: 'Python is a snake', meta: {} },
+  ];
+  await openFeedAndDeliverEvents(c, 'proj', firstBatch);
+  await rerenderRow(c, instances);
+  let html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('kind-pending-classification'), 'expected the transient state on the first poll, got: ' + html);
+
+  // Second poll: the paired tool_result lands.
+  const p = c.call('pollTeamFeed', 'proj');
+  await waitForFetch(c, (f) => f.url.indexOf('/projects/proj/team/events') === 0);
+  c.resolveFetch((f) => f.url.indexOf('/projects/proj/team/events') === 0, 200, {
+    run_id: 'run-resolve-fc',
+    events: [{
+      ts: '2026-08-14T12:00:01Z', agent: 'lead', seq: 2, kind: 'tool_result', meta: { found: true },
+      text: JSON.stringify({ claim: 'Python is a snake', found: true,
+        matches: [{ file_line: 'docs/snake.md:42', text: 'Python is a reptile.' }] }),
+    }],
+    cursors: {}, truncated: {},
+  });
+  await p;
+  await rerenderRow(c, instances);
+  html = c.instanceRowHtml('proj');
+  assert.ok(!html.includes('kind-pending-classification'), 'the transient state must clear once resolved, got: ' + html);
+  assert.ok(html.includes('fact_check: Python is a snake'), 'expected it to resolve to a fact_check claim, got: ' + html);
+});
+
+test('the transient pending state resolves to finish once a terminal status arrives on a later poll', async () => {
+  const running = [inst('proj', { status: 'running', run_id: 'run-resolve-fin' })];
+  const c = await setupCase(running);
+  const events = [
+    { ts: '2026-08-14T12:00:00Z', agent: 'lead', seq: 1, kind: 'tool_use', text: 'All done: summary text', meta: {} },
+  ];
+  await openFeedAndDeliverEvents(c, 'proj', events);
+  await rerenderRow(c, running);
+  let html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('kind-pending-classification'), 'expected the transient state while running, got: ' + html);
+
+  const finished = [inst('proj', { status: 'finished', run_id: 'run-resolve-fin' })];
+  await rerenderRow(c, finished);
+  html = c.instanceRowHtml('proj');
+  assert.ok(!html.includes('kind-pending-classification'), 'the transient state must clear once terminal, got: ' + html);
+  assert.ok(html.includes('[Finish summary]'), 'expected it to resolve to the finish summary, got: ' + html);
 });
 
 test('a handoff event renders "Delegating to <teammate>"', async () => {

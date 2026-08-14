@@ -1760,6 +1760,8 @@ PAGE_TEMPLATE = """<!doctype html>
   .team-escalation-form { display: flex; flex-direction: column; gap: 8px; }
   .team-escalation-header { font-size: 12px; color: #aaa; }
   .team-escalation-question { font-size: 13px; color: #eee; }
+  .team-escalation-options { border: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  legend.team-escalation-question { padding: 0; display: block; }
   .team-escalation-option { font-size: 13px; color: #eee; display: flex; align-items: flex-start; gap: 6px; }
   .team-escalation-option-desc { font-size: 12px; color: #888; }
   .team-escalation-form textarea { font-size: 13px; padding: 8px 10px; border-radius: 8px;
@@ -1785,6 +1787,7 @@ PAGE_TEMPLATE = """<!doctype html>
   .team-feed-event { padding: 2px 0; color: #eee; }
   .team-feed-event.kind-error { color: #ff6b6b; }
   .team-feed-event.kind-terminal-escalation { color: #ffb648; }
+  .team-feed-event.kind-pending-classification { color: #888; font-style: italic; }
   .team-feed-ts { color: #888; }
   .team-feed-agent { font-weight: 600; }
   .team-feed-match { padding-left: 14px; }
@@ -2438,11 +2441,26 @@ function renderEscalationPanel(name, team) {
       desc + '</label>';
   }).join('');
   const otherText = teamEscalationOther[name] || '';
+  // <fieldset>/<legend> around the option group (docs/design.md
+  // "Accessibility & platform notes": "Escalation form: <fieldset> for
+  // radio/checkbox groups with <legend> for the question"; docs/spec.md
+  // part B: legend text is the pending question's own question/header
+  // text). The fieldset's <legend> IS the previously-separate
+  // ".team-escalation-question" div -- reusing the same class/text there
+  // rather than rendering the question twice (once as a plain div, once
+  // as the legend) keeps the visible layout unchanged (still one question
+  // line, right above the options) while giving screen readers the
+  // group-to-question association <fieldset>/<legend> is for. Wraps the
+  // native radio/checkbox inputs specifically -- not the header chip, not
+  // the free-text "Other" field (which has its own <label>, per design.md,
+  // and isn't part of the option group being grouped).
+  const optionsFieldset = '<fieldset class="team-escalation-options">' +
+    '<legend class="team-escalation-question">' + esc(cached.question) + '</legend>' +
+    optionsHtml + '</fieldset>';
   return '<div class="team-escalation" id="team-escalation-' + esc(name) + '">' +
     '<div class="team-escalation-form">' +
     (cached.header ? '<div class="team-escalation-header">' + esc(cached.header) + '</div>' : '') +
-    '<div class="team-escalation-question">' + esc(cached.question) + '</div>' +
-    optionsHtml +
+    optionsFieldset +
     '<label>Other (free text)<br><textarea id="escalation-other-' + esc(name) + '" rows="3" ' +
     'oninput="teamEscalationOther[' + "'" + name + "'" + '] = this.value;">' + esc(otherText) + '</textarea></label>' +
     '<div class="team-actions"><button class="team-btn" onclick="doTeamResolve(' + "'" + name + "'" +
@@ -2470,7 +2488,11 @@ function findNextLeadEvent(e, leadEvents) {
   if (idx === -1) return null;
   return leadEvents[idx + 1] || null;
 }
-function teamFeedEventKindClass(e, leadEvents) {
+// `status` (team.status) is only consulted for the tool_use/empty-meta
+// branch below (backlog item 12, part C) -- every other kind/meta
+// combination disambiguates purely from the event's own shape and its
+// position in leadEvents, same as before.
+function teamFeedEventKindClass(e, leadEvents, status) {
   const meta = e.meta || {};
   if (e.kind === 'error') return 'error';
   if (e.kind === 'tool_result' && meta.found !== undefined) return 'fact-check-result';
@@ -2479,15 +2501,28 @@ function teamFeedEventKindClass(e, leadEvents) {
   if (e.kind === 'tool_use' && meta.header !== undefined) return 'ask-user';
   if (e.kind === 'tool_use' && Object.keys(meta).length === 0) {
     const next = findNextLeadEvent(e, leadEvents);
-    return (next && next.kind === 'tool_result' && next.meta && next.meta.found !== undefined) ?
-      'fact-check-claim' : 'finish';
+    if (next && next.kind === 'tool_result' && next.meta && next.meta.found !== undefined) {
+      return 'fact-check-claim';
+    }
+    // Poll-boundary self-healing refinement (docs/spec.md "Background"
+    // item C / docs/design.md is silent -- new for this cycle): `e` is the
+    // event buffer's own LAST lead-agent event (no next lead event yet)
+    // AND the run hasn't finished (team.status === 'running') -- the
+    // paired tool_result (fact_check) or the terminal status (finish)
+    // simply hasn't arrived on a poll yet, so render neither assumption
+    // and wait for the next poll instead of guessing "finish". Once a
+    // terminal status arrives (status !== 'running') or the paired
+    // tool_result shows up (next is no longer null), this branch stops
+    // matching and the disambiguation above resolves normally.
+    if (!next && e.agent === 'lead' && status === 'running') return 'pending-classification';
+    return 'finish';
   }
   if (e.kind === 'status' && meta.forced && meta.final_status) return 'terminal-escalation';
   return e.kind;
 }
-function teamFeedEventBody(e, leadEvents) {
+function teamFeedEventBody(e, leadEvents, status) {
   const meta = e.meta || {};
-  const cls = teamFeedEventKindClass(e, leadEvents);
+  const cls = teamFeedEventKindClass(e, leadEvents, status);
   if (cls === 'fact-check-claim') {
     return 'fact_check: ' + esc(e.text || '');
   }
@@ -2507,6 +2542,7 @@ function teamFeedEventBody(e, leadEvents) {
   if (cls === 'resolved') return 'Answer: ' + esc(e.text || '');
   if (cls === 'handoff') return 'Delegating to ' + esc(meta.agent || '');
   if (cls === 'ask-user') return 'ask_user: ' + esc(meta.header || e.text || '');
+  if (cls === 'pending-classification') return '⋯ pending…';
   if (cls === 'finish') return '[Finish summary] ' + esc(e.text || '');
   if (cls === 'terminal-escalation') {
     return '✕ Escalated: max rounds reached (' + esc(meta.final_status || '') + ')';
@@ -2515,11 +2551,11 @@ function teamFeedEventBody(e, leadEvents) {
   if (e.kind === 'message' || e.kind === 'status') return esc(e.text || '');
   return '[' + esc(e.kind || '') + '] ' + esc(e.text || '');
 }
-function renderTeamFeedEvent(e, leadEvents) {
+function renderTeamFeedEvent(e, leadEvents, status) {
   const color = teamAgentColor(e.agent);
   const ts = (e.ts || '').length >= 19 ? e.ts.slice(11, 19) : (e.ts || '');
-  const kindClass = teamFeedEventKindClass(e, leadEvents);
-  const body = teamFeedEventBody(e, leadEvents);
+  const kindClass = teamFeedEventKindClass(e, leadEvents, status);
+  const body = teamFeedEventBody(e, leadEvents, status);
   return '<div class="team-feed-event kind-' + esc(kindClass) + '">' +
     '<span class="team-feed-ts">' + esc(ts) + '</span> ' +
     '<span class="team-feed-agent" style="color:' + color + '">' + esc(e.agent) + '</span> ' +
@@ -2532,17 +2568,25 @@ function renderTeamFeed(name, team) {
   const agents = ['lead'].concat((team.composition && team.composition.members) || []);
   const pills = ['all'].concat(agents).map(a => {
     const label = a === 'all' ? 'All' : a;
-    const active = filter === a ? ' active' : '';
-    return '<button class="team-feed-pill' + active + '" onclick="setTeamFeedFilter(' +
-      "'" + name + "','" + a + "'" + ')">' + esc(label) + '</button>';
+    const isActive = filter === a;
+    const active = isActive ? ' active' : '';
+    return '<button class="team-feed-pill' + active + '" aria-pressed="' + (isActive ? 'true' : 'false') +
+      '" onclick="setTeamFeedFilter(' + "'" + name + "','" + a + "'" + ')">' + esc(label) + '</button>';
   }).join('');
   const filtered = filter === 'all' ? events : events.filter(e => e.agent === filter);
   const leadEvents = events.filter(e => e.agent === 'lead').sort((a, b) => (a.seq || 0) - (b.seq || 0));
   const listHtml = filtered.length === 0 ? '<div class="team-feed-empty">No events yet.</div>' :
-    filtered.map(e => renderTeamFeedEvent(e, leadEvents)).join('');
+    filtered.map(e => renderTeamFeedEvent(e, leadEvents, team.status)).join('');
+  // role="log"/aria-live="polite" (docs/design.md "Accessibility &
+  // platform notes": "Event list items should be in an <article> or
+  // similar container with role="log" and aria-live="polite" to announce
+  // new events to screen readers") -- on the scrollable list container
+  // itself (the element that actually gains new child rows on each poll),
+  // not the outer .team-feed wrapper (which also holds the non-live filter
+  // row).
   return '<div class="team-feed">' +
     '<div class="team-feed-filter">' + pills + '</div>' +
-    '<div class="team-feed-list">' + listHtml + '</div></div>';
+    '<div class="team-feed-list" role="log" aria-live="polite">' + listHtml + '</div></div>';
 }
 // Reopening always starts fresh from cursor={} (docs/spec.md "Edge cases":
 // "reopening it starts from cursor {} again ... rather than trying to

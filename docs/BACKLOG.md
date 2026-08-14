@@ -630,6 +630,26 @@ touches this area: render an explicit transient state for a `tool_use`
 event that's the buffer's own last lead event while `team.status` is
 still `running`, rather than assuming finish.
 
+**Status: A and B shipped, C partially shipped (2026-08-14).** A permanent
+regression test now covers the "already answered" escalation race branch;
+the ARIA attributes `docs/design.md` already specified (`role="log"`/
+`aria-live="polite"` on the event feed, `aria-pressed` on filter pills,
+`<fieldset>`/`<legend>` on the escalation options) are implemented and
+verified against real rendered markup. The transient-classification
+rendering for C was added but scoped narrowly to `team.status ===
+"running"`, matching this backlog item's own literal wording — the
+reviewer found and confirmed (adversarially tested, not just read) a
+structurally similar poll-boundary gap for `team.status === "blocked"`
+(a trailing empty-meta `tool_use` from the lead, no paired `tool_result`
+yet, while a **different** in-flight round's `ask_user` escalation has
+already flipped status to `blocked`): it still falls through to
+`'finish'`, the exact assumed-finish bug this cycle was meant to
+eliminate, just for a status this cycle didn't cover. Non-blocking (same
+"deliberately narrow scope, not an implementation defect" reasoning as
+the original C). **Shape of the follow-up fix:** widen the transient gate
+from `status === 'running'` to a general non-terminal check (e.g.
+`status !== 'finished' && status !== 'error'`) in a future cycle.
+
 ---
 
 ## 13. No in-app discoverability for a finished team's committed-but-unmerged branches

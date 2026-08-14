@@ -1,282 +1,253 @@
-# Implementation: test-infrastructure isolation (BACKLOG item 9)
+# Implementation: 6f part 2 follow-ups (BACKLOG item 12)
 
 ## Summary
-Two independent, test-only fixes. **A.** `tests/test_deploy_target.py`'s
-privileged fixture class now refuses to run against an orphaned
-`/home/deploy` directory (not just a live `deploy` user), and its
-`tearDown()` gained an unconditional `sudo rm -rf /home/deploy` backstop so
-a partial failure can never leave the directory behind for the next run.
-**B.** Every real (non-mocked) `team-<project>` tmux session name and the
-`switchboard-worktree-op-` sweep in `tests/test_teams_lifecycle.py` and
-`tests/test_team_routes.py` are now scoped to this process's own pid, and
-both files' `_kill_leftover_team_sessions()` sweeps were narrowed to only
-ever target this process's own scoped sessions — proven by actually running
-two full suites of both files concurrently in separate processes.
+Three independent, frontend-only fixes inside `app/app.py`'s already-shipped
+`teamRow()` non-idle branch (6f part 2), plus their permanent coverage in
+`tests/test_team_frontend.js`. **A.** Added a regression test for the
+"already answered" escalation race branch (`renderEscalationPanel()`'s
+`!cached.pending` branch), which was previously reachable/correct but
+untested. **B.** Added the ARIA attributes `docs/design.md`'s 6f part 2
+"Accessibility & platform notes" section specifies but that were never
+implemented: `role="log"`/`aria-live="polite"` on the event feed's list
+container, `aria-pressed` on each per-agent filter pill, and
+`<fieldset>`/`<legend>` around the escalation option group. **C.** Added a
+transient "pending classification" rendering state for the fact_check-vs-
+finish disambiguation's poll-boundary edge case: a `tool_use` event with
+empty `meta` that is the event buffer's own last lead-agent event, while
+`team.status === 'running'`, no longer renders as an assumed finish
+summary — it renders a distinct transient state until the paired
+`tool_result` or a terminal status arrives on a later poll.
+
+No Python file was touched (matches `docs/spec.md`'s Non-goals).
 
 ## Root cause
-Not applicable (test-infrastructure hardening, not a bugfix against a single
-reported symptom) — see `docs/spec.md` "Background" for the two defects this
-closes.
+Not applicable (three independently-diagnosed follow-up items recorded
+during 6f part 2's own review, not a bugfix against a single reported
+symptom) — see `docs/spec.md` "Background" for each item's own diagnosis.
 
 ## Changes by file
 
-- `tests/test_deploy_target.py`
-  - `InstallScriptDeployTargetBlockTests.setUp()`: skip guard now checks
-    `os.path.exists("/home/deploy")` in addition to the existing `id deploy`
-    check — either condition means the fixture isn't safely available.
-  - `InstallScriptDeployTargetBlockTests.tearDown()`: added an unconditional
-    `subprocess.run(["sudo", "rm", "-rf", "/home/deploy"])` immediately after
-    the existing `userdel -r deploy` call.
-  - Added `DeployTargetOrphanDetectionTests` (new class): constructs a
-    genuinely orphaned `/home/deploy` (real directory + stale
-    `authorized_keys`, no `deploy` account) and runs a real test method of
-    `InstallScriptDeployTargetBlockTests` through `unittest.TestCase.run()`
-    with a `unittest.TestResult`, asserting `result.skipped` has exactly one
-    entry mentioning `/home/deploy` — proves the class is genuinely
-    *skipped*, not that it happens to pass.
-  - Added `DeployTargetTearDownBackstopTests` (new class, **reworked once**
-    after review — see "Review fix" below): runs a real subclass of
-    `InstallScriptDeployTargetBlockTests` (inheriting its real, unmodified
-    `setUp`/`tearDown`) whose test body constructs `/home/deploy` directly
-    (no `useradd`, no `deploy` account created at all) and then deliberately
-    raises `RuntimeError`, through the same `TestCase.run()`/`TestResult`
-    mechanism (unittest always calls `tearDown()` after a failing test body
-    — standard library behavior, not reimplemented here), then asserts
-    `/home/deploy` no longer exists on disk.
+- `app/app.py`
+  - **Part A**: no production code change — the `!cached.pending` branch in
+    `renderEscalationPanel()` was already correct (added during 6f part 2,
+    confirmed by the reviewer with a targeted, uncommitted test at the
+    time); this cycle only adds its permanent test.
+  - **Part B**:
+    - `renderTeamFeed()`: the `.team-feed-list` div (the scrollable
+      container that actually gains new child rows on each poll — not the
+      outer `.team-feed` wrapper, which also holds the non-live filter row)
+      now carries `role="log" aria-live="polite"`.
+    - `renderTeamFeed()`'s filter-pill `map()`: each `<button>` now carries
+      `aria-pressed="true"`/`aria-pressed="false"` reflecting
+      `filter === a`.
+    - `renderEscalationPanel()`: the option group (the native
+      radio/checkbox `<label>` elements built into `optionsHtml`) is now
+      wrapped in `<fieldset class="team-escalation-options">` with a
+      `<legend class="team-escalation-question">` — see "Key decisions"
+      below for why the legend *replaces* the previously-separate
+      `.team-escalation-question` div rather than duplicating its text.
+    - New CSS: `.team-escalation-options` (border/margin/padding reset so
+      the fieldset doesn't introduce a visible box), `legend.team-
+      escalation-question` (padding reset, `display: block`, so it reads
+      identically to the div it replaced), `.team-feed-event.kind-pending-
+      classification` (dimmed/italic, matching the other `kind-*`
+      variants' styling convention).
+  - **Part C**:
+    - `teamFeedEventKindClass(e, leadEvents, status)`,
+      `teamFeedEventBody(e, leadEvents, status)`, and
+      `renderTeamFeedEvent(e, leadEvents, status)` all gained a third
+      `status` parameter (threaded from `renderTeamFeed()`'s own
+      `team.status`, its only caller).
+    - `teamFeedEventKindClass()`'s `tool_use`-with-empty-`meta` branch: when
+      there is no next lead event (`findNextLeadEvent()` returns `null`)
+      AND `e.agent === 'lead'` AND `status === 'running'`, the event now
+      classifies as `'pending-classification'` instead of falling straight
+      to `'finish'`. Every other combination (a next event exists, or the
+      status is any non-`'running'` value, or the event isn't the lead's
+      own) is unchanged.
+    - `teamFeedEventBody()`: `'pending-classification'` renders `'⋯
+      pending…'`.
 
-- `tests/test_teams_lifecycle.py`
-  - Added `_RUN_ID_SCOPE = f"p{os.getpid()}"` and a `_scoped(name)` helper
-    (`f"{name}-{_RUN_ID_SCOPE}"`), same technique
-    `tests/test_teams_headless.py`'s own `_RUN_ID_SCOPE`/`_SESSION_PREFIX`
-    already established.
-  - Every literal project name that becomes part of a real
-    `team-<project>` tmux session in a real-tmux test class now goes
-    through `_scoped(...)`: `demo`, `dirty`, `detached`, `nongit`, `demo2`,
-    `demo3`, `demo4`, `"demo with space"`, `proj`, `clidemo`, `atomicdemo`,
-    `failchain`, `failchain2`, `sessionrace`. Every corresponding literal
-    `"team-<name>"` assertion string was replaced with
-    `teamsmod._team_session_name(_scoped("<name>"))` (never reimplementing
-    the `team-` prefix in the test).
-  - `_kill_leftover_team_sessions()`: the sweep now only kills sessions
-    matching `name.startswith("team-") and name.endswith(f"-{_RUN_ID_SCOPE}")`
-    — the old unconditional `"team-"`/`"switchboard-"` prefix match is
-    removed entirely (see "Key decisions" below for why the
-    `"switchboard-"` branch was dropped rather than scoped).
-  - `RunRunUserCommandRealTmuxTests.test_no_leftover_session_or_rundir`
-    (found while proving the concurrency criterion by hand — see "Key
-    decisions"): now snapshots existing `switchboard-worktree-op-*`
-    sessions *before* its own `_run_run_user_command()` call and only
-    asserts no *new* ones appeared, instead of a blind post-hoc
-    `list-sessions` scan that would false-positive-fail in the presence of
-    a concurrent process's own, unrelated `switchboard-worktree-op-*`
-    session.
+- `tests/test_team_frontend.js`
+  - **Part A**: new test `'waiting_on_you true but a fresh /team/inbox
+    already reports pending:false renders "already answered", no form'`,
+    inserted between the existing `'escalated_max_rounds ... never fetches
+    /team/inbox'` and `'selecting a single-select option...'` tests. Drives
+    exactly the scenario `docs/spec.md` part A describes: `team.waiting_on_
+    you: true` (the cached `/status` read) followed by
+    `deliverTeamInbox(..., { pending: false })` (the real backend's own
+    exact response shape for a non-`blocked_ask_user` state — confirmed
+    against `app/app.py`'s `_handle_team_inbox()`). Asserts the "already
+    answered" copy renders, no `team-escalation-form`, and that it isn't
+    conflated with the separate fetch-failure copy.
+  - **Part B**: three new tests —
+    - `'the event feed list container carries role="log" and aria-
+      live="polite"'` — regex-asserts both attributes on the
+      `.team-feed-list` div specifically (not just present anywhere in the
+      row).
+    - `'per-agent filter pills carry aria-pressed, toggling true/false as
+      the selected pill changes'` — asserts the default "All" pill starts
+      `aria-pressed="true"` and "helper" starts `aria-pressed="false"`,
+      then calls `setTeamFeedFilter('proj', 'helper')` and re-asserts both
+      values flipped — the "toggle test" the spec's acceptance criteria
+      explicitly ask for, not just a static single-state check.
+    - `'the escalation option group is wrapped in <fieldset>/<legend>,
+      legend text is the question'` — regex-asserts a `<fieldset>` whose
+      `<legend>` text is the question, then slices the markup between
+      `</legend>` and `</fieldset>` and asserts the radio options are
+      inside that slice (not just present somewhere in the row).
+  - **Part C**: the pre-existing test `'a tool_use with empty meta and no
+    following lead event renders as the finish summary, not a fact_check
+    claim'` used `team.status: 'running'` — exactly the scenario this
+    cycle's new transient state now intercepts, so its old assertion
+    (`[Finish summary]`) would have become wrong under the new behavior.
+    Renamed to `'...renders as the finish summary once the run has ended'`
+    and its instance status changed to `'finished'` (a genuinely terminal
+    poll, where the disambiguation is unambiguous) — same assertions,
+    still passing, still exercising the same code path for the terminal
+    case. Three new tests added in its place for the running/transient
+    behavior:
+    - `'a trailing tool_use with empty meta renders a transient pending
+      state while team.status is still "running"'` — the exact scenario
+      the old test used to (mis)cover; asserts `kind-pending-
+      classification` renders and neither `[Finish summary]` nor
+      `fact_check:` appear.
+    - `'the transient pending state resolves to fact_check once the paired
+      tool_result arrives on a later poll'` — first poll shows the
+      transient state; a second `pollTeamFeed()` call delivers the paired
+      `tool_result` with `meta.found`; asserts the transient class is gone
+      and it resolves to the fact_check rendering.
+    - `'the transient pending state resolves to finish once a terminal
+      status arrives on a later poll'` — first poll (status `running`)
+      shows the transient state; a second `rerenderRow()` with status
+      `'finished'` (no new event) asserts the transient class is gone and
+      it resolves to `[Finish summary]`.
 
-- `tests/test_team_routes.py`
-  - Added `_PROJ = f"proj-{_RUN_ID_SCOPE}"`, `_PROJ_A = f"proj-a-{_RUN_ID_SCOPE}"`,
-    `_PROJ_B = f"proj-b-{_RUN_ID_SCOPE}"`, reusing the file's own existing
-    `_RUN_ID_SCOPE` (already defined for `switchboard-headless-*` scoping
-    from 6d part 2a's own follow-up).
-  - `_project(self, name=_PROJ)`'s default is now scoped, matching
-    `docs/spec.md`'s explicit callout.
-  - Every literal `"proj"` / `"proj-a"` / `"proj-b"` value used as a real
-    project directory name, dict key, or `/projects/<name>/...` URL segment
-    across every `_RealHTTPTeamTestCase` subclass and
-    `OrphanCheckSelfCorrectsForLiveCliRunTests` (both real-tmux) was
-    replaced with `_PROJ`/`_PROJ_A`/`_PROJ_B` (plain-string URLs converted
-    to f-strings where needed; already-f-string URLs had only the
-    `/projects/proj.../` segment substituted). `TeamThreadsLockTests`'
-    in-memory-dict-only tests (no tmux involved at all) were also updated
-    to `_PROJ` for internal consistency, though they don't strictly need
-    scoping.
-  - `_kill_leftover_team_sessions()`: same fix shape as
-    `test_teams_lifecycle.py` — `"team-"` matches now require
-    `.endswith(f"-{_RUN_ID_SCOPE}")`; the existing `_SESSION_PREFIX`
-    (`switchboard-headless-<scope>`) branch was already correctly scoped
-    and is unchanged.
-
-No changes to `app/teams.py` or any other production file.
+No changes to any Python file, any backend route, or any other frontend
+test file (`test_deploy_frontend.js`/`test_singleton_toggle_frontend.js`/
+`test_upload_frontend.js`).
 
 ## Key decisions / tradeoffs
 
-- **`_kill_leftover_team_sessions()`'s `"switchboard-"` branch was removed
-  entirely in `test_teams_lifecycle.py`, not scoped.** Its only real
-  purpose there is cleaning up `switchboard-worktree-op-*` sessions from
-  `_run_run_user_command()` (`app/teams.py`), but that function's `op_id`
-  is `f"{int(time.time())}-{secrets.token_hex(6)}"` — no per-process token
-  to scope a sweep by safely, and it's production code this cycle must not
-  touch. `_run_run_user_command()` already self-cleans its own session
-  unconditionally in its own `finally` block (verified by reading
-  `app/teams.py:3049-3052`), so a defensive sweep for it in the test file
-  was unsafe-for-concurrency and, on inspection, redundant for the normal
-  case. `test_team_routes.py`'s own `_kill_leftover_team_sessions()` already
-  had a correctly-scoped `_SESSION_PREFIX` branch for
-  `switchboard-headless-*` (from a prior cycle), which was left untouched.
-- **`RunRunUserCommandRealTmuxTests.test_no_leftover_session_or_rundir` was
-  additionally hardened** beyond what `docs/spec.md`'s "Proposed approach"
-  literally enumerates. Found by directly constructing the acceptance
-  criterion's own scenario (planting a fake foreign
-  `switchboard-worktree-op-*` session and running the file's tests): the
-  sweep itself correctly left the foreign session untouched, but this
-  *unrelated* test's own blind `list-sessions` + prefix-filter assertion
-  false-positive-failed in its presence (a read, not a kill, so it doesn't
-  violate the "sweep must not touch others" criterion, but it does mean
-  the file's tests wouldn't all pass cleanly next to a concurrent process,
-  which is the spirit of the criterion). Fixed with a before/after
-  baseline diff instead of an absolute scan. This is judgment applied
-  in the same file/area the spec already names, not new scope.
-- **`_PROJ`/`_PROJ_A`/`_PROJ_B` chosen over per-test-method local variables**
-  in `test_team_routes.py`. Given ~140 call sites across the file, module-
-  level constants (computed once from `_RUN_ID_SCOPE`, already
-  process-scoped) kept the diff a mechanical, uniform substitution rather
-  than restructuring every test method to compute and thread through a
-  local scoped name.
-- **A few substitutions landed slightly wider than the strict minimum**
-  (e.g., `ValidateProjectForTeamRealGitTests`/`CreateRemoveWorktreeRealGitTests`
-  in `test_teams_lifecycle.py`, which touch real git but never a real
-  `team-<project>` tmux session, and `TeamThreadsLockTests` in
-  `test_team_routes.py`, an in-memory-dict-only test). These were included
-  because the exact-substring replacements (`os.path.join(self.tmp,
-  "proj")`, `"proj"`) are identical regardless of which test class uses
-  them, and scoping them is harmless (no assertion depends on the specific
-  unscoped literal) while keeping the mechanical substitution simple and
-  exhaustive rather than hand-carving exclusions.
+- **The `aria-checked` ambiguity (`docs/spec.md` part B) resolves to: it
+  does not apply anywhere in this codebase's current markup.**
+  `docs/design.md`'s "Accessibility & platform notes" section says:
+  *"Filter pills should be `<button>` or `<input type="radio">` with
+  `aria-pressed="true"` / `aria-checked="true"` for selected pill."* This
+  single sentence pairs the two attributes with the two *alternative*
+  implementations of the *same* element (filter pills) — `<button>` →
+  `aria-pressed`, `<input type="radio">` → `aria-checked` — not two
+  different elements. `app/app.py`'s `renderTeamFeed()` already renders
+  filter pills as `<button class="team-feed-pill">` (confirmed by reading
+  the code before making any change), so `aria-pressed` is the attribute
+  that applies, which part B's own preceding bullet already calls out
+  explicitly ("`aria-pressed` ... on each per-agent filter pill button").
+  Separately, the escalation panel's own options are native
+  `<input type="radio">`/`<input type="checkbox">` elements (confirmed in
+  `renderEscalationPanel()`) — but design.md's escalation-specific
+  guidance ("Escalation form: `<fieldset>` for radio/checkbox groups with
+  `<legend>` for the question") never mentions `aria-checked` for them,
+  and native form controls' `checked` DOM property is already exposed to
+  assistive tech without a redundant `aria-checked` attribute (standard
+  ARIA authoring-practices guidance: don't add ARIA state attributes that
+  duplicate what a native control's own semantics already convey). So
+  `aria-checked` was not added anywhere — `aria-pressed` on the button
+  pills and `<fieldset>`/`<legend>` on the native option group are the
+  complete, correct implementation of design.md's own text as written.
+
+- **The escalation panel's `<legend>` *replaces* the previously-separate
+  `.team-escalation-question` div, rather than duplicating its text.**
+  `docs/spec.md` part B leaves the legend's exact placement to the
+  developer ("developer's call, document the choice"). Rendering the
+  question both as a plain, visible div *and* again as the fieldset's
+  legend would have produced two visually-identical lines stacked on top
+  of each other. Instead, the `<legend class="team-escalation-question">`
+  element now *is* the visible question line (same class, same text, same
+  visual position — CSS resets the browser's default fieldset border/
+  padding and legend padding so the rendered layout is pixel-identical to
+  before), and the old separate div was removed. This keeps exactly one
+  visible question line while still giving the option group a
+  screen-reader-visible association with the question via `<legend>`.
+
+- **The transient "pending classification" state is gated on
+  `e.agent === 'lead'` in addition to `!next` and `status === 'running'`.**
+  `docs/spec.md`'s own acceptance criterion wording is specifically about
+  "the buffer's own last **lead-agent** event" — `findNextLeadEvent()`
+  already only searches `leadEvents` (pre-filtered to `agent === 'lead'`),
+  so for a non-lead event `indexOf(e)` returns `-1` and `next` is always
+  `null` regardless of position, which without the explicit agent guard
+  would have made teammates' own (hypothetical) empty-`meta` `tool_use`
+  events also flicker through the transient state. The guard keeps every
+  non-lead event's classification byte-for-byte unchanged from before this
+  cycle (falls straight to `'finish'`, same as always) and confines the
+  new behavior to exactly the scenario the spec describes.
+
+- **Copy for the transient state (`'⋯ pending…'`) is a developer choice, not
+  literally specified.** `docs/spec.md` part C describes the target
+  behavior as "a transient '…' / pending-classification state" without
+  committing to exact wording. A bare ellipsis alone seemed too cryptic for
+  a log line a human operator is reading in real time; `'⋯ pending…'` keeps
+  the visual "still working" cue while being self-explanatory, and its own
+  `kind-pending-classification` CSS class (dimmed, italic) visually
+  distinguishes it from both the eventual fact_check and finish renderings
+  it resolves into.
 
 ## Deviations from spec
-None. Both fixes match `docs/spec.md`'s "Proposed approach" section; the
-`test_no_leftover_session_or_rundir` hardening above is an extension found
-while proving the spec's own acceptance criteria, in the same file/function
-the spec already names, not a new area of scope.
-
-## Review fix: `DeployTargetTearDownBackstopTests` didn't actually prove the
-backstop line (post-review rework)
-
-**Finding (not disputed).** The reviewer reverted only the new
-`sudo rm -rf /home/deploy` backstop line (keeping the pre-existing
-`userdel -r deploy` call intact) and reran
-`DeployTargetTearDownBackstopTests` — it still passed. Root cause: the
-test's forced-failure scenario always ran *after* a fully successful
-`useradd deploy` (via `run_block()`), so the pre-existing `userdel -r
-deploy` already removed `/home/deploy` as an ordinary side effect of
-removing the account (typical `useradd -m`/`userdel -r` behavior), entirely
-independent of whether the new backstop line existed. The test's own
-docstring claim that "only `tearDown()`'s own unconditional backstop is
-what can remove it" was not actually true for the scenario it constructed.
-
-**Fix.** Reworked the test body's fixture-construction step so it no longer
-calls `run_block()` (which runs a real `useradd deploy`) at all. Instead it
-constructs the orphan shape directly — `sudo mkdir -p /home/deploy/.ssh` +
-a stale `authorized_keys` — the exact same shape
-`DeployTargetOrphanDetectionTests` already uses above it in this file, with
-no `deploy` account ever created. With no matching account, the inherited
-`tearDown()`'s pre-existing `sudo userdel -r deploy` call fails as a no-op
-(nothing to delete), so only the new, explicit `sudo rm -rf /home/deploy`
-backstop line can be what removes the directory. The test's own body
-asserts `id deploy` is non-zero (no account) before raising, so the
-scenario's shape is verified, not just assumed.
-
-**Revert-and-fail proof (the same check the reviewer used), re-run in this
-session:**
-1. Confirmed the host was clean beforehand (`sudo test -e /home/deploy` →
-   absent, `id deploy` → no such user).
-2. Temporarily reverted only the `subprocess.run(["sudo", "rm", "-rf",
-   "/home/deploy"])` backstop line in `InstallScriptDeployTargetBlockTests
-   .tearDown()` (kept the pre-existing `userdel -r deploy` call intact) and
-   ran `python3 -m unittest
-   tests.test_deploy_target.DeployTargetTearDownBackstopTests -v`:
-   ```
-   FAIL: test_teardown_backstop_removes_home_deploy_after_a_forced_mid_test_failure
-   AssertionError: True is not false : tearDown's backstop must remove
-   /home/deploy even when no 'deploy' user ever existed for userdel -r to
-   clean it up as a side effect
-   Ran 1 test in 0.048s
-   FAILED (failures=1)
-   ```
-   The test now genuinely fails without the backstop line — proving it's
-   the thing being tested.
-3. Manually removed the leftover `/home/deploy` this proof run left behind
-   (the reverted tearDown had no way to clean it up, by design), restored
-   the backstop line, and reran the same command:
-   ```
-   test_teardown_backstop_removes_home_deploy_after_a_forced_mid_test_failure ... ok
-   Ran 1 test in 0.055s
-   OK
-   ```
-   Confirmed the working tree diff round-tripped back to exactly the
-   restored version (`diff` against a pre-revert backup produced no
-   output).
-
-**Full-suite re-verification after the fix**, host confirmed clean
-(`/home/deploy` absent, no `deploy` user) before and after:
-```
-python3 -m unittest tests.test_deploy_target -v      # 32/32 OK
-python3 -m unittest discover -s tests                # 792/792 OK (unchanged
-                                                       # — this cycle only
-                                                       # reworked one
-                                                       # existing test's
-                                                       # internals, no
-                                                       # tests added/removed)
-node tests/test_singleton_toggle_frontend.js          # 15/15
-node tests/test_upload_frontend.js                    # 8/8
-node tests/test_team_frontend.js                       # 52/52
-node tests/test_deploy_frontend.js                     # 9/9
-```
-No regressions. No production code touched.
+None. All three pieces match `docs/spec.md`'s "Proposed approach" as
+written; the `aria-checked` ambiguity was resolved by reading
+`docs/design.md`'s exact wording as instructed (see "Key decisions" above),
+not by guessing or re-designing.
 
 ## Known limitations
-- `tests/test_deploy_target.py`'s `PrivilegedEndToEndTests` class (a
-  *different* class from the one this cycle fixes) uses a fixed, unscoped
-  system username (`TEST_USER = "aidswbtest"`) and is **not** safe to run
-  concurrently across two processes — confirmed directly: running
-  `test_deploy_target.py` in two simultaneous processes produces real SSH/
-  rsync failures there from the two processes racing the same system
-  account. This is out of scope for this cycle (`docs/spec.md`'s
-  concurrency acceptance criterion names only
-  `tests/test_team_routes.py`/`tests/test_teams_lifecycle.py`; the
-  `PrivilegedEndToEndTests` username shape is a pre-existing, separate
-  condition this spec's "Non-goals" doesn't ask this cycle to fix).
-- The orphan-detection fix in `InstallScriptDeployTargetBlockTests.setUp()`
-  still only guards against `/home/deploy` specifically — a differently
-  named leftover (e.g. a stale sudoers file with no `/home/deploy`) is not
-  detected, matching `docs/spec.md`'s own scope (directory presence, not a
-  general leftover-state scan).
+- The transient `'pending-classification'` state is only reachable in a
+  real, un-mocked deployment during the sub-millisecond-to-4-second window
+  `docs/spec.md`'s own "Background" describes (the lead's `tool_use` and
+  paired `tool_result` transcript entries are written synchronously,
+  sub-millisecond apart, relative to the 4s poll cadence) — this cycle
+  does not (and per `docs/spec.md`'s Non-goals, is not asked to) make that
+  window provably unreachable; it only ensures it renders correctly *if*
+  hit, which the new tests construct directly rather than relying on
+  timing to reproduce.
+- No visual/screen-reader manual smoke test was performed (e.g. an actual
+  screen reader announcing the `aria-live="polite"` region, or a real
+  browser rendering the reset `<fieldset>`/`<legend>` box model) — coverage
+  here is markup-presence assertions against the real rendered `<script>`,
+  the same technique and the same level of rigor every other test in this
+  file already uses; a full manual accessibility audit is out of this
+  cycle's scope per `docs/spec.md`'s Non-goals ("this cycle implements
+  [design.md's] spec, it doesn't design new UI").
 
 ## How to verify locally
 
-Part A (orphan detection + backstop), single process:
+Frontend tests (this cycle's own):
 ```
-python3 -m unittest tests.test_deploy_target -v
+node tests/test_team_frontend.js
 ```
-`DeployTargetOrphanDetectionTests` and `DeployTargetTearDownBackstopTests`
-require passwordless `sudo` (same gate as the rest of the file) and
-construct/remove a real `/home/deploy` directory.
+Expect `ALL PASS (59/59)` (52 baseline + 1 for part A + 3 for part B + 3 for
+part C, replacing 1 renamed test — net +7).
 
-Part B concurrency proof (the actual regression test for the reported
-problem — must be two separate processes, not sequential):
+Full Node suite (no regressions in the other three files, all unchanged):
 ```
-python3 -m unittest tests.test_teams_lifecycle tests.test_team_routes -v &
-python3 -m unittest tests.test_teams_lifecycle tests.test_team_routes -v &
-wait
-```
-Both must print `OK` with zero failures/errors, and `tmux list-sessions`
-afterward must show no leftover `team-*`/`switchboard-*` sessions from
-either run.
-
-Part B sweep-safety proof (a concurrent process's own sessions must survive
-this file's tearDown sweep):
-```
-tmux new-session -d -s "switchboard-worktree-op-9999999999-deadbeef0000" "sleep 60"
-tmux new-session -d -s "team-otherproj-p9999999" "sleep 60"
-python3 -m unittest tests.test_teams_lifecycle -q
-tmux list-sessions   # both planted sessions must still be listed
-tmux kill-session -t "switchboard-worktree-op-9999999999-deadbeef0000"
-tmux kill-session -t "team-otherproj-p9999999"
-```
-
-Full regression suite:
-```
-python3 -m unittest discover -s tests -v   # expect 792 tests, OK (790 baseline + 2 new)
-node tests/test_singleton_toggle_frontend.js   # 15/15
-node tests/test_upload_frontend.js             # 8/8
-node tests/test_team_frontend.js               # 52/52
 node tests/test_deploy_frontend.js             # 9/9
+node tests/test_singleton_toggle_frontend.js    # 15/15
+node tests/test_team_frontend.js                # 59/59
+node tests/test_upload_frontend.js              # 8/8
+```
+Total: 91/91 (baseline 84 + 7 new).
+
+Full Python suite (untouched by this cycle, re-run to confirm no
+regression):
+```
+python3 -m unittest discover -s tests   # 792/792 OK, unchanged
+```
+
+Manual spot-check of the real rendered markup (this project's established
+extract-and-inspect technique, same one every test in `test_team_
+frontend.js` already uses under the hood):
+```
+TOTP_SECRET=JBSWY3DPEHPK3PXP python3 -c "
+import sys; sys.path.insert(0, 'app')
+import app as appmod
+print(appmod.render_page())
+" | grep -o 'role="log"[^>]*aria-live="polite"'
 ```
