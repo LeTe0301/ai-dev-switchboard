@@ -2553,3 +2553,76 @@ print(app.smoke_check_run('some-project', 'expected text'))
 # Confirm {'ok': True, 'status_code': 200, 'elapsed_ms': <int>,
 # 'content_ok': True|False} against a real locally running dev server.
 ```
+
+# Implementation: fix pre-existing `tests/test_deploy_frontend.js` regression from item 13
+
+## Summary
+`tests/test_deploy_frontend.js`'s `setupCase()` now drains the unconditional
+`/projects/<name>/team/branches` fetch that backlog item 13's
+`renderTeamBranches()` fires as a side effect of rendering any
+`kind='inst'` row, mirroring the exact technique already proven this
+session in `tests/test_smoke_check_frontend.js::setupCase()` (added during
+item 18). This clears the "Known limitations" item flagged in item 18's
+own implementation entry above — 4/9 previously-failing cases now pass,
+with no assertion loosened.
+
+## Root cause
+Backlog item 13 (PR #8) added an unconditional, one-time-per-project
+`fetchTeamBranches()` call inside `teamRow()`'s render path, fired for
+every `kind='inst'` row regardless of that project's own `on`/`url`/
+`deploy` fields. `tests/test_deploy_frontend.js`'s `setupCase()` helper
+predates that change and never drains the resulting
+`/projects/<name>/team/branches` fetch, so it sat in `pendingFetches`
+polluting every subsequent `assert.strictEqual(c.pendingFetches.length, ...)`
+assertion in the 4 dispatch-flow tests that check exact pending-fetch
+counts/URLs right after `doDeploy(...)`.
+
+## Changes by file
+- `tests/test_deploy_frontend.js` — `setupCase()`: after the real
+  `refresh()` call resolves, drain any pending
+  `/projects/<name>/team/branches` fetch per instance (resolving it with
+  an empty array, matching the same team-branches shape used elsewhere),
+  before returning the case to the calling test. Comment mirrors
+  `test_smoke_check_frontend.js::setupCase()`'s own explanation verbatim
+  in substance.
+
+## Key decisions / tradeoffs
+- Copied the sibling file's technique exactly (same drain loop shape,
+  same comment content) rather than inventing a different fix, per the
+  spec's explicit instruction and the orchestrator's right-sizing rule
+  (mechanical repeat of an already-proven technique).
+- Kept the added `await tick()` calls immediately before and after the
+  drain loop, matching `test_smoke_check_frontend.js`'s own ordering,
+  since the fetch is dispatched synchronously during `teamRow()`'s render
+  pass triggered by `refresh()`'s promise but the pending-fetch array
+  should be quiesced before returning control to each test.
+
+## Deviations from spec
+None. The fix is scoped exactly as the spec described: drain the extra
+fetch in `setupCase()`, don't touch any of the 9 existing test bodies or
+their assertions.
+
+## Known limitations
+None new. This closes out the "Known limitations" entry recorded in the
+item 18 implementation section above.
+
+## How to verify locally
+```
+node tests/test_deploy_frontend.js
+# ALL PASS (9/9)
+
+node tests/test_team_frontend.js
+# ALL PASS (94/94)
+
+node tests/test_smoke_check_frontend.js
+# ALL PASS (10/10)
+
+node tests/test_clone_frontend.js
+# ALL PASS (8/8)
+
+node tests/test_singleton_toggle_frontend.js
+# ALL PASS (15/15)
+
+node tests/test_upload_frontend.js
+# ALL PASS (8/8)
+```
