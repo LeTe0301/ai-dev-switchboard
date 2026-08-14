@@ -1790,6 +1790,105 @@ def fact_check(claim: str, grounding: dict, *,
     return {"claim": claim, "found": bool(matches), "matches": matches}
 
 
+# ─── AI merge-request reviewer (backlog item 8, docs/spec.md) ──────────────
+# One bounded, one-shot call per PR (diff + grounding digest in, review text
+# out) -- not a lead-loop tool, no board_read/board_write/ask_user, no
+# tier-driven behavior (see docs/spec.md "Why roster tiers don't matter
+# here"). Driven entirely from app.py's Gitea poll extension; this module
+# only supplies the model-call primitive.
+
+_AI_REVIEWER_SYSTEM = (
+    "You are an AI code reviewer for a pull request. Give short, specific, "
+    "comment-only advisory feedback grounded in the project's own documented "
+    "conventions. You have no authority to block, approve, or merge -- never "
+    "phrase anything as if you do."
+)
+
+
+def _build_review_prompt(pr_title: str, pr_body: str, diff_text: str, diff_truncated: bool,
+                         digest: str) -> str:
+    """Pure string-builder, no I/O -- unit-testable directly. Role framing +
+    the grounding digest verbatim + the (possibly-truncated) diff + an
+    explicit truncation notice when diff_truncated + output-format
+    instructions (docs/spec.md "teams.review_pr_diff()")."""
+    truncation_note = (
+        "\n(Note: this diff was truncated before being sent to you -- some "
+        "changes may not be reflected below. Do not claim the diff is "
+        "complete.)\n" if diff_truncated else ""
+    )
+    return (
+        "You are reviewing a pull request for consistency with this "
+        "project's own documented conventions -- not a general code "
+        "review. Use the project grounding digest below (its own "
+        "auto-discovered docs) as your source of truth for what "
+        "\"consistent\" means here.\n\n"
+        f"## Project grounding\n{digest}\n\n"
+        f"## Pull request\nTitle: {pr_title}\n\n"
+        f"Description:\n{pr_body}\n"
+        f"{truncation_note}\n"
+        f"## Diff\n{diff_text}\n\n"
+        "Write a short markdown review: a brief overall assessment, then "
+        "specific observations citing the relevant file/hunk. This is "
+        "comment-only advisory feedback -- never phrase anything as "
+        "blocking, approving, requesting changes, or merging; you have no "
+        "authority to do any of those."
+    )
+
+
+def review_pr_diff(model: dict, workdir: str, pr_title: str, pr_body: str,
+                   diff_text: str, diff_truncated: bool) -> dict:
+    """{"ok": True, "text": <review markdown>} or {"ok": False, "error": "..."}.
+
+    `workdir` is the project's REAL directory (PROJECTS_DIR/<name>) -- read
+    only via load_grounding()'s already read-only-guaranteed path (6b's
+    monkeypatch + AST scan already prove nothing under that call path can
+    write). For an `engine`-kind model, `workdir` is used ONLY to build the
+    grounding digest -- the reviewing engine itself is never pointed at it
+    (see below).
+    """
+    digest = load_grounding(workdir)["digest"]
+    prompt = _build_review_prompt(pr_title, pr_body, diff_text, diff_truncated, digest)
+
+    if model.get("kind") == "ollama":
+        payload, err = _tier1_call_with_retry(
+            TEAM_LLM_BASE_URL, model["name"], system=_AI_REVIEWER_SYSTEM, user=prompt,
+            tools=[], timeout=TEAM_LLM_TIMEOUT_SECONDS,
+            retry_budget=TEAM_LLM_TRANSPORT_RETRY_BUDGET)
+        if err:
+            return {"ok": False, "error": err}
+        return {"ok": True, "text": _tier1_raw_text(payload)}
+
+    # kind == "engine": the reviewing engine is NEVER given the project's
+    # real working copy. This is the load-bearing safety property of this
+    # whole feature (docs/spec.md) -- a freshly created, RUN_USER-owned
+    # throwaway scratch directory, unconditionally deleted afterward, so
+    # even a rogue/over-eager headless invocation that ignores its
+    # instructions and tries to edit files can only ever touch a directory
+    # that's gone seconds later. No worktree, no branch, no risk to the
+    # real project checkout.
+    scratch = os.path.join(TEAM_STATE_DIR, "_ai_reviewer_scratch", secrets.token_hex(8))
+    os.makedirs(TEAM_STATE_DIR, exist_ok=True)
+    os.chmod(TEAM_STATE_DIR, 0o711)  # same "don't rely on SVC_USER's ambient
+                                      # umask" discipline agent_run()'s own
+                                      # rundir/prompt-file chmods already use
+                                      # -- RUN_USER's mkdir -p below needs to
+                                      # be able to cd into this directory.
+    mk = _run_run_user_command(["mkdir", "-p", scratch], cwd=TEAM_STATE_DIR)
+    if not mk["ok"]:
+        return {"ok": False,
+                "error": mk.get("error") or "failed to create review scratch directory"}
+    try:
+        try:
+            result = agent_run(model["name"], scratch, prompt, timeout=TEAM_HEADLESS_TIMEOUT_SECONDS)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        if not result.get("ok"):
+            return {"ok": False, "error": result.get("error") or "engine review failed"}
+        return {"ok": True, "text": result.get("text", "")}
+    finally:
+        _run_run_user_command(["rm", "-rf", scratch], cwd=TEAM_STATE_DIR)
+
+
 # ─── roster + lead loop (backlog item 6c; docs/spec.md, docs/story.md §4) ──
 # Every headless-eligible engines.d entry plus one configured Ollama model,
 # each tagged with a lead-adapter tier (1 native tool-calling / 2 schema-
