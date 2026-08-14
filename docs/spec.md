@@ -1,490 +1,531 @@
-# Spec: Backlog item 19 part 1 — interject a free-form message into a running team (backend)
+# Spec: Backlog item 19 part 2 — chat-UI-facing surface for interjecting into a running team
 
 ## Summary
-Give a human a third lever on a live team run — alongside answering a
-pending `ask_user`/`board_write` and stopping the team outright — to inject
-an unsolicited free-text message to the **lead** while it keeps running,
-delivered on the same round-boundary checkpoint the existing `cancel_event`
-mechanism already uses, recorded through a new per-run `human.jsonl` file
-merged into the existing `GET .../team/events` feed exactly like a
-teammate's own log is today. This is backend + CLI only — the chat-bubble
-UI (a compose box, "human" as a feed identity/filter pill) is a separate,
-sequential part 2 feature cycle once this lands (see "Non-goals").
+Add the human-facing presentation and interaction layer on top of item 19
+part 1's already-shipped backend (`teams.interject()`, `POST
+/projects/<name>/team/interject`, `human.jsonl` merged into `GET
+.../team/events` as `agent="human"`/`kind="message"`): a per-project compose
+box + Send control on the Teams row, a distinct (not full chat-bubble) row
+treatment for human messages in the existing merged event feed, and explicit,
+reasoned handling of the compose box's interaction with a live
+`blocked_ask_user`/`blocked_board_write` escalation panel and with part 1's
+two length/byte constants. This is front-end-only (`app/app.py`'s inline
+HTML/CSS/JS) — no `app/teams.py` change, no new route, no new data shape.
 
 ## Goals
-- A new `teams.interject(run_id, text) -> dict` function, following
-  `resolve_ask_user()`'s exact `{"ok": True, ...}` /
-  `{"ok": False, "error": ...}` shape, that queues a human message for a
-  run without touching `run.json` from the calling (request) thread.
-- The lead loop (`team_step()`) drains any queued messages as the very
-  first thing it does each round, before calling the lead at all — cheaper
-  than the existing `cancel_event` checkpoint, and delivered to the lead as
-  the round history's own `last_entry` (full text shown), reusing
-  `_round_context()` unchanged.
-- `POST /projects/<name>/team/interject` (web route) and `team-interject`
-  (CLI subcommand), both thin wrappers, mirroring `/team/resolve` /
-  `team-resolve`'s existing shape.
-- The message appears in `GET .../team/events` tagged `"agent": "human"`,
-  `"kind": "message"` — a kind already rendered generically by the existing
-  frontend (`teamFeedEventBody()`'s `e.kind === 'message'` branch,
-  `app/app.py`) even before part 2's dedicated styling lands.
-- Never races with, or is silently dropped by, the background driving
-  thread's own `_persist(state)` calls — the concrete correctness concern
-  the backlog flags, resolved architecturally (see "Proposed approach"),
-  not by adding locking around the existing single-writer `run.json`.
+- A textarea + "Send" control on the Teams page, per project, that posts a
+  free-text message via the already-shipped `POST .../team/interject`,
+  visible exactly when the backend would actually accept it (`running`,
+  `blocked_ask_user`, `blocked_board_write` — not `idle`/`finished`/
+  `error`/`escalated_max_rounds`), reusing the existing TOTP-retry (`toggle`/
+  `actionPath`/`actionBody`/`handleActionResult`) machinery `team-resolve`/
+  `team-board-resolve` already established, not a new gating mechanism.
+- Human (`agent==="human"`, `kind==="message"`) events get their own,
+  visually distinct row treatment in the existing merged log-list feed — a
+  new CSS classification, not a redesign of the feed into chat bubbles (see
+  "Proposed approach" §2 for why).
+- The compose box and the escalation panel (when `waiting_on_you`) render
+  and function simultaneously — matches part 1's own explicit "allowed while
+  blocked" design, restated and made visible in the UI rather than assumed.
+- `TEAM_INTERJECT_MAX_CHARS` (2000) is enforced client-side before the
+  request is even sent: a live character counter, and Send disabled while
+  empty or over limit — mirroring, and going one step further than,
+  `team-resolve`'s existing submit-time-only check.
+- Answer backlog item 19's own "purely visual restyling... or a chat-bubble
+  reskin?" question concretely, in this spec, not left for `ux-designer` to
+  re-litigate (see "Proposed approach" §2 and "Open questions").
 
 ## Non-goals
-- **Chat-bubble UI** (compose box, dedicated "human" filter pill, bubble
-  styling/alignment) — part 2, a separate feature cycle once this backend
-  lands. `docs/BACKLOG.md`'s own "purely visual restyling... or a
-  differently-shaped event envelope?" question is answered here: **no new
-  envelope shape** — `kind="message"`/`agent="human"` reuses 6f's existing
-  `{ts, agent, seq, kind, text, meta}` shape and cursor-polling mechanism
-  verbatim (see "Proposed approach").
-- **Messaging a specific teammate directly**, bypassing the lead. The
-  four-tool lead loop has no concept of an inbound message at all today,
-  delegation is a synchronous blocking call the lead itself initiates
-  (`agent_run()` in `team_step()`'s `delegate` branch), and none of the
-  roster's engines are wired for genuine two-way mid-turn stdio here (6d's
-  own research doc noted Claude Code's `--input-format stream-json` COULD
-  support this, but nothing in this codebase uses it). Every interjection
-  goes to the lead only, exactly like `ask_user`/`board_write` are
-  lead-only concepts. A future increment could revisit direct-to-teammate
-  messaging; not attempted here.
-- **True mid-tool-call interruption.** "Interrupt at any point" is
-  delivered at the same granularity `cancel_event` (stop) already uses
-  today — the top of `team_step()`, before the lead is called, and (for
-  `cancel_event` specifically, unchanged by this spec) also right after the
-  lead call returns and right after a `delegate` call returns. There is no
-  mechanism to inject text into an **in-flight** `agent_run()` subprocess
-  (a delegate call already underway, or the lead's own call already in
-  flight) — a message posted mid-delegate sits queued and is delivered at
-  the very next round boundary, after that delegate call finishes. See
-  "Open questions" for why this is the deliberate scope, not a shortfall.
-- Editing/withdrawing an already-queued-but-not-yet-delivered interjection.
-- Any change to `ask_user`/`board_write`/`stop_team()`'s own existing
-  behavior.
+- **No `app/teams.py` or route change of any kind.** All backend plumbing
+  (`interject()`, the route, `human.jsonl`, the `GET .../team/events` merge)
+  already shipped in part 1 (`backlog/team-chat-interrupt-19`, already
+  merged into this branch). This part touches `app/app.py`'s front-end code
+  only.
+- **No full chat-bubble redesign of the merged event feed.** Decided, not
+  deferred (see "Proposed approach" §2): the feed carries structured,
+  multi-party, mostly non-conversational content (fact-check match arrays,
+  board-write diffs, terminal-escalation banners, delegate handoffs) across
+  more than two participants (lead + N teammates + human) — a bubble/
+  alignment layout doesn't fit that shape and would put 6f part 2's existing
+  `role="log"`/`aria-live="polite"` accessibility contract at risk for no
+  functional gain. Human messages get a distinct row style within the
+  existing log-list instead.
+- **No Enter-to-send keybinding.** Every other multi-line free-text input in
+  this app (`task-<name>` textarea, the escalation "Other" textarea) is
+  submitted only via an explicit button click; adding chat-style
+  Enter-to-send here alone would be a one-off inconsistency, not a real
+  requirement of the backlog item.
+- **No UI control tied to `TEAM_HUMAN_MSG_MAX_BYTES_PER_ROUND`.** Decided,
+  not an oversight (see "Proposed approach" §4) — it bounds a server-side
+  per-round *drain* of already-queued messages into the lead's visible
+  history, not any single message's size, and has no effect on when a
+  posted message becomes visible in the human-facing feed (`human.jsonl` is
+  merged into `GET .../team/events` directly and independently of
+  `team_step()`'s own drain timing). There is nothing meaningful to
+  pre-validate against client-side.
+- **No live server-exposed value for `TEAM_INTERJECT_MAX_CHARS`.** The
+  client hardcodes `2000` (the documented default), exactly mirroring
+  `team-resolve`'s own existing hardcoded-`2000` precedent
+  (`doTeamResolve()`, `app/app.py:3339`) rather than introducing a new
+  config-fetch mechanism nothing else in this app has. If the env var is
+  ever overridden, the client-side guard drifts out of sync with the
+  server's actual limit — an existing gap class this spec is consistent
+  with, not a new one, and not fixed here (server-side validation is still
+  authoritative and always wins).
+- **No double-submit / in-flight Send-disable protection beyond what other
+  actions in this app already have.** No existing action button (Submit
+  answer, Approve/Reject, Stop team) disables itself while its own POST is
+  in flight; `teams.interject()`'s append-only semantics make a duplicate
+  rapid double-click benign (two queued messages, no corruption) — not
+  introducing a new pattern for this one control alone.
+- **No messaging a specific teammate directly, editing/withdrawing a sent
+  message, or true mid-tool-call interruption** — all already out of scope
+  per part 1's own "Non-goals"; restated here only because they're the kind
+  of thing "chat UI" framing could otherwise imply. The UI has exactly one
+  compose box, addressed to the lead only, matching the one channel
+  (`human.jsonl`) that exists.
 
 ## Background / current state
-- `app/teams.py`'s lead loop (`team_run()` → `team_step()`) has exactly
-  four/six tools the LEAD can call (`_LEAD_TOOL_NAMES`,
-  `app/teams.py:1900`); there is no tool or mechanism for the human to push
-  something INTO the loop except answering a pending `ask_user`
-  (`resolve_ask_user()`, `app/teams.py:4144`) or `board_write`
-  (`resolve_board_write()`, `app/teams.py:4244`) — both of which only apply
-  when the run is already `blocked_*` (the driving thread has already
-  exited `team_run()`'s loop and returned). Both share one hardened
-  race-safety shape, evolved across three real, found-live races (see that
-  function's own docstring): state is always reloaded fresh from disk,
-  `os.replace()` on `inbox.json`/`inbox.resolved.json` is the sole atomic
-  arbiter of "who won," and history/transcript are only appended AFTER that
-  replace succeeds.
-- The one other human lever, `stop_team()` (`app/teams.py:3814`), is
-  unconditional and terminal — it doesn't feed anything back into the
-  loop, it ends the run.
-- `cancel_event` (a `threading.Event`, backlog item 6d part 2a) is the
-  existing precedent for "the human did something, and a live background
-  driving thread needs to notice it soon, safely." It's checked at three
-  points: top of `team_run()`'s loop, right after `_call_lead()` returns
-  inside `team_step()`, and right after a `delegate` branch's own
-  `agent_run()` call returns — see `team_step()`'s own docstring
-  (`app/teams.py:2910`) for why those three points and not others. It sets
-  status, appends one history entry, and persists — a genuine stop, not a
-  message.
-- `_run_team_in_background()` (`app/app.py:1813`) spawns one daemon thread
-  per live run, keyed by project name in `_team_threads` (guarded by
-  `_team_threads_lock`). That thread holds its own **in-memory** `state`
-  dict across an entire round — which, for a `delegate` round, can be
-  minutes long (a real `agent_run()` call) — and calls `_persist(state)`
-  (a full `run.json` overwrite, `app/teams.py:2703`) only at round
-  boundaries. `mark_run_error()`'s own docstring (`app/teams.py:3881`)
-  states this project's already-accepted tradeoff plainly: "no lock on
-  `run.json`... whichever writer's `_persist()` call lands last wins."
-  **This is exactly why a naive "human posts → load state → append to
-  `state['history']` → persist" implementation of interject would be
-  unsafe**: the request thread's freshly-loaded-and-persisted state would
-  very likely be clobbered by the driving thread's own next round-end
-  `_persist(state)` call, silently dropping the interjection — the
-  concrete race the backlog explicitly calls out as needing the same
-  hardening discipline as `resolve_ask_user()`'s own history.
-- `GET .../team/events` (`app/app.py:4944`, `_handle_team_events`) already
-  merges multiple per-identity `.jsonl` files by building a `files` list —
-  `[("lead", transcript_path)] + [(m, agent_log_path(run_id, m)) for m in
-  members]` — cursor-polling each independently via
-  `tail_jsonl_events()` (`app/teams.py:4081`, byte-offset based, holds a
-  partial trailing line across polls, never loses/duplicates a line) and
-  merging + sorting the result by `(ts, agent, seq)`. Each event's `agent`
-  field comes from what was written into the file, not the file list
-  itself — `_append_transcript()` (`app/teams.py:2733`) always stamps
-  `"agent": "lead"`.
-- `_round_context()` (`app/teams.py:2326`) builds the lead's per-round
-  prompt from `state["history"]`: one-line summaries of every prior round,
-  plus the FULL `full_result_text` of only the single most recent entry
-  (`last_entry`) — capped at `TEAM_DELEGATE_RESULT_MAX_CHARS`. This is the
-  exact mechanism `resolve_ask_user()`'s own `ask_user_resolved` entry and
-  `resolve_board_write()`'s own `board_write_resolved` entry already ride
-  to surface a human-originated event to the lead — neither needed any new
-  prompt-building code, they just append an ordinary `_append_history()`
-  entry with a non-`None` `tool`.
+- `app/teams.py:4241` `interject(run_id, text)` accepts while `status` is
+  `"running"`, `"blocked_ask_user"`, or `"blocked_board_write"`; rejects
+  (`{"ok": False, "error": f"run {run_id} is not accepting messages
+  (status={status})"}`) for `"finished"`, `"escalated_max_rounds"`,
+  `"error"`, `"stopped"`.
+- `app/app.py:4776-4847` (`/status`-family payload builder) collapses that
+  six-value backend status space into the frontend's `team.status` ∈
+  `{idle, running, blocked, finished, error}` plus a separate
+  `team.waiting_on_you` boolean, true only for `blocked_ask_user`/
+  `blocked_board_write` (the exact two backend statuses, alongside
+  `running`, that `interject()` accepts). `escalated_max_rounds` also maps
+  to frontend `blocked`, but with `waiting_on_you === false` — already the
+  live discriminator `renderTeamStatusStrip()` (`app/app.py:2920-2932`) and
+  the `escalatedNote` computation (`app/app.py:3407`) use to tell "blocked,
+  waiting on you" from "blocked, escalated on max rounds" apart. This means
+  `team.status === "running" || (team.status === "blocked" &&
+  team.waiting_on_you)` is already, today, an exact frontend mirror of
+  `interject()`'s own accept set — no new backend field or endpoint is
+  needed to compute compose-box visibility correctly.
+- `app/app.py:5367-5407` `POST /projects/<name>/team/interject` — validates
+  `run_id` (via `_RUN_ID_RE`, defaulting to `latest_run_for_project`),
+  validates `text` non-empty and `<= teams.TEAM_INTERJECT_MAX_CHARS` at the
+  route layer, calls `teams.interject()`, returns `{"ok": true, "run_id":
+  ...}` or `{"error": ...}` (400). No background thread is spun up (see part
+  1 spec §5) — this route only queues.
+- `app/app.py:4964-4965` `_handle_team_events()`'s `files` list already
+  includes `("human", teams._human_log_path(run_id))` — a posted
+  interjection is visible via the very next `GET .../team/events` poll, with
+  no dependency on when/whether `team_step()` has drained it into round
+  history yet.
+- Client-side live-feed state (`app/app.py:2680-2684`): `teamFeedOpen`,
+  `teamFeedCursor`, `teamFeedEvents`, `teamFeedFilter`, `teamFeedPolling` —
+  all keyed by project `name`. `clearTeamFeedState(name)`
+  (`app/app.py:2718-2725`) resets all of them (plus escalation-form state)
+  whenever a row falls back to the `idle` branch of `teamRow()`.
+- `teamRow(name, team)` (`app/app.py:3361-3418`): the `idle` branch (task
+  textarea + Start button) short-circuits at the top; the non-idle branch
+  renders, in order, `statusStrip` → `escalatedNote` → `escalationPanel` (if
+  `waiting_on_you`) → `feedToggle` → `feedPanel` → a `Stop team` button →
+  the shared `.team-msg` result slot → `renderTeamBranches()`.
+- `renderTeamFeed()` (`app/app.py:3229-3255`) builds the per-agent filter
+  pill row from `['lead'].concat(team.composition.members || [])` — no
+  `'human'` entry exists today. `teamFeedEventKindClass()`
+  (`app/app.py:3130-3167`) and `teamFeedEventBody()`
+  (`app/app.py:3168-3218`) classify/render each event; the existing
+  catch-all `if (e.kind === 'message' || e.kind === 'status') return
+  esc(e.text || '');` (`app/app.py:3216`) already renders a human message's
+  *text* correctly today (part 1 shipped this "renders generically even
+  before part 2's styling lands" as one of its own goals) — what's missing
+  is only a distinct CSS *classification*, not correct text rendering.
+  `teamAgentColor(agentName)` (`app/app.py:2704-2709`) is a generic
+  string-hash → palette-index function, already producing a distinct,
+  stable color for `agent: "human"` with zero code change.
+- `renderTeamStatusStrip`/`renderEscalationPanel`/free-text inputs
+  (`teamTaskText`, `teamEscalationOther`) all follow the same "client-side
+  mirror map survives a full-row `refresh()` re-render and a 428 TOTP retry;
+  read the live DOM element first, fall back to the mirror" idiom — most
+  explicitly commented at `app/app.py:3472-3479` (`team-start`'s own task
+  text). `updateTeamStartButton(name)` (`app/app.py:2895-2902`) is the
+  precedent for "recompute a button's `disabled` state via a direct,
+  narrow DOM write on `oninput`, not a full `refresh()`" — `refresh()`
+  replaces the row's `innerHTML`, which would drop focus/cursor position on
+  every keystroke.
+- `toggle(kind, name, on, checkboxEl)` (`app/app.py:3670-3700`) →
+  `performAction()` → `handleActionResult()` is the fully generic
+  TOTP-optimistic-then-428-retry dispatch path every existing action
+  (`team-start`, `team-stop`, `team-resolve`, `team-board-resolve`, ...)
+  already uses; `actionPath(kind, ...)` (`app/app.py:3444-3456`) and
+  `actionBody(kind, ...)` (`app/app.py:3457-3506`) are the two `switch`-like
+  functions that need one new `kind` branch each; `handleActionResult()`
+  needs one new `kind === 'team-interject'` branch (own `.team-msg` result
+  slot), placed before its generic 400 fallback, exactly mirroring
+  `team-resolve`'s own branch (`app/app.py:3575-3598`). `submitActionCode()`
+  (`app/app.py:3836+`) is fully generic over `pendingToggle.kind` — needs no
+  change.
 
 ## Proposed approach
 
-### 1. A dedicated append-only file, not a `run.json` field
-Add `_human_log_path(run_id)` (`app/teams.py`, next to `_transcript_path`)
-→ `<run_dir>/human.jsonl`. `teams.interject(run_id, text)`:
-1. `_load_state(run_id)` (catch `FileNotFoundError` →
-   `{"ok": False, "error": f"no such run_id: {run_id}"}`, matching
-   `resolve_ask_user()`'s wording convention).
-2. Reject if `state["status"]` is terminal (`finished`, `error`,
-   `escalated_max_rounds`, `stopped`) →
-   `{"ok": False, "error": f"run {run_id} is not accepting messages (status={state['status']})"}`.
-   Allowed for `running`, `blocked_ask_user`, AND `blocked_board_write` —
-   a message posted while blocked simply sits until the next `team_step()`
-   round runs (see "Edge cases").
-3. Append ONE envelope — `{"ts": _now_iso(), "agent": "human", "seq":
-   <computed the same way `_next_transcript_seq()` does, but scoped to
-   `human.jsonl`>, "kind": "message", "text": text, "meta": {}}` — via
-   `os.makedirs` + `open(path, "a")` + one `f.write(json.dumps(envelope) +
-   "\n")` call, the same idiom `_append_transcript()` already uses.
-4. Return `{"ok": True, "run_id": run_id}`.
-
-This function **never calls `_persist(state)`** and never mutates
-`state["history"]` — it is a read-only check plus an append to a file
-`team_step()`'s own driving thread does not otherwise touch during a round.
-This is the whole fix for the race described in "Background": there is no
-shared mutable `run.json` write from the request thread at all, so there is
-nothing for the driving thread's own end-of-round `_persist()` to clobber.
-Multiple concurrent human posts (two tabs) are safe because each is its own
-independent `open(...,"a")` + one bounded `write()` call — capped well
-under Linux's 4 KiB `PIPE_BUF` by `TEAM_INTERJECT_MAX_CHARS` (below), so
-each append is atomic with respect to the others; there is no shared
-in-memory buffer to race on the way there would be for a `run.json` field.
-
-### 2. Draining, at the top of `team_step()`, before the lead is ever called
-Add `state["human_cursor"]` (int byte offset into `human.jsonl`, default
-`0`) to `_new_state()`'s dict — additive, same "missing key defaults to
-0/None/{}" precedent `worktrees`/`project_name` already established for
-runs persisted before this field existed
-(`state.get("human_cursor", 0)` wherever read).
-
-At the very top of `team_step()` (before `round_n`/`system`/
-`round_context` are computed — earlier than the existing `cancel_event`
-checkpoint, since this one can save an LLM call entirely, matching
-`team_run()`'s own "cheapest possible checkpoint" rationale for its
-max-rounds check):
-```python
-new_events, new_cursor, _ = tail_jsonl_events(
-    _human_log_path(state["run_id"]), state.get("human_cursor", 0),
-    TEAM_HUMAN_MSG_MAX_BYTES_PER_ROUND, agent="human")
-if new_events:
-    for ev in new_events:
-        round_n = len(state["history"]) + 1
-        text = ev.get("text") or ""
-        _append_history(state, round_n, tool="human_interject",
-                        args_summary=f'human_interject("{text[:60]}")',
-                        outcome_summary=f"human said: {text[:80]}",
-                        full_result_text=text, log_path=None,
-                        transcript_entries=[])
-    state["human_cursor"] = new_cursor
-    _persist(state)
-    return state
+### 1. Compose box: visibility, state, wiring
+Add one client-side draft-text map, alongside the existing per-project
+mirrors:
+```js
+let teamInterjectText = {};  // name -> string draft
+const TEAM_INTERJECT_MAX_CHARS_CLIENT = 2000;  // mirrors teams.TEAM_INTERJECT_MAX_CHARS's default -- see "Non-goals"
 ```
-`transcript_entries=[]` deliberately — the message is already durably
-recorded in `human.jsonl` itself (which `GET .../team/events` merges in
-directly, see part 4 below), so no second copy is written to
-`transcript.jsonl`. Reusing `tail_jsonl_events()` (already proven:
-byte-capped, holds a partial trailing line, never loses/duplicates a line
-across polls) instead of a bespoke reader is a deliberate reuse, not a new
-parsing path. A new constant, `TEAM_HUMAN_MSG_MAX_BYTES_PER_ROUND`
-(default `65536`, matching `TEAM_EVENTS_MAX_BYTES_PER_FILE_PER_POLL`'s own
-"round, conservative default" precedent) bounds one drain call the same
-way that constant bounds one poll.
-
-This makes the very next queued interjection the round's `last_entry` once
-`team_step()` returns and loops back around — `_round_context()` shows its
-`full_result_text` in full under "Most recent result (round N,
-human_interject):" with **zero changes to `_round_context()` itself**. If
-several messages queued up since the last round (rare, but possible if the
-human posts twice while a `delegate` call is in flight), each becomes its
-own history round in order; only the last one gets the full-text
-treatment, the earlier ones get the same one-line "Round history" summary
-any other round does — the same degrade-gracefully behavior a flurry of
-any other round type already has, not a new special case.
-
-### 3. Making the lead's next action responsive to a `human_interject` round
-Add a new required-verbatim mitigation clause, `_INTERJECT_MITIGATION`, to
-`_system_framing()` (next to `_FACT_CHECK_MITIGATION`/
-`_DELEGATION_HISTORY_MITIGATION`/`_BOARD_WRITE_MITIGATION`, same "make the
-thing the model should notice explicit and salient, don't leave it to be
-inferred" discipline all three already establish):
-> "A round history entry with tool `human_interject` is an unsolicited
-> message the human sent you WHILE you were working — it is not a reply to
-> a question you asked (that would be `ask_user_resolved`), and it does not
-> mean your current plan is wrong. Read it, and let it inform what you do
-> next: it may be new information, a correction, a change of priority, or
-> a request to stop and explain your progress. If it changes what you
-> should be doing, adjust; if it doesn't, briefly acknowledge it (in your
-> reasoning, not a tool call) and continue."
-
-### 4. Wiring into `GET .../team/events`
-In `_handle_team_events()` (`app/app.py:4944`), extend the `files` list by
-exactly one entry:
-```python
-files = [("lead", teams._transcript_path(run_id)), ("human", teams._human_log_path(run_id))]
-files += [(m, teams._agent_log_path(run_id, m)) for m in state.get("members", [])]
+A shared visibility predicate (single source of truth, used both for
+rendering and for clearing stale drafts — avoids the same kind of
+duplicated-logic drift `computeTeamResolveAnswer()` was introduced to
+prevent):
+```js
+function teamAcceptsInterject(team) {
+  return !!team && (team.status === 'running' ||
+                     (team.status === 'blocked' && team.waiting_on_you));
+}
 ```
-No other change to that function — the existing per-file cursor,
-byte-cap, truncation-flag, and chronological-merge-sort logic is generic
-over the file list already and needs nothing agent-specific added.
-
-### 5. The route and CLI wrappers
-`POST /projects/<name>/team/interject` (`app/app.py`, alongside
-`/team/resolve`/`/team/board-resolve`, same shared TOTP gate, no new
-gating code):
-- `run_id = (body.get("run_id") or "").strip() or None`; if given, validate
-  against `teams._RUN_ID_RE` BEFORE any load/path-join (backlog item 11(b)
-  — the same settled, non-optional intake-point hardening `/team/resolve`
-  and `/team/board-resolve` already apply, mirrored here byte-for-byte:
-  reject → `{"error": "no run found for this project"}`, 400), then
-  `teams._load_state(run_id)` and check `state.get("project_name") ==
-  name` (cross-project ownership check, same as the two existing routes).
-  If no `run_id` given, `teams.latest_run_for_project(name)`.
-- **Length/emptiness validation happens at THIS route layer**, not inside
-  `teams.interject()` — mirroring `/team/resolve`'s own
-  `TEAM_ASK_USER_ANSWER_MAX_CHARS` check (`app/app.py:5290`) exactly:
-  `text = (body.get("text") or "").strip()`; if empty or
-  `len(text) > teams.TEAM_INTERJECT_MAX_CHARS`, 400 with
-  `f"message must be non-empty and at most {teams.TEAM_INTERJECT_MAX_CHARS} characters"`.
-- Calls `teams.interject(run_id, text)`; `{"error": result["error"]}`, 400
-  on failure, else `{"ok": True, "run_id": run_id}`.
-- **Does NOT spin up a background thread.** Unlike `/team/resolve`/
-  `/team/board-resolve` (which resume a loop that has already exited),
-  `interject` while `status == "running"` expects a driving thread to
-  already be alive (it will pick the message up on its own next round);
-  while `blocked_ask_user`/`blocked_board_write`, the message simply waits
-  in `human.jsonl` for whichever future resolve action restarts the driving
-  thread. Starting a second thread here would violate the existing
-  "at most one live driving thread per run" invariant `/team/resolve`
-  already asserts defensively (`_team_threads_get(name) is not None` check,
-  `app/app.py:5305`) for no benefit.
-
-New constant, `app/teams.py` (next to `TEAM_ASK_USER_ANSWER_MAX_CHARS`,
-same file region/style):
-```python
-# Max length of the free-text `text` POST /team/interject accepts -- a
-# short unsolicited human message injected into a RUNNING lead's next round,
-# a materially different action from TEAM_ASK_USER_ANSWER_MAX_CHARS's own
-# "answer to a question the lead itself asked" even though both are short
-# human free text (same "materially different case, kept a separate,
-# independently tunable constant" precedent TEAM_BOARD_WRITE_VALUE_MAX_CHARS
-# already set against TEAM_ASK_USER_ANSWER_MAX_CHARS). Same 2000-char
-# default -- no evidence yet that this needs a different budget.
-TEAM_INTERJECT_MAX_CHARS = int(os.environ.get("TEAM_INTERJECT_MAX_CHARS", "2000"))
+Render function (new), returning `''` — and proactively discarding any
+stale draft — whenever the current status doesn't accept one:
+```js
+function renderTeamInterjectBox(name, team) {
+  if (!teamAcceptsInterject(team)) { delete teamInterjectText[name]; return ''; }
+  const text = teamInterjectText[name] || '';
+  const len = text.length;
+  const over = len > TEAM_INTERJECT_MAX_CHARS_CLIENT;
+  const disabled = !text.trim() || over;
+  const placeholder = team.waiting_on_you ?
+    'Send a message to the team (this will not answer the pending question above)…' :
+    'Send a message to the team…';
+  return '<div class="team-interject">' +
+    '<div class="team-interject-row">' +
+    '<textarea class="team-interject-textarea" id="interject-' + esc(name) + '" rows="2" ' +
+    'placeholder="' + esc(placeholder) + '" oninput="teamInterjectText[' + "'" + name + "'" +
+    '] = this.value; updateTeamInterjectControls(' + "'" + name + "'" + ');">' + esc(text) + '</textarea>' +
+    '<button class="team-btn" id="interject-send-' + esc(name) + '"' + (disabled ? ' disabled' : '') +
+    ' onclick="doTeamInterject(' + "'" + name + "'" + ')">Send</button>' +
+    '</div>' +
+    '<div class="team-interject-counter' + (over ? ' over-limit' : '') + '" id="interject-counter-' + esc(name) + '">' +
+    len + '/' + TEAM_INTERJECT_MAX_CHARS_CLIENT + '</div></div>';
+}
 ```
-
-CLI: `team-interject <run_id> <text>` subcommand
-(`p_team_interject = sub.add_parser("team-interject", ...)`, alongside
-`team-resolve`/`team-board-resolve`), `_cli_team_interject(args)`:
-```python
-def _cli_team_interject(args: argparse.Namespace) -> int:
-    result = interject(args.run_id, args.text)
-    if not result["ok"]:
-        print(f"error: {result['error']}", file=sys.stderr)
-        return 1
-    print(f"queued for run {result['run_id']}")
-    return 0
+`updateTeamInterjectControls(name)` — a narrow direct-DOM update on
+`oninput`, matching `updateTeamStartButton()`'s exact idiom (no `refresh()`
+call, so typing never re-renders the row or loses cursor position):
+```js
+function updateTeamInterjectControls(name) {
+  const btn = document.getElementById('interject-send-' + name);
+  if (!btn) return;
+  const text = teamInterjectText[name] || '';
+  const len = text.length;
+  const over = len > TEAM_INTERJECT_MAX_CHARS_CLIENT;
+  btn.disabled = !text.trim() || over;
+  const counterEl = document.getElementById('interject-counter-' + name);
+  if (counterEl) {
+    counterEl.textContent = len + '/' + TEAM_INTERJECT_MAX_CHARS_CLIENT;
+    counterEl.className = 'team-interject-counter' + (over ? ' over-limit' : '');
+  }
+}
 ```
-Deliberately does **not** call `_drive_and_report()` the way
-`_cli_team_resolve()`/`_cli_team_board_resolve()` do — those resume a loop
-that had already stopped; `team-interject` never starts or resumes driving
-anything (there may already be a live driver, in this process or another
-`team-start`/`team-resume` invocation, and double-driving one run_id is
-exactly the bug class `/team/resolve`'s own defensive `_team_threads_get`
-check exists to prevent at the web layer). It queues and returns,
-full stop, matching the design intent: posting a message is not the same
-action as resuming a stopped run.
+Dispatch (mirrors `doTeamResolve()` exactly):
+```js
+function doTeamInterject(name) {
+  const msgEl = document.getElementById('team-msg-' + name);
+  if (msgEl) { msgEl.textContent = ''; msgEl.className = 'team-msg'; }
+  const text = (teamInterjectText[name] || '').trim();
+  if (!text || text.length > TEAM_INTERJECT_MAX_CHARS_CLIENT) {
+    if (msgEl) {
+      msgEl.textContent = 'Message must be non-empty and at most ' + TEAM_INTERJECT_MAX_CHARS_CLIENT + ' characters';
+      msgEl.className = 'team-msg error';
+    }
+    return;
+  }
+  toggle('team-interject', name, true, null);
+}
+```
+Three small additions to the existing generic dispatch functions:
+- `actionPath()`: `if (kind === 'team-interject') return '/projects/' + encodeURIComponent(name) + '/team/interject';`
+- `actionBody()`: reads the live textarea first, falls back to the mirror —
+  same "survives a mid-flow re-render/428 retry" reasoning as `team-start`'s
+  own task-text field:
+  ```js
+  if (kind === 'team-interject') {
+    const el = document.getElementById('interject-' + name);
+    body.text = (el ? el.value : (teamInterjectText[name] || '')).trim();
+  }
+  ```
+- `handleActionResult()`'s 428 label switch: add
+  `kind === 'team-interject' ? 'Sending message: ' + (name || 'this') :`
+- `handleActionResult()`: new branch, placed before the generic-400
+  fallback, exactly mirroring the `team-resolve` branch's shape
+  (`app/app.py:3575-3598`):
+  ```js
+  if (kind === 'team-interject') {
+    hideCodeOverlay();
+    const data = await r.json().catch(() => ({}));
+    const msgEl = document.getElementById('team-msg-' + name);
+    if (msgEl) {
+      if (r.ok && data.ok) {
+        msgEl.textContent = '✓ Message sent';
+        msgEl.className = 'team-msg success';
+        delete teamInterjectText[name];
+        const ta = document.getElementById('interject-' + name);
+        if (ta) ta.value = '';
+        updateTeamInterjectControls(name);
+      } else {
+        // Draft text is deliberately NOT cleared on failure -- the
+        // operator can fix and resend without retyping.
+        msgEl.textContent = '✕ Error: ' + (data.error || 'could not send message');
+        msgEl.className = 'team-msg error';
+      }
+    }
+    return;
+  }
+  ```
+`clearTeamFeedState()` (`app/app.py:2718-2725`) gets one more line —
+`delete teamInterjectText[name];` — for the `idle`-transition case (falling
+back to the idle branch skips `renderTeamInterjectBox()` entirely, so its
+own stale-draft cleanup never runs for that particular transition).
+
+`teamRow()`'s non-idle render order (`app/app.py:3413`) gains exactly one
+new piece, inserted between `escalationPanel` and `feedToggle`:
+```js
+const interjectBox = renderTeamInterjectBox(name, team);
+return '<div class="team-row">' + statusStrip + escalatedNote + escalationPanel +
+  interjectBox + feedToggle + feedPanel + ...
+```
+Rationale for this position: escalation resolution (answering a specific
+pending question) is the higher-priority, often-blocking action and stays
+visually first when present; the always-available free-form channel sits
+directly below it; both sit above the passive, scrollable log feed.
+
+### 2. Feed styling for human messages — a distinct row, not a bubble reskin
+Decision (answering backlog item 19's own open question): **no chat-bubble
+redesign.** The merged feed already renders ~10 structurally different kinds
+(board-write proposals/resolutions, fact-check claims/results with match
+arrays, ask_user prompts, delegate handoffs, terminal-escalation banners, in
+addition to plain messages) from more than two participants (lead + every
+teammate + human) — bubble/alignment layout is built for two-party, purely
+textual back-and-forth, which this isn't, and reworking it would risk 6f
+part 2's own `role="log"`/`aria-live="polite"` accessibility contract for no
+functional gain. Instead, human messages get a new, additive CSS
+classification within the existing log-list:
+```js
+// In teamFeedEventKindClass(), right after the existing `if (e.kind ===
+// 'error') return 'error';` check (app/app.py:3132) -- kind==='message'
+// never matches any of the other branches below it, so this is safe to add
+// anywhere before the final `return e.kind;` fallback; placed early to read
+// as "most specific first", matching this function's existing style.
+if (e.kind === 'message' && e.agent === 'human') return 'human-message';
+```
+`teamFeedEventBody()` needs **no change** — its existing catch-all
+(`app/app.py:3216`, `if (e.kind === 'message' || e.kind === 'status') return
+esc(e.text || '');`) already renders a human message's full text correctly;
+the classification above only changes which CSS class
+`renderTeamFeedEvent()` (`app/app.py:3219-3228`) attaches
+(`'team-feed-event kind-human-message'`). No text prefix/decoration is
+added — the row's existing `.team-feed-agent` span already colors `"human"`
+distinctly via `teamAgentColor()` with zero code change; the new CSS class
+adds a second, row-level visual cue (background tint or left-border accent,
+following the same weight `.kind-error`/`.kind-terminal-escalation` already
+have — exact color TBD by `ux-designer`/`docs/design.md`, using a hue that
+doesn't collide with the existing red (`error`/`nomatch`) or orange
+(`terminal-escalation`), e.g. this app's existing accent blue `#4da6ff`
+already used for active filter pills).
+
+`renderTeamFeed()`'s filter-pill agent list (`app/app.py:3233`) gains
+`'human'`, positioned right after `'lead'`:
+```js
+const agents = ['lead', 'human'].concat((team.composition && team.composition.members) || []);
+```
+No new filtering code is needed — the existing generic `filter === 'all' ?
+events : events.filter(e => e.agent === filter)` (`app/app.py:3241`) already
+isolates exactly the human messages when `filter === 'human'`, since
+`human.jsonl` only ever contains `agent: "human"` envelopes. The `human`
+pill is shown unconditionally (even before any interjection has been sent
+for this run), matching `lead`'s own existing "always present" behavior.
+
+### 3. Escalation-panel coexistence
+Already settled server-side in part 1 (`teams.interject()` explicitly
+accepts `blocked_ask_user`/`blocked_board_write`); this part's only job is
+to not contradict that in the UI. `teamAcceptsInterject()` (§1) already
+returns `true` whenever `team.waiting_on_you` is true, so the compose box
+and `renderEscalationPanel()`'s output render together, unconditionally,
+whenever a question/proposal is pending — no additional gating, warning, or
+confirmation step is added (the trust-direction question was already
+settled in part 1: human → agent, immediate, no approval gate). The only
+UI-level nod to the two boxes coexisting is the placeholder copy variant in
+§1 (`"...this will not answer the pending question above"`), a soft nudge
+rather than a hard gate, since typing an answer into the wrong box would
+otherwise silently do the wrong (delayed, not immediately-actionable-as-an-
+answer) thing.
+
+### 4. Character/byte limits
+Two constants exist server-side; they get different treatment here, and the
+difference is a deliberate finding, not an inconsistency:
+- **`TEAM_INTERJECT_MAX_CHARS`** (2000, a per-message character cap enforced
+  at the route layer) — this is the one real, meaningful, client-
+  pre-validatable constraint on THIS control. Surfaced via the live counter
+  and disabled-Send logic in §1.
+- **`TEAM_HUMAN_MSG_MAX_BYTES_PER_ROUND`** (64 KiB, a per-`team_step()`-round
+  server-side drain cap — see `app/teams.py:2998-3018`) — investigated and
+  found to have **no meaningful client-facing surface**: it bounds how many
+  already-queued bytes one `team_step()` call reads out of `human.jsonl`
+  into the lead's own round history in one go, not any single message's
+  size (2000 chars is tiny relative to 64 KiB regardless), and it has zero
+  effect on when a posted message becomes visible to the human in the feed
+  (`_handle_team_events()` merges `human.jsonl` directly, independent of
+  drain timing — §"Background"). Its only real-world effect is a narrow,
+  invisible-to-the-UI delay (a message's *delivery to the lead* — not its
+  visibility to the human — could, in an extreme multi-message pile-up,
+  land one round later than usual); `tail_jsonl_events()` never truncates
+  mid-message. No control is added for it (see "Non-goals").
 
 ## Affected areas
-- `app/teams.py`: `_human_log_path()` (new), `TEAM_INTERJECT_MAX_CHARS`
-  (new constant), `TEAM_HUMAN_MSG_MAX_BYTES_PER_ROUND` (new constant),
-  `_new_state()` (add `"human_cursor": 0`), `interject()` (new function,
-  next to `resolve_ask_user()`/`resolve_board_write()`), `team_step()`
-  (drain check at the top), `_system_framing()` (`_INTERJECT_MITIGATION`
-  clause, added to `parts` alongside the other three mitigations, every
-  tier), `_cli_team_interject()` (new) + `team-interject` subparser wiring
-  in the CLI's `main()`/argparse setup.
-- `app/app.py`: `_handle_team_events()` (`files` list, one new tuple),
-  `POST /projects/<name>/team/interject` (new route branch in `do_POST`,
-  alongside `/team/resolve`/`/team/board-resolve`).
-- `config/switchboard.env.example`: document `TEAM_INTERJECT_MAX_CHARS`
-  and `TEAM_HUMAN_MSG_MAX_BYTES_PER_ROUND` alongside the existing
-  `TEAM_*` entries, matching how every other `os.environ.get(...)`-backed
-  constant here is already documented.
-- No data-model change to `run.json`'s existing fields beyond the one
-  additive `human_cursor` key; no change to `inbox.json`'s shape.
+- `app/app.py` only — all within the existing inline `<style>`/`<script>`
+  blocks:
+  - New CSS: `.team-interject`, `.team-interject-row`,
+    `.team-interject-textarea`, `.team-interject-counter` (+
+    `.over-limit` modifier), `.team-feed-event.kind-human-message` — added
+    near the existing `.team-escalation-*`/`.team-feed-*` rules
+    (`app/app.py:2215-2277`), following their naming/sizing conventions.
+  - New JS: `teamInterjectText` (state map), `TEAM_INTERJECT_MAX_CHARS_CLIENT`
+    (constant), `teamAcceptsInterject()`, `renderTeamInterjectBox()`,
+    `updateTeamInterjectControls()`, `doTeamInterject()`.
+  - Modified JS: `actionPath()`, `actionBody()`, `handleActionResult()`
+    (new `team-interject` kind branch + 428-label switch entry),
+    `clearTeamFeedState()` (one new `delete`), `teamRow()` (one new
+    `interjectBox` variable + insertion point), `teamFeedEventKindClass()`
+    (one new early-return branch), `renderTeamFeed()` (one-token change to
+    the `agents` array).
+- No `app/teams.py` change. No new/changed route. No new data shape,
+  migration, or config constant.
 
 ## Edge cases
-- **Interjecting into a `blocked_ask_user`/`blocked_board_write` run**:
-  allowed (see "Proposed approach" step 1); delivered as the FIRST
-  drained round once a human resolve action restarts the driving thread.
-  Order is preserved correctly regardless of wall-clock ordering between
-  the interject and the resolve, because both are only ever "applied" (an
-  `_append_history()` call) at the moment each is actually processed by
-  code that already runs sequentially on one thread — `resolve_ask_user()`
-  appends its own `ask_user_resolved` entry synchronously before returning,
-  and the resumed `team_run()` loop's very first `team_step()` call drains
-  `human.jsonl` before doing anything else, so a message queued before the
-  resolve always appears in history AFTER the resolution entry, never
-  reordered ahead of it.
-- **Interjecting into a terminal run** (`finished`/`error`/
-  `escalated_max_rounds`/`stopped`): rejected with a clear error; nothing
-  is written to `human.jsonl`.
-- **A message posted in the exact instant the run naturally exhausts
-  `max_rounds`**: `team_run()`'s own loop checks
-  `len(state["history"]) >= state["max_rounds"]` BEFORE calling
-  `team_step()` again — so a message written to `human.jsonl` a moment
-  after that check already passed (and the loop is about to call
-  `_force_ask_user(..., status="escalated_max_rounds")`, a TERMINAL,
-  non-resumable-via-`/team/resolve` status) is never drained and is
-  effectively stranded. Narrow (needs a post to land inside a small window
-  right as a run is already about to escalate on rounds) and not
-  data-destructive (the message is still sitting in `human.jsonl`, just
-  never delivered to a live lead) — accepted as a documented, narrow
-  tradeoff for this increment rather than restructured around, matching
-  this project's own precedent for similarly narrow poll/round-boundary
-  races (e.g. backlog item 12's part C).
-- **Two humans post concurrently (two tabs)**: each is an independent file
-  append under `TEAM_INTERJECT_MAX_CHARS`, safely below `PIPE_BUF` — both
-  land, in whatever order the OS serializes the two `write()` calls, no
-  data loss. `seq` is computed the same "count existing lines" way
-  `_next_transcript_seq()` already does for the lead's own file, so a
-  genuinely simultaneous pair could in principle compute the same `seq`
-  once (same class of narrow, accepted race `_next_transcript_seq()`
-  itself already has for the lead's transcript today) — cosmetic only
-  (`seq` is a display/sort tiebreaker, `ts` plus insertion order in the
-  merged feed is still correct), not a data-loss or misdelivery risk.
-- **Empty/whitespace-only message**: rejected at the route layer (400),
-  never reaches `teams.interject()`.
-- **A run with no live driving thread anywhere** (e.g. the process
-  restarted and nothing has resumed this run yet) but `status == "running"`
-  on disk: this is `sweep_dead_teams()`'s own existing orphan-detection
-  territory (crash/reboot with the tmux session gone → marked `error` on
-  the next sweep pass) — unrelated to and unaffected by this change; an
-  interjection posted in that narrow window is queued exactly as normal
-  and, if the run is later found orphaned and marked `error`, becomes
-  permanently undelivered — the same "terminal status, never drained"
-  outcome as any other terminal-status case above.
+- **Empty/whitespace-only or over-limit draft**: Send stays disabled
+  client-side; if ever bypassed (e.g. a stale/hand-crafted request), the
+  existing server-side 400 (`app/app.py:5399-5403`) renders in the same
+  `.team-msg` slot via the generic 400 fallback, same as any other route.
+- **Run transitions out of a compose-eligible status between polls** (e.g.
+  finishes, is stopped, or is answered by another tab such that
+  `waiting_on_you` flips false) while a draft is unsent: the next
+  `teamRow()` re-render (every 4s poll) re-evaluates `teamAcceptsInterject()`
+  fresh against the current `team` snapshot, so the compose box disappears
+  and the draft is discarded — no attempt to persist/restore it, matching
+  the existing behavior of every other per-status-scoped input in this app.
+  If a brand-new run later starts for the same project, `teamInterjectText`
+  has already been cleared, so no stale draft can reappear.
+- **A message posted right as `waiting_on_you` flips (e.g., another
+  tab/operator resolves the same escalation between this tab's polls)**:
+  never turns a UI-permitted send into a server rejection —
+  `teams.interject()` accepts `running` and both `blocked_*` statuses
+  uniformly, and the compose box's own eligibility set is exactly that same
+  set.
+- **Two tabs/operators interjecting concurrently**: already proven safe
+  server-side (part 1: independent, `PIPE_BUF`-safe file appends, no data
+  loss); no client-side special handling is needed — each tab's own next
+  poll picks up both messages, correctly ordered by the existing
+  `(ts, agent, seq)` merge-sort regardless of which tab's poll observes them
+  first.
+- **A maximal-length (2000-char) human message in the feed**: no truncation
+  — human messages get exactly the same no-length-cap rendering every other
+  `message`/`status`-kind row already has; long text simply wraps within
+  `.team-feed-list`'s existing scrollable container.
+- **`human` filter pill clicked before any interjection has ever been sent
+  for a run**: shows the existing "No events yet." empty state, same as any
+  other filter with zero matching events — no special-case needed.
+- **Double-click / rapid re-click on Send**: not newly protected against
+  (see "Non-goals") — at most two independent, harmless queued messages;
+  consistent with every other action button in this app today.
 
 ## Acceptance criteria
-- [ ] Given a run with `status == "running"`, when `teams.interject(run_id,
-      "some text")` is called, then it returns `{"ok": True, "run_id":
-      run_id}` and a new line is appended to that run's `human.jsonl`
-      shaped `{"ts": ..., "agent": "human", "seq": ..., "kind": "message",
-      "text": "some text", "meta": {}}`, and `run.json` itself is
-      byte-for-byte unchanged by this call (no `_persist()` call reachable
-      from `interject()`).
-- [ ] Given a run with `status in ("finished", "error",
-      "escalated_max_rounds", "stopped")`, when `teams.interject()` is
-      called, then it returns `{"ok": False, "error": ...}` naming the
-      run's actual status, and `human.jsonl` is not written to.
-- [ ] Given an unknown `run_id`, when `teams.interject()` is called, then
-      it returns `{"ok": False, "error": "no such run_id: <run_id>"}`.
-- [ ] Given a run with one message already queued in `human.jsonl` (not
-      yet drained) and `status == "running"`, when `team_step()` is next
-      called, then it appends exactly one `human_interject` history entry
-      (not a lead call) whose `full_result_text` equals the queued
-      message, advances `state["human_cursor"]` past that message, and
-      returns without calling `_call_lead()` — verified via a test that
-      injects a message directly into `human.jsonl` between two
-      `team_step()` calls against a mocked/fake lead and asserts the lead
-      adapter was NOT invoked on the round that drained it.
-- [ ] Given a queued message drained in round N, when `team_step()` is
-      called again for round N+1, then `_round_context()`'s "Most recent
-      result" section contains the message's full text under
-      `(round N, human_interject)`.
-- [ ] Given two messages queued in `human.jsonl` before a single drain,
-      when `team_step()` drains them, then two separate `human_interject`
-      history entries are appended, in file order, and `human_cursor`
-      advances past both in that same `team_step()` call.
-- [ ] `GET /projects/<name>/team/events?run_id=<id>&cursor=<cursor
-      including "human">` returns the human message event, tagged
-      `"agent": "human"`, `"kind": "message"`, once posted — verified via
-      a real `POST .../team/interject` followed by a real `GET
-      .../team/events` against a live-but-mocked run (no real lead/teammate
-      subprocess needed for this assertion).
-- [ ] `POST /projects/<name>/team/interject` with `run_id` omitted resolves
-      to `latest_run_for_project(name)`, matching `/team/resolve`'s own
-      documented default-run behavior.
-- [ ] `POST /projects/<name>/team/interject` with a `run_id` belonging to a
-      DIFFERENT project returns 400 ("this run belongs to a different
-      project"), matching `/team/resolve`'s existing cross-project check.
-- [ ] `POST /projects/<name>/team/interject` with a syntactically invalid
-      `run_id` (e.g. containing `../`) is rejected against `_RUN_ID_RE`
-      before any file access, returning the same 400 shape
-      `/team/resolve` already returns for that case (regression test
-      mirroring the existing item-11(b) coverage for the other two
-      routes).
-- [ ] `POST .../team/interject` with an empty or all-whitespace `text`, or
-      `text` longer than `TEAM_INTERJECT_MAX_CHARS`, returns 400 and
-      `teams.interject()` is never called (verify via a test double / call
-      count, matching how `/team/resolve`'s own length check is tested
-      today).
-- [ ] `team-interject <run_id> "<text>"` (CLI): on success, prints
-      `queued for run <run_id>` and exits 0, WITHOUT driving the run (no
-      lead call happens as a side effect of this command) — verified by
-      asserting the mocked lead adapter's call count is unchanged after
-      the CLI call.
-- [ ] Every one of the four required-verbatim mitigation clauses,
-      including the new `_INTERJECT_MITIGATION`, is present in
-      `_system_framing()`'s output for all three tiers (extend the
-      existing per-tier framing test the same way `_BOARD_WRITE_MITIGATION`
-      was covered).
+- [ ] Given `team.status === 'running'`, when `teamRow(name, team)` renders,
+      then the compose box (`#interject-<name>` textarea + `#interject-send-
+      <name>` button) is present in the output.
+- [ ] Given `team.status === 'blocked'` and `team.waiting_on_you === true`
+      (either `blocked_ask_user` or `blocked_board_write`), when
+      `teamRow()` renders, then BOTH `renderEscalationPanel()`'s output and
+      the compose box are present simultaneously.
+- [ ] Given `team.status` is `'idle'`, `'finished'`, `'error'`, or
+      `'blocked'` with `team.waiting_on_you === false` (escalated on max
+      rounds), when `teamRow()` renders, then the compose box is absent —
+      verified for each of these four cases individually.
+- [ ] Given an empty or whitespace-only draft in `teamInterjectText[name]`,
+      when `renderTeamInterjectBox()`/`updateTeamInterjectControls()` runs,
+      then `#interject-send-<name>` has `disabled` set; given a draft longer
+      than 2000 characters, then Send is also disabled and
+      `#interject-counter-<name>` carries the `over-limit` class.
+- [ ] Given a non-empty, ≤2000-character draft, when the operator clicks
+      Send, then `doTeamInterject()` calls `toggle('team-interject', name,
+      true, null)`, which POSTs `{"text": "<trimmed draft>"[, "code": ...]}`
+      to `/projects/<name>/team/interject` via the same 428-retry flow
+      `team-resolve` uses, with the code-overlay label reading `"Sending
+      message: <name>"` during a retry.
+- [ ] Given a `{"ok": true, ...}` response, when `handleActionResult()`
+      processes it, then `#team-msg-<name>` shows `"✓ Message sent"`
+      (`success` class), `#interject-<name>`'s value and
+      `teamInterjectText[name]` are both cleared, and Send becomes disabled
+      again.
+- [ ] Given an `{"error": "..."}`, 400 response, when `handleActionResult()`
+      processes it, then `#team-msg-<name>` shows `"✕ Error: <server
+      message>"` (`error` class) and the draft text in
+      `teamInterjectText[name]`/the textarea is preserved, not cleared.
+- [ ] Given a successful send, when the next `pollTeamFeed()` cycle runs,
+      then the new event (`agent: "human"`, `kind: "message"`) appears in
+      `teamFeedEvents[name]` and `teamFeedEventKindClass()` returns
+      `'human-message'` for it (verified by unit-level call, and by the
+      rendered row carrying CSS class `team-feed-event kind-human-message`).
+- [ ] Given a project with `team.composition.members` non-empty, when
+      `renderTeamFeed()` builds its filter pills, then the pill order is
+      `All, lead, human, <member1>, <member2>, ...`, and clicking the
+      `human` pill filters `teamFeedEvents` to exactly the events with
+      `agent === 'human'` via the existing generic filter (no new filtering
+      code path exercised).
+- [ ] Given an unsent draft and a status transition to a
+      compose-ineligible status (e.g. `running` → `finished`) on the next
+      poll, when `teamRow()` re-renders, then the compose box disappears and
+      `teamInterjectText[name]` is deleted (verified: does not reappear with
+      stale content if a new run later starts for the same project).
+- [ ] `git diff` for this cycle touches only `app/app.py` — no
+      `app/teams.py`, route, config, or data-shape change.
 
 ## Open questions
-- **Trust direction (settled, not left open):** unlike items 7/8 (agent →
-  external system writes, both gated behind human approval), this is
-  human → agent: the human's own message, injected into the LEAD's own
-  next-round context, with no external side effect triggered by the act of
-  sending it. The lead can act on it, ignore it, or ask_user for
-  clarification — it has exactly the same status as `ask_user`'s own
-  answer text already has today (immediate, no separate approval gate).
-  Proceeding on this basis; no propose-then-approve step is added.
-- **Lead-only, not teammate-direct (settled, not left open):** see
-  "Non-goals" — the four/six-tool loop and `agent_run()`'s synchronous call
-  shape don't support addressing a specific in-flight teammate today; doing
-  so would need genuinely new plumbing (bidirectional stdio to an
-  already-running `agent_run()` call) this spec does not attempt.
-- **Round-boundary delivery, not true mid-call interruption (settled, not
-  left open):** see "Non-goals" — matches the granularity `cancel_event`
-  already uses; a message posted mid-delegate is delivered at the next
-  round boundary, after that delegate call completes, not injected into
-  the live subprocess.
-- **`TEAM_INTERJECT_MAX_CHARS` kept as its own constant, not reusing
-  `TEAM_ASK_USER_ANSWER_MAX_CHARS`** — same value today (2000), but
-  independently tunable later, matching the
-  `TEAM_BOARD_WRITE_VALUE_MAX_CHARS`-vs-`TEAM_ASK_USER_ANSWER_MAX_CHARS`
-  precedent of keeping similarly-shaped-but-semantically-different human
-  text fields on separate constants. Flagging as a judgment call, not a
-  blocker — trivial to consolidate later if it never diverges.
-- **Part 2 (chat UI)** is intentionally not specced here (see "Non-goals")
-  — a fresh product-manager pass once this part is reviewer-approved,
-  following the same sequential-parts precedent items 6d, 6f, and 7 already
-  used, per skill 11 (load-balanced decomposition).
+- **Chat-bubble vs. distinct-row-style (settled, not left open):** decided
+  against a bubble reskin; see "Proposed approach" §2 for the full
+  reasoning (multi-party, structurally heterogeneous content, existing
+  accessibility contract). Exact color/border treatment for
+  `kind-human-message` is left to `ux-designer`'s `docs/design.md` pass —
+  the functional classification (which events get the new class) is settled
+  here.
+- **Escalation-panel coexistence (settled, not left open):** compose box and
+  escalation panel always render together when `waiting_on_you` is true, no
+  hard gate, only a softer placeholder-copy nudge — see "Proposed approach"
+  §3.
+- **`TEAM_INTERJECT_MAX_CHARS_CLIENT` hardcoded to 2000 (settled, flagged,
+  not blocking):** mirrors `team-resolve`'s own existing pattern; will
+  silently drift if the server-side env var is ever overridden away from its
+  default. Pre-existing gap class, not newly introduced, not fixed here —
+  server-side validation remains authoritative regardless.
+- **No UI surface for `TEAM_HUMAN_MSG_MAX_BYTES_PER_ROUND` (settled, not
+  left open):** investigated and found to have no meaningful per-message,
+  client-validatable constraint to surface — see "Proposed approach" §4.
+- **No Enter-to-send (settled, not left open):** consistency with every
+  other multi-line free-text input in this app; see "Non-goals".
+- **Relationship to items 7/8's trust model:** restating part 1's own
+  already-settled conclusion for completeness at the UI layer — this
+  remains human → agent (not agent → external system), so no approval/
+  confirmation step is added on top of the compose box's own Send action,
+  unlike items 7/8's propose-then-approve model.
 
 ## Risk / rollback notes
-- Purely additive: one new file per run (`human.jsonl`, absent = no
-  events, same as any other missing per-agent log `tail_jsonl_events()`
-  already tolerates via its own `FileNotFoundError → ([], offset, False)`
-  path), one new optional `run.json` key defaulted on read, one new
-  route, one new CLI subcommand, one new required prompt clause. No
-  existing route, CLI subcommand, tool, or status transition changes
-  behavior for a run that never receives an interjection.
-- Rollback is deleting the new route/CLI branch and the drain check at the
-  top of `team_step()`; no migration needed since `human_cursor`'s absence
-  already defaults to `0` and no other code depends on it existing.
-- Worst-case failure mode if the drain logic has a bug: a `human_interject`
-  history entry could be malformed or duplicated, visible in
-  `team-status`/the events feed as a clearly-labeled anomaly, not a crash
-  or data loss elsewhere in the run — same "degrade to a visible artifact
-  in the feed, not a hard failure" posture backlog item 11's own
-  stale-transcript-entry finding was judged by.
+- Purely additive, front-end-only change confined to `app/app.py`'s existing
+  inline `<style>`/`<script>` blocks — no schema, migration, route, or
+  backend-behavior change. A project that never uses the compose box is
+  visually and behaviorally unaffected except for the always-present
+  (but functionally inert until clicked) `human` filter pill.
+- Rollback is reverting the `app/app.py` diff; nothing to migrate, no data
+  written by this part that outlives a single render cycle (the compose
+  box's own draft state is entirely client-side and ephemeral).
+- Worst-case failure modes: (a) the compose box renders in a status where
+  the server would reject it — still safely caught by `teams.interject()`'s
+  own existing status check (part 1), surfacing as an inline 400, not a
+  crash or data issue; (b) it fails to render in a status where sending
+  should be allowed — a missed capability for that render, not a
+  correctness or data-safety bug, and self-heals on the very next poll once
+  `team.status`/`waiting_on_you` next matches `teamAcceptsInterject()`.

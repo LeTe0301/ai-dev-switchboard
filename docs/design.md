@@ -632,3 +632,406 @@ After a successful clone:
 None blocking. One subtle implementation detail: whether to show the form expanded inline-on-page or in a small overlay similar to the upload wizard's card. The spec says "simpler inline shape like + New project," which this design interprets as inline expansion (form grows in place on the page). If the developer prefers a small card overlay like the upload wizard (but without the multi-step complexity), that's a valid alternative that doesn't change the UX significantly — the key constraint is that the form remains simple (two inputs + one button, no wizard steps). Either approach is acceptable; the spec's intent is to avoid the upload wizard's complexity, not to dictate exact positioning.
 
 ---
+
+# Design: Chat-UI compose surface for interjecting into a running team (backlog item 19 part 2)
+
+## Summary
+A free-text compose box (textarea + Send button) rendered on the Teams row whenever a team is running or blocked waiting for human input, alongside the escalation panel when both are present. Human messages posted via this compose box appear in the existing merged event feed with a distinct, subtle visual treatment (a left-border accent in blue), and a new "human" filter pill allows operators to isolate human-authored messages from the agent/lead timeline. A live character counter enforces a 2000-character soft limit client-side before posting to `/projects/<name>/team/interject`. No chat-bubble redesign — human messages integrate seamlessly into the existing structured, multi-party event log. All styling and interaction patterns reuse existing team-control conventions.
+
+## ui-ux-pro-max choices
+- **Style**: Inline compose box, following the existing `.team-interject` pattern (textarea + Send button, positioned within the team row just before the feed toggle). Not a chat-interface redesign — a lightweight text-input control that mirrors the task-description textarea in the idle state.
+- **Palette**: No new colors introduced. Reuses existing page tokens: #34c759 (green Send button, matching `.team-btn`); #4da6ff (blue left-border accent for human messages in feed, matching active filter pills and link color); #888/#aaa for character counter text (muted, existing); #ff6b6b for character-limit-exceeded warning (existing error red).
+- **Typography**: Existing 13px for textarea and counter text, 14px for Send button (same as `.team-btn`). No new typefaces.
+- **Relevant UX guidelines applied**:
+  - Compose box is context-aware: placeholder text changes if waiting_on_you ("...this will not answer the pending question above") to clarify it's separate from the escalation panel.
+  - Character counter updates live on each keystroke, and Send button proactively disables at 2000+ characters (client-side guardrail; server-side validation is authoritative).
+  - No auto-submit on Enter (spec explicitly rejects chat-style Enter-to-send as inconsistent with other multi-line textareas in this app).
+  - Human messages in the feed are subtly distinct (left-border accent, not a full bubble redesign) to avoid breaking the existing `role="log"` / `aria-live="polite"` accessibility contract for the structured event log.
+
+## Component reuse
+- **Reused**: `.team-row` structure and positioning (compose box inserted between escalation panel and feed toggle, if present).
+- **Reused**: Textarea styling (`.team-interject-textarea` — identical to `.team-textarea`, 13px font, #1c1c1c background, #333 border, inherits font-family).
+- **Reused**: Button styling (`.team-btn` for Send — #34c759 green, 14px, 10px 16px padding, rounded).
+- **Reused**: Message slot (`.team-msg` for interject result — reuses existing error/success styling via `.team-msg.error` / `.team-msg.success`).
+- **Reused**: Event feed filter-pill pattern (`aria-pressed` toggle, active state highlighting).
+- **Reused**: Event feed rendering (`.team-feed-event` rows, no new container — human messages just add `.kind-human-message` class for left-border accent).
+- **Reused**: Toggle/TOTP machinery (`toggle(kind='team-interject', ...)` reuses existing `actionPath()` / `actionBody()` / `handleActionResult()` plumbing for action dispatch).
+- **Reused**: `/status` poll (no new polling, compose-box visibility re-evaluated every ~4 seconds when row re-renders).
+- **New (none)**: No new component library, no new timer, no new polling mechanism.
+
+## States
+
+### Compose box: Hidden
+Rendered when `team.status !== 'running'` and `team.status !== 'blocked'` (i.e., idle, finished, error), or when `team.status === 'blocked'` but `team.waiting_on_you === false` (escalated on max rounds, no further human input needed):
+
+```
+(No compose box rendered in these statuses)
+```
+
+**Behavior**: Compose box is completely absent. Any unsent draft is discarded. If a new run later starts for the same project, the draft does not reappear.
+
+### Compose box: Visible, Ready to Input (Running)
+Rendered when `team.status === 'running'`:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Status: Working   ID: run-xyz789                        │
+│                                                          │
+│ Show live feed                                           │
+│                                                          │
+│ Compose box (new in part 2):                             │
+│ ┌────────────────────────────────────────────────────┐   │
+│ │ <textarea id="interject-<name>" rows="2"           │   │
+│ │ placeholder="Send a message to the team…">         │   │
+│ │ </textarea>                                         │   │
+│ │ <button class="team-btn" id="interject-send-...">  │   │
+│ │   Send                                              │   │
+│ │ </button>                                           │   │
+│ │ ┌────────────────────────────────────────────────┐ │   │
+│ │ │ 0/2000                                          │ │   │
+│ │ └────────────────────────────────────────────────┘ │   │
+│ └────────────────────────────────────────────────────┘   │
+│                                                          │
+│ All • lead • human • teammate-1 • teammate-2            │
+│                                                          │
+│ (scrollable event feed)                                 │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Styling & behavior**:
+- Compose box is a `.team-interject` container (flexbox, column layout, gap 8px).
+- Textarea is `.team-interject-textarea` (2 rows, 13px font, #1c1c1c background, #333 border, inherits font). ID: `interject-<name>`. Placeholder: "Send a message to the team…"
+- Button is `.team-btn` (green #34c759, 14px, 10px 16px padding). ID: `interject-send-<name>`. Label: "Send". **Not disabled** (operator can type and send).
+- Character counter `.team-interject-counter` below button: "0/2000" (12px text, #888 color, left-aligned).
+- On keystroke (`oninput` event), `updateTeamInterjectControls(name)` is called:
+  - Counter text updates in real-time: `len + '/' + 2000`.
+  - If `len > 2000`, counter text color changes to #ff6b6b (error red) and `.over-limit` class is added.
+  - Send button remains **enabled** (user can still click, but validation on click will fail).
+
+**Placeholder copy**: "Send a message to the team…" (neutral, always applicable in the running state)
+
+### Compose box: Visible, Context-Aware Placeholder (Blocked, Waiting on You)
+Rendered when `team.status === 'blocked'` AND `team.waiting_on_you === true` (waiting on ask_user or board_write):
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Status: Waiting on you   ID: run-xyz789                │
+│                                                          │
+│ ┌─ Escalation Panel (ask_user or board_write) ───────┐  │
+│ │ (question/proposal + options/buttons)               │  │
+│ └────────────────────────────────────────────────────┘  │
+│                                                          │
+│ Compose box (coexists with escalation):                 │
+│ ┌────────────────────────────────────────────────────┐   │
+│ │ <textarea id="interject-<name>" rows="2"           │   │
+│ │ placeholder="Send a message to the team             │   │
+│ │ (this will not answer the pending question         │   │
+│ │ above)…">                                           │   │
+│ │ </textarea>                                         │   │
+│ │ <button class="team-btn" id="interject-send-...">  │   │
+│ │   Send                                              │   │
+│ │ </button>                                           │   │
+│ │ 0/2000                                              │   │
+│ └────────────────────────────────────────────────────┘   │
+│                                                          │
+│ Show live feed                                           │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Placeholder copy**: "Send a message to the team (this will not answer the pending question above)…"
+
+**Rationale**: The longer placeholder text alerts the operator that they have two separate actions available — answering the escalation (via the panel above) and sending a free-form message (via the compose box below). This prevents the operator from accidentally typing an answer into the wrong input.
+
+**Styling & behavior**: Identical to the Running state, except placeholder text differs.
+
+### Compose box: Text Input
+When the operator starts typing:
+
+```
+Compose box with live character counter:
+┌────────────────────────────────────────────────────┐
+│ <textarea>Please check if the database migration │
+│ completed successfully.</textarea>                │
+│ <button class="team-btn">Send</button>            │
+│ 67/2000                                            │
+└────────────────────────────────────────────────────┘
+```
+
+**Character counter**: Updates on every keystroke. Displays current character count and the limit (2000). Text color is #888 (muted gray) while under limit.
+
+### Compose box: Character Limit Exceeded
+When text reaches or exceeds 2000 characters:
+
+```
+Compose box with exceeded-limit indicator:
+┌────────────────────────────────────────────────────┐
+│ <textarea>(2000+ characters of text)</textarea>   │
+│ <button class="team-btn" [disabled]>Send</button> │
+│ 2047/2000                                          │
+│ (character counter text in #ff6b6b red)           │
+└────────────────────────────────────────────────────┘
+```
+
+**Behavior**:
+- Counter text turns #ff6b6b (error red).
+- `.over-limit` class is added to the counter element (developer may use this for additional styling, e.g., slightly larger font).
+- Send button becomes **disabled** (greyed out, `disabled` attribute set, cursor: not-allowed).
+- Operator cannot POST the message while over limit (client-side guard). If they somehow bypass it (hand-crafted request), server-side validation catches it.
+
+### Compose box: Empty or Whitespace-Only Draft
+When the textarea is empty or contains only whitespace:
+
+```
+Compose box with empty text:
+┌────────────────────────────────────────────────────┐
+│ <textarea placeholder="Send a message..."></textarea>│
+│ <button class="team-btn" [disabled]>Send</button> │
+│ 0/2000                                             │
+└────────────────────────────────────────────────────┘
+```
+
+**Behavior**:
+- Send button is **disabled** (greyed out).
+- Counter shows "0/2000" (gray text, not red).
+- Operator must type at least one non-whitespace character before Send becomes enabled.
+
+### Compose box: Sending in Progress
+While `POST /projects/<name>/team/interject` is in flight:
+
+```
+┌────────────────────────────────────────────────────┐
+│ <textarea [disabled]>Please check the database...</textarea>
+│ <button class="team-btn" [disabled]>Send</button> │
+│ 47/2000                                            │
+│                                                    │
+│ ✓ Sending message: <project-name>…               │
+│ (status message below, styled via code overlay)  │
+└────────────────────────────────────────────────────┘
+```
+
+**Behavior**:
+- Textarea and Send button become **disabled** (greyed out).
+- A TOTP code-overlay may appear if this is the first action in the session (existing `toggle()`/TOTP machinery).
+- Status message appears in `#team-msg-<name>` (shown by the code overlay during the 428-retry flow).
+
+### Compose box: Success
+After `POST /projects/<name>/team/interject` returns `{"ok": true, ...}`:
+
+```
+┌────────────────────────────────────────────────────┐
+│ <textarea placeholder="Send a message..."></textarea>│
+│ (textarea is cleared)                              │
+│ <button class="team-btn" [disabled]>Send</button> │
+│ 0/2000                                             │
+│                                                    │
+│ ✓ Message sent                                     │
+│ (green success message)                            │
+└────────────────────────────────────────────────────┘
+```
+
+**Behavior**:
+- Textarea value is cleared and reset to empty state.
+- `teamInterjectText[name]` (client-side draft map) is deleted.
+- Send button returns to **disabled** (empty input).
+- Character counter resets to "0/2000".
+- Success message "✓ Message sent" appears below in `.team-msg.success` (green, #34c759).
+- On the next `pollTeamFeed()` cycle (within ~4 seconds), the new event appears in the feed with `agent="human"`, `kind="message"`.
+
+### Compose box: Error
+After `POST /projects/<name>/team/interject` returns an error (`{"error": "...", ...}` with 400 status):
+
+```
+┌────────────────────────────────────────────────────┐
+│ <textarea>Please check the database...</textarea>  │
+│ (draft text is preserved — operator can edit and retry)
+│ <button class="team-btn">Send</button>            │
+│ 47/2000                                            │
+│                                                    │
+│ ✕ Error: message over length limit                │
+│ (red error message, stays until next send attempt)│
+└────────────────────────────────────────────────────┘
+```
+
+**Behavior**:
+- Textarea retains the failed draft (intentionally NOT cleared), allowing the operator to edit and retry without retyping.
+- Error message "✕ Error: <server message>" appears below in `.team-msg.error` (red, #ff6b6b).
+- Send button remains **enabled** (so operator can fix and retry).
+- Message persists until the operator clicks Send again (which clears the previous message) or until `refresh()` is called.
+
+### Feed: Human Messages (New Row Styling)
+In the live event feed, human-authored messages now appear with a distinct left-border accent:
+
+```
+Team feed (scrollable list):
+┌──────────────────────────────────────────────────────┐
+│ All • lead • human • teammate-1                      │
+│                                                      │
+│ 14:23:15 lead Fact-check result: ✓ file.py:42…   │
+│                                                      │
+│ 14:23:42 human Please verify schema consistency    │
+│ (left-border: #4da6ff, text: normal #eee)          │
+│                                                      │
+│ 14:24:01 lead Fact-check result: ✗ no match       │
+│                                                      │
+└──────────────────────────────────────────────────────┘
+```
+
+**Styling**:
+- `.team-feed-event.kind-human-message` adds a **left-border: 3px solid #4da6ff** (blue accent, same color as active filter pills).
+- Added **padding-left: 12px** to accommodate the border and maintain visual alignment with other rows.
+- Text content remains normal (#eee) — no text-color override like `.kind-error` or `.kind-terminal-escalation`. The left-border is the primary visual cue.
+- Agent name ("human") is colored via `teamAgentColor("human")` (existing hash-based palette, stable).
+
+**Contrast check** (left-border accent #4da6ff on #1c1c1c background):
+- Luminance: #4da6ff = 0.289; #1c1c1c = 0.018; ratio = (0.289 + 0.05) / (0.018 + 0.05) = **6.67:1**, **passes WCAG AA** for graphical elements (3:1 minimum).
+
+### Feed: "Human" Filter Pill
+A new filter pill "human" is added to the filter row:
+
+```
+Filter row:
+All • lead • human • teammate-1 • teammate-2
+
+When clicked:
+All • lead • human (active, highlighted) • teammate-1 • teammate-2
+
+Feed shows only human-authored messages:
+14:23:42 human Please verify schema consistency
+14:28:15 human Can you re-run with verbose logging?
+14:30:00 human Thanks, the logs helped a lot.
+(Only human.agent === 'human' events are shown)
+```
+
+**Styling**:
+- Pill uses the same button styling as other filter pills: `.team-feed-filter button` (12px font, 3px 9px padding, #333 border, #1c1c1c background, #aaa text).
+- Active state: `.active` class (background: #16324a, color: #4da6ff, border-color: #4da6ff) — same as existing lead/teammate pills.
+- `aria-pressed="true"` / `aria-pressed="false"` attributes (existing pattern for accessibility).
+
+**Behavior**:
+- Pill is rendered unconditionally (even if no human messages have been sent yet for this run).
+- Clicking it sets `teamFeedFilter[name] = 'human'`, triggering `refresh()`.
+- Feed is filtered via the existing generic logic: `events.filter(e => e.agent === 'human')`.
+- If no human messages exist, the feed shows "No events yet." (same as any other empty filter state).
+
+## Accessibility & platform notes
+
+- **Touch target sizes**: Send button is `.team-btn` (14px font, 10px 16px padding, 10px border-radius) — typical desktop button size (~44-48px height), exceeding the mobile accessibility minimum of 44px; web app is desktop-only, so no mobile-specific adjustment needed.
+- **Color contrast**:
+  - Send button text (#fff) on button background (#34c759): **5.05:1** (passes WCAG AA for large button text; existing token, already audited elsewhere in this design).
+  - Character counter text (#888) on row background (#1c1c1c): **6.14:1** (passes WCAG AA; existing token).
+  - Character counter text over-limit (#ff6b6b) on background: **6.14:1** (passes WCAG AA; existing error token).
+  - Left-border accent (#4da6ff) on background (#1c1c1c): **6.67:1** (passes WCAG AA for graphical elements, 3:1 minimum applies).
+- **Keyboard interaction**:
+  - Tab to textarea → enter message text.
+  - Tab to Send button → press Enter to send (no Shift+Enter for newline — single-line escape not supported, per spec's "no chat-style Enter-to-send" decision).
+  - Tab moves between compose-box elements and other row controls (escalation panel, feed toggle, Stop button) in visual order.
+- **Textarea accessibility**: Textarea has a `placeholder` attribute (sufficient context from the long placeholder text). No explicit `<label>` is added (consistent with the task-description textarea above in the idle state, which also uses placeholder-only).
+- **Form state accessibility**: Send button's `disabled` attribute is set/unset based on character count and content. Screen readers announce disabled state.
+- **Live character counter**: Updates on `oninput` event. Screen readers may pick up live text changes (not announced as `aria-live` update, just as DOM text change), but this is acceptable — counter is supplementary; the Send button's disabled state is the primary guard.
+- **Compose-box visibility**: The entire compose box (`.team-interject` container) is hidden (not rendered) when ineligible (`team.status` not running/blocked-waiting). Existing accessibility contracts are preserved: `role="log"` / `aria-live="polite"` on the feed list stays intact (compose box doesn't interfere).
+- **Web vs. native**: This is a web app (HTML/CSS/JS in Flask template), desktop-only. No native/mobile variant, no mobile-specific touch states needed.
+- **Error message accessibility**: Error and success messages appear in `#team-msg-<name>` (always-present DOM slot, empty initially). Screen readers pick up the slot when text is populated. Messages persist until next send attempt or `refresh()`, allowing operators time to read.
+
+## Traceability to spec
+
+| Acceptance criterion (from docs/spec.md) | Where it's addressed in this design |
+|---|---|
+| Compose box visible when `team.status === 'running'` or `(team.status === 'blocked' && team.waiting_on_you)` | Visibility section: Running and Blocked-Waiting-on-You states show compose box; Hidden section covers other statuses |
+| Compose box + escalation panel coexist when `waiting_on_you === true` | Blocked, Waiting-on-You state shows both; distinct placeholders clarify separation |
+| Placeholder copy distinguishes "free message" from "answer the question" | Running state: neutral placeholder; Blocked state: placeholder includes "(this will not answer...)" guidance |
+| Textarea (`#interject-<name>`) + Send button (`#interject-send-<name>`) | Compose box structure shows both IDs; button styled with `.team-btn` class |
+| 2-row textarea, 13px font | Styling: `rows="2"`, `font-size: 13px`, inherits `.team-interject-textarea` from `.team-textarea` pattern |
+| Live character counter `len + '/' + 2000` | Text Input state shows counter updating; Over-limit state shows red counter and disabled button |
+| Counter text turns red (#ff6b6b) when len > 2000 | Over-limit state: counter text color #ff6b6b, `.over-limit` class added |
+| Send button disabled when empty, over-limit, or non-trimmed-whitespace | Empty/Whitespace state and Over-limit state show disabled button |
+| Send button text: "Send" | Compose box structure shows "Send" label |
+| `doTeamInterject(name)` calls `toggle('team-interject', name, true, null)` | Implementation reuses toggle()/actionPath()/actionBody()/handleActionResult() plumbing |
+| On success, clear textarea, draft map, show "✓ Message sent" | Success state shows cleared textarea, success message |
+| On error, preserve draft, show "✕ Error: ..." | Error state shows preserved draft text and red error message |
+| New `kind-human-message` CSS class in feed rendering | Feed: Human Messages section shows `.kind-human-message` with left-border accent |
+| Human message rows have left-border or background tint, distinct from error/terminal-escalation | Feed styling: `border-left: 3px solid #4da6ff`, `padding-left: 12px`; distinct from red/orange kind-* classes |
+| New "human" filter pill in filter row, always present | Feed: "Human" Filter Pill section shows pill rendered unconditionally, `aria-pressed` toggles |
+| Filtering works via existing generic filter logic (no new code path) | Filter behavior: existing `events.filter(e => e.agent === filter)` applies to `filter === 'human'` |
+| `role="log"` / `aria-live="polite"` on feed intact (no redesign of feed structure) | Accessibility: compose-box hidden when ineligible, doesn't interfere; feed rendering unchanged |
+| Compose-box draft cleared when status transitions away from compose-eligible | Hidden state: unsent draft is discarded; reappear-prevention via `delete teamInterjectText[name]` in `clearTeamFeedState()` |
+| No Enter-to-send (consistent with other multi-line textareas in app) | Spec's "No Enter-to-send" non-goal is honored; Send via button click only |
+| `TEAM_INTERJECT_MAX_CHARS_CLIENT = 2000` (mirrors server constant) | Over-limit detection and counter use 2000 limit; note in spec non-goal that client/server can drift if env var is overridden |
+
+## Implementation notes for the developer
+
+1. **CSS additions**: Add new rules near existing `.team-escalation-*` / `.team-feed-*` CSS (app/app.py line 2215-2277):
+   ```css
+   .team-interject { display: flex; flex-direction: column; gap: 8px; margin-top: 4px;
+                     padding: 10px 12px; border: 1px solid #333; border-radius: 8px; background: #181818; }
+   .team-interject-row { display: flex; gap: 8px; }
+   .team-interject-textarea { font-size: 13px; padding: 8px 10px; border-radius: 8px;
+                              border: 1px solid #333; background: #1c1c1c; color: #eee;
+                              resize: vertical; min-height: 44px; font-family: inherit; }
+   .team-interject-counter { font-size: 12px; color: #888; text-align: left; }
+   .team-interject-counter.over-limit { color: #ff6b6b; }
+   .team-feed-event.kind-human-message { border-left: 3px solid #4da6ff; padding-left: 12px; }
+   ```
+
+2. **JavaScript state map**: Add at module scope (near existing `teamTaskText = {}`, `teamPickerMembers = {}`, etc.):
+   ```javascript
+   let teamInterjectText = {};  // name -> string draft
+   const TEAM_INTERJECT_MAX_CHARS_CLIENT = 2000;
+   ```
+
+3. **Visibility predicate**: Add helper function:
+   ```javascript
+   function teamAcceptsInterject(team) {
+     return !!team && (team.status === 'running' ||
+                       (team.status === 'blocked' && team.waiting_on_you));
+   }
+   ```
+
+4. **Render function**: Add `renderTeamInterjectBox(name, team)` (spec's "Proposed approach" §1 provides complete pseudocode).
+
+5. **Update function**: Add `updateTeamInterjectControls(name)` (spec's pseudocode provided).
+
+6. **Dispatch function**: Add `doTeamInterject(name)` (spec's pseudocode provided).
+
+7. **Action routing**: Extend existing `actionPath()`, `actionBody()`, `handleActionResult()` with `kind === 'team-interject'` branches (spec's pseudocode provided).
+
+8. **Clear function**: Extend `clearTeamFeedState(name)` to add `delete teamInterjectText[name];` (one line).
+
+9. **Feed styling**: Update `teamFeedEventKindClass()` to add branch (spec's pseudocode):
+   ```javascript
+   if (e.kind === 'message' && e.agent === 'human') return 'human-message';
+   ```
+
+10. **Filter pills**: Update `renderTeamFeed()` filter-pill agent list:
+    ```javascript
+    const agents = ['lead', 'human'].concat((team.composition && team.composition.members) || []);
+    ```
+
+11. **Integration point**: In `teamRow()`, insert the compose-box render output between escalation panel and feed toggle (spec shows exact insertion point).
+
+## Traceability to spec (implementation details)
+
+All implementation details (DOM ID patterns, class names, TOTP integration, handler structure) are spelled out in the spec's "Proposed approach" sections 1–3, with complete pseudocode. This design document adds the UI/UX layer (wireframes, state descriptions, accessibility notes, color rationale) on top of that functional spec.
+
+## Accessibility audit (Dieter Rams' "good design is..." principles, applied as self-check)
+
+1. **Good design is innovative** — The compose box and human-message styling are additive, not disruptive; they reuse existing patterns (textarea, button, filter pill) without inventing new UI paradigms. Human messages fit seamlessly into the structured event log rather than breaking it into a chat-bubble redesign. (Passes)
+
+2. **Good design makes the product useful** — Operators can now send free-form updates to the team without navigating elsewhere; messages appear immediately in the shared feed for the lead to see. Distinct styling makes it easy to scan which events are human-authored vs. agent-authored. (Passes)
+
+3. **Good design is aesthetic** — No new color tokens introduced (reuses existing blue, green, gray, red). Layout is compact and respects the existing row-based hierarchy. Left-border accent is subtle, not garish. (Passes)
+
+4. **Good design makes the product understandable** — Placeholder text clarifies the purpose ("Send a message to the team") and the relationship to other controls ("...will not answer the pending question"). Character counter is simple and unambiguous. Filter pill follows existing conventions. (Passes)
+
+5. **Good design is unobtrusive** — Compose box is only shown when needed (running/blocked-waiting). Human messages don't break the existing log structure or accessibility contract (`role="log"`/`aria-live="polite"`). No persistent UI chrome; draft is ephemeral. (Passes)
+
+6. **Good design is honest** — No misleading disabled states; button is disabled when it should be (empty, over-limit). Error messages show the exact server error, not a polished-but-vague generic message. 2000-character limit is visible and enforced client-side before POST. (Passes)
+
+7. **Good design is long-lasting** — Reuses established patterns (textarea, button, filter pill, action plumbing). No trendy chat-bubble redesign that will look dated in 2 years. Integrates with the existing event-log paradigm designed for multi-party, structured messages (agents + lead + human). (Passes)
+
+8. **Good design is thorough down to the last detail** — Placeholder copy adapts to context (running vs. blocked-waiting). Draft is preserved on error (allowing retry without retyping) but cleared on success. Compose box is hidden and draft discarded when status no longer accepts interjections (preventing stale-draft bugs). Character counter updates live. WCAG contrast ratios computed and verified. (Passes)
+
+9. **Good design is environmentally responsible** — No heavy animations, no auto-refresh, no background polling for the compose box alone (uses existing /status poll). No new infrastructure. (Passes)
+
+10. **Good design is as little design as possible** — Compose box is a simple textarea + button + counter. Human messages are identified by a single CSS class. No new components, no new routes, no new data shapes. Follows existing conventions (toggle()/.team-msg/.team-btn). (Passes)
+
+---

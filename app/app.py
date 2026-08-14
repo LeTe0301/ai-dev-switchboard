@@ -2275,6 +2275,20 @@ PAGE_TEMPLATE = """<!doctype html>
   .team-feed-agent { font-weight: 600; }
   .team-feed-match { padding-left: 14px; }
   .team-feed-nomatch { color: #ff6b6b; }
+  /* Compose box for interjecting into a running team (backlog item 19 part
+     2, docs/design.md) -- reuses .team-textarea's own shape verbatim for
+     the textarea and .team-btn for Send; only the outer wrapper + counter
+     are new. Human messages in the feed get a left-border accent, not a
+     chat-bubble redesign (docs/spec.md "Proposed approach" §2). */
+  .team-interject { display: flex; flex-direction: column; gap: 8px; margin-top: 4px;
+                     padding: 10px 12px; border: 1px solid #333; border-radius: 8px; background: #181818; }
+  .team-interject-row { display: flex; gap: 8px; }
+  .team-interject-textarea { font-size: 13px; padding: 8px 10px; border-radius: 8px;
+                              border: 1px solid #333; background: #1c1c1c; color: #eee;
+                              resize: vertical; min-height: 44px; font-family: inherit; flex: 1; }
+  .team-interject-counter { font-size: 12px; color: #888; text-align: left; }
+  .team-interject-counter.over-limit { color: #ff6b6b; }
+  .team-feed-event.kind-human-message { border-left: 3px solid #4da6ff; padding-left: 12px; }
   .new-project-row { display: flex; gap: 8px; padding: 4px 0 16px; }
   .new-project-row input { flex: 1; font-size: 14px; padding: 10px 12px; border-radius: 10px;
                             border: 1px solid #333; background: #1c1c1c; color: #eee; }
@@ -2694,6 +2708,16 @@ let teamEscalationOther = {};   // name -> string, the free-text "Other" answer 
 // reads the SAME action the operator originally clicked rather than
 // something sourced from the (possibly-already-gone) pendingToggle context.
 let teamBoardResolveAction = {};
+// Chat-UI compose surface (backlog item 19 part 2, docs/spec.md "Proposed
+// approach" §1) -- per-project draft-text mirror, same "survives a full-row
+// refresh() re-render and a 428 TOTP retry" idiom teamTaskText already
+// establishes above. TEAM_INTERJECT_MAX_CHARS_CLIENT hardcodes the server's
+// documented default (teams.TEAM_INTERJECT_MAX_CHARS) rather than fetching
+// it live -- mirrors doTeamResolve()'s own existing hardcoded-2000
+// precedent; see docs/spec.md "Non-goals" for the accepted drift risk if
+// the env var is ever overridden.
+let teamInterjectText = {};  // name -> string draft
+const TEAM_INTERJECT_MAX_CHARS_CLIENT = 2000;
 
 // Agent-identity colour palette (docs/design.md "ui-ux-pro-max choices") --
 // deliberately distinct from the four semantic status colors
@@ -2722,6 +2746,11 @@ function clearTeamFeedState(name) {
   delete teamFeedFilter[name];
   delete teamEscalationSelected[name];
   delete teamEscalationOther[name];
+  // Chat-UI compose surface (backlog item 19 part 2) -- an unsent draft is
+  // discarded the moment a project falls back to the idle branch, same
+  // "no attempt to persist/restore" treatment every other per-status-scoped
+  // input in this app already gets (docs/spec.md "Edge cases").
+  delete teamInterjectText[name];
 }
 
 // Client-side mirror of teams.validate_composition()'s rules (docs/spec.md
@@ -3130,6 +3159,12 @@ function findNextLeadEvent(e, leadEvents) {
 function teamFeedEventKindClass(e, leadEvents, status) {
   const meta = e.meta || {};
   if (e.kind === 'error') return 'error';
+  // Chat-UI compose surface (backlog item 19 part 2, docs/spec.md "Proposed
+  // approach" §2) -- a human-authored interjection gets its own row
+  // classification (a left-border accent, not a chat-bubble redesign);
+  // kind==='message' never matches any of the other branches below, so
+  // this is safe placed early, before the final `return e.kind;` fallback.
+  if (e.kind === 'message' && e.agent === 'human') return 'human-message';
   // Board-write proposal/resolution (backlog item 7 part 2, docs/spec.md
   // §6 / docs/design.md) -- checked BEFORE the generic 'tool_result' +
   // meta.resolved -> 'resolved' branch below, since a board_write_resolved
@@ -3230,7 +3265,12 @@ function renderTeamFeed(name, team) {
   if (!teamFeedOpen[name]) return '';
   const events = teamFeedEvents[name] || [];
   const filter = teamFeedFilter[name] || 'all';
-  const agents = ['lead'].concat((team.composition && team.composition.members) || []);
+  // 'human' (backlog item 19 part 2, docs/spec.md "Proposed approach" §2)
+  // is shown unconditionally, right after 'lead', matching lead's own
+  // "always present" behavior -- no filtering code change needed, the
+  // existing generic filter below already isolates human.jsonl's own
+  // events once selected.
+  const agents = ['lead', 'human'].concat((team.composition && team.composition.members) || []);
   const pills = ['all'].concat(agents).map(a => {
     const label = a === 'all' ? 'All' : a;
     const isActive = filter === a;
@@ -3358,6 +3398,78 @@ function doTeamBoardResolve(name, action) {
   teamBoardResolveAction[name] = action;
   toggle('team-board-resolve', name, true, null);
 }
+// Chat-UI compose surface (backlog item 19 part 2, docs/spec.md "Proposed
+// approach" §1) -- single source of truth for compose-box visibility, used
+// both by renderTeamInterjectBox() below and by teamRow()'s own idle/
+// non-idle branching indirectly (via team.status), matching exactly which
+// statuses teams.interject() itself accepts server-side (running,
+// blocked_ask_user, blocked_board_write -- i.e. team.status==='blocked' &&
+// team.waiting_on_you), never escalated_max_rounds.
+function teamAcceptsInterject(team) {
+  return !!team && (team.status === 'running' ||
+                     (team.status === 'blocked' && team.waiting_on_you));
+}
+// Narrow, direct-DOM update on oninput (matches updateTeamStartButton()'s
+// own idiom above) -- no refresh() call here, so typing in the textarea
+// never re-renders the row or loses focus/cursor position.
+function updateTeamInterjectControls(name) {
+  const btn = document.getElementById('interject-send-' + name);
+  if (!btn) return;
+  const text = teamInterjectText[name] || '';
+  const len = text.length;
+  const over = len > TEAM_INTERJECT_MAX_CHARS_CLIENT;
+  btn.disabled = !text.trim() || over;
+  const counterEl = document.getElementById('interject-counter-' + name);
+  if (counterEl) {
+    counterEl.textContent = len + '/' + TEAM_INTERJECT_MAX_CHARS_CLIENT;
+    counterEl.className = 'team-interject-counter' + (over ? ' over-limit' : '');
+  }
+}
+// Returns '' -- and proactively discards any stale draft -- whenever the
+// current status doesn't accept an interjection (docs/spec.md "Edge cases":
+// a status transition away from compose-eligible discards the unsent
+// draft, no persist/restore). Placeholder copy is context-aware (docs/
+// spec.md "Proposed approach" §3): when the escalation panel is also
+// showing, the longer copy makes clear this box does NOT answer the
+// pending question above.
+function renderTeamInterjectBox(name, team) {
+  if (!teamAcceptsInterject(team)) { delete teamInterjectText[name]; return ''; }
+  const text = teamInterjectText[name] || '';
+  const len = text.length;
+  const over = len > TEAM_INTERJECT_MAX_CHARS_CLIENT;
+  const disabled = !text.trim() || over;
+  const placeholder = team.waiting_on_you ?
+    'Send a message to the team (this will not answer the pending question above)…' :
+    'Send a message to the team…';
+  return '<div class="team-interject">' +
+    '<div class="team-interject-row">' +
+    '<textarea class="team-interject-textarea" id="interject-' + esc(name) + '" rows="2" ' +
+    'placeholder="' + esc(placeholder) + '" oninput="teamInterjectText[' + "'" + name + "'" +
+    '] = this.value; updateTeamInterjectControls(' + "'" + name + "'" + ');">' + esc(text) + '</textarea>' +
+    '<button class="team-btn" id="interject-send-' + esc(name) + '"' + (disabled ? ' disabled' : '') +
+    ' onclick="doTeamInterject(' + "'" + name + "'" + ')">Send</button>' +
+    '</div>' +
+    '<div class="team-interject-counter' + (over ? ' over-limit' : '') + '" id="interject-counter-' + esc(name) + '">' +
+    len + '/' + TEAM_INTERJECT_MAX_CHARS_CLIENT + '</div></div>';
+}
+// Client-side validation only (docs/spec.md "Proposed approach" §1) -- the
+// route's own 400 (app/app.py POST .../team/interject) is the authoritative
+// check either way, same discipline doTeamResolve()/doTeamStart() already
+// follow. Reuses toggle()'s TOTP-retry/code-overlay plumbing exactly like
+// every other team-* action above.
+function doTeamInterject(name) {
+  const msgEl = document.getElementById('team-msg-' + name);
+  if (msgEl) { msgEl.textContent = ''; msgEl.className = 'team-msg'; }
+  const text = (teamInterjectText[name] || '').trim();
+  if (!text || text.length > TEAM_INTERJECT_MAX_CHARS_CLIENT) {
+    if (msgEl) {
+      msgEl.textContent = 'Message must be non-empty and at most ' + TEAM_INTERJECT_MAX_CHARS_CLIENT + ' characters';
+      msgEl.className = 'team-msg error';
+    }
+    return;
+  }
+  toggle('team-interject', name, true, null);
+}
 function teamRow(name, team) {
   const msgSlot = '<div class="team-msg" id="team-msg-' + esc(name) + '"></div>';
   if (!team || team.status === 'idle') {
@@ -3408,10 +3520,17 @@ function teamRow(name, team) {
     '<div class="team-sub">Escalated — max rounds reached. No pending question to answer. ' +
     'Review the feed below or Stop team and start a new run.</div>' : '';
   const escalationPanel = team.waiting_on_you ? renderEscalationPanel(name, team) : '';
+  // Chat-UI compose surface (backlog item 19 part 2, docs/spec.md "Proposed
+  // approach" §1) -- positioned between the escalation panel and the feed
+  // toggle: escalation resolution (answering a specific pending question)
+  // stays visually first when present; the always-available free-form
+  // channel sits directly below it; both sit above the passive, scrollable
+  // log feed.
+  const interjectBox = renderTeamInterjectBox(name, team);
   const feedToggle = renderTeamFeedToggle(name);
   const feedPanel = renderTeamFeed(name, team);
   return '<div class="team-row">' + statusStrip + escalatedNote + escalationPanel +
-    feedToggle + feedPanel +
+    interjectBox + feedToggle + feedPanel +
     '<div class="team-actions"><button class="team-btn" onclick="doTeamStop(' +
     "'" + name + "'" + ')">Stop team</button></div>' +
     msgSlot + renderTeamBranches(name) + '</div>';
@@ -3452,6 +3571,7 @@ function actionPath(kind, name, on) {
   if (kind === 'team-stop') return '/projects/' + encodeURIComponent(name) + '/team/stop';
   if (kind === 'team-resolve') return '/projects/' + encodeURIComponent(name) + '/team/resolve';
   if (kind === 'team-board-resolve') return '/projects/' + encodeURIComponent(name) + '/team/board-resolve';
+  if (kind === 'team-interject') return '/projects/' + encodeURIComponent(name) + '/team/interject';
   return '/instance/' + encodeURIComponent(name) + '/' + (on ? 'on' : 'off');
 }
 function actionBody(kind, name, on, code) {
@@ -3502,6 +3622,14 @@ function actionBody(kind, name, on, code) {
   // populates BEFORE dispatching, same "survives a TOTP retry" discipline
   // team-start's own task/lead/members fields already rely on above.
   if (kind === 'team-board-resolve') body.action = teamBoardResolveAction[name];
+  // Chat-UI compose surface (backlog item 19 part 2, docs/spec.md "Proposed
+  // approach" §1) -- reads the live textarea first, falls back to the
+  // teamInterjectText[] mirror, same "survives a mid-flow re-render/428
+  // retry" reasoning team-start's own task-text field already relies on.
+  if (kind === 'team-interject') {
+    const el = document.getElementById('interject-' + name);
+    body.text = (el ? el.value : (teamInterjectText[name] || '')).trim();
+  }
   return body;
 }
 async function performAction(kind, name, on, code) {
@@ -3535,6 +3663,7 @@ async function handleActionResult(r, ctx) {
       kind === 'team-stop' ? 'Stopping team: ' + (name || 'this') :
       kind === 'team-resolve' ? 'Submitting answer: ' + (name || 'this') :
       kind === 'team-board-resolve' ? 'Resolving board write: ' + (name || 'this') :
+      kind === 'team-interject' ? 'Sending message: ' + (name || 'this') :
       kind === 'clone' ? 'Cloning from URL' :
       (on ? 'Turning on: ' : 'Turning off: ') + (name || 'this');
     document.getElementById('action-code').value = '';
@@ -3614,6 +3743,32 @@ async function handleActionResult(r, ctx) {
         delete teamBoardResolveAction[name];
       } else {
         msgEl.textContent = '✕ Error: ' + (data.error || 'could not resolve board write');
+        msgEl.className = 'team-msg error';
+      }
+    }
+    return;
+  }
+  if (kind === 'team-interject') {
+    // Its own inline result slot (docs/design.md "Compose box: Success" /
+    // "Compose box: Error"), same pattern as team-resolve/team-board-resolve
+    // above -- handled before the generic 400 branch below for the same
+    // reason (an over-length/empty-message 400 belongs in THIS row's own
+    // team-msg slot, not the new-project error field).
+    hideCodeOverlay();
+    const data = await r.json().catch(() => ({}));
+    const msgEl = document.getElementById('team-msg-' + name);
+    if (msgEl) {
+      if (r.ok && data.ok) {
+        msgEl.textContent = '✓ Message sent';
+        msgEl.className = 'team-msg success';
+        delete teamInterjectText[name];
+        const ta = document.getElementById('interject-' + name);
+        if (ta) ta.value = '';
+        updateTeamInterjectControls(name);
+      } else {
+        // Draft text is deliberately NOT cleared on failure -- the operator
+        // can fix and resend without retyping.
+        msgEl.textContent = '✕ Error: ' + (data.error || 'could not send message');
         msgEl.className = 'team-msg error';
       }
     }
