@@ -2005,4 +2005,308 @@ python3 -m unittest discover -s tests &
 python3 -m unittest discover -s tests &
 wait
 ```
+
+---
+
+# Implementation: `install.sh --with-ollama` -- link an existing Ollama (sub-spec 6d, part 2b of 2)
+
+## Summary
+
+`install.sh` gains one new optional flag, `--with-ollama`: prompts for an
+existing, already-running Ollama's OpenAI-compatible endpoint URL and a
+model name, validates both against the **exact** path the tier-1 lead
+adapter really calls (`GET "$BASE/models"`, not Ollama's own native
+`/api/tags`), and writes `TEAM_LLM_BASE_URL`/`TEAM_LLM_MODEL` only when
+that validation succeeds. This **links** a remote Ollama -- it installs
+nothing locally (no package, no model pull, no container, no systemd
+unit), per docs/story.md §2.5's own finding that the standard switchboard
+container has ~715MB free RAM with swap already exhausted, so no
+tool-capable model fits there. Off by default, matching every other
+`--with-*` flag. `app/app.py` and `app/teams.py` are untouched -- this
+cycle is `install.sh` + tests + docs only, per spec.
+
+## Changes by file
+
+- **`install.sh`**:
+  - Usage-block comment (near the top, alongside every other `--with-*`
+    flag's own paragraph) documents `--with-ollama`.
+  - Flag plumbing: `WITH_OLLAMA=0` default alongside the other `WITH_*`
+    defaults; `--with-ollama) WITH_OLLAMA=1 ;;` case alongside the others.
+  - New block, placed **immediately before** the `--with-deploy-target`
+    block (both sit after `ENV_FILE` is defined at the top of the "Config"
+    section) -- see "Key decisions" below for why this exact placement,
+    not simply appended after deploy-target, mattered:
+    - Two prompts: endpoint URL (default `http://127.0.0.1:11434/v1`,
+      shown for shape only -- a remote endpoint is the expected real
+      answer) and model name (default `qwen3:8b`), each pre-filled from
+      any existing `TEAM_LLM_BASE_URL`/`TEAM_LLM_MODEL` in `switchboard.env`
+      so a blank re-run answer resubmits the *previous* value rather than
+      the shape-only default (see "Idempotence" below).
+    - Trailing-slash normalisation (`${OLLAMA_BASE_URL_INPUT%/}`) before
+      validating or writing -- never appends `/v1` if the operator left it
+      off; only strips a redundant trailing slash so `/models` is never
+      requested as `//models`.
+    - Validation: `curl -fsS --max-time 10 "$BASE_NORM/models"`, bounded so
+      an unreachable or stalling host can never hang the installer. The
+      response is parsed with a `python3` script (built into a shell
+      variable via a heredoc, then invoked as `python3 -c "$VAR"` with the
+      JSON piped separately -- see "Key decisions" for why `python3 -
+      <<PYEOF` doesn't work when the script also needs piped stdin data),
+      never `grep`, comparing the wanted model name against each `id` in
+      `{"data": [{"id": ...}, ...]}` by **exact equality**.
+    - Three distinct outcomes: unreachable/non-JSON/HTTP-error (skip,
+      write nothing, explain the tier-2 fallback), reachable-but-model-
+      absent (skip, write nothing, **list the available model ids**), and
+      both-fine (`set_env` both keys, print a summary that says plainly
+      nothing was installed locally).
+- **`tests/test_install_ollama.py`** (new, 16 tests, `InstallShOllamaBlockTests`)
+  -- see "Verification status" below.
+- **`tests/test_deploy_target.py`** (one-line fix, not a new test): the
+  existing `test_combined_with_host_control_no_conflicting_state`'s own
+  `host_control_block` extraction end-marker (`'fi\n\n# ── Optional:
+  deploy-target'`) was a literal string that happened to match the text
+  immediately following `--with-host-control`'s closing `fi` *only because
+  nothing sat between it and the deploy-target block's own comment before
+  this cycle*. Inserting `--with-ollama` between them made that marker
+  match much further down the file instead (right after MY new block's own
+  closing `fi`), silently absorbing the entire `--with-ollama` block into
+  `host_control_block` and producing a bash syntax error two commands
+  later. Fixed by updating the literal marker to the new correct text
+  (`'fi\n\n# ── Optional: link an existing remote Ollama'`) -- a real,
+  demonstrated regression this cycle's structural change caused in an
+  *existing* test, not a speculative touch-up. See "Key decisions" below
+  for the same underlying issue in this cycle's own new test file, fixed
+  before it ever shipped rather than discovered afterward.
+- **`config/switchboard.env.example`**: unchanged. `TEAM_LLM_BASE_URL`/
+  `TEAM_LLM_MODEL` were already documented there in 6c, including a
+  comment that already names `install.sh --with-ollama` by its final name
+  -- confirmed by inspection before starting, not assumed.
+- **`app/app.py`, `app/teams.py`**: unchanged. Confirmed by `git diff
+  --stat -- app/app.py app/teams.py` showing no output for this cycle's
+  diff.
+
+## Key decisions / tradeoffs
+
+- **Block placement: immediately BEFORE `--with-deploy-target`, not
+  appended after it.** The first attempt placed the new block *after*
+  `--with-deploy-target` and before the `"== Done =="` summary. That broke
+  4 existing tests in `tests/test_deploy_target.py`: their own block
+  extraction (`_extract_between(source, "# ── Optional: deploy-target
+  receiver", 'echo "== Done =="')`) is a literal-text slice, and inserting
+  new content between the deploy-target block and that shared end marker
+  silently pulled the entire new `--with-ollama` block into what those
+  tests thought was just the deploy-target block -- producing `bash: line
+  119: WITH_OLLAMA: unbound variable` under `set -u` (that harness never
+  sets `WITH_OLLAMA`). Moving the new block to sit *before*
+  `--with-deploy-target` instead restores the original adjacency between
+  deploy-target's own block and the summary exactly as it was, so those
+  existing extractions need no change at all. This is a real, general
+  lesson for this codebase's "extract a literal block from install.sh's
+  own source" test technique: appending a new optional block anywhere
+  between an existing block and *its own* end marker is unsafe regardless
+  of which existing block is involved; inserting before it (or as the new
+  last block before the final marker) is not. One further, unavoidable
+  fix was still needed even after choosing the safer placement:
+  `test_combined_with_host_control_no_conflicting_state`'s own separate
+  extraction (a literal string ending exactly at what used to be
+  immediately after `--with-host-control`'s closing `fi`) still needed its
+  end-marker literal updated, since something now genuinely sits between
+  host-control and deploy-target that didn't before -- see "Changes by
+  file" above.
+- **The new test file's own two internal `_extract_between` calls use
+  `"# ── Optional: deploy-target receiver"` as the end marker, not `'echo
+  "== Done =="'`** -- for the identical reason: with `--with-ollama` now
+  sitting immediately before `--with-deploy-target`, ending the extraction
+  at the shared summary marker would just reproduce the same class of bug
+  in the *new* file that had to be fixed in the existing one. Caught and
+  fixed here before ever running the full suite, by reasoning through the
+  file's new structure rather than waiting to discover it as a failure.
+- **`python3 -c "$VAR"` with piped stdin, not `python3 - <<PYEOF ... JSON
+  piped in too`.** The first draft tried `printf '%s' "$JSON" | python3 -
+  "$MODEL" <<'PYEOF' ... PYEOF` -- piping the response JSON into the same
+  command whose stdin a heredoc also redirects. Verified directly (not
+  assumed) that this is broken: `bash -c 'printf "PIPED-JSON" | python3 -
+  <<PYEOF
+sys.stdin.read()
+PYEOF'` prints `''`, not `'PIPED-JSON'` -- the
+  heredoc always wins that fd, so the JSON payload would never reach the
+  script. Fixed by building the script text into a shell variable via a
+  heredoc (a `cat <<'PYEOF' ... PYEOF` with no pipe involved, so no
+  conflict), then invoking `python3 -c "$VAR" "$MODEL"` with the JSON
+  piped in **separately** -- confirmed working for both the exact-match
+  and substring-safety cases by hand before writing it into install.sh.
+- **A blank prompt answer resubmits the *previous* value (via `get_env`
+  pre-fill), not an empty string guarded by `[ -n "$X" ] && set_env`.**
+  docs/spec.md's own "Proposed approach" shows a literal
+  `prompt "..." "http://127.0.0.1:11434/v1"` (hardcoded shape-only
+  default), while its separate "Idempotence" section requires that a
+  blank answer leave any previous value untouched, matching the
+  deploy-target block's own `[ -n "$X" ] && set_env` idiom. These two are
+  in real tension for a value whose default is non-blank: deploy-target's
+  own idiom works because its own defaults are all empty strings, so
+  "blank" and "the default" are the same thing there. For `--with-ollama`
+  they are not. Resolved by following this same file's OWN older, more
+  common convention for exactly this shape (`AUTH_MODE`/`PVE_HOST`/
+  `SIMPLE_USERNAME`/`PUBLISH_MODE`/`BASE_URL` all pre-fill their `prompt`
+  default from `get_env "$ENV_FILE" <KEY>`) rather than the deploy-target
+  block's blank-default idiom, which doesn't fit here: `OLLAMA_BASE_URL_
+  DEFAULT="$(get_env ...)"`, then `prompt "..."
+  "${OLLAMA_BASE_URL_DEFAULT:-http://127.0.0.1:11434/v1}"`. A blank answer
+  on a fresh install still shows the spec's own literal shape-only
+  default (satisfying "Proposed approach" for the first-run case); a
+  blank answer on a re-run resubmits the exact previous value, which then
+  gets *revalidated* (not just left alone) -- if that revalidation
+  succeeds, the write is a byte-for-byte no-op; if the previously-working
+  endpoint has since gone unreachable, nothing gets clobbered either
+  (the block just writes nothing, same "refuse to write unverifiable
+  config" discipline as every other outcome). Verified directly by test
+  (`test_blank_answers_leave_existing_values_untouched`,
+  `test_changed_model_updates_only_team_llm_model`,
+  `test_rerun_with_same_answers_is_a_noop`), with the stub server kept
+  running across both prompts in each test so the revalidation path is
+  exercised for real, not assumed away.
+- **The written `TEAM_LLM_BASE_URL` is the normalised (trailing-slash-
+  stripped) form, not the operator's raw input verbatim.** The spec's own
+  acceptance criterion ("validates and writes correctly") doesn't pin down
+  which exact string gets written for the trailing-slash case; the
+  normalised form was chosen because it matches `_tier1_call()`'s own
+  `f"{base_url}/chat/completions"` convention (no trailing slash, mirroring
+  `DESC_LLM_BASE_URL`'s existing shape) -- confirmed by reading
+  `app/teams.py` before deciding, not assumed.
+- **`--with-ollama` needs no root-privileged system state at all** (no
+  `useradd`, no sudoers file, no `/usr/local/bin` install) unlike
+  `--with-deploy-target`/`--with-host-control` -- so, unlike
+  `InstallScriptDeployTargetBlockTests`, none of `test_install_ollama.py`'s
+  tests are gated on `HAVE_PASSWORDLESS_SUDO`; they run unconditionally.
+  The pty-driven technique (`_run_with_pty`, copied verbatim from
+  `tests/test_deploy_target.py` with the same docstring, since
+  install.sh's own `prompt()` deliberately reads from `/dev/tty` rather
+  than stdin) is still required, though, since this block calls `prompt`
+  twice -- so `InstallShDeployMapBlockTests`' simpler plain-subprocess
+  technique (valid there because that file's two blocks never call
+  `prompt` at all) doesn't apply here.
+
+## Deviations from spec
+
+1. **Prompt defaults are pre-filled from any existing config (`get_env`),
+   not always the spec's own literal hardcoded default string.** See "Key
+   decisions" above for the full reasoning -- this resolves a real tension
+   between the spec's own "Proposed approach" code sample and its separate
+   "Idempotence" section, in favor of satisfying the section with an actual
+   testable acceptance criterion attached, while still showing the spec's
+   own literal shape-only defaults on a genuinely fresh install (no prior
+   `TEAM_LLM_*` in `switchboard.env`).
+2. **A blank re-run answer causes the block to *revalidate* the previous
+   value over the network, not simply skip validation and leave the file
+   untouched by construction.** The spec's own "Idempotence" section states
+   the *outcome* ("a blank answer must leave any previous value
+   untouched"), which this satisfies, but doesn't specify *how*. The
+   alternative (skip re-validation entirely on a blank answer) would let a
+   config value silently go stale if the endpoint became unreachable
+   between runs, without ever alerting the operator -- reverifying on every
+   run, including blank re-runs, is the more conservative reading of "never
+   write config you cannot verify" (a "Settled before this cycle" line),
+   and it composes correctly with the "changed model" test case (which by
+   construction must still hit the network to check the new model name is
+   present).
+3. **The written `TEAM_LLM_BASE_URL` is the trailing-slash-normalised
+   form.** See "Key decisions" above -- the spec's own acceptance criterion
+   doesn't pin this down explicitly; the choice matches the existing
+   `DESC_LLM_BASE_URL`/`_tier1_call()` no-trailing-slash convention.
+
+No other deviations. `app/app.py`/`app/teams.py` are genuinely untouched
+(confirmed by `git diff --stat`), matching the spec's explicit non-goal;
+nothing surfaced during this cycle that looked like it required a code
+change.
+
+## Known limitations
+
+- **No locking/atomicity between a concurrent `--with-ollama` run and any
+  other process writing `switchboard.env` at the same instant.** Same
+  category of gap as every other `set_env` call in `install.sh` -- this
+  cycle doesn't introduce it and doesn't claim to fix it (install.sh has
+  never had cross-process file locking for `switchboard.env`).
+- **A model that ollama's `/v1/models` lists but that isn't actually
+  loaded/runnable (e.g., insufficient VRAM at inference time, a corrupted
+  pull) is accepted at install time.** The spec's own non-goals explicitly
+  exclude runtime health-checking ("Health-checking the endpoint at
+  runtime, on a timer, or at team start" is out of scope) -- this is that
+  same boundary, restated for the install-time case: presence in the
+  `/models` listing is the full extent of what install-time verification
+  can mean here, by design.
+- **The two `curl`/`python3` version constraints are whatever ships with
+  Debian 12+'s `apt-get install python3 curl`** (both already installed
+  unconditionally per `install.sh:146`, per the spec's own precondition) --
+  not independently version-pinned or checked by this block.
+
+## Verification status
+
+| Check | Command | Result |
+|---|---|---|
+| Syntax | `bash -n install.sh` | clean |
+| Manual, real stub server, all 3 outcomes + trailing slash + substring safety | see below | all correct, confirmed by hand before writing the automated tests |
+| Manual, real stalling stub, bounded | `time bash <extracted block>` against a `time.sleep(60)` handler | `real 0m10.015s` -- bounded by `curl --max-time 10`, never hangs |
+| New test file alone | `uv run --with pytest python -m pytest tests/test_install_ollama.py -q` | **16 passed** |
+| `tests/test_deploy_target.py` (regression check after the placement fix) | `uv run --with pytest python -m pytest tests/test_deploy_target.py -q` | **30 passed** (was 4 failing before the placement + marker fixes, see "Key decisions") |
+| Full suite, 2 consecutive clean runs this cycle | `uv run --with pytest python -m pytest tests/ -q` | **690 passed** both runs (674 baseline + 16 new), no flake |
+| Four Node suites | `node tests/test_{team,deploy,singleton_toggle,upload}_frontend.js` | 17/17, 9/9, 15/15, 8/8 -- all pass, untouched by this cycle |
+| `app/app.py`/`app/teams.py` diff scope | `git diff --stat -- app/app.py app/teams.py` | empty -- no output, confirming the non-goal held |
+
+Manual verification, real stub server, before any automated test was
+written (`python3 -m http.server`-style script serving canned JSON on a
+real port, extracted block run via `bash` with hand-supplied
+`OLLAMA_BASE_URL_INPUT`/`OLLAMA_MODEL_INPUT` and a pre-populated
+`switchboard.env`):
+```
+$ bash /tmp/full_test.sh          # reachable, model present
+Linked remote Ollama: http://127.0.0.1:18999/v1, model qwen3:8b.
+Nothing was installed locally -- this endpoint runs elsewhere.
+
+$ bash /tmp/full_test2.sh         # substring safety: asked for "qwen3:8"
+                                   # against a stub advertising "qwen3:8b"
+Reached http://127.0.0.1:18999/v1 but model 'qwen3:8' is not available
+there -- writing nothing. Available models: qwen3:8b,llama3.2:1b
+
+$ bash /tmp/full_test3.sh         # trailing slash in stored config
+Linked remote Ollama: http://127.0.0.1:18999/v1, model qwen3:8b.
+# (TEAM_LLM_BASE_URL written WITHOUT the trailing slash)
+
+$ time bash /tmp/full_test4.sh    # unreachable (nothing listening)
+Could not reach http://127.0.0.1:1/v1/models ... -- writing nothing.
+real 0m0.011s
+```
+
+## How to verify locally
+
+```bash
+# Syntax
+bash -n install.sh
+
+# New test file
+/home/dev/.local/bin/uv run --with pytest python -m pytest tests/test_install_ollama.py -v
+
+# Regression check on the existing deploy-target block tests (needed a
+# one-line marker fix this cycle, see "Key decisions")
+/home/dev/.local/bin/uv run --with pytest python -m pytest tests/test_deploy_target.py -q
+
+# Full suite (run more than once)
+/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q
+
+# Node suites (untouched by this cycle, run for completeness)
+node tests/test_team_frontend.js
+node tests/test_deploy_frontend.js
+node tests/test_singleton_toggle_frontend.js
+node tests/test_upload_frontend.js
+
+# Confirm app/app.py and app/teams.py are untouched
+git diff --stat -- app/app.py app/teams.py
+
+# Manual end-to-end sanity check against a real stub server (no pty needed
+# if you pre-populate switchboard.env and use YES=1 -- see
+# tests/test_install_ollama.py's own InstallShOllamaBlockTests for the
+# pty-driven version that exercises the real interactive prompts)
+python3 -m http.server --bind 127.0.0.1 0   # or any script serving
+                                             # {"data":[{"id":"qwen3:8b"}]}
+                                             # at /v1/models
+```
 ```

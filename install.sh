@@ -33,6 +33,14 @@
 #                         tracker), left OFF until toggled in the web UI —
 #                         see docs/spec.md and the "Optional: self-hosted
 #                         Taiga" section below
+#   --with-ollama         LINK an existing, already-running remote Ollama for
+#                         multi-agent team leads (docs/story.md §2.5) —
+#                         installs nothing locally (no package, no model
+#                         pull, no container, no systemd unit). Prompts for
+#                         an endpoint URL + model name, validates both are
+#                         actually reachable/present, writes TEAM_LLM_BASE_URL/
+#                         TEAM_LLM_MODEL. Refuses to write config it can't
+#                         verify — see docs/spec.md (6d part 2b)
 #
 # Safe to re-run: every step here either checks for existing state first or
 # overwrites deterministically-generated files (units, sudoers), never
@@ -66,6 +74,7 @@ WITH_CODE_SERVER=0
 WITH_HOST_CONTROL=0
 WITH_DEPLOY_TARGET=0
 WITH_TAIGA=0
+WITH_OLLAMA=0
 for arg in "$@"; do
     case "$arg" in
         --yes) YES=1 ;;
@@ -74,6 +83,7 @@ for arg in "$@"; do
         --with-host-control) WITH_HOST_CONTROL=1 ;;
         --with-deploy-target) WITH_DEPLOY_TARGET=1 ;;
         --with-taiga) WITH_TAIGA=1 ;;
+        --with-ollama) WITH_OLLAMA=1 ;;
         *) echo "Unknown flag: $arg (see the top of install.sh for the list)" >&2; exit 1 ;;
     esac
 done
@@ -621,6 +631,97 @@ if [ "$WITH_HOST_CONTROL" -eq 1 ]; then
     done
     [ -f "$CONFIG_DIR/host.env" ] || cp "$REPO_DIR/host-agent/host.env.example" "$CONFIG_DIR/host.env"
     set_env "$CONFIG_DIR/host.env" ENGINES_DIR "$CONFIG_DIR/engines.d"
+fi
+
+# ── Optional: link an existing remote Ollama for multi-agent team leads
+# (--with-ollama). This LINKS a remote endpoint — it never installs Ollama,
+# a model, a container, or a systemd unit on this machine. The standard
+# switchboard container has ~715MB free RAM with swap already exhausted
+# (docs/story.md §2.5); no tool-capable model fits here, so the endpoint
+# must already be running somewhere else. TEAM_LLM_BASE_URL/TEAM_LLM_MODEL
+# are already documented in config/switchboard.env.example (added in 6c) —
+# this block writes them, it does not introduce them.
+if [ "$WITH_OLLAMA" -eq 1 ]; then
+    echo "-- Link an existing Ollama (multi-agent team leads) --"
+    echo "This LINKS a remote Ollama endpoint — nothing is installed on this"
+    echo "machine. Point it at an Ollama instance already running elsewhere"
+    echo "(e.g. another host on your tailnet)."
+
+    OLLAMA_BASE_URL_DEFAULT="$(get_env "$ENV_FILE" TEAM_LLM_BASE_URL)"
+    OLLAMA_MODEL_DEFAULT="$(get_env "$ENV_FILE" TEAM_LLM_MODEL)"
+    OLLAMA_BASE_URL_INPUT=$(prompt "Ollama endpoint URL (OpenAI-compatible, e.g. an existing remote Ollama's /v1)" "${OLLAMA_BASE_URL_DEFAULT:-http://127.0.0.1:11434/v1}")
+    OLLAMA_MODEL_INPUT=$(prompt "Model name" "${OLLAMA_MODEL_DEFAULT:-qwen3:8b}")
+
+    # Normalise a trailing slash so we validate — and write — the exact URL
+    # TEAM_LLM_BASE_URL will be, never "//models" (docs/spec.md
+    # "Validation"). Deliberately does NOT append /v1 if the operator left
+    # it off — silently rewriting their URL is how the wrong endpoint gets
+    # validated instead of the one that was actually typed.
+    OLLAMA_BASE_URL_NORM="${OLLAMA_BASE_URL_INPUT%/}"
+
+    # Validate against the exact OpenAI-compatible path the lead adapter
+    # will really call (app/teams.py's _tier1_call() hits
+    # "$TEAM_LLM_BASE_URL/chat/completions") — NOT Ollama's native
+    # /api/tags, which lives outside /v1 and would validate a different URL
+    # than the one being written. Bounded so an unreachable/stalled host can
+    # never hang the installer.
+    OLLAMA_MODELS_JSON=$(curl -fsS --max-time 10 "$OLLAMA_BASE_URL_NORM/models" 2>/dev/null || true)
+
+    if [ -z "$OLLAMA_MODELS_JSON" ]; then
+        echo "Could not reach $OLLAMA_BASE_URL_NORM/models (unreachable, no response, or an HTTP error) — writing nothing. The team lead will fall back to an engines.d tier-2 engine until this is fixed. Re-run --with-ollama once the endpoint is reachable." >&2
+    else
+        # Parsed with python3 (unconditionally installed above), never
+        # grep — a substring match would false-positive "qwen3:8" against
+        # an endpoint advertising only "qwen3:8b". Exact id comparison
+        # only. A 200 response that isn't valid JSON (an HTML proxy login
+        # page, a captive portal) is treated as a parse failure, not as a
+        # valid empty model list.
+        #
+        # The script text is built into a variable via a heredoc, THEN run
+        # as `python3 -c "$VAR"` with the JSON piped separately — `python3
+        # - <<PYEOF` (script AND data both on stdin) doesn't work here, the
+        # heredoc always wins that fd and the piped JSON would never reach
+        # sys.stdin.
+        OLLAMA_MODEL_CHECK_SCRIPT=$(cat <<'PYEOF'
+import json
+import sys
+
+wanted = sys.argv[1]
+raw = sys.stdin.read()
+try:
+    data = json.loads(raw)
+    ids = [m.get("id") for m in data.get("data", []) if isinstance(m, dict)]
+except Exception:
+    print("PARSE_ERROR")
+    sys.exit(0)
+if wanted in ids:
+    print("OK")
+else:
+    print("MODEL_ABSENT:" + ",".join(str(i) for i in ids if i is not None))
+PYEOF
+)
+        OLLAMA_MODEL_CHECK=$(printf '%s' "$OLLAMA_MODELS_JSON" | \
+            python3 -c "$OLLAMA_MODEL_CHECK_SCRIPT" "$OLLAMA_MODEL_INPUT")
+        case "$OLLAMA_MODEL_CHECK" in
+            OK)
+                set_env "$ENV_FILE" TEAM_LLM_BASE_URL "$OLLAMA_BASE_URL_NORM"
+                set_env "$ENV_FILE" TEAM_LLM_MODEL "$OLLAMA_MODEL_INPUT"
+                echo "Linked remote Ollama: $OLLAMA_BASE_URL_NORM, model $OLLAMA_MODEL_INPUT."
+                echo "Nothing was installed locally — this endpoint runs elsewhere."
+                ;;
+            MODEL_ABSENT:*)
+                OLLAMA_AVAILABLE="${OLLAMA_MODEL_CHECK#MODEL_ABSENT:}"
+                if [ -z "$OLLAMA_AVAILABLE" ]; then
+                    echo "Reached $OLLAMA_BASE_URL_NORM but it has no models available — writing nothing." >&2
+                else
+                    echo "Reached $OLLAMA_BASE_URL_NORM but model '$OLLAMA_MODEL_INPUT' is not available there — writing nothing. Available models: $OLLAMA_AVAILABLE" >&2
+                fi
+                ;;
+            *)
+                echo "Reached $OLLAMA_BASE_URL_NORM/models but its response could not be parsed as JSON (a proxy login page or captive portal can look like this) — writing nothing." >&2
+                ;;
+        esac
+    fi
 fi
 
 # ── Optional: deploy-target receiver (--with-deploy-target). Fully

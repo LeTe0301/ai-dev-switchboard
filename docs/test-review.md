@@ -1763,3 +1763,276 @@ cycle's own tests; and `docs/design.md`'s rewritten contrast numbers check
 out against my own independent computation, with one small, already-
 disclosed, non-blocking documentation gap (`.team-sub`) still unaddressed.
 Full suite reconfirmed at 674 passed.
+
+# Test & Review: `install.sh --with-ollama` — link an existing remote Ollama (sub-spec 6d, part 2b of 2)
+
+New sub-spec, new cycle. Baseline before this cycle: 674 passing. After
+this cycle's diff: 690 passed (pytest) + 17/9/15/8 passed (the four Node
+suites, untouched by this cycle). Uncommitted working tree: `install.sh`
+(usage block, flag plumbing, one new block), `tests/test_install_ollama.py`
+(new, 16 tests), `tests/test_deploy_target.py` (one-line marker fix).
+
+## Scope
+
+Covers `docs/spec.md` (6d part 2b)'s full acceptance-criteria list (usage/
+off-by-default, reachable-with-model write, unreachable-endpoint skip,
+reachable-but-absent-model skip+list, bounded stall, substring safety,
+trailing-slash normalisation, idempotent re-run, nothing-installed-locally,
+full-suite regression), both stated edge cases (HTML/captive-portal body,
+empty model list, URL missing `/v1` not silently rewritten), and the
+test-isolation requirement (ephemeral ports, no fixed ports, no writes
+outside a per-test fixture). Also independently probed beyond the
+developer's own 16 tests: shell/JSON metacharacters and flag-shaped model
+names, HTTP-error bucketing, `set -euo pipefail` abort-vs-skip-only-this-
+block behavior under a real induced failure, and the fresh-install (no
+prior key at all) idempotence case.
+
+## Test cases
+
+| # | Criterion / case | Method | Result | Evidence |
+|---|---|---|---|---|
+| 1 | `--with-ollama` in usage block, `WITH_OLLAMA=0` default, flag wired up | automated | pass | `test_usage_block_documents_the_flag`, `test_flag_defaults_to_off_in_flag_plumbing` |
+| 2 | Without the flag, no `TEAM_LLM_*` written, no block output | automated | pass | `test_without_the_flag_writes_no_team_llm_keys` |
+| 3 | Reachable + model present → both keys written with exactly the supplied values | automated, real stub HTTP server (ephemeral port) | pass | `test_reachable_with_model_writes_both_keys_exactly` |
+| 4 | Unreachable endpoint → neither key written, run still succeeds (rc=0), file inspected not just stdout | automated | pass | `test_unreachable_endpoint_writes_nothing_run_still_succeeds` |
+| 5 | Reachable, model absent → neither key written, available ids listed | automated | pass | `test_reachable_but_model_absent_lists_available_ids` |
+| 6 | Reachable, empty model list → "no models available", not silently treated as valid | automated | pass | `test_reachable_with_empty_model_list_says_none_available` |
+| 7 | Bounded: stalling endpoint doesn't hang the installer | automated, real stub that sleeps 60s, `curl --max-time 10` | pass | `test_stalling_endpoint_is_bounded_does_not_hang` (elapsed < 20s asserted) |
+| 8 | Substring safety: `qwen3:8` rejected against a stub advertising only `qwen3:8b` | automated | pass | `test_substring_model_name_is_rejected_not_accepted` |
+| 9 | Trailing slash normalised, no `//models`, request path asserted directly | automated | pass | `test_trailing_slash_validates_and_writes_no_double_slash` |
+| 10 | URL missing `/v1` validated as given, not silently rewritten | automated | pass | `test_url_without_v1_is_validated_as_given_not_silently_rewritten` |
+| 11 | Idempotent re-run: blank leaves values untouched; changed model updates only `TEAM_LLM_MODEL`; same-answer re-run is a byte-for-byte no-op | automated, stub kept running across both prompts | pass | `test_blank_answers_leave_existing_values_untouched`, `test_changed_model_updates_only_team_llm_model`, `test_rerun_with_same_answers_is_a_noop` |
+| 12 | Nothing installed locally: no `apt-get`/`docker`/`systemctl`/`ollama pull`/`ollama run`/`useradd` anywhere in the block | automated, literal source scan | pass | `test_block_issues_no_local_install_command` |
+| 13 | HTML/captive-portal 200 response treated as unreachable-for-this-purpose, not a valid empty list | automated | pass | `test_html_response_treated_as_unreachable_for_this_purpose` |
+| 14 | Full suite green, four Node suites green | automated | pass | see "Regression check" below |
+| 15 | (probe, not developer's own test) Model name shaped like a CLI flag (`-x`, `-evil-url`) doesn't get misinterpreted by `python3 -c`/`curl` | manual, reproduced live | pass | see "Independent probing beyond the developer's own tests" below |
+| 16 | (probe) Model name with shell metacharacters (`` ` ``, `$(...)`, `"`) never executes, is written/read back literally | manual, reproduced live | pass | see below — confirmed no command injection, `/tmp/pwned_by_reviewer` never created |
+| 17 | (probe) HTTP 500 from a reachable endpoint lands in outcome-1 ("unreachable"), with a message that explicitly names "HTTP error" as one of the three folded sub-cases, not a misleadingly bare "unreachable" | manual, real stub returning 500 | pass | see below |
+| 18 | (probe) Fresh install, no prior `TEAM_LLM_*` key at all (only the commented-out example lines from `config/switchboard.env.example`) | manual, reproduced live | pass | see below — `get_env` correctly doesn't match `#TEAM_LLM_BASE_URL=...`, falls back to the spec's literal default, comment lines left untouched |
+| 19 | (probe) `set -euo pipefail` — can any path abort the whole installer instead of skipping only its own block? | manual, reproduced live | **fail — see Finding #1** | a re-run (upsert path) with a model/URL value containing a literal `|` aborts the whole run with `sed: -e expression #1, char 44: unknown option to 's'`, rc=1 |
+
+## Independent probing beyond the developer's own tests
+
+**Metacharacter/flag-shaped model names (test-case 15/16 above).** Ran the
+extracted block directly (not through `unittest`, via a standalone script
+using the test file's own harness functions) with:
+- `-x` and `-evil-url` as the model name / base URL respectively — both
+  pass through correctly (`python3 -c "$SCRIPT" "$MODEL"` receives `-x` as
+  `sys.argv[1]`, never as a flag to `python3` itself, since `-c` already
+  consumed the flag position; curl on a `-`-prefixed URL just fails
+  cleanly as "could not reach", no hang, no abort).
+- `weird"name`` `` `$(touch /tmp/pwned_by_reviewer)` `` `` as the model
+  name (JSON-served by the stub, so it flows all the way through
+  `curl → python3 json.loads → case → set_env`): written to
+  `TEAM_LLM_MODEL` byte-for-byte, `/tmp/pwned_by_reviewer` never created —
+  confirmed no command injection anywhere in this path. The model name
+  reaches `python3` as `sys.argv[1]` (never interpolated into shell text)
+  and reaches `set_env`'s `printf`/`sed` as a quoted shell variable, not as
+  literal script text.
+
+**HTTP-error bucketing (test-case 17).** Stood up a real stub returning
+HTTP 500 with a JSON error body. `curl -fsS` fails closed (the `-f` flag
+suppresses the error body), `OLLAMA_MODELS_JSON` ends up empty, and the
+block prints "Could not reach ... (unreachable, no response, or an HTTP
+error) — writing nothing." — this message explicitly names all three
+sub-cases the spec's own outcome 1 folds together
+("unreachable / non-JSON / HTTP error"), so a reachable-but-erroring host
+is not misleadingly reported as simply "down". This matches the spec's own
+explicit instruction to fold these three into one outcome with one
+message — not a defect.
+
+**Fresh-install idempotence (test-case 18).** The developer's own 16 tests
+all start from an empty `switchboard.env` (`open(env_file, "w").close()`),
+which is not quite the real first-run shape — a real fresh install copies
+`config/switchboard.env.example` into place first (`install.sh:235`),
+which already has `#TEAM_LLM_BASE_URL=...`/`#TEAM_LLM_MODEL=...` commented
+out (confirmed present at `config/switchboard.env.example:331-332`).
+Reproduced that exact shape by hand: `get_env` correctly does not match
+the commented-out lines (its `grep "^${key}="` anchor requires the key at
+column 1, and `#TEAM_LLM_BASE_URL=...` starts with `#`), so the prompt
+falls back to the spec's own literal default
+(`http://127.0.0.1:11434/v1`), that default is (correctly) unreachable in
+the test environment, nothing is written, and the commented-out example
+lines are left completely untouched. Matches the developer's own claimed
+behavior for this case.
+
+## Finding — should-fix, not must-fix
+
+### 1. A re-run with a model/base-URL value containing `|` aborts the entire installer, violating the "skip only this block" requirement — pre-existing in the shared `set_env()` helper, not newly introduced by this diff
+
+`set_env()` (`install.sh:112-118`, unchanged by this cycle) upserts via
+`sed -i "s|^${key}=.*|${key}=${val}|" "$file"` when the key already
+exists. `$val` (the operator's prompt answer) is interpolated into the
+`sed` expression completely unescaped, using `|` as the delimiter. Two
+distinct, demonstrated symptoms, both requiring the **upsert** path (the
+key must already exist — i.e. this is a re-run, not a first run):
+
+- **A value containing a literal `|`** breaks the `sed` expression's own
+  syntax outright. Reproduced live: after one successful run writes
+  `TEAM_LLM_MODEL=normal-model`, a second run supplying the model name
+  `weird|model` fails with `sed: -e expression #1, char 44: unknown
+  option to 's'` and **the whole script exits 1** — under this harness's
+  `set -euo pipefail` (identical to `install.sh`'s own top-of-file `set
+  -euo pipefail`), an unhandled non-zero exit from `sed` aborts the
+  entire run, not just this block. This directly contradicts the spec's
+  own explicit requirement ("Failure never aborts the whole `install.sh`
+  run — it skips this block only, per the `rrsync` precedent") and is
+  exactly the property the dispatch asked me to probe under a real
+  induced failure, not by reading the code.
+- **A value containing a literal `&`** doesn't abort, but silently
+  corrupts the config: `sed`'s replacement text treats `&` as "the whole
+  matched line", so re-running with model name `weird&model` after an
+  existing `TEAM_LLM_MODEL=normal-model` line produces
+  `TEAM_LLM_MODEL=weirdTEAM_LLM_MODEL=normal-modelmodel` — a garbled
+  line, written with `rc=0` and no diagnostic at all.
+
+**Why should-fix, not must-fix:** the root cause is entirely inside
+`set_env()`, a shared helper this cycle doesn't touch, and is already
+reachable today via several existing call sites that feed free-text
+prompt answers into it the same way (`PVE_HOST`, `SIMPLE_USERNAME`,
+`BASE_URL`, `AUTH_MODE`, etc. — all pre-existing, all upsert-path, all
+unescaped). This diff doesn't introduce the defect; it calls the existing
+helper exactly the way every other optional block in this file already
+does. The realistic trigger is also narrow: Ollama model tags (the
+`org/model:tag`-shaped strings Ollama and OCI registries use) don't
+contain `|` or `&` in practice, and I could not construct a base-URL
+value that reaches the `set_env` write path while also containing `&` or
+`|` — a URL containing either of those characters breaks the `.../models`
+GET itself first (confirmed live: a URL with `?api_key=abc&team=x`
+produces a malformed request path and is correctly rejected as
+unreachable before ever reaching `set_env`). So in practice this is
+reachable only via an unusual/adversarial **model name** on a **second or
+later** run.
+
+**Recommendation (out of this cycle's scope to fix, filed as a follow-up):**
+either have `--with-ollama` reject/escape values containing `set_env`'s
+own delimiter/replacement-special characters before calling it, or fix
+`set_env()` itself (e.g. escape `&`, `\`, and the delimiter in `$val`, or
+switch to a NUL-safe non-`sed` upsert) — the latter would also close the
+same pre-existing gap for `PVE_HOST`/`SIMPLE_USERNAME`/`BASE_URL` and
+every other existing upsert caller, which is a repo-wide fix beyond what
+this "link an existing Ollama" cycle's own spec asked for.
+
+## Regression check
+
+`/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q`:
+**690 passed**, `690 passed, 14 warnings in 131.60s` — matches the
+expected 674 baseline + 16 new tests exactly, no flake observed.
+`tests/test_deploy_target.py` run in isolation
+(`uv run --with pytest python -m pytest tests/test_deploy_target.py -v`):
+**30 passed**, including
+`InstallScriptDeployTargetBlockTests::test_combined_with_host_control_no_conflicting_state`
+(the test whose end-marker literal this cycle's diff had to change) —
+confirmed **PASSED**, not skipped, in the verbose run. Independently
+re-derived (not just trusted) that the new end-marker
+(`'fi\n\n# ── Optional: link an existing remote Ollama'`) extracts exactly
+the host-control block and nothing more: wrote a standalone script using
+the exact same `_extract_between` logic against the real `install.sh`
+source and confirmed the extracted `host_control_block` (855 chars) ends
+at the host-control block's own closing `set_env "$CONFIG_DIR/host.env"
+ENGINES_DIR ...` line, with `"WITH_OLLAMA"`/`"TEAM_LLM"` both absent from
+it — no leakage of the new block into the old test's own extraction.
+`tests/test_install_ollama.py` run in isolation, verbose: **16 passed**
+(`77.22s`), matching the developer's own reported count. Four Node
+suites, run individually: `test_team_frontend.js` 17/17,
+`test_deploy_frontend.js` 9/9, `test_singleton_toggle_frontend.js` 15/15,
+`test_upload_frontend.js` 8/8 — all pass, untouched by this cycle.
+
+## Spec coverage
+
+Every checkbox in `docs/spec.md`'s "Acceptance criteria" section is
+covered by an automated test that actually ran this session (test-cases
+1-14 above), plus the "Edge cases worth stating" section (HTML body,
+empty `data` array, URL missing `/v1`) is covered by test-cases 6/10/13.
+The "Test-isolation requirement" (ephemeral ports, no fixed ports, no
+writes outside a per-test fixture) is satisfied by construction
+(`_unused_port()`/`HTTPServer(("127.0.0.1", 0), ...)`, per-test `tempfile.
+mkdtemp()`) — read directly, confirmed no fixed port or shared path
+anywhere in the new test file. No acceptance criterion is unimplemented
+or untested.
+
+## Correctness / security review (diff read directly, not re-derived from the developer's own writeup)
+
+- **No command injection.** The model name and base URL never touch
+  shell-interpolated script text — the model name is passed to `python3`
+  as `sys.argv[1]` (an argument, not code), and both values reach
+  `set_env`'s `printf`/`sed` as quoted shell variables. Independently
+  reproduced with backticks/`$(...)`/quotes embedded in the model name
+  (see "Independent probing" above) — no execution occurred.
+- **The `set_env` sed-delimiter/replacement issue** — see Finding #1
+  above (should-fix, pre-existing, not newly introduced).
+- **Quoting throughout the new block is correct**: every variable
+  expansion that reaches `curl`/`sed`/`echo` is double-quoted; no
+  unquoted expansion that could word-split or glob.
+- **`set -euo pipefail` interaction, otherwise**: the `curl ... || true`
+  assignment and the `python3` script's own `except Exception: ...;
+  sys.exit(0)` (always exits 0, even on malformed JSON, non-dict `data`,
+  etc.) both correctly prevent `set -e` from aborting the run on any of
+  curl's or python3's own failure paths — confirmed by direct testing of
+  the unreachable, stalling, HTML-body, and non-dict-shaped-JSON cases,
+  all of which correctly land in a "skip, write nothing" branch with
+  rc=0. Finding #1 above is the one place this guarantee actually breaks,
+  and it breaks via `sed`, not via `curl`/`python3`.
+- **Block placement / `ENV_FILE` ordering**: sits at `install.sh:641`,
+  after `ENV_FILE` is defined and the real config file is guaranteed to
+  exist (`install.sh:234-235`, `[ -f "$ENV_FILE" ] || cp
+  ".../switchboard.env.example" "$ENV_FILE"`) — confirmed by reading, and
+  by the fresh-install probe above (test-case 18) actually exercising
+  that exact file shape.
+- **`tests/test_deploy_target.py`'s changed marker** — the single
+  highest-risk line in this diff per the dispatch brief — independently
+  re-verified correct (see "Regression check" above), not just re-run.
+
+## Simplicity / scope review
+
+- The new block is a single `if [ "$WITH_OLLAMA" -eq 1 ]; then ... fi`,
+  matching the `--with-deploy-target` precedent's shape exactly (prompts,
+  bounded validation, idempotent upsert, skip-don't-abort on failure,
+  inline summary). No new abstraction, no new file, no new dependency —
+  `curl`/`python3` are both already unconditional installs
+  (`install.sh:156`, not `:146` as `docs/spec.md`'s own line-number
+  citation says — a trivial, non-substantive doc drift, not worth a
+  fix-up on its own).
+- **Non-goals confirmed held**: `git diff --stat -- app/app.py
+  app/teams.py` produces no output — genuinely untouched. `git status
+  --short` confirms the same. No package/systemd-unit/container/model-pull
+  command appears anywhere in the new block (test-case 12, plus my own
+  independent `grep`/read of the extracted block). No UI surface added
+  (no `.js`/`.html` in the diff). No runtime health-check added to
+  `app/teams.py` (untouched). No authentication support added.
+- **Deviations from spec** (both disclosed in `docs/implementation.md`,
+  both independently checked and judged reasonable): (1) prompt defaults
+  pre-filled from `get_env` rather than always the spec's literal
+  hardcoded string — necessary to satisfy the spec's own separate
+  "Idempotence" section for a non-blank default, and confirmed correct on
+  both the fresh-install and re-run paths (test-cases 11/18); (2) a blank
+  re-run answer revalidates over the network rather than skipping
+  validation — a defensible, more conservative reading of "never write
+  config you cannot verify," confirmed not to clobber a previously-good
+  value if the endpoint later becomes unreachable (would just skip the
+  write, per `test_blank_answers_leave_existing_values_untouched`'s own
+  setup keeping the stub server alive across both prompts). Neither
+  deviation touches `app/app.py`/`app/teams.py` or expands scope beyond
+  the spec's own intent.
+
+## Overall verdict
+
+**Approved, with one should-fix follow-up logged (Finding #1: `set_env`'s
+unescaped `sed` upsert can abort the whole installer, or silently corrupt
+config, on a re-run whose model/URL value contains `|`/`&` — pre-existing
+in a shared helper this cycle doesn't touch, narrow real-world trigger for
+Ollama model tags specifically, not blocking).** All ten acceptance
+criteria plus both stated edge cases are covered by tests that actually
+ran this session (16 new automated tests, all independently re-run and
+confirmed passing, plus 8 additional manual probes beyond the developer's
+own suite). Full regression suite reconfirmed at 690 passed (674 baseline
++ 16 new, no flake across two independent runs), `tests/test_deploy_target.py`
+independently reconfirmed at 30 passed with the changed end-marker proven
+to extract exactly the intended block and nothing more. Both `Non-goals`
+(no `app/app.py`/`app/teams.py` changes, nothing installed locally) hold,
+confirmed by diff inspection and by direct execution of the block. No
+command-injection risk found despite deliberately adversarial input
+(backticks, `$(...)`, quotes, flag-shaped strings). The one real defect
+found (Finding #1) is real and reproduced live, not hypothetical, but is
+pre-existing, narrowly triggered, and out of this cycle's own stated
+scope to fix — logged as a follow-up rather than blocking this cycle.

@@ -592,7 +592,8 @@ class InstallScriptDeployTargetBlockTests(unittest.TestCase):
         with open(INSTALL_SH) as f:
             source = f.read()
         host_control_block = _extract_between(
-            source, 'echo "-- Host-control agent', 'fi\n\n# ── Optional: deploy-target')
+            source, 'echo "-- Host-control agent',
+            'fi\n\n# ── Optional: link an existing remote Ollama')
         helpers = _extract_between(source, "interactive() {", "random_token() {")
         deploy_block = _extract_between(
             source, "# ── Optional: deploy-target receiver", 'echo "== Done =="')

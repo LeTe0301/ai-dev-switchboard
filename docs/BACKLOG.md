@@ -512,3 +512,40 @@ per-site change: scope the name to the process.
 
 **Open for the future session:** whether the privileged deploy tests should
 run in CI at all, or be marked as an explicitly opt-in local-only suite.
+
+---
+
+## 10. `set_env()`'s unescaped `sed` upsert can abort install.sh or corrupt config
+
+Found by the reviewer during 6d part 2b (`install.sh --with-ollama`), logged
+as a non-blocking should-fix rather than fixed in that cycle since the bug
+is pre-existing in a shared helper the cycle didn't otherwise touch.
+
+`install.sh`'s `set_env()` does an idempotent upsert via
+`sed -i "s|^${key}=.*|${key}=${val}|"`. Neither `sed`'s `|` delimiter nor its
+`&`/backreference metacharacters are escaped in `$val` before interpolation.
+Reproduced live:
+- A value containing a literal `|` (e.g. a `TEAM_LLM_BASE_URL` or model tag
+  that happens to include one) breaks the `sed` expression
+  (`sed: unknown option to 's'`, rc=1) and **aborts the whole `install.sh`
+  run** on a re-run — violating the "skip only this block, never abort the
+  whole run" discipline every other optional block follows.
+- A value containing a literal `&` is silently **corrupted** in the written
+  config line (sed's replacement-side backreference), rather than erroring.
+
+Any `--with-ollama`, `--with-deploy-target`, or other optional block that
+calls `set_env()` with an operator-supplied value can trigger this on a
+*re-run* specifically (the first write via `>>`/append doesn't go through
+`sed`). The realistic trigger surface is narrow — most values here are
+hostnames/paths/tokens unlikely to contain `|`/`&` — but it is real and
+reproducible, not hypothetical.
+
+**Shape of the fix:** either escape `$val` for `sed`'s replacement side
+before interpolating (e.g. `val_escaped=$(printf '%s' "$val" | sed
+'s/[&|\\]/\\&/g')`), or switch `set_env()` to an approach that never
+shells out user-controlled text through `sed`'s pattern language at all
+(e.g. an awk/python3 line-rewrite, matching this project's existing
+"parse with python3, not grep/sed" precedent from 6d part 2b's own
+`/models` response handling). Fix once in the shared helper — every
+`--with-*` block that writes an operator-supplied value benefits, no
+per-block workaround needed.
