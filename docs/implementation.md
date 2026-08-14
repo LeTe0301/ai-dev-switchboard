@@ -2075,3 +2075,234 @@ already-installed box with `RUN_USER` set to something other than `"dev"`,
 confirm `switchboard.env`'s `RUN_USER` is unchanged; start a tmux session
 as `RUN_USER`, re-run `--update`, confirm the restart is deferred and the
 session survives; stop it, re-run again, confirm the service restarts.
+
+# Implementation: Backlog item 17 part 1 -- external-origin detection + GitHub REST client
+
+## Summary
+Two new, purely-backend capabilities in `app/app.py`, neither wired into
+any poll loop, route, or item 8's existing Gitea-only reviewer yet (that's
+item 17 part 2):
+- **External-origin detection** -- `detect_project_origin(name)` runs an
+  unprivileged `git remote get-url origin` against
+  `PROJECTS_DIR/<name>` and classifies the result as `"local"` (this
+  switchboard's own Gitea -- detected by loopback-IP semantics, not a
+  hardcoded host string), `"github"` (host is `github.com`, with
+  `owner`/`repo` parsed from the path), `"external"` (any other real host),
+  or `"none"` (no `origin` configured / not a git repo at all). Never
+  raises, no new sudoers entry -- `SVC_USER` already has ambient read
+  access under `PROJECTS_DIR` (same basis `teams.load_grounding()` already
+  relies on).
+- **GitHub REST API client** -- `_github_api`/`_github_api_raw`, mirroring
+  `_gitea_api`/`_gitea_api_raw`'s exact `(status, body)` contract (raise
+  `ConnectionError` only on a real transport failure, never on a non-2xx
+  HTTP status), authenticated via a new `GITHUB_TOKEN` config var
+  (`switchboard.env`-style, no bootstrap script since GitHub isn't
+  self-hosted here), plus a concrete global in-memory rate-limit cooldown
+  gate driven by `X-RateLimit-Remaining`/`X-RateLimit-Reset`/`Retry-After`
+  response headers. Four read+write convenience functions on top:
+  `github_list_open_prs`, `github_pr_diff`, `github_list_branches`,
+  `github_post_pr_comment` -- the last one posts directly and
+  synchronously, the same way `_gitea_api`'s own `POST .../comments` call
+  already does inside item 8's `_ai_reviewer_review_run()`, per this
+  cycle's settled scope decision (no propose-then-approve gate; recorded
+  in `docs/BACKLOG.md` item 17 and `docs/spec.md`).
+
+## Root cause
+Not applicable (new feature/groundwork, not a bugfix).
+
+## Changes by file
+- `app/app.py`:
+  - New config block, placed directly after the existing
+    `GITEA_API_TOKEN`/`NEW_PROJECT_FROM_GITEA_SCRIPT` block: `GITHUB_TOKEN`
+    (default `""`), `GITHUB_API_BASE` (fixed
+    `"https://api.github.com"`), `GITHUB_API_TIMEOUT_SECONDS` (15, matches
+    `_gitea_api`'s own hardcoded timeout), `GITHUB_RATE_LIMIT_FALLBACK_
+    SECONDS` (60).
+  - New "external-origin detection + GitHub REST client" section, placed
+    right after `_gitea_api_raw()` and before the "poll-based sync-on-push"
+    section:
+    - `_project_origin_url(name)` -- the one `subprocess.run(["git", "-C",
+      ..., "remote", "get-url", "origin"], timeout=10)` call. Returns
+      `None` (never raises) for a non-git-repo, no-origin, or any
+      subprocess/timeout failure.
+    - `_classify_origin_url(url)` -- pure, never-raising classifier. Tries
+      `urllib.parse.urlsplit(url).hostname` first (covers `https://`/
+      `ssh://` scheme forms and bracketed IPv6 loopback); if that yields no
+      host (git's scp-shorthand has no scheme for `urlsplit` to parse),
+      falls back to a plain `user@host:path` split. Loopback classification
+      uses `ipaddress.ip_address(host).is_loopback`, not a string compare
+      against `"127.0.0.1"` -- also matches `::1`. `github.com` matching is
+      case-insensitive (`.lower()`); `owner`/`repo` are parsed from the
+      path with a trailing `.git` stripped. Wrapped in a top-level
+      `try/except Exception` as defense in depth (falls through to
+      `"external"`, `owner`/`repo`: `None`) -- classification must never
+      crash a caller over a malformed `origin`.
+    - `detect_project_origin(name)` -- the one public entry point,
+      composing the two functions above (`_classify_origin_url
+      (_project_origin_url(name) or "")`).
+    - `_github_rate_limit_lock`/`_github_rate_limited_until`/
+      `_github_rate_limited()` -- the global (not per-repo -- GitHub's rate
+      limit is per-token, shared across every repo that token touches)
+      in-memory cooldown gate.
+    - `_github_note_rate_limit(headers, status)` -- called after every real
+      GitHub HTTP response (success or `HTTPError`). Only acts on
+      `status in (403, 429)`: a present `Retry-After` header wins outright
+      (`now + int(Retry-After)`, or `now + GITHUB_RATE_LIMIT_FALLBACK_
+      SECONDS` if it's non-numeric); otherwise, if `X-RateLimit-Remaining
+      == "0"`, uses `X-RateLimit-Reset` (falling back to the same default
+      if missing/non-numeric); otherwise (a 403/429 with neither signal,
+      or a normal 2xx/4xx with remaining quota) is a no-op. Never lowers an
+      already-active cooldown.
+    - `_github_request_headers(accept=None)` -- the shared header set
+      (`Authorization: Bearer <GITHUB_TOKEN>`, `Accept`,
+      `X-GitHub-Api-Version: 2022-11-28`, `User-Agent: ai-dev-switchboard`
+      -- GitHub's API rejects requests with no `User-Agent` at all, unlike
+      Gitea).
+    - `_github_api(method, path, body=None)` / `_github_api_raw(method,
+      path, accept=None)` -- check `_github_rate_limited()` **before**
+      building any request (short-circuit to `(429, {"error": "rate
+      limited, retry later"})` / `(429, "rate limited, retry later")` with
+      zero HTTP calls made); otherwise build and send the request, call
+      `_github_note_rate_limit()` with the real response's headers +
+      status, and return `(status, parsed_json_or_{})` /
+      `(status, text)`. Same `except HTTPError` (never raises) / `except
+      (URLError, TimeoutError[, ValueError])` (raises `ConnectionError`)
+      split as `_gitea_api`/`_gitea_api_raw`.
+    - `_github_token_missing_error()` -- the shared `{"ok": False,
+      "error": "GITHUB_TOKEN isn't configured -- see switchboard.env"}`
+      shape.
+    - `github_list_open_prs(owner, repo)` / `github_pr_diff(owner, repo,
+      number)` / `github_list_branches(owner, repo)` /
+      `github_post_pr_comment(owner, repo, number, body)` -- each checks
+      `GITHUB_TOKEN` first (returns the missing-token error with zero
+      network calls if unset), calls the underlying client function,
+      catches `ConnectionError` and turns it into `{"ok": False, "error":
+      ...}` rather than propagating, and returns GitHub's own response
+      shape unmodified (`{"ok": True, "prs": [...]}` etc.) -- same
+      "don't reshape the upstream response" choice `_gitea_api`'s own
+      callers already make.
+- `config/switchboard.env.example` -- new documented, commented-out
+  `GITHUB_TOKEN` block, placed directly before the existing `GITEA_DIR`/
+  `GITEA_SSH_PORT` comment (i.e. right after `GITEA_API_TOKEN`'s own
+  block), same "documented secret, not auto-provisioned" treatment as
+  `SIMPLE_PASSWORD`/`GITEA_API_TOKEN`.
+- New `tests/test_github_api.py` (40 tests) -- see "How to verify locally"
+  below.
+
+No existing function was modified. No new Flask route, no new HTML/JS
+template change, no schema/data-model change, no new privileged script, no
+new sudoers entry.
+
+## Key decisions / tradeoffs
+- **`_classify_origin_url()` deliberately does not reuse item 16's
+  `_CLONE_URL_SCHEME_RE`/`_CLONE_URL_SCP_RE`/`_SAFE_HOST_RE`/
+  `_clone_url_host_is_safe()`.** Those exist to defend a *privileged,
+  argv-sensitive* `git clone` subprocess against injection; this function
+  classifies an **already-existing** `origin` remote for a materially
+  lower-stakes, read-only purpose (no privileged subprocess argv is ever
+  built from its output). A new, simpler parser -- written per
+  `docs/spec.md`'s own explicit direction -- keeps the two concerns
+  separate rather than overloading item 16's security-validation regexes
+  for an unrelated purpose.
+- **The rate-limit gate is global, not per-repo.** GitHub's rate limit is
+  per-token, shared across every repo that token touches (unlike Gitea's
+  per-project sync/review locks, which exist for concurrency-safety, a
+  different reason entirely) -- one cooldown, guarded by one lock,
+  correctly reflects that a 403/429 on any call means every other
+  `github_*()` call across every project should also back off, not just
+  the one that happened to trip it.
+- **`_github_api`/`_github_api_raw`'s short-circuit rate-limit response
+  reuses `status == 429`**, the same code GitHub itself would return for a
+  secondary-rate-limit abuse response -- callers built on top of these two
+  functions (the `github_*()` convenience functions today, item 17 part
+  2's poll loop later) don't need to special-case "gate tripped locally"
+  differently from "GitHub itself just told us to back off," since both
+  already mean the same thing to a caller: don't retry yet.
+- **No `GITHUB_ENABLED` toggle** -- `detect_project_origin()` needs no
+  token and always runs; the `github_*()` calls themselves are gated
+  purely on `GITHUB_TOKEN` being set, matching how `GITEA_API_TOKEN` alone
+  (no separate boolean) already gates `create_project()`'s Gitea calls
+  beyond the `GITEA_ENABLED` toggle Gitea needs for an unrelated reason
+  (it's a locally-run service that has to be started).
+
+## Deviations from spec
+None. Every function signature, contract, and edge case in this
+implementation matches `docs/spec.md`'s "Proposed approach" and
+"Acceptance criteria" as written -- no ambiguity requiring a judgment call
+was hit while implementing this part.
+
+## Known limitations
+- **No live GitHub API call was exercised in this session** -- every test
+  in `tests/test_github_api.py` monkeypatches `urllib.request.urlopen`
+  (`GithubApiTests`) or `_github_api`/`_github_api_raw`
+  (`GithubConvenienceTests`), following `tests/test_gitea.py`'s own
+  established "no real network/Docker call in this file" convention. A
+  real end-to-end smoke test against `api.github.com` (a real
+  `GITHUB_TOKEN`, a real repo, `github_list_open_prs`/`github_pr_diff`/
+  `github_list_branches`/`github_post_pr_comment` called directly from a
+  `python3 -c` one-liner) was not performed -- no scope in this part calls
+  these functions from anywhere the operator could exercise via the UI or
+  CLI yet (that's item 17 part 2). The "How to verify locally" section
+  below includes the manual one-liners an operator with a real
+  `GITHUB_TOKEN` could run to close this gap by hand.
+- **`_classify_origin_url()`'s scp-shorthand fallback is a plain
+  `user@host:path` split**, not `_CLONE_URL_SCP_RE`-validated -- by design
+  (see "Key decisions" above), but it means a syntactically-unusual
+  `origin` some other tool wrote (e.g. a bare `host:path` with no `user@`
+  prefix) falls through to `"external"` with `owner`/`repo`: `None` rather
+  than being further parsed. This matches every acceptance criterion and
+  edge case `docs/spec.md` actually lists (all of which use a `user@`
+  prefix or a `scheme://` form); a repo whose `origin` genuinely uses that
+  unusual bare form is classified correctly as "some non-github,
+  non-loopback host" (still `"external"`), just without `owner`/`repo`
+  populated -- and part 1 never promised those two fields outside the
+  `"github"` case.
+- **This part is inert in a running install.** Nothing in `app.py` calls
+  `detect_project_origin()` or any `github_*()` function from anywhere
+  reachable via the web UI, `/status`, or item 8's existing poll loop --
+  by design (`docs/spec.md` "Non-goals"). Setting `GITHUB_TOKEN` in a real
+  `switchboard.env` today has no observable effect until part 2 wires
+  these functions in.
+
+## How to verify locally
+```
+# This cycle's new tests (40):
+python3 tests/test_github_api.py -v
+# Ran 40 tests ... OK
+
+# No regressions in the existing Gitea/AI-reviewer suites this new code
+# sits directly alongside (item 17 part 1 touches no existing function in
+# either area, but both are the closest-precedent code paths):
+python3 -m unittest tests.test_gitea tests.test_gitea_poll tests.test_ai_reviewer tests.test_github_api -v
+# Ran 157 tests ... OK
+
+# Full existing suite (including this cycle's new tests):
+python3 -m unittest discover -s tests
+# Ran 1094 tests in 148.466s ... OK
+
+# Syntax/compile check:
+python3 -m py_compile app/app.py
+
+# Verifies "no new route" (docs/spec.md acceptance criteria):
+git diff app/app.py | grep -i "Flask\|@app.route\|def do_GET\|def do_POST"
+# -> no output (no new route/handler lines in the diff)
+
+# Manual smoke test against a real GitHub repo (requires a real
+# GITHUB_TOKEN with `repo` scope, not performed in this session -- see
+# "Known limitations"):
+cd app && GITHUB_TOKEN=<a real PAT> python3 -c "
+import app
+print(app.github_list_open_prs('<owner>', '<repo>'))
+print(app.github_list_branches('<owner>', '<repo>'))
+"
+# Confirm {'ok': True, 'prs': [...]} / {'ok': True, 'branches': [...]}
+# against a real repo's actual open PRs/branches.
+
+# Manual origin-detection smoke test against a real local project:
+cd app && PROJECTS_DIR=/path/to/projects python3 -c "
+import app
+print(app.detect_project_origin('<a project name under PROJECTS_DIR>'))
+"
+# Confirm 'local' for a Gitea-created project, 'github' (with owner/repo)
+# for one cloned from github.com, 'none' for a project with no origin.
+```

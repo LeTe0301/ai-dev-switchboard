@@ -149,6 +149,27 @@ NEW_PROJECT_FROM_GITEA_SCRIPT = os.environ.get(
     "NEW_PROJECT_FROM_GITEA_SCRIPT",
     "/usr/local/bin/ai-dev-switchboard-new-project-from-gitea.sh")
 
+# GitHub REST API client (backlog item 17 part 1, docs/spec.md) -- unlike
+# GITEA_API_TOKEN above, GitHub isn't a service this switchboard runs, so
+# there's no bootstrap script: GITHUB_TOKEN is a PAT the operator creates
+# directly on github.com and pastes into switchboard.env, same
+# documented-but-never-shipped-a-value treatment as SIMPLE_PASSWORD/
+# TOTP_SECRET. Gated purely on GITHUB_TOKEN being set -- no separate
+# GITHUB_ENABLED toggle (host detection itself needs no token and is always
+# available; see docs/spec.md "Non-goals").
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_API_BASE = "https://api.github.com"        # fixed -- GitHub, unlike
+                                                    # self-hosted Gitea, has
+                                                    # no configurable port/host
+GITHUB_API_TIMEOUT_SECONDS = 15                    # matches _gitea_api's own
+                                                    # hardcoded timeout
+GITHUB_RATE_LIMIT_FALLBACK_SECONDS = 60            # conservative default
+                                                    # cooldown when a 403/429
+                                                    # carries neither
+                                                    # Retry-After nor a
+                                                    # parseable
+                                                    # X-RateLimit-Reset
+
 # Clone-from-URL (backlog item 16, docs/spec.md) -- unlike NEW_PROJECT_FROM_
 # GITEA_SCRIPT above, installed UNCONDITIONALLY (base install.sh block, like
 # NEW_PROJECT_FROM_UPLOAD_SCRIPT) -- cloning an arbitrary external repo URL
@@ -863,6 +884,283 @@ def _gitea_api_raw(method: str, path: str) -> tuple:
         return e.code, (e.read() or b"").decode("utf-8", errors="ignore")
     except (urllib.error.URLError, TimeoutError):
         raise ConnectionError("gitea unreachable")
+
+
+# ─── external-origin detection + GitHub REST client (backlog item 17 part 1,
+# docs/spec.md) ─────────────────────────────────────────────────────────────
+# Detects, per project, whether its `origin` remote is this switchboard's
+# own local Gitea, github.com, or something else -- unprivileged, on demand,
+# no new sudoers entry (SVC_USER already has ambient read access under
+# PROJECTS_DIR, same basis teams.load_grounding() already relies on). Plus a
+# GitHub REST API client mirroring _gitea_api/_gitea_api_raw's exact
+# contract. Nothing here is wired into a poll loop, a route, or item 8's
+# Gitea-only reviewer yet -- see docs/spec.md "Non-goals" (that's item 17
+# part 2).
+
+def _project_origin_url(name: str) -> str | None:
+    """Unprivileged `git remote get-url origin` against
+    PROJECTS_DIR/<name>. Returns None (never raises) for: not a git repo,
+    no `origin` remote configured, or any subprocess/timeout failure -- all
+    three are ordinary, expected states (a local-only `git init` project, an
+    upload-wizard project with no remote at all), not errors."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", os.path.join(PROJECTS_DIR, name), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=10)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    url = r.stdout.strip()
+    return url or None
+
+
+def _classify_origin_url(url: str) -> dict:
+    """Never raises. Returns {"kind": "local"|"github"|"external"|"none",
+    "owner": str|None, "repo": str|None}.
+
+    "none" -- no url at all (empty string). "local" -- origin's host parses
+    as a loopback IP (ipaddress.ip_address(host).is_loopback) -- covers
+    every origin this switchboard itself has ever generated (always
+    literally 127.0.0.1, see scripts/new-project-from-gitea.sh) and is
+    robust to a bracketed ::1 too, without hardcoding the string
+    "127.0.0.1". "github" -- host case-insensitively equals "github.com",
+    with owner/repo parsed from the path (both scheme:// and
+    user@host:path forms) and a trailing ".git" stripped. Anything else
+    (unparseable, or a real but non-github, non-loopback host) is
+    "external" with owner/repo left None -- no client exists for it in
+    this part.
+
+    Parsing detail: try urllib.parse.urlsplit(url).hostname first (handles
+    https://github.com/owner/repo.git, ssh://git@github.com/owner/repo.git,
+    bracketed IPv6 loopback); if that yields no host (e.g. git's
+    scp-shorthand, which has no scheme for urlsplit to parse), fall back to
+    a plain user@host:path split. This is a read-only classification of an
+    already-existing origin, not a security-validation path like item 16's
+    _validate_clone_url() -- item 16's injection-safety regexes are
+    deliberately not reused here (see docs/spec.md "Background")."""
+    if not url:
+        return {"kind": "none", "owner": None, "repo": None}
+    try:
+        host = None
+        path = ""
+        try:
+            parts = urllib.parse.urlsplit(url)
+        except ValueError:
+            parts = None
+        if parts is not None and parts.hostname:
+            host = parts.hostname
+            path = parts.path or ""
+        else:
+            _user, sep, rest = url.partition("@")
+            if sep:
+                h, csep, p = rest.partition(":")
+                if h and csep and p:
+                    host, path = h, p
+        if not host:
+            return {"kind": "external", "owner": None, "repo": None}
+        try:
+            if ipaddress.ip_address(host).is_loopback:
+                return {"kind": "local", "owner": None, "repo": None}
+        except ValueError:
+            pass
+        if host.lower() == "github.com":
+            segments = [s for s in path.strip("/").split("/") if s]
+            owner = segments[0] if len(segments) >= 1 else None
+            repo = segments[1] if len(segments) >= 2 else None
+            if repo and repo.endswith(".git"):
+                repo = repo[:-4]
+            return {"kind": "github", "owner": owner, "repo": repo}
+        return {"kind": "external", "owner": None, "repo": None}
+    except Exception:
+        # Classification must never crash a caller over a malformed origin
+        # some unrelated process created.
+        return {"kind": "external", "owner": None, "repo": None}
+
+
+def detect_project_origin(name: str) -> dict:
+    """Public entry point -- composes _project_origin_url()/
+    _classify_origin_url() (docs/spec.md "Detection mechanism")."""
+    return _classify_origin_url(_project_origin_url(name) or "")
+
+
+_github_rate_limit_lock = threading.Lock()
+_github_rate_limited_until = 0.0
+
+
+def _github_rate_limited() -> bool:
+    with _github_rate_limit_lock:
+        return time.time() < _github_rate_limited_until
+
+
+def _github_note_rate_limit(headers, status: int) -> None:
+    """Called after every real GitHub HTTP response (success or
+    HTTPError). Sets _github_rate_limited_until (never lowers an existing,
+    still-active cooldown) when:
+    - status in (403, 429) and a Retry-After header is present -> now +
+      int(Retry-After) seconds (the most authoritative signal GitHub
+      gives; a malformed/non-numeric value falls back to
+      GITHUB_RATE_LIMIT_FALLBACK_SECONDS rather than being ignored).
+    - status in (403, 429) and X-RateLimit-Remaining == "0" (no
+      Retry-After) -> X-RateLimit-Reset epoch seconds, if present and
+      parses as an int; else now + GITHUB_RATE_LIMIT_FALLBACK_SECONDS as a
+      conservative default rather than not backing off at all.
+    - Otherwise (a normal 2xx/4xx with remaining quota, or a 403/429 with
+      neither signal) -> no-op. Never raises."""
+    global _github_rate_limited_until
+    if status not in (403, 429):
+        return
+    now = time.time()
+    headers = headers or {}
+    retry_after = headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            until = now + int(retry_after)
+        except (TypeError, ValueError):
+            until = now + GITHUB_RATE_LIMIT_FALLBACK_SECONDS
+    else:
+        remaining = headers.get("X-RateLimit-Remaining")
+        if remaining != "0":
+            return
+        reset = headers.get("X-RateLimit-Reset")
+        try:
+            until = float(int(reset))
+        except (TypeError, ValueError):
+            until = now + GITHUB_RATE_LIMIT_FALLBACK_SECONDS
+    with _github_rate_limit_lock:
+        if until > _github_rate_limited_until:
+            _github_rate_limited_until = until
+
+
+def _github_request_headers(accept: str = None) -> dict:
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": accept or "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        # GitHub's API rejects requests with no User-Agent at all -- a real,
+        # documented GitHub-specific requirement Gitea doesn't have.
+        "User-Agent": "ai-dev-switchboard",
+    }
+
+
+def _github_api(method: str, path: str, body: dict = None) -> tuple:
+    """Returns (status, parsed_json_or_{}). Never raises for a non-2xx HTTP
+    status -- only for a real connection failure, converted to
+    ConnectionError, same contract as _gitea_api(). Checks the rate-limit
+    cooldown gate BEFORE building the request; if still cooling down,
+    returns (429, {"error": "rate limited, retry later"}) without making an
+    HTTP call at all. After any real response (success or HTTPError), calls
+    _github_note_rate_limit() with the response headers + status."""
+    if _github_rate_limited():
+        return 429, {"error": "rate limited, retry later"}
+    data = json.dumps(body).encode() if body is not None else None
+    headers = _github_request_headers()
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(
+        f"{GITHUB_API_BASE}{path}", data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=GITHUB_API_TIMEOUT_SECONDS) as resp:
+            _github_note_rate_limit(resp.headers, resp.status)
+            return resp.status, json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        _github_note_rate_limit(e.headers, e.code)
+        try:
+            return e.code, json.loads(e.read() or b"{}")
+        except ValueError:
+            return e.code, {}
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        raise ConnectionError("github unreachable")
+
+
+def _github_api_raw(method: str, path: str, accept: str = None) -> tuple:
+    """Like _github_api() but returns (status, text) without attempting
+    json.loads on the body -- needed for GitHub's diff Accept header
+    (application/vnd.github.v3.diff), which returns plain diff text, not
+    JSON. Same rate-limit-gate-then-note handling, and the same "raise
+    ConnectionError only on a real transport failure, never on a non-2xx
+    status" contract, as _github_api()."""
+    if _github_rate_limited():
+        return 429, "rate limited, retry later"
+    headers = _github_request_headers(accept)
+    req = urllib.request.Request(f"{GITHUB_API_BASE}{path}", method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=GITHUB_API_TIMEOUT_SECONDS) as resp:
+            _github_note_rate_limit(resp.headers, resp.status)
+            return resp.status, resp.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as e:
+        _github_note_rate_limit(e.headers, e.code)
+        return e.code, (e.read() or b"").decode("utf-8", errors="ignore")
+    except (urllib.error.URLError, TimeoutError):
+        raise ConnectionError("github unreachable")
+
+
+def _github_token_missing_error() -> dict:
+    return {"ok": False, "error": "GITHUB_TOKEN isn't configured -- see switchboard.env"}
+
+
+def github_list_open_prs(owner: str, repo: str) -> dict:
+    """GET /repos/{owner}/{repo}/pulls?state=open. {"ok": True,
+    "prs": [...]} -- each item keeps GitHub's own shape (number, title,
+    body, labels: [{"name": ...}, ...]), same "don't reshape the upstream
+    response" choice _gitea_api's own callers already make."""
+    if not GITHUB_TOKEN:
+        return _github_token_missing_error()
+    try:
+        status, resp = _github_api("GET", f"/repos/{owner}/{repo}/pulls?state=open")
+    except ConnectionError as e:
+        return {"ok": False, "error": str(e)}
+    if status != 200 or not isinstance(resp, list):
+        return {"ok": False, "error": f"unexpected response (status {status})"}
+    return {"ok": True, "prs": resp}
+
+
+def github_pr_diff(owner: str, repo: str, number: int) -> dict:
+    """GET /repos/{owner}/{repo}/pulls/{number} with the diff Accept
+    header (_github_api_raw). {"ok": True, "diff": <text>}."""
+    if not GITHUB_TOKEN:
+        return _github_token_missing_error()
+    try:
+        status, text = _github_api_raw(
+            "GET", f"/repos/{owner}/{repo}/pulls/{number}",
+            accept="application/vnd.github.v3.diff")
+    except ConnectionError as e:
+        return {"ok": False, "error": str(e)}
+    if status != 200:
+        return {"ok": False, "error": f"diff fetch failed (status {status})"}
+    return {"ok": True, "diff": text}
+
+
+def github_list_branches(owner: str, repo: str) -> dict:
+    """GET /repos/{owner}/{repo}/branches. {"ok": True, "branches": [...]}."""
+    if not GITHUB_TOKEN:
+        return _github_token_missing_error()
+    try:
+        status, resp = _github_api("GET", f"/repos/{owner}/{repo}/branches")
+    except ConnectionError as e:
+        return {"ok": False, "error": str(e)}
+    if status != 200 or not isinstance(resp, list):
+        return {"ok": False, "error": f"unexpected response (status {status})"}
+    return {"ok": True, "branches": resp}
+
+
+def github_post_pr_comment(owner: str, repo: str, number: int, body: str) -> dict:
+    """POST /repos/{owner}/{repo}/issues/{number}/comments, {"body": body}
+    -- GitHub, like Gitea, treats a PR's comments as issue comments. Posted
+    directly and synchronously, same as _gitea_api's own POST call in
+    _ai_reviewer_review_run() -- see docs/spec.md "Settled scope decision"
+    for why this write needs no extra confirmation gate. {"ok": True} on a
+    2xx status."""
+    if not GITHUB_TOKEN:
+        return _github_token_missing_error()
+    try:
+        status, _resp = _github_api(
+            "POST", f"/repos/{owner}/{repo}/issues/{number}/comments", {"body": body})
+    except ConnectionError as e:
+        return {"ok": False, "error": str(e)}
+    if status // 100 != 2:
+        return {"ok": False, "error": f"comment post failed (status {status})"}
+    return {"ok": True}
 
 
 # ─── poll-based sync-on-push (backlog item 2c, part 1) ─────────────────────
