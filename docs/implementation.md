@@ -3477,3 +3477,295 @@ losing call leaves a transcript trace (now: never).
 # Full suite
 /home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q
 ```
+
+---
+
+# Implementation: 6f part 2 -- the Teams page (live event feed, per-agent filter, status strip, escalation inbox), 2026-08-14
+
+## Summary
+
+Extends `teamRow()`'s non-idle branch (`app/app.py`) with a 4-state status
+strip (Working / Waiting on you / Blocked-terminal / Finished / Error), a
+collapsible merged event feed polled via 6f part 1's already-shipped
+`GET .../team/events` cursor protocol (folded into the existing 4s
+`refresh()` cycle, no new timer), a per-agent filter pill row, and an
+escalation-answer panel (question/header/options/free-text "Other") that
+submits through a new `team-resolve` action kind reusing the existing
+`toggle()`/TOTP code-overlay machinery verbatim. Purely frontend -- no
+`app/teams.py` change, no route change, no new backend tests (matching the
+spec's own scoping). `blocked_ask_user` and `escalated_max_rounds` (both
+bucketed as `team.status === "blocked"` by `/status`) now render distinctly
+via `team.waiting_on_you`, replacing the old shared "Lead is waiting for
+input" copy.
+
+## Changes by file
+
+- **`app/app.py`** (frontend only -- embedded `<style>`/`<script>` inside
+  `PAGE_TEMPLATE`):
+  - **CSS**: new classes for the status strip (`.team-status-strip` +
+    4 `.status-*` variants, reusing 6d's existing 4 status colour tokens
+    verbatim), the escalation panel (`.team-escalation`,
+    `.team-escalation-form` and its sub-elements), the feed toggle
+    (`.team-feed-toggle`, reusing 6e's `.team-configure-btn` look), and the
+    feed itself (`.team-feed-filter`/`.team-feed-pill`/`.team-feed-list`
+    reusing `.wizard-card`'s `max-height:85vh; overflow-y:auto` scroll
+    pattern per docs/spec.md/`.team-feed-event`, first monospace/log-styled
+    panel in this codebase per docs/design.md).
+  - **New client state** (all per-project, keyed the same way
+    `teamTaskText`/`teamPickerLead` already are): `teamFeedOpen`,
+    `teamFeedCursor`, `teamFeedEvents` (rolling buffer, capped at 500),
+    `teamFeedFilter`, `teamFeedPolling` (re-entrancy guard),
+    `teamInboxCache` (keyed by `run_id`, not project name -- a question
+    belongs to a run), `teamEscalationSelected` (per-project
+    `Set<number>` of *indices* into the cached inbox's `options[]`, not
+    label text -- see "Key decisions"), `teamEscalationOther`.
+  - **`teamAgentColor(name)`**: deterministic string hash (`* 31 + charCode`,
+    `>>> 0`) into a fixed 6-colour palette (`TEAM_AGENT_PALETTE`), matching
+    docs/design.md's suggested palette exactly.
+  - **`clearTeamFeedState(name)`**: called at the top of `teamRow()`'s idle
+    branch -- wipes every feed/escalation client map entry for that
+    project when its row falls back to idle (docs/spec.md "Edge cases").
+    `teamInboxCache` is deliberately NOT touched (keyed by `run_id`, which
+    is never reused, so stale entries just go cold).
+  - **`renderTeamStatusStrip(team)`**: the 4/5-state strip. `blocked` +
+    `waiting_on_you` -> "Waiting on you"; `blocked` + `!waiting_on_you`
+    (`escalated_max_rounds`) -> "Blocked — Max rounds reached", no answer
+    form; `running`/`finished`/`error` unchanged in meaning, new copy
+    ("Working" instead of "Status: [running]").
+  - **`fetchTeamInbox`/`renderEscalationPanel`/`onEscalationOptionChange`/
+    `computeTeamResolveAnswer`**: fetch-once-per-`run_id`-then-`refresh()`
+    idiom (same as `fetchTeamGrounding`); options rendered as radio
+    (`multi_select: false`) or checkbox (`true`), free-text "Other"
+    textarea always present per spec even with zero options.
+    `computeTeamResolveAnswer()` is the single shared implementation of
+    "free text wins, else selected label(s) joined with `, `" -- used by
+    both `doTeamResolve()`'s client validation and `actionBody()`'s
+    `team-resolve` body, so they can never diverge.
+  - **`renderTeamFeedToggle`/`renderTeamFeed`/`renderTeamFeedEvent`/
+    `teamFeedEventKindClass`/`teamFeedEventBody`/`findNextLeadEvent`**: the
+    feed panel. `findNextLeadEvent()` implements the spec's positional
+    fact_check-vs-finish disambiguation by filtering the buffer to
+    `agent === 'lead'`, sorting by `seq`, and using array-`indexOf` object
+    identity (not a seq/agent re-match) to find the next lead event.
+    `teamFeedEventBody()` renders `fact_check` claims/results (parsing the
+    `tool_result`'s `text` as JSON, listing each match's `file_line` +
+    passage, or the explicit "no supporting passage found" string),
+    `handoff`, `resolved`, `ask_user`, the terminal-escalation `status`
+    event, and a generic `[kind] text` fallback -- never a raw JSON blob.
+  - **`toggleTeamFeed`/`setTeamFeedFilter`/`pollTeamFeed`**: `toggleTeamFeed`
+    resets cursor to `{}` and clears the buffer on open (matching "reopen
+    always replays from scratch, same as a reload" per spec) and just
+    clears on close. `setTeamFeedFilter` is purely client-side (no
+    refetch). `pollTeamFeed` is an async drain loop: fetches with the
+    current cursor, appends+re-sorts by `(ts, agent, seq)` (lexical
+    compare on the fixed-width ISO-8601 `ts`), trims to 500, and loops
+    again immediately (no `setTimeout`) while any `truncated[agent]` is
+    true -- `teamFeedPolling[name]` guards against two overlapping drains.
+    See "Key decisions" for why it deliberately does *not* call `refresh()`
+    itself when the drain completes.
+  - **`doTeamResolve(name)`**: client-side validation (non-empty, <= 2000
+    chars, mirroring the server's own `TEAM_ASK_USER_ANSWER_MAX_CHARS`)
+    then `toggle('team-resolve', name, true, null)` -- same shape as
+    `doTeamStart`/`doTeamStop`.
+  - **`refresh()`**: one new line per instance -- `pollTeamFeed(inst.name)`
+    fired (not awaited) when `inst.team.status !== 'idle'` and the
+    project's feed is open, folded into the existing loop right after
+    `TEAM_BY_NAME[inst.name]` is set and `teamRow()` has already seeded
+    `teamFeedOpen[inst.name]`'s default.
+  - **`teamRow()`**: idle branch gains `clearTeamFeedState(name)` as its
+    first line; the non-idle branch is rewritten to seed
+    `teamFeedOpen[name] = true` the first time it renders (design's
+    "expanded by default"), then compose status strip + escalated-terminal
+    note + escalation panel + feed toggle + feed panel + the unchanged
+    Stop button/message slot.
+  - **`actionPath`/`actionBody`/`handleActionResult`**: `team-resolve`
+    added alongside `team-start`/`team-stop` in all three -- path routes to
+    `POST .../team/resolve`, body's `answer` comes from
+    `computeTeamResolveAnswer()`, the 428 overlay label reads "Submitting
+    answer: `<name>`", and the result branch (mirroring
+    `team-start`/`team-stop`'s own) sets `✓ Answer submitted` /
+    `✕ Error: ...` in the row's existing `team-msg` slot and, on success,
+    clears the now-stale `teamInboxCache`/`teamEscalationSelected`/
+    `teamEscalationOther` entries.
+- **`tests/test_team_frontend.js`** (extends the existing extract-and-run
+  the real `<script>` harness): 30 -> 52 tests. One pre-existing 6d test
+  ("blocked renders the 'Lead is waiting' subtitle") was replaced with two
+  tests matching the new spec-required split between `blocked_ask_you` and
+  `escalated_max_rounds`; two pre-existing Stop-team tests were adjusted to
+  filter `pendingFetches` by URL rather than assert on the raw array
+  length, since a running team's feed now defaults open and fires its own
+  `/team/events` poll from the same `setupCase()` bootstrap `refresh()`.
+  22 new tests cover: the "Working" status-strip copy; the feed defaulting
+  open with "No events yet."; idle rendering no strip/feed/escalation UI;
+  the escalation panel fetching the inbox once and rendering
+  question/header/options/free-text (including the zero-options case);
+  `escalated_max_rounds` never polling `/team/inbox`; single- and
+  multi-select answer submission (including the `", "`-join and
+  free-text-wins conventions); an over-2000-char/empty answer being
+  rejected client-side; the 428 TOTP retry path for `team-resolve`; merged
+  chronological + colour-coded rendering across two agents; the per-agent
+  filter; `fact_check` `found: true`/`found: false` rendering (claim +
+  match `file_line`/passage, and the explicit non-match text); the
+  finish-summary vs. fact_check-claim positional disambiguation; `handoff`
+  rendering; the truncated-response immediate-follow-up-poll behaviour; the
+  reopen-from-`cursor={}` behaviour; the 500-event trim; a resolved
+  escalation dropping out of "Waiting on you" on the next poll; and an
+  idle transition clearing feed state (verified by re-running the same
+  project and confirming the feed defaults open again, not wherever it was
+  left).
+
+## Key decisions / tradeoffs
+
+- **`pollTeamFeed()` never calls `refresh()` itself.** The spec's own
+  reference implementation (docs/design.md) calls `renderTeamRow(name)`
+  after a poll completes, but this app has no per-row incremental
+  re-render -- only the full `refresh()`. Calling `refresh()` from
+  `pollTeamFeed()`'s own completion would have `refresh()` immediately
+  re-invoke `pollTeamFeed()` again (the feed is still open), self-sustaining
+  a fetch loop far faster than the intended 4s cadence -- a real
+  production bug, not just a test-harness inconvenience (discovered via
+  the TDD process: it manifested as a hung Node test process with exit
+  code 0 and no completion line, since an unresolved `await fetch(...)`
+  doesn't keep Node's event loop alive on its own). Newly-polled events
+  now render on the *next* natural 4s tick instead -- still well within
+  "one subsequent poll interval", which is what every acceptance criterion
+  that touches timing actually requires; only the truncation-drain
+  criterion needs an *immediate* follow-up, and that's satisfied by the
+  drain loop's own internal `while`, independent of any render.
+- **Escalation options are addressed by index into the cached inbox's
+  `options[]`, not by label text.** Unlike engine/project names elsewhere
+  in this file (NAME_RE-restricted, safe to embed raw into an
+  `onclick`/`onchange` string), an option's `label` is LLM-authored free
+  text that could contain quotes or HTML. Embedding it directly into an
+  attribute string the way `onTeamMateToggle(name, e.name, ...)` does for
+  engine names would be a real (if narrow -- the lead's own output, not an
+  external user's) injection surface. Passing the option's array index
+  instead (always a safe integer) and reading the label back out of the
+  cache when composing the answer sidesteps this entirely; the visible
+  label text itself is still `esc()`-escaped for display exactly like
+  every other server-controlled string on this page.
+- **`teamEscalationSelected`/`teamEscalationOther` are real client state,
+  not read from the DOM at submit time**, even though docs/design.md's own
+  reference `actionBody()` snippet reads `document.querySelectorAll(...)`
+  directly. This app's `refresh()` rebuilds every row's `innerHTML` from
+  scratch every 4 seconds; any unmirrored DOM state (a checked
+  radio/checkbox, a partially-typed "Other" answer) would be silently
+  wiped on the very next poll tick while the operator is still composing
+  an answer -- the exact problem `teamTaskText`/`teamPickerLead` already
+  solve for the task textarea and composition picker. Mirroring the same
+  pattern here is consistent with the codebase's own established
+  convention, not a deviation from it.
+- **`fetchTeamInbox`'s own `refresh()` call needed a second helper in
+  tests** (`deliverTeamInbox`), analogous to the picker's own `openPicker()`
+  helper, to also wait-for-and-resolve the follow-up `/status` fetch that
+  `refresh()` triggers -- otherwise the DOM never actually picks up the
+  now-cached inbox response even though the cache itself is correctly
+  populated. Two tests initially written without this (calling a second,
+  independent `refresh()`-triggering action back to back without draining
+  the first one's own `/status` fetch in between) hung the test process;
+  root-caused via `systematic-debugging` (the stalled test's own promise
+  chain, traced to `resolveFetch`'s find-first-match semantics resolving
+  the *wrong*, stale pending fetch) rather than papered over with a longer
+  timeout.
+- **Terminal-escalation status strip copy and the "already answered" race
+  message are the developer's own wording**, not verbatim spec quotes --
+  the spec's "Proposed approach" gives example copy ("Escalated — max
+  rounds reached, no pending question to answer...") which this
+  implementation follows closely but not byte-for-byte; docs/design.md's
+  own mockup copy ("Blocked — Max rounds reached") was used for the strip
+  itself since design.md is the more specific, later-authored source for
+  exact UI text.
+
+## Deviations from spec
+
+- **`pollTeamFeed()` does not call a per-row re-render on completion** (see
+  "Key decisions" above) -- docs/design.md's own reference
+  `pollTeamFeed()` snippet calls `renderTeamRow(name)`/`refresh()` after
+  every poll. This app has no `renderTeamRow()`; the closest equivalent
+  (`refresh()`) is a full-page re-render, and wiring it up the same way
+  would create a self-sustaining fetch loop (see above). Flagging this as
+  the one meaningful behavioural departure from design.md's own
+  implementation notes; every acceptance criterion is still met (verified
+  by test) because none of them require sub-4-second visual latency for
+  newly-polled (non-truncated) events, only for the truncation-drain case,
+  which the internal `while` loop already satisfies independent of any
+  render call.
+- **Added a fourth escalation-panel state design.md doesn't explicitly
+  enumerate**: "This question was already answered." for the narrow race
+  where `team.waiting_on_you` (a moment-in-time `/status` snapshot) is
+  still true but the freshly-fetched `/team/inbox` already reports
+  `pending: false` (e.g. another tab/operator just resolved it). Distinct
+  from the genuine-fetch-failure copy ("Could not load the pending
+  question...") so the operator isn't told to check `tmux attach` for a
+  question that's already been answered. Not spec-mandated, but a strict
+  improvement over conflating the two cases into one message, and costs
+  one extra `if` branch.
+- Everything else matches docs/spec.md's "Proposed approach" and
+  docs/design.md's "Implementation notes for the developer" sections
+  directly -- no other deviations.
+
+## Known limitations
+
+- **`docs/BACKLOG.md` item 11(b)** (`run_id` not validated against path
+  traversal on the three `team/*` routes) is explicitly out of scope per
+  the spec's own non-goals -- this cycle only calls those routes, never
+  adds to the gap.
+- **Agent-identity colours can collide** for two different agent names
+  hashing into the same one of 6 palette slots (a `teamAgentColor('lead')`
+  vs `teamAgentColor('helper')` collision was hit incidentally while
+  writing this cycle's own frontend test -- both hash to `#d4a484`). This
+  is an accepted property of a fixed 6-colour hash palette (docs/spec.md
+  only requires the palette be distinct from the four *semantic* status
+  colours, not pairwise-distinct across arbitrary agent names, which is
+  mathematically impossible to guarantee once there are more than 6
+  agents in a run) -- not a bug, just a known coarse-grained property
+  worth recording so a future cycle doesn't "fix" it as a regression.
+- **The escalation panel's inbox fetch is not retried automatically** on
+  failure (`cached === null`) -- the operator sees "Could not load the
+  pending question. Check `tmux attach`." and must reload or wait for the
+  team to otherwise transition; there's no retry button. Matches this
+  page's existing failure-handling style elsewhere (e.g.
+  `renderTeamGrounding()`'s own "Grounding unavailable" with no retry),
+  so not a new gap this cycle introduces, but noted since escalation
+  answering is more time-sensitive than a pre-start grounding summary.
+- **Overall multi-agent-teams story observation (flagged, not fixed here,
+  per the task's own instruction not to scope-creep):** with 6f part 2
+  landing, every sub-spec in `docs/story.md` appears to have a shipped
+  cycle (6d parts 1/2a/2b, 6e, 6f parts 1/1b/2) -- the one item this
+  developer noticed still explicitly open is `docs/story.md`'s own §3
+  "Automatically merging or discarding teammate worktrees" open question,
+  which 6f part 2's own spec re-confirms as "still deferred" in its
+  Non-goals. Worth a final product-manager pass to confirm the story is
+  actually complete or to spin up a follow-on cycle for that item.
+
+## Verification status
+
+| Check | Command | Result |
+|---|---|---|
+| Syntax/compile | `python3 -m py_compile app/app.py` | clean |
+| Rendered `<script>` syntax | `python3 -c "..."` (extract `render_page()`'s `<script>...</script>`) piped through `node --check` | clean |
+| Rendered `<style>` brace balance + new class presence | same extraction technique, `{`/`}` count + substring checks | 132/132 balanced; all 7 new top-level classes present |
+| Frontend test suite, before this cycle | `node tests/test_team_frontend.js` | 29 passed (baseline) |
+| Frontend test suite, after this cycle | `node tests/test_team_frontend.js` | **52 passed** (29 baseline - 1 superseded-and-replaced + 2 replacement + 22 new), 3 consecutive repeat runs all clean, 0 flakes |
+| Full Python suite, before this cycle | `/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q` | 765 passed (unchanged baseline -- confirms no backend touched) |
+| Full Python suite, after this cycle | same command | **765 passed**, identical -- `app/teams.py` and every `tests/test_team*.py` file are byte-for-byte untouched by this diff |
+
+## How to verify locally
+
+```bash
+# Frontend test suite (this cycle's own primary coverage)
+node tests/test_team_frontend.js
+
+# Full Python suite (confirms the backend truly wasn't touched)
+/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q
+
+# Manual check: extract and syntax-check the real rendered <script>
+TOTP_SECRET=JBSWY3DPEHPK3PXP python3 -c "
+import sys; sys.path.insert(0, 'app')
+import app as appmod
+print(appmod.render_page())" > /tmp/rendered.html
+node --check <(python3 -c "
+import re
+html = open('/tmp/rendered.html').read()
+print(re.search(r'<script>([\s\S]*)</script>', html).group(1))")
+```

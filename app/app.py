@@ -1742,6 +1742,53 @@ PAGE_TEMPLATE = """<!doctype html>
                          padding: 4px 8px; background: #1c1c1c; }
   .team-grounding { font-size: 12px; color: #888; }
   .team-validation-error { font-size: 12px; color: #ff6b6b; min-height: 14px; }
+  /* Live event feed + escalation inbox (backlog item 6f part 2, docs/
+     design.md) -- status strip replaces the old plain "Status: [label]"
+     line the non-idle branch used to render; escalation panel and the
+     collapsible feed are new panels below it. Status strip colors reuse
+     the same four status-* tokens 6d part 2a already established
+     (`.team-status.status-*` above); only the agent-identity palette
+     (`TEAM_AGENT_PALETTE` in the script below) is new, chosen distinct
+     from all four semantic tokens per docs/spec.md's own constraint. */
+  .team-status-strip { font-size: 13px; font-weight: 600; }
+  .team-status-strip.status-running { color: #4da6ff; }
+  .team-status-strip.status-blocked { color: #ffb648; }
+  .team-status-strip.status-finished { color: #34c759; }
+  .team-status-strip.status-error { color: #ff6b6b; }
+  .team-escalation { display: flex; flex-direction: column; gap: 8px; margin-top: 4px;
+                      padding: 10px 12px; border: 1px solid #333; border-radius: 8px; background: #181818; }
+  .team-escalation-form { display: flex; flex-direction: column; gap: 8px; }
+  .team-escalation-header { font-size: 12px; color: #aaa; }
+  .team-escalation-question { font-size: 13px; color: #eee; }
+  .team-escalation-option { font-size: 13px; color: #eee; display: flex; align-items: flex-start; gap: 6px; }
+  .team-escalation-option-desc { font-size: 12px; color: #888; }
+  .team-escalation-form textarea { font-size: 13px; padding: 8px 10px; border-radius: 8px;
+                                    border: 1px solid #333; background: #1c1c1c; color: #eee;
+                                    resize: vertical; min-height: 44px; font-family: inherit; }
+  .team-feed-toggle-row { margin-top: 2px; }
+  .team-feed-toggle { color: #4da6ff; cursor: pointer; font-size: 12px;
+                       background: none; border: none; padding: 0; text-decoration: underline; }
+  .team-feed { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+  .team-feed-filter { display: flex; flex-wrap: wrap; gap: 6px; }
+  .team-feed-filter button { font-size: 12px; padding: 3px 9px; border-radius: 12px; border: 1px solid #333;
+                              background: #1c1c1c; color: #aaa; cursor: pointer; }
+  .team-feed-filter button.active { background: #16324a; color: #4da6ff; border-color: #4da6ff; }
+  /* Reuses .wizard-card's own max-height:85vh/overflow-y:auto scroll
+     pattern (docs/spec.md: "reuse that pattern for the feed's own scroll
+     container rather than inventing a new one"). monospace + 1.4
+     line-height is this codebase's first log-like panel (docs/spec.md:
+     "no existing monospace/log-styling precedent"). */
+  .team-feed-list { max-height: 85vh; overflow-y: auto; padding: 8px 10px; border: 1px solid #333;
+                     border-radius: 8px; background: #181818; font-family: monospace; font-size: 12px;
+                     line-height: 1.4; }
+  .team-feed-empty { color: #888; }
+  .team-feed-event { padding: 2px 0; color: #eee; }
+  .team-feed-event.kind-error { color: #ff6b6b; }
+  .team-feed-event.kind-terminal-escalation { color: #ffb648; }
+  .team-feed-ts { color: #888; }
+  .team-feed-agent { font-weight: 600; }
+  .team-feed-match { padding-left: 14px; }
+  .team-feed-nomatch { color: #ff6b6b; }
   .new-project-row { display: flex; gap: 8px; padding: 4px 0 16px; }
   .new-project-row input { flex: 1; font-size: 14px; padding: 10px 12px; border-radius: 10px;
                             border: 1px solid #333; background: #1c1c1c; color: #eee; }
@@ -2019,6 +2066,16 @@ async function refresh() {
     TEAM_BY_NAME[inst.name] = inst.team;
     html += row(inst.name, inst.on, inst.url, 'inst', inst.name, inst.desc, inst.engine,
                inst.code_on, inst.code_url, undefined, undefined, inst.gitea_sync, inst.deploy, inst.team);
+    // Live event feed polling (backlog item 6f part 2, docs/spec.md
+    // "Proposed approach" §3) -- folded into this existing 4s cycle, no new
+    // setInterval. teamFeedOpen[inst.name] is only ever set once row()'s
+    // own teamRow() call above has already run for this project (it seeds
+    // the default-open state the first time a row renders non-idle), so
+    // this check always sees the up-to-date value. Fire-and-forget: does
+    // not block this refresh() call's own render.
+    if (inst.team && inst.team.status !== 'idle' && teamFeedOpen[inst.name]) {
+      pollTeamFeed(inst.name);
+    }
   }
   if (s.instances.length === 0) html += '<div class="empty">No project folders under the configured PROJECTS_DIR yet.</div>';
   if (s.host_enabled) html += row(s.host_label, s.host, s.host_url, 'host', null, '', null, false, null);
@@ -2101,6 +2158,49 @@ let teamPickerInitialized = {}; // name -> bool, true once seeded from inst.team
 let teamPickerLead = {};        // name -> {kind, name} | null
 let teamPickerMembers = {};     // name -> Set<string> (engine names)
 let teamGroundingCache = {};    // name -> {files, skipped} | null (fetch failed) | undefined (not fetched yet)
+
+// Live event feed + escalation inbox (backlog item 6f part 2, docs/spec.md
+// / docs/design.md) -- per-project client state, all keyed by project name
+// (or, for the inbox cache, by run_id -- a question is a property of a
+// specific run, not a project) and all surviving refresh()'s own full-row
+// re-render the same way teamTaskText/teamPickerLead already do above.
+let teamFeedOpen = {};          // name -> bool, undefined until the row first renders non-idle
+let teamFeedCursor = {};        // name -> {agent: byte_offset}, the last /team/events cursor
+let teamFeedEvents = {};        // name -> event[] (rolling buffer, most recent 500 kept)
+let teamFeedFilter = {};        // name -> "all" | agent name
+let teamFeedPolling = {};       // name -> bool, true while pollTeamFeed()'s own drain loop is in flight
+let teamInboxCache = {};        // run_id -> inbox response | 'pending' | null (fetch failed)
+let teamEscalationSelected = {}; // name -> Set<number> (indices into the cached inbox's own options[])
+let teamEscalationOther = {};   // name -> string, the free-text "Other" answer in progress
+
+// Agent-identity colour palette (docs/design.md "ui-ux-pro-max choices") --
+// deliberately distinct from the four semantic status colors
+// (#4da6ff/#ffb648/#34c759/#ff6b6b) so agent identity in the feed is never
+// confused with run status. Hash is deterministic -- stable across polls
+// and page reloads for the same agent name.
+const TEAM_AGENT_PALETTE = ['#d084d0', '#6eb5d4', '#b4a84d', '#84b484', '#d4a484', '#a49ed4'];
+function teamAgentColor(agentName) {
+  const s = agentName || '';
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return TEAM_AGENT_PALETTE[h % TEAM_AGENT_PALETTE.length];
+}
+// Clears every piece of feed/escalation client state for a project -- called
+// when its row falls back into the idle branch (docs/spec.md "Edge cases":
+// "A team stops ... the feed/escalation panel and their client-side state
+// ... are cleared when the row re-renders back into the idle branch").
+// teamInboxCache is intentionally NOT touched here -- it is keyed by
+// run_id, not project name, and a finished run's own run_id is never
+// reused (teams._run_id() draws from secrets), so its cache entry just
+// goes cold rather than needing active cleanup.
+function clearTeamFeedState(name) {
+  delete teamFeedOpen[name];
+  delete teamFeedCursor[name];
+  delete teamFeedEvents[name];
+  delete teamFeedFilter[name];
+  delete teamEscalationSelected[name];
+  delete teamEscalationOther[name];
+}
 
 // Client-side mirror of teams.validate_composition()'s rules (docs/spec.md
 // 6e) -- fast feedback only; the server's own check in POST .../team/start
@@ -2234,9 +2334,312 @@ function updateTeamStartButton(name) {
 // after deployRow()'s own shape (a single-purpose row, not the
 // checkbox-toggle pattern), since starting a team needs a task-text input,
 // not a boolean flip.
+// Live event feed + escalation inbox (backlog item 6f part 2, docs/spec.md
+// / docs/design.md) -- status strip, escalation-answer panel, and the
+// collapsible merged event feed, all rendered inline in teamRow()'s
+// non-idle branch below. No new page/route -- built entirely against 6f
+// part 1's already-shipped GET .../team/events, GET .../team/inbox, and
+// POST .../team/resolve.
+function renderTeamStatusStrip(team) {
+  const idSuffix = team.run_id ? ' (ID: ' + esc(team.run_id) + ')' : '';
+  if (team.status === 'running') {
+    return '<div class="team-status-strip status-running">Working' + idSuffix + '</div>';
+  }
+  if (team.status === 'blocked') {
+    if (team.waiting_on_you) {
+      return '<div class="team-status-strip status-blocked waiting-on-you">⚠ Waiting on you' + idSuffix + '</div>';
+    }
+    return '<div class="team-status-strip status-blocked">Blocked — Max rounds reached' + idSuffix + '</div>';
+  }
+  if (team.status === 'finished') return '<div class="team-status-strip status-finished">Finished' + idSuffix + '</div>';
+  if (team.status === 'error') return '<div class="team-status-strip status-error">Error' + idSuffix + '</div>';
+  return '<div class="team-status-strip">' + esc(team.status) + idSuffix + '</div>';
+}
+// Fetched once per run_id (docs/design.md "On first render for a given
+// run_id ... fetch GET .../team/inbox once and cache the result client-side
+// keyed by run_id, not re-fetched on every poll tick") -- same
+// fetch-then-refresh() idiom fetchTeamGrounding() already uses above.
+async function fetchTeamInbox(name, runId) {
+  teamInboxCache[runId] = 'pending';
+  try {
+    const r = await fetch('/projects/' + encodeURIComponent(name) + '/team/inbox?run_id=' + encodeURIComponent(runId));
+    teamInboxCache[runId] = r.ok ? await r.json() : null;
+  } catch (e) {
+    teamInboxCache[runId] = null;
+  }
+  refresh();
+}
+// Options are addressed by INDEX into the cached inbox's own options[], not
+// by label text -- labels are LLM-authored free text that could contain
+// quotes/HTML and must never be embedded into an onclick/onchange
+// attribute string (unlike engine/project names, which are NAME_RE-
+// restricted elsewhere in this file). teamEscalationSelected[name] survives
+// refresh()'s own full-row re-render the same way teamPickerMembers already
+// does for the composition picker.
+function onEscalationOptionChange(name, idx, multiSelect, checked) {
+  const set = teamEscalationSelected[name] || (teamEscalationSelected[name] = new Set());
+  if (multiSelect) {
+    if (checked) set.add(idx); else set.delete(idx);
+  } else {
+    set.clear();
+    if (checked) set.add(idx);
+  }
+  refresh();
+}
+// Shared by doTeamResolve()'s own client-side validation and
+// actionBody()'s 'team-resolve' body so they can never diverge (docs/
+// spec.md "Proposed approach" §2: free text wins if filled in, else the
+// chosen option's label(s) joined with ", " for multi-select).
+function computeTeamResolveAnswer(name) {
+  const other = (teamEscalationOther[name] || '').trim();
+  if (other) return other;
+  const team = TEAM_BY_NAME[name];
+  const runId = team && team.run_id;
+  const cached = runId ? teamInboxCache[runId] : null;
+  const options = (cached && cached.options) || [];
+  const idxs = Array.from(teamEscalationSelected[name] || []);
+  const labels = idxs.map(i => options[i] && options[i].label).filter(Boolean);
+  if (cached && cached.multi_select) return labels.join(', ');
+  return labels[0] || '';
+}
+function renderEscalationPanel(name, team) {
+  if (!team.waiting_on_you) return '';
+  const runId = team.run_id;
+  const cached = runId ? teamInboxCache[runId] : null;
+  if (cached === undefined) {
+    if (runId) fetchTeamInbox(name, runId);
+    return '<div class="team-escalation" id="team-escalation-' + esc(name) + '">Loading question…</div>';
+  }
+  if (cached === 'pending') {
+    return '<div class="team-escalation" id="team-escalation-' + esc(name) + '">Loading question…</div>';
+  }
+  if (cached === null) {
+    return '<div class="team-escalation" id="team-escalation-' + esc(name) + '">' +
+      'Could not load the pending question. Check `tmux attach`.</div>';
+  }
+  if (!cached.pending) {
+    // A narrow race, not a fetch failure: this project's own last /status
+    // snapshot still says waiting_on_you (team.waiting_on_you is a
+    // moment-in-time read), but /team/inbox -- fetched a beat later --
+    // already reports no pending question (e.g. another tab/operator just
+    // answered it). The next 4s poll will pick up the resolved status.
+    return '<div class="team-escalation" id="team-escalation-' + esc(name) + '">' +
+      'This question was already answered.</div>';
+  }
+  const selected = teamEscalationSelected[name] || new Set();
+  const inputType = cached.multi_select ? 'checkbox' : 'radio';
+  const optionsHtml = (cached.options || []).map((opt, i) => {
+    const checked = selected.has(i) ? ' checked' : '';
+    const desc = opt.description ?
+      '<div class="team-escalation-option-desc">' + esc(opt.description) + '</div>' : '';
+    return '<label class="team-escalation-option"><input type="' + inputType + '" name="escalation-option-' +
+      esc(name) + '"' + checked + ' onchange="onEscalationOptionChange(' + "'" + name + "'," + i + ',' +
+      (cached.multi_select ? 'true' : 'false') + ', this.checked)"><span>' + esc(opt.label) + '</span>' +
+      desc + '</label>';
+  }).join('');
+  const otherText = teamEscalationOther[name] || '';
+  return '<div class="team-escalation" id="team-escalation-' + esc(name) + '">' +
+    '<div class="team-escalation-form">' +
+    (cached.header ? '<div class="team-escalation-header">' + esc(cached.header) + '</div>' : '') +
+    '<div class="team-escalation-question">' + esc(cached.question) + '</div>' +
+    optionsHtml +
+    '<label>Other (free text)<br><textarea id="escalation-other-' + esc(name) + '" rows="3" ' +
+    'oninput="teamEscalationOther[' + "'" + name + "'" + '] = this.value;">' + esc(otherText) + '</textarea></label>' +
+    '<div class="team-actions"><button class="team-btn" onclick="doTeamResolve(' + "'" + name + "'" +
+    ')">Submit answer</button></div>' +
+    '</div></div>';
+}
+// The escalation form's submit result (error/success) renders in the row's
+// own single "id=team-msg-<name>" slot below (docs/design.md "Message slot
+// (.team-msg pattern)") -- not a second/duplicate message element here.
+function renderTeamFeedToggle(name) {
+  const open = !!teamFeedOpen[name];
+  return '<div class="team-feed-toggle-row"><a class="team-feed-toggle" onclick="toggleTeamFeed(' +
+    "'" + name + "'" + ')">' + (open ? 'Hide live feed' : 'Show live feed') + '</a></div>';
+}
+// Positional fact_check-vs-finish disambiguation (docs/spec.md
+// "Background"): a `tool_use` event with empty `meta` is ambiguous between
+// a fact_check claim and a finish summary -- resolved by looking at the
+// NEXT event in the LEAD's own transcript sequence (not the merged/
+// interleaved buffer), never by content. `leadEvents` is the full buffer
+// filtered to agent==='lead' and sorted by seq; object identity (not a
+// seq/agent match) finds `e`'s own position, since the array elements are
+// the very same objects the merged buffer holds.
+function findNextLeadEvent(e, leadEvents) {
+  const idx = leadEvents.indexOf(e);
+  if (idx === -1) return null;
+  return leadEvents[idx + 1] || null;
+}
+function teamFeedEventKindClass(e, leadEvents) {
+  const meta = e.meta || {};
+  if (e.kind === 'error') return 'error';
+  if (e.kind === 'tool_result' && meta.found !== undefined) return 'fact-check-result';
+  if (e.kind === 'tool_result' && meta.resolved) return 'resolved';
+  if (e.kind === 'handoff') return 'handoff';
+  if (e.kind === 'tool_use' && meta.header !== undefined) return 'ask-user';
+  if (e.kind === 'tool_use' && Object.keys(meta).length === 0) {
+    const next = findNextLeadEvent(e, leadEvents);
+    return (next && next.kind === 'tool_result' && next.meta && next.meta.found !== undefined) ?
+      'fact-check-claim' : 'finish';
+  }
+  if (e.kind === 'status' && meta.forced && meta.final_status) return 'terminal-escalation';
+  return e.kind;
+}
+function teamFeedEventBody(e, leadEvents) {
+  const meta = e.meta || {};
+  const cls = teamFeedEventKindClass(e, leadEvents);
+  if (cls === 'fact-check-claim') {
+    return 'fact_check: ' + esc(e.text || '');
+  }
+  if (cls === 'fact-check-result') {
+    let parsed = null;
+    try { parsed = JSON.parse(e.text || '{}'); } catch (err) { parsed = null; }
+    if (!parsed || !parsed.found) {
+      return 'Fact-check result: <span class="team-feed-nomatch">✗ no supporting passage found</span>';
+    }
+    const matches = (parsed.matches || []).map(m => {
+      const t = m.text || '';
+      const shown = t.length > 200 ? t.slice(0, 200) + '…' : t;
+      return '<div class="team-feed-match">✓ ' + esc(m.file_line || '') + ' — ' + esc(shown) + '</div>';
+    }).join('');
+    return 'Fact-check result:' + matches;
+  }
+  if (cls === 'resolved') return 'Answer: ' + esc(e.text || '');
+  if (cls === 'handoff') return 'Delegating to ' + esc(meta.agent || '');
+  if (cls === 'ask-user') return 'ask_user: ' + esc(meta.header || e.text || '');
+  if (cls === 'finish') return '[Finish summary] ' + esc(e.text || '');
+  if (cls === 'terminal-escalation') {
+    return '✕ Escalated: max rounds reached (' + esc(meta.final_status || '') + ')';
+  }
+  if (e.kind === 'error') return '✕ ' + esc(e.text || '');
+  if (e.kind === 'message' || e.kind === 'status') return esc(e.text || '');
+  return '[' + esc(e.kind || '') + '] ' + esc(e.text || '');
+}
+function renderTeamFeedEvent(e, leadEvents) {
+  const color = teamAgentColor(e.agent);
+  const ts = (e.ts || '').length >= 19 ? e.ts.slice(11, 19) : (e.ts || '');
+  const kindClass = teamFeedEventKindClass(e, leadEvents);
+  const body = teamFeedEventBody(e, leadEvents);
+  return '<div class="team-feed-event kind-' + esc(kindClass) + '">' +
+    '<span class="team-feed-ts">' + esc(ts) + '</span> ' +
+    '<span class="team-feed-agent" style="color:' + color + '">' + esc(e.agent) + '</span> ' +
+    '<span class="team-feed-text">' + body + '</span></div>';
+}
+function renderTeamFeed(name, team) {
+  if (!teamFeedOpen[name]) return '';
+  const events = teamFeedEvents[name] || [];
+  const filter = teamFeedFilter[name] || 'all';
+  const agents = ['lead'].concat((team.composition && team.composition.members) || []);
+  const pills = ['all'].concat(agents).map(a => {
+    const label = a === 'all' ? 'All' : a;
+    const active = filter === a ? ' active' : '';
+    return '<button class="team-feed-pill' + active + '" onclick="setTeamFeedFilter(' +
+      "'" + name + "','" + a + "'" + ')">' + esc(label) + '</button>';
+  }).join('');
+  const filtered = filter === 'all' ? events : events.filter(e => e.agent === filter);
+  const leadEvents = events.filter(e => e.agent === 'lead').sort((a, b) => (a.seq || 0) - (b.seq || 0));
+  const listHtml = filtered.length === 0 ? '<div class="team-feed-empty">No events yet.</div>' :
+    filtered.map(e => renderTeamFeedEvent(e, leadEvents)).join('');
+  return '<div class="team-feed">' +
+    '<div class="team-feed-filter">' + pills + '</div>' +
+    '<div class="team-feed-list">' + listHtml + '</div></div>';
+}
+// Reopening always starts fresh from cursor={} (docs/spec.md "Edge cases":
+// "reopening it starts from cursor {} again ... rather than trying to
+// resume a stale cursor from before it was closed"), same as a full page
+// reload's own behavior -- simpler, and no extra state to keep consistent.
+function toggleTeamFeed(name) {
+  const opening = !teamFeedOpen[name];
+  teamFeedOpen[name] = opening;
+  if (opening) {
+    teamFeedCursor[name] = {};
+    teamFeedEvents[name] = [];
+  } else {
+    delete teamFeedCursor[name];
+    delete teamFeedEvents[name];
+  }
+  refresh();
+}
+// Client-side only -- filtering never refetches (docs/spec.md "Edge cases":
+// "Switching the per-agent filter does not reset or refetch").
+function setTeamFeedFilter(name, agent) {
+  teamFeedFilter[name] = agent;
+  refresh();
+}
+// Folded into refresh()'s existing 4s poll cycle (docs/spec.md "Proposed
+// approach" §3), not a new setInterval -- called from refresh() itself for
+// every project whose feed is open. Drains any `truncated: true` file
+// immediately in a loop rather than waiting for the next 4s tick (docs/
+// spec.md: "loop until no file reports truncated"). Deliberately does NOT
+// call refresh() itself once the drain completes -- this app has no
+// per-row incremental re-render, only the full refresh(), and calling it
+// here would have refresh() invoke pollTeamFeed() again immediately (since
+// the feed is still open), self-sustaining a tight fetch loop far faster
+// than the intended 4s cadence. The freshly-appended events render on the
+// next natural 4s tick instead -- well within "one subsequent poll
+// interval", which is what every acceptance criterion here actually
+// requires. teamFeedPolling[name] guards against two overlapping drains for
+// the same project (e.g. a slow poll still in flight when the next tick
+// fires).
+async function pollTeamFeed(name) {
+  if (teamFeedPolling[name]) return;
+  teamFeedPolling[name] = true;
+  try {
+    let more = true;
+    while (more) {
+      const cursor = teamFeedCursor[name] || {};
+      const cursorJson = encodeURIComponent(JSON.stringify(cursor));
+      let r;
+      try {
+        r = await fetch('/projects/' + encodeURIComponent(name) + '/team/events?run_id=&cursor=' + cursorJson);
+      } catch (e) {
+        break;  // network hiccup -- the next 4s tick retries from the same cursor
+      }
+      if (!r.ok) break;
+      const data = await r.json().catch(() => null);
+      if (!data) break;
+      if (data.events && data.events.length) {
+        teamFeedEvents[name] = (teamFeedEvents[name] || []).concat(data.events);
+        // Re-sort by (ts, agent, seq) on every append -- merges safely even
+        // if two agents' events arrive slightly out of ts order across
+        // polls (docs/spec.md "Proposed approach" §3). ts is a fixed-width
+        // ISO-8601 UTC string (teams._now_iso()), so lexical compare sorts
+        // chronologically.
+        teamFeedEvents[name].sort((a, b) =>
+          (a.ts || '').localeCompare(b.ts || '') || (a.agent || '').localeCompare(b.agent || '') ||
+          (a.seq || 0) - (b.seq || 0));
+        if (teamFeedEvents[name].length > 500) {
+          teamFeedEvents[name] = teamFeedEvents[name].slice(-500);
+        }
+      }
+      teamFeedCursor[name] = data.cursors || teamFeedCursor[name] || {};
+      more = !!(data.truncated && Object.keys(data.truncated).some(k => data.truncated[k]));
+    }
+  } finally {
+    teamFeedPolling[name] = false;
+  }
+}
+// Client-side validation only (docs/design.md) -- the route's own 400 is
+// the authoritative check either way, same discipline doTeamStart() already
+// follows. Reuses toggle()'s TOTP-retry/code-overlay plumbing exactly like
+// doTeamStart()/doTeamStop() above.
+function doTeamResolve(name) {
+  const msgEl = document.getElementById('team-msg-' + name);
+  if (msgEl) { msgEl.textContent = ''; msgEl.className = 'team-msg'; }
+  const answer = computeTeamResolveAnswer(name);
+  if (!answer || answer.length > 2000) {
+    if (msgEl) {
+      msgEl.textContent = 'Answer must be non-empty and at most 2000 characters';
+      msgEl.className = 'team-msg error';
+    }
+    return;
+  }
+  toggle('team-resolve', name, true, null);
+}
 function teamRow(name, team) {
   const msgSlot = '<div class="team-msg" id="team-msg-' + esc(name) + '"></div>';
   if (!team || team.status === 'idle') {
+    clearTeamFeedState(name);
     const text = teamTaskText[name] || '';
     const taskArea = '<textarea class="team-textarea" id="task-' + esc(name) + '" placeholder="Task description..." ' +
       'oninput="teamTaskText[' + "'" + name + "'" + '] = this.value; ' +
@@ -2270,14 +2673,23 @@ function teamRow(name, team) {
       ' onclick="doTeamStart(' + "'" + name + "'" + ')">Start team</button></div>' +
       msgSlot + '</div>';
   }
-  const labels = {running: 'running', blocked: 'blocked', finished: 'finished', error: 'error'};
-  const label = labels[team.status] || team.status;
-  const sub = team.status === 'blocked' ?
-    '<div class="team-sub">Lead is waiting for input · check tmux attach</div>' : '';
-  return '<div class="team-row">' +
-    '<div class="team-status status-' + esc(team.status) + '">Status: [' + esc(label) + ']' +
-    (team.run_id ? '&nbsp;&nbsp;&nbsp;ID: ' + esc(team.run_id) : '') + '</div>' +
-    sub +
+  // Overwatch feed + escalation inbox (backlog item 6f part 2, docs/
+  // spec.md / docs/design.md) -- 4-state status strip, an escalation-answer
+  // panel when waiting_on_you, and the collapsible merged event feed
+  // (default OPEN the first time this project's row renders non-idle --
+  // docs/design.md "expanded by default whenever team.status !== 'idle'",
+  // seeded once here the same way teamPickerInitialized seeds the
+  // composition picker's own pre-selection once above).
+  if (teamFeedOpen[name] === undefined) teamFeedOpen[name] = true;
+  const statusStrip = renderTeamStatusStrip(team);
+  const escalatedNote = (team.status === 'blocked' && !team.waiting_on_you) ?
+    '<div class="team-sub">Escalated — max rounds reached. No pending question to answer. ' +
+    'Review the feed below or Stop team and start a new run.</div>' : '';
+  const escalationPanel = team.waiting_on_you ? renderEscalationPanel(name, team) : '';
+  const feedToggle = renderTeamFeedToggle(name);
+  const feedPanel = renderTeamFeed(name, team);
+  return '<div class="team-row">' + statusStrip + escalatedNote + escalationPanel +
+    feedToggle + feedPanel +
     '<div class="team-actions"><button class="team-btn" onclick="doTeamStop(' +
     "'" + name + "'" + ')">Stop team</button></div>' +
     msgSlot + '</div>';
@@ -2315,6 +2727,7 @@ function actionPath(kind, name, on) {
   if (kind === 'deploy') return '/instance/' + encodeURIComponent(name) + '/deploy';
   if (kind === 'team-start') return '/projects/' + encodeURIComponent(name) + '/team/start';
   if (kind === 'team-stop') return '/projects/' + encodeURIComponent(name) + '/team/stop';
+  if (kind === 'team-resolve') return '/projects/' + encodeURIComponent(name) + '/team/resolve';
   return '/instance/' + encodeURIComponent(name) + '/' + (on ? 'on' : 'off');
 }
 function actionBody(kind, name, on, code) {
@@ -2344,6 +2757,12 @@ function actionBody(kind, name, on, code) {
       body.members = Array.from(teamPickerMembers[name] || []).map(n => ({kind: 'engine', name: n}));
     }
   }
+  // Live event feed + escalation inbox (backlog item 6f part 2, docs/
+  // spec.md "Proposed approach" §2) -- computeTeamResolveAnswer() is the
+  // single shared implementation of the free-text-wins/else-labels-joined
+  // convention, also used by doTeamResolve()'s own client-side validation,
+  // so the two can never diverge.
+  if (kind === 'team-resolve') body.answer = computeTeamResolveAnswer(name);
   return body;
 }
 async function performAction(kind, name, on, code) {
@@ -2375,6 +2794,7 @@ async function handleActionResult(r, ctx) {
       kind === 'deploy' ? 'Deploying: ' + (name || 'this') :
       kind === 'team-start' ? 'Starting team: ' + (name || 'this') :
       kind === 'team-stop' ? 'Stopping team: ' + (name || 'this') :
+      kind === 'team-resolve' ? 'Submitting answer: ' + (name || 'this') :
       (on ? 'Turning on: ' : 'Turning off: ') + (name || 'this');
     document.getElementById('action-code').value = '';
     document.getElementById('err-code').textContent = '';
@@ -2407,6 +2827,30 @@ async function handleActionResult(r, ctx) {
       } else {
         msgEl.textContent = r.ok ? '✓ Team stopped successfully' : '✕ Error: ' + (data.error || 'could not stop team');
         msgEl.className = 'team-msg ' + (r.ok ? 'success' : 'error');
+      }
+    }
+    return;
+  }
+  if (kind === 'team-resolve') {
+    // Its own inline result slot (docs/design.md "Escalation Panel" /
+    // "Message slot"), same pattern as team-start/team-stop above -- and
+    // handled before the generic 400 branch below for the same reason
+    // (an over-length/empty-answer 400 belongs in THIS row's own
+    // team-msg slot, not the new-project error field).
+    hideCodeOverlay();
+    const data = await r.json().catch(() => ({}));
+    const msgEl = document.getElementById('team-msg-' + name);
+    if (msgEl) {
+      if (r.ok && data.ok) {
+        msgEl.textContent = '✓ Answer submitted';
+        msgEl.className = 'team-msg success';
+        const team = TEAM_BY_NAME[name];
+        if (team && team.run_id) delete teamInboxCache[team.run_id];
+        delete teamEscalationSelected[name];
+        delete teamEscalationOther[name];
+      } else {
+        msgEl.textContent = '✕ Error: ' + (data.error || 'could not submit answer');
+        msgEl.className = 'team-msg error';
       }
     }
     return;

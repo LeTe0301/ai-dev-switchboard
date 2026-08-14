@@ -286,12 +286,26 @@ test('running renders coarse status label + Stop team button, no textarea', asyn
   assert.ok(!html.includes('Lead is waiting'), 'the blocked subtitle must not show for running');
 });
 
-test('blocked renders the "Lead is waiting" subtitle', async () => {
-  const c = await setupCase([inst('proj', { status: 'blocked', run_id: 'run-abc123' })]);
+// Superseded by 6f part 2 (docs/spec.md "Edge cases" -- blocked_ask_user vs
+// escalated_max_rounds must render distinctly, not the old shared "Lead is
+// waiting for input · check tmux attach" copy). See test_team_frontend.js's
+// own "status strip" section below for the two distinct replacements.
+test('blocked + waiting_on_you renders "Waiting on you" and the escalation panel, not the old terminal copy', async () => {
+  const c = await setupCase([inst('proj', { status: 'blocked', run_id: 'run-abc123', waiting_on_you: true })]);
   const html = c.instanceRowHtml('proj');
   assert.ok(html.includes('status-blocked'));
-  assert.ok(html.includes('Lead is waiting for input'), 'expected the blocked subtitle, got: ' + html);
-  assert.ok(html.includes('check tmux attach'));
+  assert.ok(html.includes('Waiting on you'), 'expected the "Waiting on you" strip copy, got: ' + html);
+  assert.ok(!html.includes('Lead is waiting for input'), 'the old shared blocked copy must be gone');
+  assert.ok(!html.includes('Max rounds reached'), 'must not show the terminal-escalation copy here');
+});
+
+test('blocked without waiting_on_you (escalated_max_rounds) renders terminal copy, no escalation panel', async () => {
+  const c = await setupCase([inst('proj', { status: 'blocked', run_id: 'run-abc123', waiting_on_you: false })]);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('status-blocked'));
+  assert.ok(html.includes('Max rounds reached'), 'expected the terminal-escalation strip copy, got: ' + html);
+  assert.ok(!html.includes('Waiting on you'));
+  assert.ok(!html.includes('team-escalation-form'), 'no answer form for a terminal escalated_max_rounds run');
 });
 
 test('finished and error render their own status classes, no subtitle', async () => {
@@ -417,7 +431,11 @@ test('clicking Stop team then cancelling the confirm() dialog sends no request',
   c.setConfirmReturn(false);
   c.call('doTeamStop', 'proj');
   await tick();
-  assert.strictEqual(c.pendingFetches.length, 0);
+  // A running team's feed defaults open (docs/design.md 6f part 2), which
+  // fires its own /team/events poll from setupCase()'s own bootstrap
+  // refresh() -- unrelated to Stop, filtered out here rather than asserting
+  // on the raw pending-fetch count.
+  assert.ok(!c.pendingFetches.some((f) => f.url.includes('/team/stop')), 'no stop request should have been sent');
   assert.strictEqual(c.confirmCalls.length, 1);
   assert.ok(c.confirmCalls[0].includes('Stop team?'));
   assert.ok(c.confirmCalls[0].includes('Any uncommitted work will be lost.'));
@@ -428,9 +446,12 @@ test('confirmed stop dispatches POST /projects/<name>/team/stop and shows a succ
   c.setConfirmReturn(true);
   const p = c.call('doTeamStop', 'proj');
   await tick();
-  assert.strictEqual(c.pendingFetches.length, 1);
-  assert.strictEqual(c.pendingFetches[0].url, '/projects/proj/team/stop');
-  assert.strictEqual(c.pendingFetches[0].opts.method, 'POST');
+  // See the cancel test above for why an unrelated /team/events fetch may
+  // also be pending here (the feed's own default-open poll).
+  const stopFetch = c.pendingFetches.find((f) => f.url === '/projects/proj/team/stop');
+  assert.ok(stopFetch, 'expected a pending POST /projects/proj/team/stop, got: ' +
+    c.pendingFetches.map((f) => f.url).join(', '));
+  assert.strictEqual(stopFetch.opts.method, 'POST');
   c.resolveFetch((f) => f.url === '/projects/proj/team/stop', 200,
     { ok: true, session_removed: true, worktrees: {} });
   await p;
@@ -710,6 +731,447 @@ test('clicking Start while the open picker composition is invalid sends no reque
   assert.strictEqual(c.pendingFetches.length, 0, 'no fetch should have been dispatched');
   assert.strictEqual(c.msgEl('proj').textContent, 'Lead is required');
   assert.ok(c.msgEl('proj').className.includes('error'));
+});
+
+// ─── Live event feed + escalation inbox (backlog item 6f part 2,
+// docs/spec.md / docs/design.md) ──────────────────────────────────────────
+
+// Delivers a /team/events response to whichever project's feed poll is
+// currently in flight (a running team's feed defaults open, so setupCase()
+// itself already triggered pollTeamFeed()'s own first fetch) and drains the
+// microtask queue enough for pollTeamFeed()'s while-loop/finally to settle.
+async function openFeedAndDeliverEvents(c, name, events, truncated) {
+  await waitForFetch(c, (f) => f.url.indexOf('/projects/' + name + '/team/events') === 0);
+  c.resolveFetch((f) => f.url.indexOf('/projects/' + name + '/team/events') === 0, 200,
+    { run_id: 'run-events', events, cursors: {}, truncated: truncated || {} });
+  await tick();
+  await tick();
+  await tick();
+}
+
+// pollTeamFeed() deliberately does not call refresh() itself once its own
+// drain loop completes (see its own doc comment in app/app.py -- avoids a
+// self-sustaining fetch loop faster than the intended 4s cadence), so a
+// test that wants to see freshly-polled events actually rendered has to
+// drive a further refresh() cycle itself, exactly like the real 4s
+// setInterval would on the next tick. Any events fetch this new refresh()
+// cycle re-triggers is left unresolved/ignored, same convention the
+// Stop-team tests above already use for the same reason.
+async function rerenderRow(c, instances, roster) {
+  const p = c.call('refresh');
+  await waitForFetch(c, (f) => f.url === '/status');
+  c.resolveFetch((f) => f.url === '/status', 200, statusWith(instances, roster));
+  await p;
+  await tick();
+}
+// Several action helpers (setTeamFeedFilter()/onEscalationOptionChange()/
+// toggleTeamFeed()) trigger their OWN internal refresh() call as a
+// fire-and-forget side effect, exactly like onTeamMateToggle() already does
+// for the composition picker. Call this right after one of those -- never
+// rerenderRow() -- to drain THAT already-in-flight /status fetch. Calling
+// rerenderRow() (which dispatches a SECOND, independent refresh()) instead
+// would leave two /status fetches pending at once; resolveFetch()'s own
+// find-first-match semantics would resolve the wrong (stale) one and the
+// second call's own awaited promise would hang forever.
+async function drainTriggeredRefresh(c, instances, roster) {
+  await waitForFetch(c, (f) => f.url === '/status');
+  c.resolveFetch((f) => f.url === '/status', 200, statusWith(instances, roster));
+  await tick();
+  await tick();
+}
+
+// fetchTeamInbox() (app/app.py) caches the response then calls refresh()
+// itself -- exactly like fetchTeamGrounding() already does for the
+// composition picker (see openPicker()'s own two-step drain above). That
+// follow-up refresh() issues its own /status fetch which must also be
+// resolved, or the row's rendered HTML never actually picks up the
+// now-cached inbox (the cache would be populated, but the DOM would stay
+// on its pre-fetch snapshot).
+async function deliverTeamInbox(c, name, runId, instances, payload) {
+  await waitForFetch(c, (f) => f.url === '/projects/' + name + '/team/inbox?run_id=' + runId);
+  c.resolveFetch((f) => f.url === '/projects/' + name + '/team/inbox?run_id=' + runId, 200, payload);
+  await waitForFetch(c, (f) => f.url === '/status');
+  c.resolveFetch((f) => f.url === '/status', 200, statusWith(instances));
+  await tick();
+  await tick();
+  await tick();
+}
+
+test('running renders the "Working" status strip, not the old "Status: [running]" wording', async () => {
+  const c = await setupCase([inst('proj', { status: 'running', run_id: 'run-w' })]);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('team-status-strip'));
+  assert.ok(html.includes('Working'), 'expected the "Working" copy, got: ' + html);
+  assert.ok(!html.includes('Status: [running]'), 'the old static wording must be gone');
+});
+
+test('a running team\'s feed panel defaults open ("Hide live feed") and shows "No events yet." with an empty buffer', async () => {
+  const c = await setupCase([inst('proj', { status: 'running', run_id: 'run-e' })]);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('Hide live feed'), 'expected the feed to default open, got: ' + html);
+  assert.ok(html.includes('No events yet.'));
+});
+
+test('idle renders no status-strip/feed/escalation UI (unchanged from 6d/6e)', async () => {
+  const c = await setupCase([inst('proj', null)]);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(!html.includes('team-status-strip'));
+  assert.ok(!html.includes('team-feed'));
+  assert.ok(!html.includes('team-escalation'));
+});
+
+// ─── Escalation panel ───────────────────────────────────────────────────
+
+test('waiting_on_you fetches the inbox once and renders question/header/options/free-text', async () => {
+  const instances = [inst('proj', { status: 'blocked', run_id: 'run-1', waiting_on_you: true })];
+  const c = await setupCase(instances);
+  await deliverTeamInbox(c, 'proj', 'run-1', instances, {
+    pending: true, run_id: 'run-1', question: 'Is this correct?', header: 'from lead',
+    options: [{ label: 'Yes', description: 'proceed' }, { label: 'No' }], multi_select: false,
+  });
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('team-escalation-form'));
+  assert.ok(html.includes('Is this correct?'));
+  assert.ok(html.includes('from lead'));
+  assert.ok(html.includes('>Yes<'));
+  assert.ok(html.includes('>No<'));
+  assert.ok(html.includes('escalation-other-proj'), 'the free-text Other input must always be present');
+  assert.ok(html.includes('type="radio"'), 'single_select must render radios');
+});
+
+test('multi_select renders checkboxes; zero options still renders the always-present free-text input', async () => {
+  const instances = [inst('proj', { status: 'blocked', run_id: 'run-2', waiting_on_you: true })];
+  const c = await setupCase(instances);
+  await deliverTeamInbox(c, 'proj', 'run-2', instances, {
+    pending: true, run_id: 'run-2', question: 'fallback question', header: '', options: [], multi_select: true,
+  });
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('escalation-other-proj'));
+  // Scoped to "escalation-option-<name>" specifically -- the row's own
+  // singleton on/off switch always renders an unrelated
+  // `<input type="checkbox">`, which a bare `html.includes('type="checkbox"')`
+  // check would false-negative on.
+  assert.ok(!html.includes('name="escalation-option-proj"'), 'no options to render yet');
+});
+
+test('escalated_max_rounds (waiting_on_you=false) never fetches /team/inbox', async () => {
+  const c = await setupCase([inst('proj', { status: 'blocked', run_id: 'run-3', waiting_on_you: false })]);
+  await tick();
+  await tick();
+  assert.ok(!c.pendingFetches.some((f) => f.url.indexOf('/team/inbox') !== -1),
+    'must never poll the inbox just to light the "waiting on you" indicator');
+});
+
+test('selecting a single-select option and submitting sends {answer: "<label>"} via team-resolve', async () => {
+  const instances = [inst('proj', { status: 'blocked', run_id: 'run-r', waiting_on_you: true })];
+  const c = await setupCase(instances);
+  await deliverTeamInbox(c, 'proj', 'run-r', instances, {
+    pending: true, run_id: 'run-r', question: 'q', header: '', multi_select: false,
+    options: [{ label: 'Yes, proceed' }, { label: 'No, revise' }],
+  });
+  c.call('onEscalationOptionChange', 'proj', 0, false, true);
+  await tick();
+  c.call('doTeamResolve', 'proj');
+  await tick();
+  const f = c.pendingFetches.find((x) => x.url === '/projects/proj/team/resolve');
+  assert.ok(f, 'expected a pending POST /projects/proj/team/resolve');
+  assert.strictEqual(f.opts.method, 'POST');
+  const body = JSON.parse(f.opts.body);
+  assert.strictEqual(body.answer, 'Yes, proceed');
+  c.resolveFetch((x) => x.url === '/projects/proj/team/resolve', 200, { ok: true, run_id: 'run-r' });
+  await tick();
+  await tick();
+  const msg = c.msgEl('proj');
+  assert.strictEqual(msg.textContent, '✓ Answer submitted');
+  assert.ok(msg.className.includes('success'));
+});
+
+test('multi_select joins several chosen labels with ", "', async () => {
+  const instances = [inst('proj', { status: 'blocked', run_id: 'run-m', waiting_on_you: true })];
+  const c = await setupCase(instances);
+  await deliverTeamInbox(c, 'proj', 'run-m', instances, {
+    pending: true, run_id: 'run-m', question: 'q', header: '', multi_select: true,
+    options: [{ label: 'A' }, { label: 'B' }, { label: 'C' }],
+  });
+  c.call('onEscalationOptionChange', 'proj', 0, true, true);
+  c.call('onEscalationOptionChange', 'proj', 2, true, true);
+  await tick();
+  assert.strictEqual(c.call('computeTeamResolveAnswer', 'proj'), 'A, C');
+});
+
+test('free-text "Other" wins over any selected option when both are present', async () => {
+  const instances = [inst('proj', { status: 'blocked', run_id: 'run-o', waiting_on_you: true })];
+  const c = await setupCase(instances);
+  await deliverTeamInbox(c, 'proj', 'run-o', instances, {
+    pending: true, run_id: 'run-o', question: 'q', header: '', multi_select: false,
+    options: [{ label: 'Yes' }],
+  });
+  c.call('onEscalationOptionChange', 'proj', 0, false, true);
+  c.sandbox.document.getElementById('escalation-other-proj').value = 'a custom answer instead';
+  vm.runInContext(
+    "teamEscalationOther['proj'] = document.getElementById('escalation-other-proj').value;", c.sandbox);
+  assert.strictEqual(c.call('computeTeamResolveAnswer', 'proj'), 'a custom answer instead');
+});
+
+test('an over-2000-char or empty answer is rejected client-side with no request dispatched', async () => {
+  const instances = [inst('proj', { status: 'blocked', run_id: 'run-v', waiting_on_you: true })];
+  const c = await setupCase(instances);
+  await deliverTeamInbox(c, 'proj', 'run-v', instances, {
+    pending: true, run_id: 'run-v', question: 'q', header: '', multi_select: false, options: [],
+  });
+  c.call('doTeamResolve', 'proj');
+  await tick();
+  assert.ok(!c.pendingFetches.some((f) => f.url === '/projects/proj/team/resolve'),
+    'an empty answer must never be dispatched');
+  assert.ok(c.msgEl('proj').className.includes('error'));
+});
+
+test('a 428 mid-resolve shows the code overlay labeled for this team\'s answer submission', async () => {
+  const instances = [inst('proj', { status: 'blocked', run_id: 'run-428', waiting_on_you: true })];
+  const c = await setupCase(instances);
+  await deliverTeamInbox(c, 'proj', 'run-428', instances, {
+    pending: true, run_id: 'run-428', question: 'q', header: '', multi_select: false,
+    options: [{ label: 'Yes' }],
+  });
+  c.call('onEscalationOptionChange', 'proj', 0, false, true);
+  await tick();
+  c.call('doTeamResolve', 'proj');
+  await tick();
+  c.resolveFetch((f) => f.url === '/projects/proj/team/resolve', 428, { error: 'totp_required' });
+  await tick();
+  await tick();
+  const label = c.elements.get('code-overlay-label');
+  assert.strictEqual(label.textContent, 'Submitting answer: proj');
+  c.elements.get('action-code').value = '123456';
+  c.call('submitActionCode');
+  await tick();
+  const retry = c.pendingFetches.find((f) => f.url === '/projects/proj/team/resolve');
+  assert.ok(retry);
+  assert.strictEqual(JSON.parse(retry.opts.body).code, '123456');
+  c.resolveFetch((f) => f.url === '/projects/proj/team/resolve', 200, { ok: true, run_id: 'run-428' });
+  await tick();
+  await tick();
+  assert.strictEqual(c.msgEl('proj').textContent, '✓ Answer submitted');
+});
+
+// ─── Merged event feed ──────────────────────────────────────────────────
+
+test('events from the lead and a teammate render merged, in chronological order, colour-coded per agent', async () => {
+  // 'coder' (not 'helper') deliberately -- teamAgentColor()'s simple 6-bucket
+  // hash happens to collide 'lead'/'helper' into the same palette slot,
+  // which is an acceptable general property of a 6-colour hash (more than 6
+  // agent names cannot all be unique) but would make THIS specific
+  // pairwise-distinctness assertion flaky. 'coder' does not collide with
+  // 'lead' under the same hash.
+  const instances = [inst('proj', {
+    status: 'running', run_id: 'run-feed', composition: { lead: null, members: ['coder'] },
+  })];
+  const c = await setupCase(instances);
+  const events = [
+    { ts: '2026-08-14T12:00:00Z', agent: 'lead', seq: 1, kind: 'message', text: 'Starting up', meta: {} },
+    { ts: '2026-08-14T12:00:01Z', agent: 'coder', seq: 1, kind: 'message', text: 'Working on it', meta: {} },
+  ];
+  await openFeedAndDeliverEvents(c, 'proj', events);
+  await rerenderRow(c, instances);
+  const html = c.instanceRowHtml('proj');
+  const leadIdx = html.indexOf('Starting up');
+  const coderIdx = html.indexOf('Working on it');
+  assert.ok(leadIdx !== -1 && coderIdx !== -1, 'expected both events rendered, got: ' + html);
+  assert.ok(leadIdx < coderIdx, 'expected chronological order (lead event first)');
+  // Colour-coded per agent -- the two agent name spans must carry different
+  // inline colours (a stable hash-based palette, docs/design.md).
+  const leadColor = /team-feed-agent" style="color:(#[0-9a-f]+)">lead</.exec(html);
+  const coderColor = /team-feed-agent" style="color:(#[0-9a-f]+)">coder</.exec(html);
+  assert.ok(leadColor && coderColor, 'expected colour-coded agent spans, got: ' + html);
+  assert.notStrictEqual(leadColor[1], coderColor[1]);
+});
+
+test('per-agent filter shows only that agent\'s events; "All" restores the merged view', async () => {
+  const instances = [inst('proj', {
+    status: 'running', run_id: 'run-filter', composition: { lead: null, members: ['helper'] },
+  })];
+  const c = await setupCase(instances);
+  const events = [
+    { ts: '2026-08-14T12:00:00Z', agent: 'lead', seq: 1, kind: 'message', text: 'lead line', meta: {} },
+    { ts: '2026-08-14T12:00:01Z', agent: 'helper', seq: 1, kind: 'message', text: 'helper line', meta: {} },
+  ];
+  await openFeedAndDeliverEvents(c, 'proj', events);
+  await rerenderRow(c, instances);
+  c.call('setTeamFeedFilter', 'proj', 'helper');
+  await drainTriggeredRefresh(c, instances);
+  let html = c.instanceRowHtml('proj');
+  assert.ok(!html.includes('lead line') && html.includes('helper line'), 'expected only helper events, got: ' + html);
+
+  c.call('setTeamFeedFilter', 'proj', 'all');
+  await drainTriggeredRefresh(c, instances);
+  html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('lead line') && html.includes('helper line'), 'expected the merged view restored');
+});
+
+test('fact_check found:true renders the claim and each match\'s file_line + passage text, not raw JSON', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-fc' })];
+  const c = await setupCase(instances);
+  const events = [
+    { ts: '2026-08-14T12:00:00Z', agent: 'lead', seq: 1, kind: 'tool_use', text: 'Python is a snake', meta: {} },
+    {
+      ts: '2026-08-14T12:00:01Z', agent: 'lead', seq: 2, kind: 'tool_result', meta: { found: true },
+      text: JSON.stringify({
+        claim: 'Python is a snake', found: true,
+        matches: [{ label: 'docs', path: 'x', relpath: 'docs/snake.md', line: 42,
+                    file_line: 'docs/snake.md:42', text: 'Python is a reptile, not a mammal.', end_line: 42 }],
+      }),
+    },
+  ];
+  await openFeedAndDeliverEvents(c, 'proj', events);
+  await rerenderRow(c, instances);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('fact_check: Python is a snake'), 'expected the claim rendered, got: ' + html);
+  assert.ok(html.includes('docs/snake.md:42'), 'expected the match file_line, got: ' + html);
+  assert.ok(html.includes('Python is a reptile'), 'expected the passage text, got: ' + html);
+  assert.ok(!html.includes('"matches":'), 'must never render the raw JSON blob');
+});
+
+test('fact_check found:false renders an explicit "no supporting passage found"', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-fc2' })];
+  const c = await setupCase(instances);
+  const events = [
+    { ts: '2026-08-14T12:00:00Z', agent: 'lead', seq: 1, kind: 'tool_use', text: 'The sky is green', meta: {} },
+    {
+      ts: '2026-08-14T12:00:01Z', agent: 'lead', seq: 2, kind: 'tool_result', meta: { found: false },
+      text: JSON.stringify({ claim: 'The sky is green', found: false, matches: [] }),
+    },
+  ];
+  await openFeedAndDeliverEvents(c, 'proj', events);
+  await rerenderRow(c, instances);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('no supporting passage found'), 'expected the explicit non-match text, got: ' + html);
+});
+
+test('a tool_use with empty meta and no following lead event renders as the finish summary, not a fact_check claim', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-finish' })];
+  const c = await setupCase(instances);
+  const events = [
+    { ts: '2026-08-14T12:00:00Z', agent: 'lead', seq: 1, kind: 'tool_use', text: 'All done: summary text', meta: {} },
+  ];
+  await openFeedAndDeliverEvents(c, 'proj', events);
+  await rerenderRow(c, instances);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('[Finish summary]'), 'expected the finish-summary rendering, got: ' + html);
+  assert.ok(html.includes('All done: summary text'));
+  assert.ok(!html.includes('fact_check:'), 'must not be mistaken for a fact_check claim');
+});
+
+test('a handoff event renders "Delegating to <teammate>"', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-handoff' })];
+  const c = await setupCase(instances);
+  const events = [
+    { ts: '2026-08-14T12:00:00Z', agent: 'lead', seq: 1, kind: 'handoff', text: '', meta: { agent: 'helper' } },
+  ];
+  await openFeedAndDeliverEvents(c, 'proj', events);
+  await rerenderRow(c, instances);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('Delegating to helper'), 'got: ' + html);
+});
+
+test('a truncated:true response triggers an immediate follow-up /team/events call, not waiting for the next tick', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-trunc' })];
+  const c = await setupCase(instances);
+  await waitForFetch(c, (f) => f.url.indexOf('/projects/proj/team/events') === 0);
+  const first = c.pendingFetches.find((f) => f.url.indexOf('/projects/proj/team/events') === 0);
+  assert.ok(first.url.indexOf('cursor=%7B%7D') !== -1, 'first poll must start from cursor={}, got: ' + first.url);
+  c.resolveFetch((f) => f.url.indexOf('/projects/proj/team/events') === 0, 200, {
+    run_id: 'run-trunc', events: [{ ts: '2026-08-14T12:00:00Z', agent: 'lead', seq: 1, kind: 'message', text: 'a', meta: {} }],
+    cursors: { lead: 500 }, truncated: { lead: true },
+  });
+  // No tick-count guessing needed -- assert the follow-up shows up promptly.
+  await waitForFetch(c, (f) => f.url.indexOf('/projects/proj/team/events') === 0 && f.url.indexOf('cursor=%7B%22lead%22%3A500%7D') !== -1);
+  c.resolveFetch((f) => f.url.indexOf('cursor=%7B%22lead%22%3A500%7D') !== -1, 200, {
+    run_id: 'run-trunc', events: [], cursors: { lead: 900 }, truncated: {},
+  });
+  await tick();
+  await tick();
+  // Drained -- no third call outstanding.
+  assert.ok(!c.pendingFetches.some((f) => f.url.indexOf('/projects/proj/team/events') === 0));
+});
+
+test('reopening the feed after closing it starts fresh from cursor={} (same as a page reload)', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-reopen' })];
+  const c = await setupCase(instances);
+  await waitForFetch(c, (f) => f.url.indexOf('/projects/proj/team/events') === 0);
+  c.resolveFetch((f) => f.url.indexOf('/projects/proj/team/events') === 0, 200,
+    { run_id: 'run-reopen', events: [{ ts: '2026-08-14T12:00:00Z', agent: 'lead', seq: 1, kind: 'message', text: 'x', meta: {} }],
+      cursors: { lead: 500 }, truncated: {} });
+  await tick();
+  await tick();
+  c.call('toggleTeamFeed', 'proj');  // close -- triggers its own internal refresh()
+  await drainTriggeredRefresh(c, instances);
+  c.call('toggleTeamFeed', 'proj');  // reopen -- likewise triggers its own refresh()
+  // pollTeamFeed() is only invoked from WITHIN refresh()'s own for-loop,
+  // after its /status fetch actually resolves -- draining it here is what
+  // lets the reopen's own fresh poll actually fire.
+  await drainTriggeredRefresh(c, instances);
+  const f = c.pendingFetches.find((x) => x.url.indexOf('/projects/proj/team/events') === 0);
+  assert.ok(f, 'expected a fresh poll on reopen');
+  assert.ok(f.url.indexOf('cursor=%7B%7D') !== -1, 'reopening must start from cursor={}, got: ' + f.url);
+});
+
+test('more than 500 events in the buffer are trimmed to the most recent 500, cursor unaffected', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-trim' })];
+  const c = await setupCase(instances);
+  const events = [];
+  for (let i = 0; i < 600; i++) {
+    events.push({ ts: '2026-08-14T12:00:' + String(i % 60).padStart(2, '0') + 'Z', agent: 'lead', seq: i,
+                  kind: 'message', text: 'evt' + i, meta: {} });
+  }
+  await openFeedAndDeliverEvents(c, 'proj', events, {});
+  await rerenderRow(c, instances);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(!html.includes('>evt0<'), 'the oldest events must have been trimmed');
+  assert.ok(html.includes('evt599'), 'the most recent events must be kept');
+});
+
+test('resolving an escalation transitions the strip away from "Waiting on you" within the next poll', async () => {
+  const instances = [inst('proj', { status: 'blocked', run_id: 'run-tr', waiting_on_you: true })];
+  const c = await setupCase(instances);
+  await deliverTeamInbox(c, 'proj', 'run-tr', instances, {
+    pending: true, run_id: 'run-tr', question: 'q', header: '', multi_select: false, options: [{ label: 'Yes' }],
+  });
+  c.call('onEscalationOptionChange', 'proj', 0, false, true);
+  // onEscalationOptionChange() triggers its own internal refresh() -- drain
+  // it now (see drainTriggeredRefresh()'s own doc comment) so the LATER,
+  // real rerenderRow() call below isn't racing a stale already-pending
+  // /status fetch.
+  await drainTriggeredRefresh(c, instances);
+  c.call('doTeamResolve', 'proj');
+  await tick();
+  c.resolveFetch((f) => f.url === '/projects/proj/team/resolve', 200, { ok: true, run_id: 'run-tr' });
+  await tick();
+  await tick();
+  const nextInstances = [inst('proj', { status: 'running', run_id: 'run-tr', waiting_on_you: false })];
+  await rerenderRow(c, nextInstances);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(!html.includes('Waiting on you'));
+  assert.ok(!html.includes('team-escalation-form'));
+});
+
+test('a team stopping (going idle) clears its feed/escalation client state', async () => {
+  const running = [inst('proj', { status: 'running', run_id: 'run-clear' })];
+  const c = await setupCase(running);
+  await waitForFetch(c, (f) => f.url.indexOf('/projects/proj/team/events') === 0);
+  c.resolveFetch((f) => f.url.indexOf('/projects/proj/team/events') === 0, 200,
+    { run_id: 'run-clear', events: [{ ts: '2026-08-14T12:00:00Z', agent: 'lead', seq: 1, kind: 'message', text: 'x', meta: {} }],
+      cursors: { lead: 10 }, truncated: {} });
+  await tick();
+  await tick();
+  const idle = [inst('proj', null)];
+  await rerenderRow(c, idle);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(!html.includes('team-feed'));
+  assert.ok(!html.includes('team-status-strip'));
+  // Re-running the SAME project again must default the feed back open, not
+  // stay wherever it was left before going idle.
+  const c2 = await setupCase([inst('proj', { status: 'running', run_id: 'run-clear-2' })]);
+  assert.ok(c2.instanceRowHtml('proj').includes('Hide live feed'));
 });
 
 // ─── run ────────────────────────────────────────────────────────────────

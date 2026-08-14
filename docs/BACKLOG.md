@@ -584,3 +584,43 @@ Shape of the fix: validate `run_id` the same way other user-supplied
 identifiers in this codebase already are (reject path separators / `..`
 segments, or match against a known-safe character set) before it ever
 reaches a path-join.
+
+---
+
+## 12. 6f part 2 follow-ups: escalation race test coverage, ARIA attributes, fact_check/finish poll-boundary edge case
+
+Three non-blocking should-fix/nit items from the reviewer's approval of
+6f part 2 (Teams page UI), none blocking.
+
+**Untested "already answered" race branch.** `renderEscalationPanel()`'s
+`!cached.pending` branch (rendered when a cached `/status` snapshot still
+says `waiting_on_you` but a freshly-fetched `/team/inbox` already reports
+`pending: false`) was added by the developer beyond `docs/design.md`, is
+reachable and correct (reviewer confirmed with a targeted test), but has
+zero coverage in `tests/test_team_frontend.js`. Add a permanent regression
+test for it.
+
+**Missing ARIA attributes.** `docs/design.md`'s "Accessibility & platform
+notes" (`role="log"`/`aria-live="polite"` on the event list,
+`aria-pressed`/`aria-checked` on filter pills, `<fieldset>`/`<legend>` for
+the escalation option group) weren't implemented in `app/app.py`, and the
+omission wasn't called out in `docs/implementation.md`'s "Deviations from
+spec." Basic keyboard operability is intact (native `<button>`/
+`<input type="radio/checkbox">`/`<label>` throughout), so this doesn't
+block, but it's the first scrollable log-like/live-region panel in this
+codebase and sets a precedent either way — worth a follow-up pass to add
+the recommended attributes.
+
+**fact_check/finish poll-boundary misclassification (self-healing).** The
+positional disambiguation `docs/spec.md` itself specifies (a `tool_use`
+event is a fact_check claim if immediately followed by a `tool_result`
+with `meta.found`, otherwise treated as the finish summary) can transiently
+misclassify a fact_check claim as a finish summary if its `tool_use` event
+lands in the client's buffer before the paired `tool_result` — e.g. split
+across two `/team/events` polls. Practically unreachable (both transcript
+entries are written in one synchronous call server-side, sub-millisecond
+apart relative to the 4s poll cadence) and self-corrects within one more
+poll, so not a live bug — but worth a spec refinement if a future cycle
+touches this area: render an explicit transient state for a `tool_use`
+event that's the buffer's own last lead event while `team.status` is
+still `running`, rather than assuming finish.

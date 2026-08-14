@@ -3010,3 +3010,113 @@ direct reading of the reordered code confirms the winner's path is intact
 and no other side effect was dropped, duplicated, or reordered incorrectly
 in the move. No must-fix, should-fix, or nit findings. Ready to hand back
 to the product-manager for 6f part 2.
+
+---
+
+# Test & Review: Overwatch feed + escalation inbox — Teams page UI (sub-spec 6f part 2)
+
+## Scope
+Verifies `docs/spec.md`'s 6f part 2 acceptance criteria: `teamRow()`'s
+non-idle branch rewritten with a 4-state status strip (Working/Waiting on
+you/Blocked-terminal/Finished/Error, correctly splitting `blocked_ask_user`
+from the terminal `escalated_max_rounds`), a collapsible merged event feed
+polled via 6f part 1's already-shipped `GET .../team/events` cursor
+protocol (folded into the existing 4s `refresh()` cycle), a per-agent
+filter, `fact_check` claim/result rendering per the spec's positional
+disambiguation rule, and an escalation-answer panel submitting through a
+new `team-resolve` action kind. Frontend-only, no backend change — treated
+as the likely-final sub-spec of the multi-agent-teams story, given
+correspondingly higher rigor.
+
+Zero diff confirmed in `app/teams.py` and every `tests/test_team*.py` file
+(`git diff --stat -- app/teams.py 'tests/test_team*.py'` → no output).
+
+## Test cases
+
+| # | Criterion / case | Method | Result | Evidence |
+|---|---|---|---|---|
+| 1 | `running` → status strip shows "Working" | automated | pass | `test_team_frontend.js`: "running renders the 'Working' status strip, not the old 'Status: [running]' wording" |
+| 2 | `blocked_ask_user` (`waiting_on_you: true`) → "Waiting on you" strip + escalation panel with question/header/options/free-text, always present even with zero options | automated | pass | "waiting_on_you fetches the inbox once and renders question/header/options/free-text"; "multi_select renders checkboxes; zero options still renders the always-present free-text input" |
+| 3 | `escalated_max_rounds` (`waiting_on_you: false`) → distinct terminal "Blocked" copy, no answer form, no `/team/inbox` fetch | automated | pass | "blocked without waiting_on_you renders terminal copy, no escalation panel"; "escalated_max_rounds (waiting_on_you=false) never fetches /team/inbox" |
+| 4 | Merged, chronologically-ordered, per-agent-colour-coded feed across lead + teammate | automated | pass | "events from the lead and a teammate render merged, in chronological order, colour-coded per agent" |
+| 5 | Per-agent filter genuinely filters the rendered buffer (not just colour); "All" restores | automated | pass | "per-agent filter shows only that agent's events; 'All' restores the merged view" — independently confirmed by reading `renderTeamFeed()`'s `events.filter(e => e.agent === filter)`, a real filter, not decorative |
+| 6 | `fact_check found:true` → claim + each match's `file_line`/passage, never raw JSON | automated | pass | "fact_check found:true renders the claim and each match's file_line + passage text, not raw JSON" |
+| 7 | `fact_check found:false` → explicit "no supporting passage found" | automated | pass | "fact_check found:false renders an explicit 'no supporting passage found'" |
+| 8 | Answer submitted, `{"ok":true}` → strip leaves "Waiting on you" within one subsequent poll | automated | pass | "resolving an escalation transitions the strip away from 'Waiting on you' within the next poll" |
+| 9 | Page reload mid-run → feed repopulates from `cursor={}` | automated | pass | fresh `setupCase()` always starts a poll at `cursor=%7B%7D` (asserted directly in the truncation test); confirmed by code read: `teamFeedCursor`/`teamFeedEvents` are plain module-level `let`s with no persistence, so a real reload's fresh JS context reproduces this for free |
+| 10 | `truncated[agent]===true` → immediate follow-up poll, looped until drained | automated | pass | "a truncated:true response triggers an immediate follow-up /team/events call, not waiting for the next tick" — genuine promise-chain drain via `waitForFetch`, not a timer fake |
+| 11 | `team-resolve` reuses the exact 428→overlay→retry TOTP flow | automated | pass | "a 428 mid-resolve shows the code overlay labeled for this team's answer submission" |
+| 12 | `idle` → no feed/status-strip/escalation UI | automated | pass | "idle renders no status-strip/feed/escalation UI (unchanged from 6d/6e)" |
+| 13 | >500 events trimmed to 500 most recent, cursor/polling unaffected | automated | pass | "more than 500 events in the buffer are trimmed to the most recent 500, cursor unaffected" |
+| 14 (reviewer-authored) | A fact_check pair immediately followed by a genuine finish, delivered in one poll batch — must not misclassify either | automated (new) | pass | wrote and ran `test_edge.js`'s "a fact_check pair immediately followed by a genuine finish" — seq1+seq2 correctly render as the fact_check pair, seq3 (last lead event) correctly renders as `[Finish summary]` |
+| 15 (reviewer-authored) | A fact_check claim's `tool_use` event arrives in the buffer before its paired `tool_result` (split across two poll responses) | automated (new) | **transiently fails, self-corrects** | wrote and ran `test_edge.js`'s "a fact_check claim arrives before its paired tool_result" — confirmed the claim renders as `[Finish summary] claim B` (misclassified) on the first render, then correctly re-renders as `fact_check: claim B` once the paired `tool_result` lands on the next poll. See Findings below — reachable but the backend's synchronous write pattern makes it very unlikely in practice, and it self-heals within one poll. |
+| 16 (reviewer-authored) | Escalation option label containing quotes/HTML (`Yes, i think it's <script>alert(1)</script> "correct"`) renders safely, answer computation still uses the raw label | automated (new) | pass | wrote and ran `test_edge.js`'s XSS test — rendered HTML contains `&lt;script&gt;`/`&lt;img ... &gt;`, never an executable tag; `computeTeamResolveAnswer()` still returns the raw (unescaped) label string for the POST body, correctly separate from the escaped display copy |
+| 17 (reviewer-authored) | The self-flagged "This question was already answered." race (`waiting_on_you: true` but a fresh `/team/inbox` reports `pending: false`) | automated (new) | pass | wrote and ran `test_edge.js`'s race test — renders the exact race-specific copy, distinct from the fetch-failure message, and never offers a submit form; this exact branch had **zero** prior test coverage in the developer's own 52 tests despite being new logic (see Findings) |
+
+All 17 cases (13 developer-authored + 4 reviewer-authored) were actually executed this session, not inferred. Reviewer-authored tests live in
+`/tmp/claude-1001/-home-dev-projects-ai-dev-switchboard/6739b808-e54a-472b-b846-b06e0776a558/scratchpad/test_edge.js`
+(a full copy of `tests/test_team_frontend.js` plus 4 appended cases) — not committed to the repo, kept as scratch verification per the reviewer's own instructions.
+
+## Regression check
+- Node: `node tests/test_team_frontend.js` → **52/52 PASS**, run 3 additional times back-to-back → clean every time (4 total clean runs this session, matching the developer's own claimed 3x). With the 4 reviewer-authored cases added → **56/56 PASS**.
+- Python: `/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q` → **765 passed**, 0 failures, ~136.5s. Matches the developer's claimed baseline exactly.
+- `git diff --stat -- app/teams.py 'tests/test_team*.py'` → no output (zero backend diff), independently confirmed.
+- Syntax/build: `python3 -m py_compile app/app.py` clean; extracted the real rendered `<script>` from `render_page()` and ran `node --check` on it — clean; extracted the real rendered `<style>` block — 132 open / 132 close braces balanced, all 7 new top-level classes present. All matches the developer's own verification table exactly, independently re-run rather than trusted.
+
+## Defects found
+None that block approval. Two reachable-but-narrow correctness gaps found during edge testing (see Findings #1 below) — both self-correcting and neither violates the letter of any `docs/spec.md` acceptance criterion, so testing pass is treated as clean and the review pass proceeds. Test case 15 above is the one "fails then self-corrects" result; it is reported as a finding, not a blocking defect, for the reasons given there.
+
+---
+
+## Spec coverage
+All 12 acceptance-criteria bullets in `docs/spec.md` (6f part 2) have real implementation and real test coverage — see the Test cases table above, cases 1-13, each mapped one-to-one to a spec bullet. No acceptance criterion is unimplemented or untested. The story-level goal in `docs/story.md` ("Unified live event feed across all agents, per-agent filter, status strip") is delivered and independently confirmed: the per-agent filter genuinely filters the rendered buffer (`events.filter(e => e.agent === filter)`), not merely colour-codes it.
+
+## Findings (most severe first)
+
+**Should-fix**
+
+1. **`app/app.py`, `teamFeedEventKindClass()`/`teamFeedEventBody()` (~lines 2266-2280 pre-diff-context, the `tool_use` + empty-`meta` branch) — the fact_check-vs-finish positional disambiguation can transiently misclassify a fact_check claim as the run's finish summary if its `tool_use` event lands in the client buffer before the paired `tool_result` (e.g. split across two `/team/events` poll responses).** Reproduced directly: delivering the claim alone renders `[Finish summary] claim B`; delivering the paired `tool_result` on the next poll causes it to self-correct to `fact_check: claim B`. This is not a developer deviation — it's the literal algorithm `docs/spec.md`'s own "Background" section specifies ("if the *immediately following* event ... is `tool_result` with `meta.found` present, render this pair as a fact_check block. Otherwise ... render it as the run's finish summary"), faithfully implemented. Read `app/teams.py`'s `fact_check` branch (`elif tool == "fact_check": ... _append_history(..., transcript_entries=[("tool_use", claim, {}), ("tool_result", result_text, {"found": ...})])`) — both transcript entries are written in the same synchronous Python call with no yield point between them, so in practice the two events are written atomically at sub-millisecond granularity relative to the 4-second poll cadence; an HTTP poll racing into that specific gap is exceedingly unlikely, and even if it happens the wrong render self-heals within one more 4s tick. Given the practical unreachability and the spec's own explicit algorithm, this doesn't block approval, but it's worth a product-manager/spec-owner note for a future refinement (e.g., render an explicit transient "…" state for a `tool_use`/empty-`meta` event that is the buffer's own last lead event *and* `team.status` is still `running`, rather than assuming finish).
+2. **`app/app.py`, `renderEscalationPanel()`'s `!cached.pending` branch ("This question was already answered.") had zero test coverage** in the developer's own 52-test suite, despite `docs/implementation.md` self-flagging it as new logic beyond `docs/design.md`. I wrote and ran a targeted test confirming the branch is reachable and renders correctly (distinct copy from the fetch-failure case, no submit form offered) — so it's not a bug, but an untested gap in what shipped. Recommend the developer add this as a permanent regression test in `tests/test_team_frontend.js` in a follow-up.
+3. **`docs/design.md`'s "Accessibility & platform notes" (role="log"/`aria-live="polite"` on the event list, `aria-pressed`/`aria-checked` on filter pills, `<fieldset>`/`<legend>` for the escalation option group) were not implemented in `app/app.py`, and this omission is not called out in `docs/implementation.md`'s "Deviations from spec" section.** Basic keyboard operability is intact regardless (native `<button>`/`<input type="radio/checkbox">`/`<label>` elements are used throughout, and radios/checkboxes share a `name` attribute providing implicit grouping for assistive tech), and this is a `docs/design.md` recommendation rather than a `docs/spec.md` acceptance criterion, so it does not block approval. Still worth a follow-up since this is the first scrollable log-like/live-region panel in the codebase and sets a precedent either way.
+
+**Nit**
+
+4. `docs/design.md`'s and `docs/implementation.md`'s carried-forward WCAG contrast claims (e.g. "`#888` timestamp on `#1c1c1c` = 4.81:1") are computed against `#1c1c1c`, but the actual escalation-panel/feed-list CSS (`app/app.py`, new `.team-escalation`/`.team-feed-list` rules) sets `background: #181818`, a slightly darker shade. Recomputed independently from the literal hex values against the *real* background: `#eee` → 15.3:1, `#888` → 5.01:1, `#aaa` → 7.64:1, `#ff6b6b` → 6.4:1, and all 6 agent-palette colours → 6.67:1-7.98:1 — every pairing still comfortably clears WCAG AA (4.5:1 text / 3:1 graphical), so this is a documentation-precision nit only, not a live accessibility defect.
+
+## Security review
+Reviewed every place LLM/agent-authored free text (fact_check claim text, match passage text, escalation option `label`/`description`, the `question`/`header` strings, generic event `text`) is rendered into the DOM. Confirmed by direct code read of every `esc(...)` call site in the diff (`renderEscalationPanel`, `teamFeedEventBody`, `renderTeamFeedEvent`) that every one of these values is inserted as HTML **text content** (inside a `<span>`/`<div>`), never into an unescaped attribute string — which matters because this app's `esc()` (`document.createElement('div').textContent = s; return d.innerHTML`) does not escape quote characters, only `&`/`<`/`>` (real browsers don't escape quotes in text-node serialization either, so this is not itself a bug, just a fact that makes attribute placement the actual danger zone). Verified empirically: wrote and ran a test with an option label containing both `'`/`"` and a literal `<script>`/`<img onerror>` payload — the rendered HTML never contains an executable tag, and `computeTeamResolveAnswer()` still round-trips the raw label correctly for the POST body.
+
+Independently verified the developer's stated reasoning for deviation #2 (escalation options addressed by array index, not label text, in `onchange="onEscalationOptionChange(...)"`): this is a genuine, real injection avoidance, not defensive theater — embedding a label containing a bare `'` into that single-quoted inline-JS attribute string (the same raw-embed pattern this codebase already uses for NAME_RE-restricted engine names via `onTeamMateToggle(name, e.name, ...)` at `app/app.py:2309`) would break out of the JS string literal inside the `onchange` handler, since `esc()` does not neutralize quotes. Confirmed no stale-index bug: `teamEscalationSelected`/`teamInboxCache` are both cleared together on a successful resolve (`handleActionResult`'s `team-resolve` branch) and the only way a new question's `options[]` can appear for the same `run_id` is via that same resolve-then-refetch path, so a rendered index can never point at options from a since-replaced question.
+
+No SQL/command injection surface (no new backend code at all). No secrets in code or logs. No authz/authn changes — `team-resolve` reuses the existing TOTP gate exactly, verified end-to-end via the 428→overlay→retry test.
+
+## Simplicity/scope review
+No unnecessary abstraction found. `teamFeedPolling[name]`'s re-entrancy guard is the one addition beyond `docs/spec.md`'s literal text, and it's a narrow correctness safeguard (prevents two overlapping drain loops for the same project if a poll is still in flight when the next 4s tick fires), not speculative generality. The diff is scoped exactly to `app/app.py`'s frontend template plus `tests/test_team_frontend.js`, with zero touch to `app/teams.py` or any `tests/test_team*.py` backend test — independently confirmed via `git diff --stat`. No dead code found.
+
+## Follow-ups (non-blocking)
+- Add a permanent regression test for the "already answered" race branch (Finding #2).
+- Consider a product-manager/spec note on the fact_check/finish disambiguation's poll-boundary edge case (Finding #1) for a future cycle, even though it's not currently reachable in practice.
+- Consider a follow-up to add the `docs/design.md`-recommended ARIA attributes to the feed/escalation panel (Finding #3).
+- `docs/BACKLOG.md` item 11(b) (`run_id` path traversal) remains explicitly out of scope per `docs/spec.md`'s own non-goals, unaffected by this diff.
+- `docs/implementation.md`'s own "Known limitations" already flags `docs/story.md`'s §3 "Automatically merging or discarding teammate worktrees" as the one remaining open item in the whole multi-agent-teams story — worth a final product-manager pass to confirm the story is complete or spin up a follow-on cycle.
+
+## Overall verdict
+
+**Approved.**
+
+Both the testing pass and the review pass are clean enough to ship: all 12
+`docs/spec.md` acceptance criteria have real, independently-verified
+implementation and test coverage (52/52 developer tests re-run clean 4x,
+765/765 backend tests confirm zero regression and zero backend touch), and
+the review pass — including writing and running 4 additional edge-case
+tests of my own beyond the developer's suite — found no must-fix bugs, no
+live security defect, and no scope creep. Two should-fix gaps (an
+untested-but-correct escalation race branch, and a narrow, spec-inherited,
+practically-unreachable fact_check/finish poll-boundary misclassification
+that self-heals within one poll) and one design-vs-shipped accessibility
+gap are recorded as non-blocking follow-ups, not conditions of approval.
+This closes out sub-spec 6f part 2 — per `docs/implementation.md`'s own
+"Known limitations," the multi-agent-teams story now appears complete
+except for `docs/story.md`'s explicitly-deferred §3 worktree-cleanup
+question. Ready to hand back to the product-manager for a final story-level
+pass.

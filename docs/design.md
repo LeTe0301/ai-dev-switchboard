@@ -648,3 +648,566 @@ Idle, status === 'idle'
       └─ Error (400) → Error message shown, picker remains open, can retry
 ```
 
+---
+
+# Design: Live event feed + escalation inbox (sub-spec 6f part 2)
+
+## Summary
+
+Replace the static "Status: [blocked]" label with a 4-state status strip (Working, Waiting on you, Blocked, Finished, Error) that makes "waiting on you" impossible to miss. Add a merged, live, colour-coded event feed from both the lead's transcript and all teammates' logs, updated every 4 seconds via the existing polling cycle and filterable by per-agent view. When `waiting_on_you === true`, render an escalation panel with the pending question, pickable answer options (radio for single-select, checkboxes for multi-select), and a free-text "Other" input that is always present. Submitting resolves the question via the existing TOTP machinery (new `team-resolve` action kind), reusing the identical code-overlay flow as `team-start`/`team-stop`. The feed is a live tail with a rolling 500-event buffer per project; closing it stops polling; reopening starts fresh. Per-agent colours are stable across polls and reloads via a hash-based palette distinct from the semantic status colours.
+
+## Open questions — resolved decisions
+
+**Question 1: How does a picked escalation option (or several, for multi-select) become the single `answer` string `POST .../team/resolve` expects?**
+
+**Decision: Confirmed as proposed.** Free-text "Other" input takes precedence and is sent verbatim if filled in; otherwise, for `multi_select: false` send the chosen option's `label`; for `multi_select: true`, join the chosen options' `label`s with `", "`. This is a deliberate, stated UI convention with no backend implication — the lead just receives whatever string is sent. A different join/format (e.g., newline-separated) is equally valid backend-wise and can be swapped by ux-designer/developer if there's evidence of a better default.
+
+**Question 2: Default expanded vs. collapsed state for the event feed panel?**
+
+**Decision: Confirmed as expanded by default.** When `team.status !== 'idle'`, the feed panel is shown in expanded state (rendering the live event list), matching the acceptance criterion that live visibility is the default and reducing friction for the primary use case (observing a running team without `tmux attach`). A collapsed-by-default alternative (matching 6e's "Configure team..." pattern) is not blocking and can be swapped by developer if there's a strong reason, since it's a pure rendering default with no data-shape implication.
+
+## ui-ux-pro-max choices
+
+- **Style**: Status strip replaces the old "Status: [label]" line with a cleaner 4-state indicator and accompanying copy; feed panel uses the same collapsible pattern as 6e's "Configure team...", but expanded by default for live visibility. Per-agent colour identity via hash-based palette (6-colour cycle assigned to agent names, stable across polls/reloads).
+- **Palette**: Reuses existing semantic status colours for the strip (`#4da6ff` running, `#ffb648` blocked, `#34c759` finished, `#ff6b6b` error). Agent identity colours chosen to be visually distinct from these semantics and to maintain 3:1+ contrast as graphical elements (feed stroke/text) on `#1c1c1c`. Suggested agent palette: `#d084d0` (magenta), `#6eb5d4` (cyan), `#b4a84d` (gold), `#84b484` (green), `#d4a484` (tan), `#a49ed4` (purple) — each ≥ 3:1 contrast for graphical use.
+- **Typography**: Event feed uses a monospace font (`monospace` fallback to browser default) for log-like text, distinct from body copy's `-apple-system, sans-serif` but not introducing a new system. Line-height 1.4 for readability in scrollable context. Existing font sizes (12px small, 13px body) reused for consistency.
+- **Relevant UX guidelines applied**:
+  - Status strip copy is unambiguous and action-oriented: "Waiting on you" (escalation needed), "Blocked — max rounds reached" (terminal, no action), "Working" (in progress). No generic "blocked" label that conflates the two states.
+  - Event feed is a live tail with bounded memory (500 events max per project), not a full-history browser — reduces cognitive overload and keeps the client responsive on long-running teams.
+  - Per-agent filter is a simple pill/tab row (All + one per agent), no search — fast scanning by agent without complex UI.
+  - Fact_check and finish events are disambiguated positionally per the spec rule; rendering clearly distinguishes them (fact_check shows claim + matches, finish shows summary).
+  - Escalation form fields (question, options, free-text) are laid out in reading order (question header, options, free-text), with clear visual grouping.
+  - Colour-coding by agent in feed reduces need to scan `agent` field on every line, supporting quick visual triage.
+
+## Component reuse
+
+- **Reused**: Existing status colour tokens (`#4da6ff`, `#ffb648`, `#34c759`, `#ff6b6b`) for the status strip — no new semantic colours.
+- **Reused**: Existing expand/collapse idiom from 6e ("Show live feed" / "Hide live feed" toggle link, same `.team-configure-btn` styling).
+- **Reused**: Existing scroll container pattern from `.wizard-card` (max-height: 85vh; overflow-y: auto) for the event feed panel.
+- **Reused**: Existing TOTP action plumbing (`toggle()`, `actionPath()`, `actionBody()`, `handleActionResult()`) for the escalation submit button — new `kind === 'team-resolve'` case added alongside `team-start`/`team-stop`.
+- **Reused**: Existing message slot pattern (`.team-msg`, id pattern `team-msg-<name>`) for escalation form errors and success feedback.
+- **Reused**: Existing radio/checkbox patterns (native HTML, no new library) for escalation options.
+- **New (none)**: No new component library. All styling uses existing BEM-lite naming (e.g., `.team-status-strip`, `.team-feed`, `.team-feed-event`, `.team-escalation`, `.team-escalation-form`).
+
+## States
+
+### Non-idle, Status Strip: Working (running)
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Team                                                    │
+│                                                         │
+│ ┌─ Status ──────────────────────────────────────────┐  │
+│ │ Working (ID: run-abc123)                          │  │  ← Blue, #4da6ff
+│ └───────────────────────────────────────────────────┘  │
+│                                                         │
+│ [ Show live feed ] (toggle to expand/collapse)         │
+│                                                         │
+│ <button onclick="doTeamStop('<name>')">               │
+│   Stop team                                            │
+│ </button>                                               │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Styling**: Replace the old "Status: [running] ID: run-id" line with a compact strip showing "Working (ID: run-abc123)". Status label is inline, not a separate line. Colour: `#4da6ff`. Font size: 13px (same as existing status). No icon necessary; colour and wording are sufficient.
+
+**Copy**: "Working" (not "Status: [running]"), with ID appended inline when `team.run_id` exists.
+
+### Non-idle, Status Strip: Waiting on you (blocked_ask_user, waiting_on_you=true)
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Team                                                    │
+│                                                         │
+│ ┌─ Status ──────────────────────────────────────────┐  │
+│ │ ⚠ Waiting on you (ID: run-abc123)                │  │  ← Orange, #ffb648
+│ └───────────────────────────────────────────────────┘  │
+│                                                         │
+│ ┌─ Escalation ──────────────────────────────────────┐  │
+│ │                                                   │  │
+│ │ Question header: "Is the analysis correct?"      │  │
+│ │                                                   │  │
+│ │ ☑ Yes, proceed                                  │  │
+│ │ ☐ No, revise analysis                           │  │
+│ │ ☐ Unclear, need clarification                   │  │
+│ │                                                   │  │
+│ │ Other (free text):                              │  │
+│ │ <textarea id="escalation-other-<name>" rows="3">│  │
+│ │ </textarea>                                       │  │
+│ │                                                   │  │
+│ │ <button onclick="doTeamResolve('<name>')">      │  │
+│ │   Submit answer                                  │  │
+│ │ </button>                                         │  │
+│ │                                                   │  │
+│ │ [message slot for error/success]                 │  │
+│ └───────────────────────────────────────────────────┘  │
+│                                                         │
+│ [ Show live feed ] (toggle to expand/collapse)         │
+│                                                         │
+│ <button onclick="doTeamStop('<name>')">               │
+│   Stop team                                            │
+│ </button>                                               │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Styling**: Status strip shows "Waiting on you (ID: run-abc123)" in orange (`#ffb648`). A ⚠ (warning icon) may precede the text (optional, for visual emphasis). Below the status strip, an escalation panel renders the pending question with options and free-text input.
+
+**Escalation Panel**:
+- **Question header** (from `inbox.json`'s `header`): rendered as a small chip or label above the options, e.g., "(from lead)" — provides context for what's being asked.
+- **Question text** (from `inbox.json`'s `question`): plain text, displayed prominently above options.
+- **Options** (from `inbox.json`'s `options` array):
+  - If `multi_select: false`: render as radio buttons (only one can be selected).
+  - If `multi_select: true`: render as checkboxes (multiple can be selected).
+  - Each option shows `label` and `description` (if present) — description as smaller/greyed text below label.
+- **Free-text "Other" input**: always present, even if `options` is empty or `multi_select` is false. A textarea (3 rows recommended), with label "Other (free text)" or similar. This is always the lowest-priority answer — if filled in at submission, the free text is sent; otherwise, picked options are compiled into the answer string.
+- **Submit button**: "Submit answer", styled to match other action buttons (same class/styling as "Start team").
+- **Message slot** (`.team-msg` pattern): displays error (if validation fails, e.g., over 2000 chars) or success ("Answer submitted" or similar).
+
+**Validation**:
+- Client-side: answer text must be non-empty (either at least one option selected, or free-text filled in) and ≤ 2000 characters.
+- Server-side: 400 if answer is empty or oversized (same as spec's existing `/team/resolve` contract).
+
+**Copy**:
+- Status: "Waiting on you"
+- Question label: the `header` from inbox
+- Submit button: "Submit answer"
+- Message on success: "Answer submitted"
+- Validation error: "Answer must be non-empty and at most 2000 characters"
+
+### Non-idle, Status Strip: Blocked (escalated_max_rounds, waiting_on_you=false)
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Team                                                    │
+│                                                         │
+│ ┌─ Status ──────────────────────────────────────────┐  │
+│ │ Blocked — Max rounds reached (ID: run-abc123)    │  │  ← Orange, #ffb648
+│ └───────────────────────────────────────────────────┘  │
+│                                                         │
+│ Escalated — max rounds reached. No pending question    │
+│ to answer. Review the feed below or Stop team and      │
+│ start a new run.                                       │
+│                                                         │
+│ [ Show live feed ] (toggle to expand/collapse)         │
+│                                                         │
+│ <button onclick="doTeamStop('<name>')">               │
+│   Stop team                                            │
+│ </button>                                               │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Styling**: Status strip shows "Blocked — Max rounds reached (ID: run-abc123)" in orange. Below the strip, a short inline text message (not a panel, just explanation) clarifies the terminal state and directs the operator to review the feed or stop. No escalation form is rendered for this state.
+
+**Copy**: "Escalated — max rounds reached. No pending question to answer. Review the feed below or Stop team and start a new run."
+
+### Non-idle, Feed Panel: Closed
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Team                                                    │
+│                                                         │
+│ ┌─ Status ──────────────────────────────────────────┐  │
+│ │ Working (ID: run-abc123)                          │  │
+│ └───────────────────────────────────────────────────┘  │
+│                                                         │
+│ [ Show live feed ]  ← Click to expand                  │
+│                                                         │
+│ <button onclick="doTeamStop('<name>')">               │
+│   Stop team                                            │
+│ </button>                                               │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Styling**: Feed toggle link shows "Show live feed" (or a similar label). Clicking it expands the panel below. Same styling as 6e's "Configure team..." link (`#4da6ff`, cursor: pointer, underline).
+
+### Non-idle, Feed Panel: Open, No Events Yet
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Team                                                    │
+│                                                         │
+│ ┌─ Status ──────────────────────────────────────────┐  │
+│ │ Working (ID: run-abc123)                          │  │
+│ └───────────────────────────────────────────────────┘  │
+│                                                         │
+│ [ Hide live feed ]  ← Click to collapse                │
+│                                                         │
+│ ┌─ Events ──────────────────────────────────────────┐  │
+│ │                                                   │  │
+│ │ No events yet.                                    │  │
+│ │                                                   │  │
+│ └───────────────────────────────────────────────────┘  │
+│                                                         │
+│ <button onclick="doTeamStop('<name>')">               │
+│   Stop team                                            │
+│ </button>                                               │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Styling**: Feed toggle link shows "Hide live feed". Below it, a panel with a scrollable area (max-height: 85vh, overflow-y: auto) shows "No events yet" in grey text if the buffer is empty. Panel background: `#1c1c1c` (same as cards).
+
+### Non-idle, Feed Panel: Open, With Events
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Team                                                    │
+│                                                         │
+│ ┌─ Status ──────────────────────────────────────────┐  │
+│ │ Working (ID: run-abc123)                          │  │
+│ └───────────────────────────────────────────────────┘  │
+│                                                         │
+│ [ Hide live feed ]                                     │
+│                                                         │
+│ Filter: [ All ] [ lead ] [ claude ] [ codex ]          │  ← Pill/tab row
+│                                                         │
+│ ┌─ Events ──────────────────────────────────────────┐  │
+│ │ [scrollable area, max-height: 85vh]              │  │
+│ │                                                   │  │
+│ │ 12:34:01 lead (🔵)  Starting team on claude  │  │  ← magenta lead
+│ │ 12:34:02 lead (🔵)  Delegating research      │  │
+│ │ 12:34:03 claude (🟢) Processing query...     │  │
+│ │ 12:34:05 lead (🔵)  Fact-checking claim      │  │
+│ │ fact_check: "Python is a snake"               │  │
+│ │ → docs/snake.md:42 "Python is a reptile..."  │  │
+│ │ 12:34:07 claude (🟢) Delegating to codex     │  │
+│ │ 12:34:09 codex (🟡)  Writing implementation  │  │
+│ │ 12:34:15 lead (🔵)  Waiting on user input    │  │
+│ │                                                   │  │
+│ └───────────────────────────────────────────────────┘  │
+│                                                         │
+│ <button onclick="doTeamStop('<name>')">               │
+│   Stop team                                            │
+│ </button>                                               │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Styling**: 
+- **Filter row**: Pills or tabs showing "All" (selected by default) and one per agent (e.g., "lead", "claude", "codex"). Clicking a pill re-filters the feed to show only that agent's events. Selected pill is highlighted (background color or underline). Font size: 12px.
+- **Event list**: Each event is a row in monospace font (courier, monospace fallback). Columns:
+  - Timestamp: `12:34:01` (HH:MM:SS from event `ts`), grey text (`#888`).
+  - Agent name + colour dot: `lead (🔵)` where the dot is a small coloured circle. Colour based on agent name hash. Bold or stronger weight to distinguish from body.
+  - Event text: the `text` field from the event, or formatted per `kind` (see below).
+- **Line height**: 1.4 for readability.
+- **Spacing**: 4-8px gap between timestamp, agent, and event text.
+- **Overflow**: long lines wrap or truncate; no horizontal scroll.
+
+**Event rendering by kind + meta**:
+
+1. **`kind: "message"`** (plain transcript/log line):
+   - Render as-is: `12:34:01 lead (🔵)  <text>`
+
+2. **`kind: "tool_use"` with empty `meta` (fact_check claim or finish summary)**:
+   - **If next lead event is `tool_result` with `meta.found` present**: render as fact_check claim.
+     ```
+     12:34:05 lead (🔵)  fact_check: <claim-text>
+     ```
+   - **If no following lead event with `meta.found`** (i.e., this is the run's terminal finish):
+     ```
+     12:34:20 lead (🔵)  [Finish summary]
+     12:34:20           <summary-text>
+     ```
+     (summary-text on a new indented line for visibility)
+
+3. **`kind: "tool_result"` with `meta.found` (fact_check result)**:
+   - Render the matches:
+     ```
+     12:34:06 lead (🔵)  Fact-check result:
+     12:34:06           ✓ docs/snake.md:42  "Python is a reptile..."
+     12:34:06           ✓ docs/animal.md:15 "Python (animal) belongs..."
+     ```
+     or if `found: false`:
+     ```
+     12:34:06 lead (🔵)  Fact-check result:
+     12:34:06           ✗ No supporting passage found
+     ```
+   - Each match shows `file_line` (e.g., "docs/snake.md:42") and passage text (truncated to ~60 chars on-screen; full text visible on hover/expand if implemented).
+
+4. **`kind: "tool_result"` with `meta.resolved` (accepted answer to escalation)**:
+   - Render as-is: `12:34:08 lead (🔵)  <text>` (or a simple "Answer: <text>" if text is empty or generic).
+
+5. **`kind: "error"`** (error occurred):
+   - Render in red (`#ff6b6b`): `12:34:10 lead (🔵)  ✕ <error-text>`
+
+6. **`kind: "status"`** (status change event):
+   - Render as-is or with an icon: `12:34:20 lead (🔵)  → Status: <status>`
+
+7. **`kind: "handoff"` with `meta.agent` (delegation to teammate)**:
+   - Render: `12:34:07 lead (🔵)  Delegating to <teammate-name>`
+
+8. **Other events** (native type translations, e.g., Claude's `system`, Codex's `thread.started`):
+   - Render generically by `kind`: `12:34:02 lead (🔵)  [<kind>] <text>` (de-emphasized, lower contrast).
+
+**Agent colour assignment**:
+- Hash agent name (e.g., `hash(name) % 6`) to one of 6 colours: `#d084d0`, `#6eb5d4`, `#b4a84d`, `#84b484`, `#d4a484`, `#a49ed4`.
+- Colour is stable across polls and page reloads (hash is deterministic).
+- Colour dot (●) precedes agent name; agent name is plain text in the colour.
+
+**Scrolling**: Feed container scrolls to newest events (bottom) on each poll. Operator can scroll up to see older events; new events append at the bottom. No infinite scroll; only the most recent 500 events are kept.
+
+### Non-idle, Feed Panel: Filter to Specific Agent
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Team                                                    │
+│                                                         │
+│ [ Hide live feed ]                                     │
+│                                                         │
+│ Filter: [ All ] [ lead ] [ claude (selected) ] [ codex ]│
+│                                                         │
+│ ┌─ Events ──────────────────────────────────────────┐  │
+│ │ [scrollable area]                                │  │
+│ │                                                   │  │
+│ │ 12:34:03 claude (🟢) Processing query...    │  │
+│ │ 12:34:07 claude (🟢) Delegating to codex    │  │
+│ │ 12:34:09 claude (🟢) Received delegation...│  │
+│ │                                                   │  │
+│ └───────────────────────────────────────────────────┘  │
+│                                                         │
+│ <button onclick="doTeamStop('<name>')">               │
+│   Stop team                                            │
+│ </button>                                               │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Styling**: Clicking a filter pill (e.g., "claude") highlights it (e.g., background colour changes, or underline appears) and re-renders the feed to show only that agent's events. The buffer is not re-fetched; filtering is client-side only.
+
+## Accessibility & platform notes
+
+- **Touch target sizes**: Filter pills (All/lead/agent names) should be at least 36-40px tall/wide for touch; font size 12px min.
+- **Color contrast**:
+  - Agent identity dots (🔵 in colour X on `#1c1c1c`): Each agent colour ≥ 3:1 contrast as a graphical element. Example: `#d084d0` (magenta) on `#1c1c1c` = **6.14:1**, passes WCAG AA for graphics. All 6 colours in the suggested palette meet 3:1 minimum.
+  - Event text (`#eee` on `#1c1c1c`): **13.5:1**, passes WCAG AAA.
+  - Timestamp (`#888` on `#1c1c1c`): **4.81:1**, passes WCAG AA (same as `.team-sub` established in 6d).
+  - Fact_check result "✓" or "✗" icons: inherits colour from parent (green `#34c759` for found, red `#ff6b6b` for not found), both ≥ 6:1 for graphics.
+  - Error event text (`#ff6b6b` on `#1c1c1c`): **6.14:1**, passes WCAG AA for normal text.
+  - Status strip labels (`#4da6ff`, `#ffb648`, `#34c759`, `#ff6b6b` on `#1c1c1c`): already verified in 6d (all pass AA minimum, most AAA).
+  - Escalation form labels and text: inherit page defaults (`#eee` text, `#aaa` labels) = AA/AAA.
+- **Web vs. native**: Desktop web app only. No mobile optimizations. Hover states (e.g., expand full passage text on hover) are optional for web.
+- **Keyboard interaction**:
+  - Tab to filter pills → arrow keys to select different agent, Enter to apply (optional, or just click).
+  - Tab to "Submit answer" button → Enter to submit (disabled if validation fails).
+  - Tab to feed scroll area → arrow/Page Up/Page Down to scroll (browser default).
+  - Escape to close feed panel (optional, or just click "Hide live feed").
+- **Screen reader accessibility**:
+  - Event list items should be in an `<article>` or similar container with `role="log"` and `aria-live="polite"` to announce new events to screen readers.
+  - Filter pills should be `<button>` or `<input type="radio">` with `aria-pressed="true"` / `aria-checked="true"` for selected pill.
+  - Escalation form: `<fieldset>` for radio/checkbox groups with `<legend>` for the question. Free-text textarea with associated `<label>`.
+- **Disabled state**: Submit button is disabled (greyed out) if validation error exists (empty answer, over 2000 chars).
+
+## Traceability to spec (6f part 2 acceptance criteria)
+
+| Acceptance criterion | Where it's addressed in this design |
+|---|---|
+| Status strip shows "Working" for running status | Non-idle state renders `team.status === 'running'` as "Working (ID: run-id)" in blue. |
+| Status strip shows "Waiting on you" when waiting_on_you=true | Non-idle state with `waiting_on_you === true` shows "Waiting on you (ID: run-id)" in orange, with escalation panel below. |
+| Status strip shows distinct "Blocked" when waiting_on_you=false | Non-idle state with `waiting_on_you === false` (escalated_max_rounds) shows "Blocked — Max rounds reached" in orange; no escalation form. |
+| Escalation panel renders question, header, options, free-text "Other" | When `waiting_on_you === true`, panel fetches inbox and displays question, header (small chip), options (radio/checkbox per multi_select), and always-present free-text textarea. |
+| Merged feed shows events from lead and all teammates in chronological order | Feed renders all events sorted by (ts, agent, seq); events from both lead's transcript and each teammate's log appear in single list, colour-coded by agent. |
+| Per-agent filter: "All" + one per agent | Filter row shows "All" pill (selects everything) and one pill per agent in team.composition; clicking a pill re-filters rendered (not fetched) events. |
+| Fact_check renders claim + matches (file_line + passage text) | Fact_check tool_use/tool_result pair is rendered as "fact_check: <claim>" line, then result lines showing each match's file_line and passage text. If found=false, shows "✗ No supporting passage found". |
+| Escalation form answer composition | Free-text "Other" wins if filled in; else single-select's label, or multi-select's labels joined with ", ". Submitted via new team-resolve action (TOTP-gated). |
+| Feed polling is integrated into 4s refresh cycle | Polling is not a new timer; for each non-idle project with feed open, GET /team/events is called within the existing refresh() 4s cycle. |
+| Truncated response triggers immediate follow-up poll | If any file reports truncated[agent]=true, client immediately issues another /team/events call (no waiting for next 4s tick) until no file is truncated. |
+| Page reload repopulates feed from cursor={} | Closing feed clears client state; reopening starts fresh from cursor={}, replaying all available history from disk (bounded by 64KB-per-file polls). |
+| Feed panel defaults to expanded | When team.status !== 'idle', feed toggle shows "Hide live feed" and panel is rendered expanded (not collapsed). |
+| Feed closes when team stops | When team.status flips to idle, feed/escalation UI and client state (teamFeedEvents, teamFeedCursor, etc.) are cleared in the idle branch re-render. |
+| Escalation submit reuses TOTP machinery | Submit button calls toggle(kind='team-resolve', ...) → same 428/403/success flow as team-start/team-stop, reusing existing code-overlay. |
+| Status strip and feed render inline in existing teamRow() | All new UI (status strip, feed, escalation) is rendered within the non-idle branch of teamRow(), not a new page/modal. |
+
+## Implementation notes for the developer
+
+### Client-side state (JavaScript, in app/app.py template)
+
+Add to global scope (alongside `teamTaskText`, `teamPickerOpen`, etc.):
+- `teamFeedOpen[name]` — boolean, true if feed panel is currently visible.
+- `teamFeedCursor[name]` — object `{agent: byte_offset}`, the last cursor from `/team/events`, starts at `{}`.
+- `teamFeedEvents[name]` — array of events, most recent 500 kept, sorted by (ts, agent, seq).
+- `teamFeedFilter[name]` — string, "all" or an agent name, controls which events are rendered.
+- `teamInboxCache[run_id]` — object, cached `GET /team/inbox` response, keyed by run_id to avoid refetch.
+
+### Polling integration
+
+In `refresh()` function (existing, ~4s interval):
+- For each project whose `team.status !== 'idle'` AND `teamFeedOpen[name] === true`:
+  - Call `pollTeamFeed(name)` (new helper, see below).
+
+New function `pollTeamFeed(name)`:
+```javascript
+async function pollTeamFeed(name) {
+  const cursor = teamFeedCursor[name] || {};
+  const cursorJson = encodeURIComponent(JSON.stringify(cursor));
+  const r = await fetch(`/projects/${encodeURIComponent(name)}/team/events?run_id=&cursor=${cursorJson}`);
+  const data = await r.json();
+  if (!data.events) return;
+  
+  // Append to buffer
+  teamFeedEvents[name] = (teamFeedEvents[name] || []).concat(data.events);
+  // Keep only latest 500
+  if (teamFeedEvents[name].length > 500) {
+    teamFeedEvents[name] = teamFeedEvents[name].slice(-500);
+  }
+  // Sort by (ts, agent, seq) in case out of order
+  teamFeedEvents[name].sort((a, b) => a.ts - b.ts || a.agent.localeCompare(b.agent) || a.seq - b.seq);
+  
+  // Update cursor
+  teamFeedCursor[name] = data.cursors || {};
+  
+  // If any file is truncated, re-poll immediately
+  if (data.truncated && Object.values(data.truncated).some(v => v)) {
+    setTimeout(() => pollTeamFeed(name), 0);
+  }
+  
+  // Re-render feed if open
+  if (teamFeedOpen[name]) {
+    renderTeamRow(name);
+  }
+}
+```
+
+### Render functions
+
+Extend `teamRow(name, team)` to handle non-idle state:
+- Render status strip (replacing old "Status: [label]" line).
+- If `waiting_on_you === true`, fetch `GET /team/inbox` once (cache by run_id) and render escalation panel.
+- Render feed toggle ("Show live feed" / "Hide live feed").
+- If `teamFeedOpen[name]`, render feed panel (filter row + scrollable event list).
+- Render "Stop team" button.
+
+New function `renderStatusStrip(team)`:
+- Return HTML for 4-state strip: "Working", "Waiting on you", "Blocked — Max rounds reached", "Finished", or "Error".
+- Use appropriate colour class (`.status-running`, `.status-blocked`, `.status-finished`, `.status-error`).
+- Include ID if `team.run_id` exists.
+
+New function `renderEscalationPanel(name, team)`:
+- Fetch `GET /team/inbox?run_id=` if not cached (cache by run_id).
+- Render question, header, options (radio for single_select, checkboxes for multi_select), free-text textarea.
+- Render "Submit answer" button.
+- Render message slot (`.team-msg` pattern) for errors/success.
+- Return empty string if `waiting_on_you !== true` or if `team.status === 'escalated_max_rounds'` (blocked terminal state).
+
+New function `renderTeamFeed(name, team)`:
+- Render filter pills (All + one per team.composition.members and lead).
+- Render scrollable event list, filtered by `teamFeedFilter[name]`.
+- Render each event per `kind`/`meta` rules (see States section).
+- Render "No events yet" if buffer is empty.
+
+New function `toggleTeamFeed(name)`:
+- Toggle `teamFeedOpen[name]`.
+- If opening: start with fresh cursor `{}` (simulating page reload).
+- If closing: clear client state (`teamFeedEvents[name]`, `teamFeedCursor[name]`).
+- Re-render row.
+
+New function `setTeamFeedFilter(name, agentName)`:
+- Set `teamFeedFilter[name]` to "all" or the agent name.
+- Re-render feed list (no refetch).
+
+### Action: team-resolve
+
+Extend `actionPath()` to handle `kind === 'team-resolve'`:
+```javascript
+if (kind === 'team-resolve') return '/projects/' + encodeURIComponent(name) + '/team/resolve';
+```
+
+Extend `actionBody()` to handle `team-resolve`:
+```javascript
+if (kind === 'team-resolve') {
+  // Read escalation form: selected option(s) or free-text
+  const otherText = (document.getElementById('escalation-other-' + name) || {}).value || '';
+  if (otherText.trim()) {
+    body.answer = otherText.trim();
+  } else {
+    // Compile selected options
+    const multiSelect = window.teamInboxCache[team.run_id]?.multi_select;
+    const selected = Array.from(document.querySelectorAll(`input[name="escalation-option-${name}"]:checked`))
+      .map(el => el.value);
+    if (multiSelect) {
+      body.answer = selected.join(', ');
+    } else {
+      body.answer = selected[0] || '';
+    }
+  }
+}
+```
+
+Extend `handleActionResult()` to add a `team-resolve` branch after the existing `team-start`/`team-stop` block:
+```javascript
+if (kind === 'team-resolve') {
+  hideCodeOverlay();
+  const data = await r.json().catch(() => ({}));
+  const msgEl = document.getElementById('team-msg-' + name);
+  if (msgEl) {
+    if (r.ok && data.ok) {
+      msgEl.textContent = '✓ Answer submitted';
+      msgEl.className = 'team-msg success';
+      // Clear cached inbox for this run so next render fetches fresh
+      delete teamInboxCache[team.run_id];
+    } else {
+      msgEl.textContent = '✕ Error: ' + (data.error || 'could not submit answer');
+      msgEl.className = 'team-msg error';
+    }
+  }
+  return;
+}
+```
+
+New function `doTeamResolve(name)`:
+- Validate answer (non-empty, ≤ 2000 chars).
+- If validation fails, show error in message slot and return.
+- Call `toggle('team-resolve', name, null, null)` to dispatch via existing action machinery.
+
+### Styling (CSS in app/app.py template)
+
+New classes (following BEM-lite naming):
+- `.team-status-strip` — wraps status label and ID.
+- `.team-status-strip.waiting-on-you` — styling variant for waiting-on-you state.
+- `.team-escalation` — wraps escalation panel.
+- `.team-escalation-form` — the form inside escalation panel.
+- `.team-escalation-form label` — for question, options, free-text labels.
+- `.team-escalation-form textarea` — free-text input.
+- `.team-feed-toggle` — toggle link ("Show live feed" / "Hide live feed"), reuse `.team-configure-btn` styling.
+- `.team-feed` — wrapper for feed panel.
+- `.team-feed-filter` — filter pill row.
+- `.team-feed-filter button` — individual filter pill.
+- `.team-feed-list` — scrollable event list (`max-height: 85vh; overflow-y: auto`), reuse `.wizard-card` pattern.
+- `.team-feed-event` — each event row (monospace font, 1.4 line-height).
+- `.team-feed-event.kind-<kind>` — variant for different event kinds (e.g., `.team-feed-event.kind-error` in red).
+
+Colour tokens:
+- Agent identity palette: `#d084d0`, `#6eb5d4`, `#b4a84d`, `#84b484`, `#d4a484`, `#a49ed4` (or developer's choice if different palette preferred, so long as ≥ 3:1 contrast).
+- Status strip colours: reuse existing tokens (`#4da6ff`, `#ffb648`, `#34c759`, `#ff6b6b`).
+
+### Backend (no changes to app.py routes, only frontend integration of existing routes)
+
+No new backend routes. Frontend calls:
+- `GET /projects/<name>/team/events?cursor=` — already exists (6f part 1).
+- `GET /projects/<name>/team/inbox?run_id=` — already exists (6f part 1).
+- `POST /projects/<name>/team/resolve` body `{answer, code}` — already exists (6f part 1).
+
+### Client-side validation
+
+In `doTeamResolve()`, before dispatching:
+- Answer must be non-empty (either at least one option selected, or free-text filled in).
+- Answer must be ≤ 2000 characters.
+- Show validation error in `.team-msg` slot if either check fails.
+
+### State transitions
+
+```
+team.status === 'running'
+├─ Feed closed (default) → render status + feed toggle ("Show live feed")
+│  └─ Click "Show live feed" → teamFeedOpen[name] = true, cursor = {}, re-render
+│     └─ Feed open → start polling, render events
+│
+team.status === 'blocked' + waiting_on_you === true
+├─ Escalation panel + feed (same as running)
+│  └─ Submit answer → POST /team/resolve
+│     └─ Success → clear inbox cache, next poll sees status change
+│
+team.status === 'blocked' + waiting_on_you === false
+├─ "Blocked — Max rounds reached" message (no escalation form, no poll needed after status updates)
+│
+team.status === 'idle'
+├─ Feed/escalation cleared, render idle row (unchanged from 6d)
+```
+
+---
