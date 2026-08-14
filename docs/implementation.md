@@ -1,3 +1,303 @@
+# Implementation: Backlog item 17 part 2 -- GitHub poll-loop wiring + item 8 host-agnostic dispatch
+
+## Summary
+Wires part 1's inert GitHub client into item 8's AI merge-request reviewer,
+making it host-agnostic (Gitea vs. GitHub) and adding the one new poll loop
+that both surfaces GitHub PR/label activity and doubles as item 8's GitHub
+dispatch trigger. No new UI, no new route (per `docs/spec.md`'s own settled
+scope decisions #1/#2):
+- **`_ai_reviewer_poll_repo()` / `_ai_reviewer_review_run()` / `_ai_reviewer_
+  review_bg()`** (`app/app.py`, item 8) all gain a leading `host: "gitea" |
+  "github"` parameter. Every line of label-edge-detection, per-PR locking,
+  retry-gating, and state-persistence logic is unchanged; only the
+  PR-list-fetch, diff-fetch, and comment-post calls branch per host (Gitea
+  via the existing `_gitea_api`/`_gitea_api_raw`, GitHub via part 1's
+  `github_list_open_prs`/`github_pr_diff`/`github_post_pr_comment`).
+- **`_ai_reviewer_pr_key(host, owner_repo, number)`** -- new. Gitea's key
+  format is byte-for-byte unchanged (`"owner/repo#number"`, no prefix) --
+  backward-compatible with every already-persisted `AI_REVIEWER_STATE_FILE`
+  entry. GitHub gets a `"github:"`-prefixed key that structurally cannot
+  collide with a Gitea key (no colon allowed in `owner/repo`).
+- **`_github_poll_if_due()`** -- new. Throttled (`GITHUB_POLL_INTERVAL_
+  SECONDS`, default 120), lock-guarded, same double-checked-lock shape as
+  `_gitea_poll_if_due()`. Its only per-repo work is calling
+  `_ai_reviewer_poll_repo("github", ...)` for every local project whose
+  `detect_project_origin()` resolves to `github.com` AND whose `owner/repo`
+  is listed in the new `AI_REVIEWER_GITHUB_REPOS_FILE` allowlist. Called
+  from `/status`, right after the existing `_gitea_poll_if_due(gitea_on)`
+  call.
+- **`AI_REVIEWER_GITHUB_REPOS_FILE`** -- new, hand-edited, operator-
+  maintained JSON array of `"owner/repo"` strings (default `/etc/ai-dev-
+  switchboard/ai-reviewer-github-repos.json`), same `DEPLOY_MAP_FILE`
+  "app.py only ever reads it" contract. A GitHub-origin project is only
+  polled/reviewed when `AI_REVIEWER_ENABLED=1`, `GITHUB_TOKEN` is set, AND
+  its `owner/repo` is in this file -- all three, not any one alone. This is
+  the one deliberate deviation from "just extend Gitea's behavior
+  unchanged": every Gitea repo is automatically in scope once enabled
+  (this switchboard created it), but a GitHub-origin project can be
+  arbitrary third-party infrastructure (item 16's clone-by-URL), a
+  materially different trust boundary.
+- `teams.review_pr_diff()` (`app/teams.py`) is unchanged -- already
+  host-agnostic, confirmed by this cycle rather than assumed.
+
+## Root cause
+Not applicable (new feature/wiring, not a bugfix).
+
+## Changes by file
+- `app/app.py`:
+  - New constants, next to the existing `AI_REVIEWER_*` block:
+    `AI_REVIEWER_GITHUB_REPOS_FILE` (default `/etc/ai-dev-switchboard/
+    ai-reviewer-github-repos.json`), `GITHUB_POLL_INTERVAL_SECONDS`
+    (default 120).
+  - `AI_REVIEWER_ENABLED`'s doc comment updated (no longer says
+    "Gitea-only... GitHub is item 17, not yet built") to describe the
+    host-agnostic behavior and the allowlist gate.
+  - `_ai_reviewer_pr_key(host, owner_repo, number)` -- new, described above.
+  - `_ai_reviewer_review_run(host, owner_repo, entry, pr)` -- gains the
+    leading `host` param; internal branching per host at exactly three
+    points (diff fetch, comment post, and `pr_key` construction via the new
+    helper); every other line (truncation, `AI_REVIEWER_MODEL` resolution
+    against `teams.roster()`, the `teams.review_pr_diff()` call, comment-
+    body construction, state-persistence, the outer defense-in-depth
+    `except Exception`) is untouched.
+  - `_ai_reviewer_review_bg(host, owner_repo, entry, pr)` -- gains the
+    leading `host` param, threaded through to `_ai_reviewer_review_run()`
+    and into the now-host-prefixed `pr_key` used for the per-PR lock.
+  - `_ai_reviewer_poll_repo(host, owner_repo, entry)` -- gains the leading
+    `host` param; the PR-list-fetch branches (Gitea: `_gitea_api("GET",
+    ".../pulls?state=open")`, unchanged; GitHub: `github_list_open_prs()`,
+    gated on `GITHUB_TOKEN` first), everything else (label-edge detection,
+    the documented `last_error is not None` retry-gating deviation from
+    item 8's own literal spec text, the "arm the next add as a fresh
+    episode" branch) is unchanged.
+  - `_gitea_poll_if_due()`'s one call site updated:
+    `_ai_reviewer_poll_repo(owner_repo, entry)` ->
+    `_ai_reviewer_poll_repo("gitea", owner_repo, entry)` -- the only change
+    to that function.
+  - `_load_ai_reviewer_github_repos()` -- new, next to `_load_deploy_map()`'s
+    own idiom: reads `AI_REVIEWER_GITHUB_REPOS_FILE`, returns a `set` of
+    non-empty strings from a JSON array, or an empty `set()` on any
+    missing/malformed/wrong-shape input -- never raises.
+  - `_github_poll_lock`/`_github_poll_last_at`/`_github_poll_if_due()` --
+    new, described above. Top guard: `if not AI_REVIEWER_ENABLED or not
+    GITHUB_TOKEN: return`. Loads the allowlist and returns immediately if
+    empty (skips even the `instance_names()` walk). For each local project:
+    `detect_project_origin()` wrapped in its own `try/except Exception:
+    continue` (one project's detection failure doesn't stop the rest, same
+    discipline `_gitea_poll_if_due()`'s per-repo `try/except` already
+    established), filtered to `kind == "github"` with both `owner`/`repo`
+    present, filtered again to allowlist membership, then
+    `_ai_reviewer_poll_repo("github", owner_repo, {"name": name})` wrapped
+    in its own `try/except Exception: pass`.
+  - `/status` handler (`do_GET()`): one new line,
+    `_github_poll_if_due()`, directly after the existing
+    `_gitea_poll_if_due(gitea_on)` call. No new route.
+- `config/switchboard.env.example`:
+  - `GITHUB_TOKEN`'s comment block updated (no longer "no poll loop... has
+    no visible effect until a later part") to describe that it's now wired
+    into item 8.
+  - `AI_REVIEWER_ENABLED`'s surrounding comment block updated to describe
+    the host-agnostic behavior and the Gitea-automatic-vs-GitHub-allowlisted
+    scope distinction.
+  - New `AI_REVIEWER_GITHUB_REPOS_FILE` and `GITHUB_POLL_INTERVAL_SECONDS`
+    documented, commented-out entries next to `AI_REVIEWER_STATE_FILE`.
+- New `config/ai-reviewer-github-repos.json.example` -- a one-line example
+  (`["myorg/myrepo"]`), mirroring `config/deploy-map.json.example`'s own
+  precedent for a hand-edited, operator-authored JSON allowlist.
+- `tests/test_ai_reviewer.py` (extended, all in Part A):
+  - Every existing Gitea-path test's call site updated to pass `"gitea"` as
+    the new leading argument (`_ai_reviewer_poll_repo`/`_ai_reviewer_
+    review_run`/`_ai_reviewer_review_bg`) -- zero assertion changes, proving
+    the refactor is behavior-preserving for the existing Gitea path.
+  - New `AiReviewerPrKeyTests` (3 tests) -- key format/prefix/collision-proof.
+  - New `AiReviewerPollRepoGithubTests` (5 tests) -- mirrors
+    `AiReviewerPollRepoTests` for `host="github"`: missing-token no-op,
+    label-add-edge dispatch with the `"github:"`-prefixed state key,
+    no-redispatch-after-success, non-ok `github_list_open_prs()` result
+    skipped without raising, and a note that allowlist gating is
+    deliberately NOT this function's job (that's `_github_poll_if_due()`'s).
+  - New `AiReviewerReviewRunGithubTests` (4 tests) -- mirrors
+    `AiReviewerReviewRunTests` for `host="github"`: diff-fetch failure,
+    success (comment posted + state reset), comment-post failure, diff
+    truncation.
+  - New assertion in `AiReviewerReviewBgConcurrencyTests` -- a Gitea and a
+    GitHub dispatch for the identical `owner/repo#number` use different
+    per-PR locks (host-prefixed `pr_key`).
+  - New `AiReviewerGithubReposAllowlistTests` (6 tests) -- the loader's
+    never-crash contract (missing file, malformed JSON, non-list JSON,
+    non-string entries dropped, empty array).
+  - New `GithubPollIfDueTests` (11 tests) -- throttle/lock shape (mirroring
+    `tests/test_gitea_poll.py`'s `GiteaPollIfDueTests`), plus
+    `AI_REVIEWER_ENABLED`/`GITHUB_TOKEN`/allowlist gating, per-project
+    isolation on both `detect_project_origin()` and `_ai_reviewer_poll_repo()`
+    raising, and the "missing owner/repo" edge case.
+  - New `GithubPollEndToEndReviewTests` (6 tests) -- a single full pass
+    through `_github_poll_if_due()` -> `_ai_reviewer_poll_repo()` ->
+    `_ai_reviewer_review_bg()`/`_run()` with only the lowest-level GitHub
+    client functions mocked (`github_list_open_prs`/`github_pr_diff`/
+    `github_post_pr_comment`), proving every acceptance criterion
+    end-to-end rather than piecewise: label-add posts exactly one comment,
+    a repeated poll with the label still present posts no second comment,
+    label-removed-then-readded is exactly one new episode (not zero, not
+    two), a non-allowlisted repo is never reviewed even with the label
+    present, and a diff-fetch failure records the error with no comment
+    posted.
+
+No `app/teams.py` change. No new Flask route, no new HTML/JS template
+change, no schema/data-model change, no new privileged script, no new
+sudoers entry.
+
+## Key decisions / tradeoffs
+- **The GitHub poll loop's only job is calling `_ai_reviewer_poll_repo()`**
+  -- confirmed directly (not assumed) that Gitea's own poll pass doesn't
+  surface anything else via `/status` either (`gitea_sync` is purely local-
+  checkout-sync bookkeeping, out of scope for GitHub per part 1's own
+  non-goals; PR/branch listing has never been poll-driven for either host).
+  This keeps `_github_poll_if_due()`'s scope narrow and exactly matched to
+  what actually needs periodic background work: a label being added is an
+  event a poll has to notice, everything else here is on-demand.
+  See `docs/spec.md`'s own "Settled scope decisions" #1 for the full
+  reasoning this cycle inherited verbatim.
+- **`_ai_reviewer_poll_repo("github", ...)` itself has no allowlist check.**
+  The allowlist gate lives entirely in `_github_poll_if_due()`, the only
+  caller that ever passes `host="github"` in production. This mirrors how
+  `_ai_reviewer_poll_repo("gitea", ...)` has never had a `GITEA_REPO_MAP_
+  FILE` membership check of its own either -- the caller (`_gitea_poll_if_
+  due()`) already filtered to registered repos before calling it. Keeping
+  the gate at the caller, not duplicated inside the shared function, avoids
+  two independent "is this repo in scope" code paths that could drift.
+  `AiReviewerPollRepoGithubTests.test_allowlist_gating_is_not_this_
+  functions_job` makes this boundary explicit rather than leaving it
+  implicit.
+- **The allowlist is checked, and the empty case returns, BEFORE
+  `instance_names()` is even called.** A no-allowlist install (the shipped
+  default) pays zero cost beyond one failed/empty file read per poll
+  interval -- no directory walk, no `detect_project_origin()` subprocess
+  calls, confirmed by `GithubPollIfDueTests.test_empty_allowlist_makes_no_
+  calls_and_skips_instance_walk` asserting `instance_names()` itself was
+  never invoked.
+- **`_github_poll_if_due()` has no `_on`/enabled-toggle parameter**, unlike
+  `_gitea_poll_if_due(gitea_on)`. Gitea needs one because it's a locally-run
+  Docker service that can be stopped independently of `GITEA_ENABLED`;
+  GitHub isn't a service this switchboard runs at all, so
+  `AI_REVIEWER_ENABLED`/`GITHUB_TOKEN`/the allowlist are the complete and
+  only gates, all checked inside the function itself -- matches
+  `docs/spec.md`'s own "Proposed approach" #3 exactly.
+- **Reused `test_ai_reviewer.py` for every new test class rather than
+  splitting GitHub-path coverage into `test_github_api.py`.** `docs/spec.md`
+  left this as the developer's call. Every new class here is fundamentally
+  about item 8's dispatch/state-machine logic (which `test_ai_reviewer.py`
+  already owns and whose `teams.roster()`/`teams.review_pr_diff()`
+  monkeypatch conventions the GitHub-path review-run tests need), not about
+  the GitHub HTTP client itself (which `test_github_api.py` already owns
+  and leaves untouched -- no changes needed there since none of its
+  existing functions changed shape).
+
+## Deviations from spec
+None. `_ai_reviewer_pr_key()`, the host-branching inside `_ai_reviewer_
+poll_repo()`/`_ai_reviewer_review_run()`/`_ai_reviewer_review_bg()`, the
+allowlist loader, and `_github_poll_if_due()`'s throttle/gating shape all
+match `docs/spec.md`'s "Proposed approach" pseudocode and "Acceptance
+criteria" as written -- no ambiguity requiring a judgment call was hit
+while implementing this part. The one pre-existing, disclosed deviation
+from item 8's own original spec text (`_ai_reviewer_poll_repo()`'s retry
+branch gated on `last_error is not None`, not merely `attempts <
+AI_REVIEWER_MAX_ATTEMPTS`) is preserved verbatim for both hosts, per this
+cycle's own explicit instruction not to reintroduce the literal-but-broken
+reading.
+
+## Known limitations
+- **The pre-existing, already-disclosed episode/lock race is inherited
+  identically for GitHub, not fixed** (`docs/BACKLOG.md` item 8's own
+  status note: the per-PR lock is keyed only on `pr_key`, not episode --
+  narrow but real). The host-prefixed `pr_key` means a Gitea and a GitHub
+  dispatch for the same nominal PR number can never contend on each other's
+  lock, but within a single host+PR, the same narrow race item 8 originally
+  disclosed still applies unchanged. Explicitly out of scope for this cycle
+  per `docs/spec.md`'s own "Non-goals".
+- **No live GitHub poll pass was exercised against a real `api.github.com`
+  or a real Gitea instance in this session** -- every test in this cycle's
+  additions monkeypatches `github_list_open_prs`/`github_pr_diff`/
+  `github_post_pr_comment` (or, for the throttle/gating-only tests,
+  `_ai_reviewer_poll_repo` itself), following this file's own established
+  "no real network/Docker call in this file" convention. A real end-to-end
+  smoke test (a real `GITHUB_TOKEN`, a real repo listed in a real
+  `AI_REVIEWER_GITHUB_REPOS_FILE`, a real label added to a real open PR,
+  `/status` polled until the poll interval elapses) was not performed --
+  see "How to verify locally" below for the manual steps an operator with
+  real credentials could run to close this gap by hand.
+- **`_github_poll_if_due()`'s per-project `detect_project_origin()` call
+  runs once per allowlisted-repo-check per poll interval, over every local
+  project (via `instance_names()`), not just allowlisted ones** -- this
+  mirrors part 1's own accepted cost characterization (one unprivileged
+  `git remote get-url origin` subprocess per project, cheap, no new
+  privilege boundary), and is bounded by `GITHUB_POLL_INTERVAL_SECONDS`
+  (120s default) exactly like Gitea's own per-registered-project walk is
+  bounded by `GITEA_POLL_INTERVAL_SECONDS`. Not a new limitation introduced
+  by this cycle -- `docs/spec.md`'s own "Background / current state"
+  already characterized this cost as "confirmed sufficient."
+
+## How to verify locally
+```
+# This cycle's new/updated tests (81, including every pre-existing
+# Gitea-path test with its call site updated to the new host parameter):
+python3 -m unittest tests.test_ai_reviewer -v
+# Ran 81 tests ... OK
+
+# No regressions in the closest-precedent existing suites:
+python3 -m unittest tests.test_gitea_poll tests.test_github_api tests.test_gitea -v
+# Ran 111 tests ... OK
+
+# Broad targeted run across every test file except the two known slow/
+# privileged end-to-end suites (tests/test_install_ollama.py,
+# tests/test_deploy_target.py's own PrivilegedEndToEndTests -- see this
+# file's item 20 entry for why a full `unittest discover` doesn't complete
+# in reasonable wall-clock time in this environment):
+python3 -m unittest tests.test_ai_reviewer tests.test_gitea_poll tests.test_github_api \
+  tests.test_gitea tests.test_clone tests.test_deploy_dispatch tests.test_gitea_sync_project \
+  tests.test_install_set_env tests.test_install_update tests.test_new_project_from_gitea \
+  tests.test_new_project_from_upload tests.test_new_project_from_url tests.test_smoke_check \
+  tests.test_taiga_push tests.test_taiga tests.test_team_routes tests.test_teams_board \
+  tests.test_teams_cancel tests.test_teams_composition tests.test_teams_grounding \
+  tests.test_teams_headless tests.test_teams_lead tests.test_teams_lifecycle tests.test_upload
+# Ran 1106 tests ... FAILED (failures=1) -- the one failure
+# (TeamStartEndpointTests.test_two_near_simultaneous_starts_exactly_one_succeeds,
+# unrelated to this diff, a timing-sensitive concurrency test in
+# tests/test_team_routes.py) passes in isolation:
+python3 -m unittest tests.test_team_routes.TeamStartEndpointTests.test_two_near_simultaneous_starts_exactly_one_succeeds -v
+# Ran 1 test ... OK
+
+# The non-privileged deploy-target test classes (excluding
+# PrivilegedEndToEndTests, unrelated to this diff, sudo/systemd-provisioning):
+python3 -m unittest tests.test_deploy_target.WrapperBranchingTests \
+  tests.test_deploy_target.RestartValidationTests tests.test_deploy_target.InstallShTemplateTests \
+  tests.test_deploy_target.DeployTargetOrphanDetectionTests \
+  tests.test_deploy_target.DeployTargetTearDownBackstopTests
+# Ran 18 tests ... OK
+
+# Syntax/compile check:
+python3 -m py_compile app/app.py
+
+# Verifies "no new route, no HTML/JS template change" (docs/spec.md
+# acceptance criteria):
+git diff app/app.py | grep -nE '^\+.*(@app\.route|def do_GET|def do_POST|<script|<html|<div)'
+# -> no output
+
+# Manual end-to-end smoke test against a real GitHub repo + a real running
+# switchboard (requires a real GITHUB_TOKEN with `repo` scope, a real
+# owner/repo listed in AI_REVIEWER_GITHUB_REPOS_FILE, AI_REVIEWER_ENABLED=1,
+# and an open PR with AI_REVIEWER_LABEL added -- not performed in this
+# session, see "Known limitations"):
+echo '["<owner>/<repo>"]' > /etc/ai-dev-switchboard/ai-reviewer-github-repos.json
+# set GITHUB_TOKEN, AI_REVIEWER_ENABLED=1, AI_REVIEWER_MODEL in switchboard.env,
+# restart the service, add AI_REVIEWER_LABEL to an open PR on that repo,
+# wait up to GITHUB_POLL_INTERVAL_SECONDS (120s default) after the next
+# /status poll, confirm a new AI-generated review comment appears on the PR
+# and AI_REVIEWER_STATE_FILE gains a "github:<owner>/<repo>#<number>" entry.
+```
+
+---
+
 # Implementation: Backlog item 13 -- surviving team branch discoverability
 
 ## Summary
