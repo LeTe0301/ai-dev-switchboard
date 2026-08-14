@@ -624,3 +624,42 @@ poll, so not a live bug — but worth a spec refinement if a future cycle
 touches this area: render an explicit transient state for a `tool_use`
 event that's the buffer's own last lead event while `team.status` is
 still `running`, rather than assuming finish.
+
+---
+
+## 13. No in-app discoverability for a finished team's committed-but-unmerged branches
+
+Raised at the multi-agent-teams story's completion triage (2026-08-14),
+resolving `docs/story.md` §3/§7's long-open "should a teammate's worktree
+be merged back automatically, or left for the human to review and merge?"
+question. **Decision: left for the human, permanently — not deferred,
+settled.** Consistent with every other manual-review-only precedent this
+story set (read-only grounding, no auto-deploy of AI work): the switchboard
+never merges or discards a teammate's work unattended.
+
+The safety property this needs is **already implemented**, not missing:
+`app/teams.py`'s `_remove_worktree()` calls `git worktree remove` with NO
+`--force`, so git itself refuses to remove a worktree with uncommitted or
+untracked changes (`stop_team()` records that outcome as `"dirty"` and
+leaves the directory exactly as-is for a human to find via `team-status`).
+No code path ever runs `git branch -D` on a `team-{run_id}-{agent}` branch,
+so even a *clean* worktree removal (working directory deleted, git's own
+internal metadata cleaned up) leaves the branch itself intact in the
+project's repo indefinitely, carrying whatever the teammate committed.
+Nothing an agent commits is ever silently lost.
+
+**The actual gap: discoverability.** Once a worktree directory is removed,
+`stop_team()` also drops that agent's entry from the run's own persisted
+`state["worktrees"]` map (by design — see that function's docstring on why
+a stale path entry would be unsafe for a later run to inherit), so the
+switchboard itself no longer tracks that the branch exists. An operator
+who wants to review or merge a past run's teammate work has to already
+know to run `git -C <project> branch --list 'team-*'` by hand; there is no
+UI panel, `team-status` field, or documentation pointing at this. Shape of
+a future fix, if this becomes a real pain point: list surviving
+`team-*` branches for a project (a `git branch --list` call, cheap) in the
+Teams page or `team-status` CLI output, and add a short "reviewing a
+team's work after it stops" section to `docs/ARCHITECTURE.md` or
+`README.md` documenting the plain `git log`/`git merge`/`git branch -D`
+commands to review, merge, or discard one. Non-blocking: no data-loss risk
+exists today, this is pure discoverability polish.

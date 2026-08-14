@@ -687,16 +687,27 @@ the deterministic hook-based repro technique already established in
 for the new regression test. No carried-forward items -- a small,
 single-function, fully-diagnosed fix with no new findings.
 
-**Part 2 (the Teams page itself)** -- spec in progress: `docs/spec.md`.
-The archaeology for it (single-page-app structure, exact route contracts,
-where in `teamRow()` the feed belongs) was captured verbatim in part 1b's
-own spec (preserved in git history at commit `e0e52c4`) and is reused
-directly rather than re-derived. This is the last sub-spec of the story --
-once part 2 is reviewer-approved and its own end-to-end pass is clean, the
-story's core build (6a-6f) is substantially complete, modulo the two
-non-blocking carried-forward items already recorded above (BACKLOG items
-10 and 11(b)) and the open questions in §7 below, none of which block
-shipping.
+**Part 2 status: done** (reviewer-approved, commit `628d482`). The
+Teams page itself: merged event feed, colour-coded per agent, per-agent
+filter, compact status strip, and the escalation panel with its
+always-present free-text "Other". The archaeology for it (single-page-app
+structure, exact route contracts, where in `teamRow()` the feed belongs)
+was captured verbatim in part 1b's own spec (preserved in git history at
+commit `e0e52c4`) and reused directly rather than re-derived. Frontend
+suite grew from 29 to 52 passing (`tests/test_team_frontend.js`, 3
+consecutive clean repeat runs, 0 flakes); full Python suite unchanged at
+765 passed (`app/teams.py` and every `tests/test_team*.py` file untouched
+by this diff, confirming the cycle was frontend-only as scoped). No
+carried-forward defects; two pre-existing, deliberate design choices
+recorded as "Deviations from spec" in `docs/implementation.md` (no
+per-poll row re-render, to avoid a self-sustaining fetch loop; an added
+untested-by-name-but-covered "already answered" race state), neither of
+which affects any acceptance criterion.
+
+**This was the last sub-spec of the story.** 6a-6f (all parts) are now
+all reviewer-approved and committed. See §8 below for the story-level
+completion triage (2026-08-14): full-suite green confirmation, the §3/§7
+worktree-cleanup decision, and the story's closing status.
 
 ---
 
@@ -716,9 +727,11 @@ shipping.
 - Which Ollama model ships as the documented default? `qwen3:8b` matches the
   existing `DESC_LLM_MODEL` example and is tool-capable, but this should be
   confirmed against actual tool-calling reliability during 6c.
-- Should a teammate's worktree be merged back automatically on team finish, or
-  left for the human to review and merge? Leaning: left for review, consistent
-  with deploy being manual-click-only.
+- ~~Should a teammate's worktree be merged back automatically on team
+  finish, or left for the human to review and merge?~~ **Resolved 2026-08-14
+  (story completion triage, §8): left for the human, permanently.** See §8.2
+  for the full reasoning and `docs/BACKLOG.md` item 13 for the one real gap
+  this surfaced (discoverability, not safety).
 - Does the lead need read access to teammates' `.jsonl` logs, or only their
   returned results? Leaning: results only — `fact_check` against the grounding
   set covers the verification need without unbounding the lead's context.
@@ -728,3 +741,128 @@ shipping.
   worktree)? Out of scope as specified — teammates already read code directly,
   and it would unbound the lead's context. Revisit if 6c shows the lead
   fact-checking claims the docs genuinely can't settle.
+
+## 8. Story completion triage (2026-08-14)
+
+Product-manager pass, re-entered after 6f part 2's reviewer approval
+(commit `628d482`), per `workflows/story.md`'s own closing step: confirm
+every sub-spec is genuinely done, make a real call on the one long-open
+question rather than deferring it again, and run one more end-to-end test
+pass over the whole story.
+
+### 8.1 Sub-spec completion, cross-checked against git log and implementation.md
+
+All ten build-cycle commits accounted for, each independently
+reviewer-approved (not just self-reported in this file):
+
+| Sub-spec | Commit | Status |
+|---|---|---|
+| 6a — headless engine invocation | `e7deade` | done |
+| 6b — grounding (discovery, digest, fact_check) | `926eff0` | done |
+| 6b.1 — bounded block matching for fact_check | `3e79cb0` | done |
+| 6c — roster + lead loop, all three tiers | `cbc6870` | done |
+| 6d part 1 — worktree + tmux dashboard lifecycle | `7a3e0eb` | done |
+| 6d part 2a — web routes, driving thread, cancellation | `f9d1f2b` | done |
+| 6d part 2b — `install.sh --with-ollama` (link step) | `14feb59` | done |
+| 6e — roster & composition UI | `738f274` | done |
+| 6f part 1 — overwatch event feed + inbox (backend) | `378f47c` | done |
+| 6f part 1b — fix stale transcript on losing resolve | `68dc968` | done |
+| 6f part 2 — Teams page UI | `628d482` | done |
+
+No gaps. Every sub-spec listed in §5 has a shipped, reviewer-approved
+cycle. `docs/story.md`'s own incremental bookkeeping (updated turn by turn
+across ten cycles) matches the actual git history — no drift found.
+
+### 8.2 The §3/§7 worktree-cleanup question: resolved, not deferred again
+
+**Call: leave worktree/branch cleanup manual, permanently — not an open
+question anymore.** This is a low-risk default the product-manager can
+responsibly settle alone, not a genuine architecture fork needing the
+user's sign-off, for two reasons:
+
+1. **It's the same conservative default this story already used
+   everywhere else** — read-only grounding (§3), no automatic deploy off a
+   team's work (§3, non-goals), the lead never writing to `docs/BACKLOG.md`
+   (§4.3). Auto-merging a teammate's branch would be the one place this
+   story broke its own pattern, not a neutral toss-up between two
+   equally-reasonable options.
+2. **Reading `app/teams.py` (`_remove_worktree()`, `stop_team()`,
+   `_create_worktree()`) shows the safe answer is already substantially
+   built, from 6d part 1, not still to be designed.** `_remove_worktree()`
+   calls `git worktree remove` with **no** `--force`; git itself refuses
+   to remove a worktree with uncommitted or untracked changes, and
+   `stop_team()` records that as `"dirty"` and leaves the directory
+   exactly as-is (found via `team-status`, not silently dropped). No code
+   path anywhere deletes a `team-{run_id}-{agent}` branch — even a clean
+   worktree-directory removal leaves the branch itself intact in the
+   project's repo indefinitely. **Nothing a teammate commits can be lost
+   by this story's own existing code**, automatically or otherwise.
+
+The one real gap this surfaced: once a worktree directory is removed, the
+switchboard stops tracking that its branch exists (dropped from
+`state["worktrees"]` by design, to avoid a later run mistaking a stale
+path entry for its own). An operator who wants to review a past run's
+work has to already know to run `git branch --list 'team-*'` by hand — a
+discoverability gap, not a safety one. Recorded as `docs/BACKLOG.md` item
+13 (new), same non-blocking-follow-up format as items 10-12, since it's
+genuinely out of scope for what this story's own §1 intent describes
+(build and run a team; escalate to the human when needed) — nothing there
+promises a post-hoc branch-review UI. **Not written up as a
+`docs/spec.md`** — a discoverability nice-to-have with a one-line manual
+workaround (`git branch --list`) does not warrant its own
+product-manager → ux-designer → developer → reviewer cycle right now, and
+speculatively building UI for a pain point nobody has reported yet would
+be exactly the kind of self-proposed work this project's own "Default for
+every message" rule requires sign-off for before building — sign-off this
+triage turn was not asked to seek.
+
+### 8.3 End-to-end test pass (2026-08-14)
+
+Full accumulated suite, run fresh rather than trusted from any one
+sub-spec's own cycle:
+
+| Suite | Command | Result |
+|---|---|---|
+| Python (all) | `python3 -m unittest discover -s tests` | **765 passed**, 0 failures, 0 errors |
+| `test_deploy_frontend.js` | `node tests/test_deploy_frontend.js` | **9/9 passed** |
+| `test_singleton_toggle_frontend.js` | `node tests/test_singleton_toggle_frontend.js` | **15/15 passed** |
+| `test_team_frontend.js` | `node tests/test_team_frontend.js` | **52/52 passed** |
+| `test_upload_frontend.js` | `node tests/test_upload_frontend.js` | **8/8 passed** |
+
+All green. Working tree clean (`git status --short` empty) before and
+after this pass — no uncommitted drift to explain away.
+
+### 8.4 Known, deliberately-deferred rough edges (non-blocking)
+
+Carried forward as-is, not re-litigated this turn — each was already a
+considered call by the cycle that found it:
+
+- **`docs/BACKLOG.md` item 10** — `set_env()`'s unescaped `sed` upsert can
+  abort `install.sh` or corrupt config on a re-run whose value contains a
+  literal `|` or `&`. Pre-existing shared helper, narrow trigger, not
+  touched by any team-specific cycle.
+- **`docs/BACKLOG.md` item 11(b)** — `run_id` not validated against path
+  traversal on the three `team/*` routes. Real project data stays gated by
+  the existing `project_name` check; judged narrow, not blocking.
+- **`docs/BACKLOG.md` item 12** — three small 6f part 2 follow-ups
+  (untested "already answered" race branch, missing ARIA attributes per
+  `docs/design.md`'s own accessibility notes, a practically-unreachable
+  self-healing poll-boundary misclassification).
+- **`docs/BACKLOG.md` item 13 (new this turn)** — no in-app discoverability
+  for a finished team's surviving `team-*` branches. See §8.2.
+
+None of these block story completion; none involve data loss, security
+exposure beyond what's already narrowly scoped above, or an unmet
+acceptance criterion from any sub-spec's own `docs/spec.md`.
+
+### 8.5 Verdict
+
+**The multi-agent-teams story (backlog item 6) is complete.** All six
+planned sub-specs (6a-6f, including the three that were themselves split
+into parts: 6d into 1/2a/2b, 6f into 1/1b/2) are built, reviewer-approved,
+and committed; the full accumulated test suite is green end to end; the
+one long-open architectural question is now resolved rather than
+re-deferred, with its residual discoverability gap correctly sized as
+backlog polish rather than a blocker. Nothing further is queued under this
+story. The next product-manager turn should treat this as a closed story
+and either pick up a fresh backlog item or wait for new external input.
