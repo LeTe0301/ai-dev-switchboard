@@ -4072,6 +4072,17 @@ class Handler(BaseHTTPRequestHandler):
             return None, ({"error": "unknown project"}, 404)
         run_id = (query.get("run_id") or [None])[0]
         if run_id:
+            # docs/BACKLOG.md item 11(b): validated against teams._RUN_ID_RE
+            # -- the exact shape teams._run_id() actually generates -- here,
+            # at the client-supplied-run_id intake point, BEFORE it ever
+            # reaches teams.load_state_for_project()/_load_state()/
+            # _run_dir() and a path-join. Same "unknown run_id" 404 as a
+            # syntactically-valid-but-nonexistent run_id already gets, so a
+            # malformed/traversal run_id (e.g. "../../outside/evilrun")
+            # never opens any file outside _leads_root() and never gets a
+            # distinguishable error shape.
+            if not teams._RUN_ID_RE.match(run_id):
+                return None, ({"error": "unknown run_id for this project"}, 404)
             state = teams.load_state_for_project(run_id, name)
             if state is None:
                 return None, ({"error": "unknown run_id for this project"}, 404)
@@ -4325,6 +4336,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "unknown project"}, 404)
             run_id = (body.get("run_id") or "").strip() or None
             if run_id:
+                # docs/BACKLOG.md item 11(b): same validation, same intake-
+                # point placement, as _team_events_run_and_ownership() above
+                # -- reject before _load_state()/_run_dir() ever join this
+                # into a path. Same "no run found" 400 a syntactically-
+                # valid-but-nonexistent run_id already gets via the except
+                # clause below, so this adds no new error shape.
+                if not teams._RUN_ID_RE.match(run_id):
+                    return self._json({"error": "no run found for this project"}, 400)
                 try:
                     state = teams._load_state(run_id)
                 except (OSError, ValueError):

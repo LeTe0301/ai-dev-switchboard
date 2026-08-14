@@ -22,6 +22,7 @@ TeamInboxEndpointTests, TeamResolveEndpointTests), same real-HTTP harness.
 Run with:
     python3 -m unittest discover -s tests -v
 """
+import builtins
 import json
 import os
 import shutil
@@ -58,6 +59,59 @@ from http.server import ThreadingHTTPServer  # noqa: E402
 
 def _fixture(name):
     return os.path.join(FIXTURES_DIR, name)
+
+
+# ─── run_id path-traversal validation helpers (docs/BACKLOG.md item 11(b)) ──
+# _leads_root() == TEAM_STATE_DIR/leads, so a run_id of TRAVERSAL_RUN_ID
+# joined UNvalidated into that (the pre-fix defect) resolves, once the OS
+# walks the ".."s at open() time, to TEAM_STATE_DIR's *parent* + "outside/
+# evilrun" -- i.e. self.tmp/outside/evilrun for every test class here
+# (TEAM_STATE_DIR is always self.tmp/"state"). Reproduces the exact
+# traversal the reviewer found during 6f part 1 (docs/spec.md Background).
+TRAVERSAL_RUN_ID = "../../outside/evilrun"
+
+
+def _plant_traversal_target(tmp_dir, relative="run.json", content=None):
+    """Plants a real run.json-shaped file at the exact path TRAVERSAL_RUN_ID
+    would reach if a route's run_id ever reached _run_dir() unvalidated --
+    used to prove the fixed route never opens it (not just that the
+    response status/shape happens to look right)."""
+    d = os.path.join(tmp_dir, "outside", "evilrun")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, relative)
+    with open(path, "w") as f:
+        json.dump(content or {"run_id": "evilrun", "project_name": "proj",
+                              "status": "blocked_ask_user", "members": []}, f)
+    return path
+
+
+def _get_forbidding_open_of(testcase, forbidden_path, action):
+    """Runs `action()` (a zero-arg callable that performs one HTTP request
+    against the real server) while builtins.open raises AssertionError if
+    ever called with `forbidden_path` -- proving a planted file a
+    path-traversal run_id would reach is genuinely never opened, mirroring
+    tests/test_teams_grounding.py's GroundingReadOnlyRuntimeTests own
+    monkeypatched-builtins.open technique. Safe against the real
+    ThreadingHTTPServer's separate handling thread because builtins is
+    process-global and the test blocks on the request (via urlopen) before
+    restoring the patch, so no unrelated open() call races the guard."""
+    forbidden_abs = os.path.abspath(forbidden_path)
+    real_open = builtins.open
+
+    def _guarded(file, *a, **kw):
+        try:
+            hit = os.path.abspath(str(file)) == forbidden_abs
+        except (TypeError, ValueError):
+            hit = False
+        if hit:
+            raise AssertionError(f"open() called for forbidden path {file!r}")
+        return real_open(file, *a, **kw)
+
+    builtins.open = _guarded
+    try:
+        return action()
+    finally:
+        builtins.open = real_open
 
 
 def _patch_tmux(testcase, argv):
@@ -124,15 +178,37 @@ def _init_repo(path):
 # sessions in tearDown. Scoping every run_id with this process's own pid
 # makes every "no leftover switchboard-headless-*" assertion/sweep concern
 # only sessions this process could have created. Same technique tests/
-# test_teams_headless.py's own _scope_run_ids()/_SESSION_PREFIX establish.
-_RUN_ID_SCOPE = f"p{os.getpid()}"
+# test_teams_headless.py's own _scope_run_ids()/_SESSION_PREFIX establish --
+# EXCEPT the scope token here is a fixed-width, all-digit prefix (not a
+# "p<pid>-" prefix as a separate hyphen-delimited segment) so a scoped
+# run_id stays exactly _RUN_ID_RE-shaped (docs/BACKLOG.md item 11(b)):
+# unlike test_teams_headless.py/test_teams_cancel.py, THIS file is the only
+# one that drives a real HTTP request with an explicit, client-supplied
+# run_id through app.py's three team/* routes, which now validate that
+# run_id against teams._RUN_ID_RE before ever reaching a path-join -- a
+# "p12345-..." shaped scoped run_id would otherwise be rejected there as
+# malformed, even though it's a genuinely legitimate run this test process
+# itself created (see docs/implementation.md "Deviations from spec").
+# Fixed-width (8 digits, comfortably covering any real pid) rather than
+# bare `str(os.getpid())` so no two distinct pids' scope tokens can ever be
+# a startswith-prefix of one another.
+_RUN_ID_SCOPE = f"{os.getpid():08d}"
 _SESSION_PREFIX = f"switchboard-headless-{_RUN_ID_SCOPE}"
 
 
 def _scope_run_ids(testcase):
+    """Wraps teamsmod._run_id() so every run_id it produces for the
+    duration of testcase carries this process's own scope token WHILE
+    staying _RUN_ID_RE-shaped: the scope token and the real epoch are both
+    all-digits, so they're concatenated into one numeric prefix (not joined
+    by their own separator) ahead of "-" + the real 12-hex-char suffix."""
     orig = teamsmod._run_id
     testcase.addCleanup(lambda: setattr(teamsmod, "_run_id", orig))
-    teamsmod._run_id = lambda: f"{_RUN_ID_SCOPE}-{orig()}"
+
+    def _scoped():
+        epoch, hexpart = orig().split("-")
+        return f"{_RUN_ID_SCOPE}{epoch}-{hexpart}"
+    teamsmod._run_id = _scoped
 
 
 def _kill_leftover_team_sessions():
@@ -952,6 +1028,49 @@ class TeamEventsEndpointTests(_RealHTTPTeamTestCase):
         status, payload = self._get(f"/projects/proj-b/team/events?run_id={run_a}", cookie)
         self.assertEqual(status, 404)
 
+    # ── run_id path-traversal validation (docs/BACKLOG.md item 11(b)) ───
+
+    def test_path_traversal_run_id_404_planted_file_never_opened(self):
+        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        planted = _plant_traversal_target(self.tmp)
+        cookie = self._login()
+        status, payload = _get_forbidding_open_of(
+            self, planted,
+            lambda: self._get(f"/projects/proj/team/events?run_id={TRAVERSAL_RUN_ID}", cookie))
+        self.assertEqual(status, 404)
+        self.assertEqual(payload, {"error": "unknown run_id for this project"})
+
+    def test_url_encoded_traversal_run_id_404(self):
+        # %2e%2e%2f decodes to the same literal "../" the regex already
+        # rejects (docs/spec.md "Edge cases") -- urllib.parse.parse_qs
+        # decodes percent-encoding before the route ever sees the string.
+        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        planted = _plant_traversal_target(self.tmp)
+        encoded = "%2e%2e%2f%2e%2e%2foutside%2fevilrun"
+        cookie = self._login()
+        status, payload = _get_forbidding_open_of(
+            self, planted,
+            lambda: self._get(f"/projects/proj/team/events?run_id={encoded}", cookie))
+        self.assertEqual(status, 404)
+        self.assertEqual(payload, {"error": "unknown run_id for this project"})
+
+    def test_malformed_non_traversal_run_id_404_no_500(self):
+        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        cookie = self._login()
+        for bad_run_id in ("not-a-real-run", "1700000000-ABC123DEF456"):
+            status, payload = self._get(
+                f"/projects/proj/team/events?run_id={bad_run_id}", cookie)
+            self.assertEqual(status, 404, bad_run_id)
+            self.assertEqual(payload, {"error": "unknown run_id for this project"}, bad_run_id)
+
+    def test_run_id_with_nul_byte_404_no_500(self):
+        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        cookie = self._login()
+        run_id = urllib.parse.quote("1700000000-abc123def456\x00/etc/passwd")
+        status, payload = self._get(f"/projects/proj/team/events?run_id={run_id}", cookie)
+        self.assertEqual(status, 404)
+        self.assertEqual(payload, {"error": "unknown run_id for this project"})
+
     def test_finished_run_no_thread_running_still_returns_full_history(self):
         run_id = self._make_run(status="finished")
         _append_jsonl(teamsmod._transcript_path(run_id), _envelope("lead", 1, text="done"))
@@ -1026,6 +1145,25 @@ class TeamInboxEndpointTests(_RealHTTPTeamTestCase):
         cookie = self._login()
         status, payload = self._get(f"/projects/proj-b/team/inbox?run_id={run_a}", cookie)
         self.assertEqual(status, 404)
+
+    # ── run_id path-traversal validation (docs/BACKLOG.md item 11(b)) ───
+
+    def test_path_traversal_run_id_404_planted_file_never_opened(self):
+        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        planted = _plant_traversal_target(self.tmp)
+        cookie = self._login()
+        status, payload = _get_forbidding_open_of(
+            self, planted,
+            lambda: self._get(f"/projects/proj/team/inbox?run_id={TRAVERSAL_RUN_ID}", cookie))
+        self.assertEqual(status, 404)
+        self.assertEqual(payload, {"error": "unknown run_id for this project"})
+
+    def test_malformed_non_traversal_run_id_404_no_500(self):
+        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        cookie = self._login()
+        status, payload = self._get("/projects/proj/team/inbox?run_id=not-a-real-run", cookie)
+        self.assertEqual(status, 404)
+        self.assertEqual(payload, {"error": "unknown run_id for this project"})
 
     def test_inbox_reflects_only_genuinely_pending_across_a_resolve_and_repoll_sequence(self):
         # Reviewer-added: docs/spec.md never explicitly walks a
@@ -1108,6 +1246,30 @@ class TeamResolveEndpointTests(_RealHTTPTeamTestCase):
                                      {"answer": "yes", "run_id": run_a, "code": code})
         self.assertEqual(status, 400)
         self.assertIn("different project", payload["error"])
+
+    # ── run_id path-traversal validation (docs/BACKLOG.md item 11(b)) ───
+
+    def test_path_traversal_run_id_400_planted_file_never_opened_no_thread_started(self):
+        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        planted = _plant_traversal_target(self.tmp)
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = _get_forbidding_open_of(
+            self, planted,
+            lambda: self._post("/projects/proj/team/resolve", cookie,
+                               {"answer": "yes", "run_id": TRAVERSAL_RUN_ID, "code": code}))
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "no run found for this project"})
+        self.assertIsNone(appmod._team_threads_get("proj"))
+
+    def test_malformed_non_traversal_run_id_400_no_500(self):
+        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/proj/team/resolve", cookie,
+                                     {"answer": "yes", "run_id": "not-a-real-run", "code": code})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "no run found for this project"})
 
     def test_empty_answer_400_before_any_mutation(self):
         run_id = self._make_run()

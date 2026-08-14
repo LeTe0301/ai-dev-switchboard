@@ -110,9 +110,18 @@ prompt_secret() {  # prompt_secret <message> -> echoes the answer (may be empty)
     echo "$ans"
 }
 set_env() {  # set_env <file> <KEY> <value> — idempotent upsert
-    local file="$1" key="$2" val="$3"
+    local file="$1" key="$2" val="$3" val_escaped
+    # $val is operator-supplied and must never be shelled through sed's
+    # pattern language unescaped (docs/BACKLOG.md item 10): a literal `|`
+    # breaks this sed expression (aborting the whole install.sh run on a
+    # re-run) and a literal `&` is silently corrupted via sed's whole-match
+    # backreference. Escape backslash first (so the escaping added for
+    # `&`/`|` below isn't itself re-escaped), then `&`, then the `|`
+    # delimiter. The `>>` append path (first-write case) never goes through
+    # sed, so it already handles any character correctly and is untouched.
+    val_escaped=$(printf '%s' "$val" | sed -e 's/\\/\\\\/g' -e 's/&/\\&/g' -e 's/|/\\|/g')
     if grep -q "^${key}=" "$file" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=${val}|" "$file"
+        sed -i "s|^${key}=.*|${key}=${val_escaped}|" "$file"
     else
         printf '%s=%s\n' "$key" "$val" >> "$file"
     fi
