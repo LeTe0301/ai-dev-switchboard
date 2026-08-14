@@ -129,6 +129,26 @@ def _patch_tmux(testcase, argv):
     testcase.addCleanup(_restore)
 
 
+def _patch_taiga_board(testcase, **fakes):
+    """Monkeypatches the named teamsmod.taiga_board attributes for the
+    duration of one test, restoring the originals on cleanup -- same
+    "monkeypatch the module the caller imports it through" convention
+    tests/test_teams_board.py's own _patch_taiga_board() already
+    establishes (backlog item 7 part 2, docs/spec.md §2: app.py's own
+    subject-enrichment read in GET .../team/inbox calls teams.taiga_board,
+    not a separately-imported module)."""
+    originals = {}
+    for name, fn in fakes.items():
+        originals[name] = getattr(teamsmod.taiga_board, name)
+        setattr(teamsmod.taiga_board, name, fn)
+
+    def _restore():
+        for name, fn in originals.items():
+            setattr(teamsmod.taiga_board, name, fn)
+
+    testcase.addCleanup(_restore)
+
+
 def _write_engine_file(dirpath, filename, body):
     with open(os.path.join(dirpath, filename), "w") as f:
         f.write(textwrap.dedent(body))
@@ -727,6 +747,7 @@ class TeamStopEndpointTests(_RealHTTPTeamTestCase):
         cookie = self._login()
         cases = {
             "running": "running", "blocked_ask_user": "blocked",
+            "blocked_board_write": "blocked",  # backlog item 7 part 2, docs/spec.md §1
             "escalated_max_rounds": "blocked", "finished": "finished",
             "error": "error", "stopped": "idle",
         }
@@ -749,10 +770,34 @@ class TeamStopEndpointTests(_RealHTTPTeamTestCase):
         # no Ollama configured) means default_team_composition() itself
         # refuses, so composition is None here (no saved composition
         # either). "waiting_on_you" (backlog item 6f part 1) is additive
-        # too -- False, no run at all.
+        # too -- False, no run at all. "escalation_kind" (backlog item 7
+        # part 2) is additive too -- None, no run at all.
         self.assertEqual(by_name[_PROJ]["team"],
                          {"status": "idle", "run_id": None, "composition": None,
-                          "waiting_on_you": False})
+                          "waiting_on_you": False, "escalation_kind": None})
+
+    def test_stop_on_blocked_board_write_now_actually_stops(self):
+        # docs/spec.md §4 (backlog item 7 part 2) -- the disclosed no-op gap
+        # from part 1's docs/implementation.md: a run blocked on
+        # blocked_board_write used to fall into the early-return "no team
+        # currently running" branch and Stop silently did nothing. Now it
+        # actually tears the run down, same shape as a "running"/
+        # "blocked_ask_user" stop already returns.
+        repo = self._project(_PROJ)
+        result = teamsmod.launch_team(repo, "task", {"kind": "ollama", "name": "m", "tier": 1}, [])
+        run_id = result["run_id"]
+        state = teamsmod._load_state(run_id)
+        state["status"] = "blocked_board_write"
+        teamsmod._persist(state)
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/stop", cookie, {"code": code})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertIn("session_removed", payload)
+        self.assertIn("worktrees", payload)
+        self.assertNotIn("message", payload)
+        self.assertEqual(teamsmod._load_state(run_id)["status"], "stopped")
 
 
 # ─── Roster & composition UI (backlog item 6e, docs/spec.md) ──────────────
@@ -859,16 +904,18 @@ class StatusRosterAndCompositionTests(_RealHTTPTeamTestCase):
 
     def test_waiting_on_you_true_only_for_blocked_ask_user_never_for_escalated_max_rounds(self):
         # docs/spec.md §4/"Open questions": additive-only field, true iff
-        # the project's LATEST run status is exactly "blocked_ask_user" --
-        # every existing /status field/value stays byte-for-byte unchanged
-        # (this test only checks the one new key; the full-dict exact-match
-        # tests above/elsewhere already pin the rest).
+        # the project's LATEST run status is "blocked_ask_user" OR (backlog
+        # item 7 part 2, docs/spec.md §1) "blocked_board_write" -- every
+        # existing /status field/value stays byte-for-byte unchanged (this
+        # test only checks the one new key; the full-dict exact-match tests
+        # above/elsewhere already pin the rest).
         repo = self._project(_PROJ)
         result = teamsmod.launch_team(repo, "task", {"kind": "ollama", "name": "m", "tier": 1}, [])
         run_id = result["run_id"]
         cookie = self._login()
         cases = {
             "running": False, "blocked_ask_user": True,
+            "blocked_board_write": True,
             "escalated_max_rounds": False, "finished": False,
             "error": False, "stopped": False,
         }
@@ -879,6 +926,30 @@ class StatusRosterAndCompositionTests(_RealHTTPTeamTestCase):
             s = self._get_status(cookie)
             by_name = {i["name"]: i for i in s["instances"]}
             self.assertEqual(by_name[_PROJ]["team"]["waiting_on_you"], expected, raw_status)
+
+    def test_escalation_kind_field(self):
+        # docs/spec.md §1 (backlog item 7 part 2): a direct string
+        # comparison against the LATEST run's own status -- "ask_user" for
+        # blocked_ask_user, "board_write" for blocked_board_write, None for
+        # every other status (including "no run at all", covered separately
+        # by test_status_idle_when_no_run_ever_started above).
+        repo = self._project(_PROJ)
+        result = teamsmod.launch_team(repo, "task", {"kind": "ollama", "name": "m", "tier": 1}, [])
+        run_id = result["run_id"]
+        cookie = self._login()
+        cases = {
+            "running": None, "blocked_ask_user": "ask_user",
+            "blocked_board_write": "board_write",
+            "escalated_max_rounds": None, "finished": None,
+            "error": None, "stopped": None,
+        }
+        for raw_status, expected in cases.items():
+            state = teamsmod._load_state(run_id)
+            state["status"] = raw_status
+            teamsmod._persist(state)
+            s = self._get_status(cookie)
+            by_name = {i["name"]: i for i in s["instances"]}
+            self.assertEqual(by_name[_PROJ]["team"]["escalation_kind"], expected, raw_status)
 
 
 # ─── GET /projects/<name>/team/grounding (backlog item 6e) ─────────────────
@@ -1210,6 +1281,327 @@ class TeamInboxEndpointTests(_RealHTTPTeamTestCase):
         status3, payload3 = self._get(f"/projects/{_PROJ}/team/inbox", cookie)
         self.assertEqual(status3, 200)
         self.assertEqual(payload3, {"pending": False})
+
+    # ── blocked_board_write branch (backlog item 7 part 2, docs/spec.md §2) ──
+
+    def _make_board_write_run(self, name=_PROJ, write_inbox=True,
+                              verb="set_status", ref=42, value="In progress",
+                              note="moving to in-progress", current_value=None):
+        run_id = self._make_run(name=name, status="blocked_board_write")
+        if write_inbox:
+            inbox = {"kind": "board_write", "verb": verb, "ref": ref, "value": value,
+                     "note": note, "current_value": current_value or {},
+                     "proposed_at": "2026-08-14T12:00:00Z"}
+            with open(teamsmod._inbox_path(run_id), "w") as f:
+                json.dump(inbox, f)
+        return run_id
+
+    def test_board_write_genuinely_blocked_returns_exact_persisted_proposal_shape_plus_subject(self):
+        run_id = self._make_board_write_run(
+            current_value={"status_id": 1, "status_name": "New"})
+        _patch_taiga_board(
+            self, resolve_session=lambda **k: ("http://taiga", "tok", 7),
+            get_userstory=lambda *a, **k: {"subject": "Implement auth system"})
+        cookie = self._login()
+        status, payload = self._get(f"/projects/{_PROJ}/team/inbox", cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {
+            "pending": True, "run_id": run_id, "kind": "board_write",
+            "verb": "set_status", "ref": 42, "value": "In progress",
+            "note": "moving to in-progress",
+            "current_value": {"status_id": 1, "status_name": "New"},
+            "proposed_at": "2026-08-14T12:00:00Z",
+            "subject": "Implement auth system"})
+
+    def test_board_write_taiga_unreachable_degrades_gracefully_no_subject(self):
+        run_id = self._make_board_write_run()
+
+        def _raise(*a, **k):
+            raise teamsmod.taiga_board.TaigaPushError("connection refused")
+        _patch_taiga_board(self, resolve_session=_raise)
+        cookie = self._login()
+        status, payload = self._get(f"/projects/{_PROJ}/team/inbox", cookie)
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["pending"])
+        self.assertEqual(payload["kind"], "board_write")
+        self.assertEqual(payload["verb"], "set_status")
+        self.assertEqual(payload["ref"], 42)
+        self.assertNotIn("subject", payload)
+
+    def test_board_write_missing_inbox_json_still_pending_true_with_fallback(self):
+        run_id = self._make_board_write_run(write_inbox=False)
+        cookie = self._login()
+        status, payload = self._get(f"/projects/{_PROJ}/team/inbox", cookie)
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["pending"])
+        self.assertEqual(payload["kind"], "board_write")
+        self.assertIsNone(payload["verb"])
+        self.assertTrue(payload["note"])  # non-empty fallback, never blank
+
+    def test_board_write_malformed_inbox_json_still_pending_true_with_fallback(self):
+        run_id = self._make_board_write_run()
+        with open(teamsmod._inbox_path(run_id), "w") as f:
+            f.write("not valid json")
+        cookie = self._login()
+        status, payload = self._get(f"/projects/{_PROJ}/team/inbox", cookie)
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["pending"])
+        self.assertIsNone(payload["verb"])
+        self.assertTrue(payload["note"])
+
+    def test_ask_user_branch_response_shape_unchanged_regression(self):
+        # docs/spec.md §2: "the ask_user branch is entirely unchanged --
+        # same response shape". Confirms the new board_write branch above
+        # was added alongside, not in place of, the existing ask_user path.
+        run_id = self._make_run()
+        inbox = {"question": "which way?", "header": "Choice", "multi_select": False,
+                 "options": [{"label": "a", "description": "a"}]}
+        with open(teamsmod._inbox_path(run_id), "w") as f:
+            json.dump(inbox, f)
+        cookie = self._login()
+        status, payload = self._get(f"/projects/{_PROJ}/team/inbox", cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"pending": True, "run_id": run_id, **inbox})
+
+
+# ─── POST /projects/<name>/team/board-resolve (backlog item 7 part 2, docs/spec.md) ──
+class TeamBoardResolveEndpointTests(_RealHTTPTeamTestCase):
+    def _make_run(self, name=_PROJ, status="blocked_board_write", write_inbox=True,
+                  verb="set_status", ref=42, value="In progress"):
+        os.makedirs(os.path.join(self.projects_dir, name), exist_ok=True)
+        run_id = teamsmod._run_id()
+        state = teamsmod._new_state(run_id, os.path.join(self.projects_dir, name),
+                                    {"kind": "ollama", "name": "m", "tier": 1}, [], "task",
+                                    project_name=name)
+        state["status"] = status
+        teamsmod._persist(state)
+        if write_inbox and status == "blocked_board_write":
+            with open(teamsmod._inbox_path(run_id), "w") as f:
+                json.dump({"kind": "board_write", "verb": verb, "ref": ref, "value": value,
+                          "note": None, "current_value": {}, "proposed_at": "2026-08-14T12:00:00Z"}, f)
+        return run_id
+
+    def test_unknown_project_404(self):
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/nope/team/board-resolve", cookie,
+                                     {"action": "approve", "code": code})
+        self.assertEqual(status, 404)
+
+    def test_not_blocked_400_no_resolve_call_no_thread(self):
+        run_id = self._make_run(status="running", write_inbox=False)
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/board-resolve", cookie,
+                                     {"action": "approve", "code": code})
+        self.assertEqual(status, 400)
+        self.assertIn("no pending board write", payload["error"])
+        self.assertEqual(teamsmod._load_state(run_id)["status"], "running")
+        self.assertIsNone(appmod._team_threads_get(_PROJ))
+
+    def test_no_run_at_all_400(self):
+        os.makedirs(os.path.join(self.projects_dir, _PROJ))
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/board-resolve", cookie,
+                                     {"action": "approve", "code": code})
+        self.assertEqual(status, 400)
+        self.assertIn("no run found", payload["error"])
+
+    def test_explicit_run_id_for_a_different_project_400(self):
+        run_a = self._make_run(name=_PROJ_A)
+        os.makedirs(os.path.join(self.projects_dir, _PROJ_B))
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ_B}/team/board-resolve", cookie,
+                                     {"action": "approve", "run_id": run_a, "code": code})
+        self.assertEqual(status, 400)
+        self.assertIn("different project", payload["error"])
+
+    def test_path_traversal_run_id_400_planted_file_never_opened_no_thread_started(self):
+        os.makedirs(os.path.join(self.projects_dir, _PROJ))
+        planted = _plant_traversal_target(self.tmp)
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = _get_forbidding_open_of(
+            self, planted,
+            lambda: self._post(f"/projects/{_PROJ}/team/board-resolve", cookie,
+                               {"action": "approve", "run_id": TRAVERSAL_RUN_ID, "code": code}))
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "no run found for this project"})
+        self.assertIsNone(appmod._team_threads_get(_PROJ))
+
+    def test_invalid_action_400_before_resolve_called(self):
+        run_id = self._make_run()
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/board-resolve", cookie,
+                                     {"action": "maybe", "code": code})
+        self.assertEqual(status, 400)
+        self.assertIn("action must be", payload["error"])
+        self.assertEqual(teamsmod._load_state(run_id)["status"], "blocked_board_write")
+        self.assertTrue(os.path.isfile(teamsmod._inbox_path(run_id)))
+
+    def test_missing_action_400(self):
+        self._make_run()
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/board-resolve", cookie, {"code": code})
+        self.assertEqual(status, 400)
+        self.assertIn("action must be", payload["error"])
+
+    def _record_team_threads(self):
+        """
+        docs/test-review.md (item 7 part 2 review, must-fix #1): the two
+        success-path tests below previously only asserted
+        resolve_board_write()'s own SYNCHRONOUS side effects (inbox move,
+        history entry), which are satisfied whether or not the route ever
+        starts the background driving thread -- proven vacuous by the
+        reviewer's revert-and-fail (deleting the route's entire
+        cancel_event/Thread/_team_threads_set()/t.start() block left all 12
+        tests in this class passing). Fixed per the reviewer's recommended
+        fix (a): rebind app.py's own module-level `threading` name to a
+        thin proxy whose Thread is a recording subclass (records target +
+        args on construction, then delegates to the real threading.Thread),
+        so the background thread still genuinely runs (existing
+        inbox/history assertions stay meaningful) while giving an
+        unambiguous, race-free record that _run_team_in_background() was
+        actually dispatched -- unlike the weaker `elapsed < 3.0` timing
+        proxy TeamResolveEndpointTests uses, which a fast stub could
+        satisfy even with no thread at all.
+        """
+        started = []
+        real_threading = appmod.threading
+
+        class _RecordingThread(threading.Thread):
+            def __init__(self, target=None, args=(), **kwargs):
+                started.append((target, args))
+                super().__init__(target=target, args=args, **kwargs)
+
+        class _FakeThreadingModule:
+            """
+            Only overrides Thread; everything else (Event, Lock, ...)
+            delegates to the real `threading` module. Rebinds app.py's own
+            module-level `threading` name (appmod.threading) rather than
+            mutating the shared `threading` module's Thread attribute --
+            the latter would also intercept ThreadingHTTPServer's own
+            per-connection threads (it does its own `import threading`
+            against the same module object), which is what made an earlier
+            version of this fixture record 3 threads instead of 1.
+            """
+            Thread = _RecordingThread
+
+            def __getattr__(self, name):
+                return getattr(real_threading, name)
+
+        appmod.threading = _FakeThreadingModule()
+        self.addCleanup(setattr, appmod, "threading", real_threading)
+        return started
+
+    def test_approve_resolves_and_starts_background_thread(self):
+        run_id = self._make_run()
+        _patch_taiga_board(
+            self, resolve_session=lambda **k: ("http://taiga", "tok", 7),
+            get_userstory=lambda *a, **k: {"id": 1, "version": 3},
+            list_userstory_statuses=lambda *a, **k: [{"id": 2, "name": "In progress"}],
+            set_status=lambda *a, **k: {"id": 1, "version": 4})
+        started = self._record_team_threads()
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/board-resolve", cookie,
+                                     {"action": "approve", "code": code})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["run_id"], run_id)
+        self.assertEqual(len(started), 1)
+        target, args = started[0]
+        self.assertIs(target, appmod._run_team_in_background)
+        self.assertEqual(args[0], _PROJ)
+        self.assertEqual(args[1], run_id)
+        self.assertIsInstance(args[2], threading.Event)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if not os.path.isfile(teamsmod._inbox_path(run_id)):
+                break
+            time.sleep(0.05)
+        self.assertTrue(os.path.isfile(teamsmod._inbox_resolved_path(run_id)))
+        state = teamsmod._load_state(run_id)
+        resolved = [h for h in state["history"] if h["tool"] == "board_write_resolved"]
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(resolved[0]["outcome_summary"], "approved and applied")
+
+    def test_reject_resolves_and_starts_background_thread_no_taiga_call(self):
+        run_id = self._make_run()
+
+        def _fail(*a, **k):
+            raise AssertionError("reject must never call Taiga")
+        _patch_taiga_board(self, resolve_session=_fail)
+        started = self._record_team_threads()
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/board-resolve", cookie,
+                                     {"action": "reject", "code": code})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(len(started), 1)
+        target, args = started[0]
+        self.assertIs(target, appmod._run_team_in_background)
+        self.assertEqual(args[0], _PROJ)
+        self.assertEqual(args[1], run_id)
+        self.assertIsInstance(args[2], threading.Event)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if not os.path.isfile(teamsmod._inbox_path(run_id)):
+                break
+            time.sleep(0.05)
+        state = teamsmod._load_state(run_id)
+        resolved = [h for h in state["history"] if h["tool"] == "board_write_resolved"]
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(resolved[0]["outcome_summary"], "rejected by human")
+
+    def test_totp_428_with_no_code(self):
+        self._make_run()
+        cookie = self._login()
+        status, payload = self._post(f"/projects/{_PROJ}/team/board-resolve", cookie,
+                                     {"action": "approve"})
+        self.assertEqual(status, 428)
+
+    def test_totp_403_with_wrong_code(self):
+        self._make_run()
+        cookie = self._login()
+        status, payload = self._post(f"/projects/{_PROJ}/team/board-resolve", cookie,
+                                     {"action": "approve", "code": "000000"})
+        self.assertEqual(status, 403)
+
+    def test_two_concurrent_resolves_exactly_one_succeeds(self):
+        run_id = self._make_run()
+        _patch_taiga_board(
+            self, resolve_session=lambda **k: ("http://taiga", "tok", 7),
+            get_userstory=lambda *a, **k: {"id": 1, "version": 3},
+            list_userstory_statuses=lambda *a, **k: [{"id": 2, "name": "In progress"}],
+            set_status=lambda *a, **k: {"id": 1, "version": 4})
+        cookie = self._login()
+        code = self._totp_code()
+        results = []
+
+        def _do_post():
+            results.append(self._post(f"/projects/{_PROJ}/team/board-resolve", cookie,
+                                      {"action": "approve", "code": code}))
+
+        t1 = threading.Thread(target=_do_post)
+        t2 = threading.Thread(target=_do_post)
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+        statuses = sorted(r[0] for r in results)
+        self.assertEqual(statuses, [200, 400])
+        loser = next(r for r in results if r[0] == 400)
+        self.assertTrue(
+            "no pending board write" in loser[1]["error"]
+            or "already running" in loser[1]["error"]
+            or "is not blocked on board_write" in loser[1]["error"],
+            loser[1]["error"])
 
 
 # ─── POST /projects/<name>/team/resolve (backlog item 6f part 1, docs/spec.md) ──

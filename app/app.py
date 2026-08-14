@@ -1767,6 +1767,19 @@ PAGE_TEMPLATE = """<!doctype html>
   .team-escalation-form textarea { font-size: 13px; padding: 8px 10px; border-radius: 8px;
                                     border: 1px solid #333; background: #1c1c1c; color: #eee;
                                     resize: vertical; min-height: 44px; font-family: inherit; }
+  /* Board-write proposal panel (backlog item 7 part 2, docs/design.md
+     "Escalation Panel: set_status/amend_description/append_comment Verb")
+     -- reuses .team-escalation's own wrapper/gap/padding above; only the
+     inner layout differs (verb summary + current/proposed comparison
+     blocks + buttons, no radio/checkbox form). */
+  .team-escalation-proposal { display: flex; flex-direction: column; gap: 8px; }
+  .team-escalation-proposal-summary { font-size: 13px; color: #eee; }
+  .team-escalation-proposal-label { font-size: 12px; color: #aaa; }
+  .team-escalation-proposal-box { font-size: 12px; color: #ccc; background: #0a0a0a;
+                                   border: 1px solid #333; border-radius: 6px; padding: 0.5em;
+                                   max-height: 200px; overflow-y: auto; font-family: monospace;
+                                   line-height: 1.2; width: 100%; resize: vertical; box-sizing: border-box; }
+  .team-escalation-proposal-note { font-size: 12px; color: #888; }
   .team-feed-toggle-row { margin-top: 2px; }
   .team-feed-toggle { color: #4da6ff; cursor: pointer; font-size: 12px;
                        background: none; border: none; padding: 0; text-decoration: underline; }
@@ -2175,6 +2188,15 @@ let teamFeedPolling = {};       // name -> bool, true while pollTeamFeed()'s own
 let teamInboxCache = {};        // run_id -> inbox response | 'pending' | null (fetch failed)
 let teamEscalationSelected = {}; // name -> Set<number> (indices into the cached inbox's own options[])
 let teamEscalationOther = {};   // name -> string, the free-text "Other" answer in progress
+// board_write escalation panel (backlog item 7 part 2, docs/spec.md §5) --
+// which action ("approve"/"reject") the operator just clicked, set by
+// doTeamBoardResolve() BEFORE toggle()'s first (optimistic, no-code) POST
+// fires and read back by actionBody()'s 'team-board-resolve' branch -- same
+// "small client-side map keyed by name, surviving a TOTP retry" pattern
+// teamEscalationOther already establishes above, so a 428-then-retry re-
+// reads the SAME action the operator originally clicked rather than
+// something sourced from the (possibly-already-gone) pendingToggle context.
+let teamBoardResolveAction = {};
 
 // Agent-identity colour palette (docs/design.md "ui-ux-pro-max choices") --
 // deliberately distinct from the four semantic status colors
@@ -2350,6 +2372,14 @@ function renderTeamStatusStrip(team) {
   }
   if (team.status === 'blocked') {
     if (team.waiting_on_you) {
+      // escalation_kind (backlog item 7 part 2, docs/spec.md §1 / docs/
+      // design.md "Status Strip: Board Write Pending Approval") -- same
+      // orange "blocked"/waiting-on-you visual weight either way, only the
+      // copy distinguishes a pending board-write proposal from an ask_user
+      // question, so the strip is legible without opening the panel below.
+      if (team.escalation_kind === 'board_write') {
+        return '<div class="team-status-strip status-blocked waiting-on-you">⚠ Board write pending approval' + idSuffix + '</div>';
+      }
       return '<div class="team-status-strip status-blocked waiting-on-you">⚠ Waiting on you' + idSuffix + '</div>';
     }
     return '<div class="team-status-strip status-blocked">Blocked — Max rounds reached' + idSuffix + '</div>';
@@ -2405,6 +2435,59 @@ function computeTeamResolveAnswer(name) {
   if (cached && cached.multi_select) return labels.join(', ');
   return labels[0] || '';
 }
+// Shared long-text truncation (docs/spec.md "Edge cases": "Very long
+// value/note/current_value.description text ... truncate/scroll, same
+// general long-text handling ... 200-char truncation with an ellipsis is
+// the existing precedent" -- teamFeedEventBody()'s own fact-check-match
+// rendering below). Used for the board-write panel's one-line proposal
+// summary and lead's note (docs/design.md recommends the longer
+// current/proposed description-or-comment BLOCKS instead rely on the
+// scrollable max-height box itself -- see .team-escalation-proposal-box).
+function truncateText(text, max) {
+  const s = text || '';
+  return s.length > max ? s.slice(0, max) + '…' : s;
+}
+// Verb-specific board-write proposal panel (backlog item 7 part 2, docs/
+// spec.md §5 / docs/design.md "Escalation Panel: set_status/
+// amend_description/append_comment Verb") -- fetched/cached the same way
+// renderEscalationPanel()'s ask_user branch already is (caller passes the
+// already-resolved `cached` inbox response); only the render step differs.
+function renderBoardWriteEscalationPanel(name, cached) {
+  const subject = cached.subject ? esc(cached.subject) : ('#' + esc(cached.ref));
+  const note = cached.note ? '<div class="team-escalation-proposal-note">Lead\\'s note: ' +
+    esc(truncateText(cached.note, 200)) + '</div>' : '';
+  let summary, blocks;
+  if (cached.verb === 'set_status') {
+    const cur = (cached.current_value && cached.current_value.status_name) || '(unknown)';
+    summary = 'Move <strong>' + subject + '</strong> from <strong>' + esc(cur) +
+      '</strong> to <strong>' + esc(cached.value || '') + '</strong>.';
+    blocks = '';
+  } else if (cached.verb === 'amend_description') {
+    summary = 'Replace <strong>' + subject + '</strong>\\'s description';
+    const curDesc = (cached.current_value && cached.current_value.description);
+    blocks =
+      '<div class="team-escalation-proposal-label">Current:</div>' +
+      '<textarea class="team-escalation-proposal-box" readonly rows="6">' +
+      esc(curDesc || '(description not available)') + '</textarea>' +
+      '<div class="team-escalation-proposal-label">Proposed:</div>' +
+      '<textarea class="team-escalation-proposal-box" readonly rows="6">' +
+      esc(cached.value || '(description not available)') + '</textarea>';
+  } else { // append_comment
+    summary = 'Add a comment to <strong>' + subject + '</strong>';
+    blocks =
+      '<div class="team-escalation-proposal-label">Comment text:</div>' +
+      '<textarea class="team-escalation-proposal-box" readonly rows="4">' +
+      esc(cached.value || '(comment not available)') + '</textarea>';
+  }
+  return '<div class="team-escalation" id="team-escalation-' + esc(name) + '">' +
+    '<div class="team-escalation-proposal">' +
+    '<div class="team-escalation-proposal-summary">' + summary + '</div>' +
+    blocks + note +
+    '<div class="team-actions">' +
+    '<button class="team-btn" onclick="doTeamBoardResolve(' + "'" + name + "'" + ", 'approve')" + '">Approve</button>' +
+    '<button class="team-btn" onclick="doTeamBoardResolve(' + "'" + name + "'" + ", 'reject')" + '">Reject</button>' +
+    '</div></div></div>';
+}
 function renderEscalationPanel(name, team) {
   if (!team.waiting_on_you) return '';
   const runId = team.run_id;
@@ -2424,10 +2507,15 @@ function renderEscalationPanel(name, team) {
     // A narrow race, not a fetch failure: this project's own last /status
     // snapshot still says waiting_on_you (team.waiting_on_you is a
     // moment-in-time read), but /team/inbox -- fetched a beat later --
-    // already reports no pending question (e.g. another tab/operator just
-    // answered it). The next 4s poll will pick up the resolved status.
-    return '<div class="team-escalation" id="team-escalation-' + esc(name) + '">' +
-      'This question was already answered.</div>';
+    // already reports no pending question/proposal (e.g. another tab/
+    // operator just resolved it). The next 4s poll will pick up the
+    // resolved status.
+    const already = team.escalation_kind === 'board_write' ?
+      'This proposal was already approved or rejected.' : 'This question was already answered.';
+    return '<div class="team-escalation" id="team-escalation-' + esc(name) + '">' + already + '</div>';
+  }
+  if (team.escalation_kind === 'board_write') {
+    return renderBoardWriteEscalationPanel(name, cached);
   }
   const selected = teamEscalationSelected[name] || new Set();
   const inputType = cached.multi_select ? 'checkbox' : 'radio';
@@ -2495,6 +2583,16 @@ function findNextLeadEvent(e, leadEvents) {
 function teamFeedEventKindClass(e, leadEvents, status) {
   const meta = e.meta || {};
   if (e.kind === 'error') return 'error';
+  // Board-write proposal/resolution (backlog item 7 part 2, docs/spec.md
+  // §6 / docs/design.md) -- checked BEFORE the generic 'tool_result' +
+  // meta.resolved -> 'resolved' branch below, since a board_write_resolved
+  // transcript entry's own meta ALSO sets meta.resolved: true (part 1,
+  // resolve_board_write()'s own transcript_entries -- see docs/spec.md
+  // "Background") on both approve and reject. meta.verb/meta.approved are
+  // never set on an ask_user transcript entry, so these two checks are
+  // strictly narrower and never widen what the existing checks below match.
+  if (e.kind === 'tool_use' && meta.verb !== undefined) return 'board-write-proposal';
+  if (e.kind === 'tool_result' && meta.approved !== undefined) return 'board-write-resolved';
   if (e.kind === 'tool_result' && meta.found !== undefined) return 'fact-check-result';
   if (e.kind === 'tool_result' && meta.resolved) return 'resolved';
   if (e.kind === 'handoff') return 'handoff';
@@ -2523,6 +2621,26 @@ function teamFeedEventKindClass(e, leadEvents, status) {
 function teamFeedEventBody(e, leadEvents, status) {
   const meta = e.meta || {};
   const cls = teamFeedEventKindClass(e, leadEvents, status);
+  if (cls === 'board-write-proposal') {
+    return 'board_write (' + esc(meta.verb || '') + '): ref #' + esc(meta.ref || '') + ' — ' + esc(e.text || '');
+  }
+  if (cls === 'board-write-resolved') {
+    // Parses resolve_board_write()'s own literal outcome_summary/
+    // full_result_text strings (docs/spec.md §6 -- "stable enough to
+    // branch on") rather than reusing the generic 'Answer: ' + text copy.
+    const text = e.text || '';
+    if (meta.approved === false) {
+      return '✕ Change rejected by human';
+    }
+    if (text.startsWith('approved and applied')) {
+      return '✓ Change approved and applied';
+    }
+    const failMatch = /^approved but Taiga rejected the write: (.*)$/.exec(text);
+    if (failMatch) {
+      return '⚠ Change approved but Taiga rejected the write: ' + esc(failMatch[1]);
+    }
+    return '✓ Change approved';
+  }
   if (cls === 'fact-check-claim') {
     return 'fact_check: ' + esc(e.text || '');
   }
@@ -2680,6 +2798,19 @@ function doTeamResolve(name) {
   }
   toggle('team-resolve', name, true, null);
 }
+// Board-write proposal approve/reject (backlog item 7 part 2, docs/spec.md
+// §5 / docs/design.md "Frontend: New doTeamBoardResolve() function") --
+// parallel to doTeamResolve() above, no free-text client-side validation
+// needed (resolve_board_write() takes no free text). teamBoardResolveAction
+// is set BEFORE toggle()'s first optimistic (no-code) POST fires, so
+// actionBody() can read it back on both that first attempt and any TOTP-
+// retry attempt via submitActionCode() -- see its own declaration comment.
+function doTeamBoardResolve(name, action) {
+  const msgEl = document.getElementById('team-msg-' + name);
+  if (msgEl) { msgEl.textContent = ''; msgEl.className = 'team-msg'; }
+  teamBoardResolveAction[name] = action;
+  toggle('team-board-resolve', name, true, null);
+}
 function teamRow(name, team) {
   const msgSlot = '<div class="team-msg" id="team-msg-' + esc(name) + '"></div>';
   if (!team || team.status === 'idle') {
@@ -2772,6 +2903,7 @@ function actionPath(kind, name, on) {
   if (kind === 'team-start') return '/projects/' + encodeURIComponent(name) + '/team/start';
   if (kind === 'team-stop') return '/projects/' + encodeURIComponent(name) + '/team/stop';
   if (kind === 'team-resolve') return '/projects/' + encodeURIComponent(name) + '/team/resolve';
+  if (kind === 'team-board-resolve') return '/projects/' + encodeURIComponent(name) + '/team/board-resolve';
   return '/instance/' + encodeURIComponent(name) + '/' + (on ? 'on' : 'off');
 }
 function actionBody(kind, name, on, code) {
@@ -2807,6 +2939,11 @@ function actionBody(kind, name, on, code) {
   // convention, also used by doTeamResolve()'s own client-side validation,
   // so the two can never diverge.
   if (kind === 'team-resolve') body.answer = computeTeamResolveAnswer(name);
+  // Board-write proposal approve/reject (backlog item 7 part 2, docs/
+  // spec.md §5) -- sourced from the client-side map doTeamBoardResolve()
+  // populates BEFORE dispatching, same "survives a TOTP retry" discipline
+  // team-start's own task/lead/members fields already rely on above.
+  if (kind === 'team-board-resolve') body.action = teamBoardResolveAction[name];
   return body;
 }
 async function performAction(kind, name, on, code) {
@@ -2839,6 +2976,7 @@ async function handleActionResult(r, ctx) {
       kind === 'team-start' ? 'Starting team: ' + (name || 'this') :
       kind === 'team-stop' ? 'Stopping team: ' + (name || 'this') :
       kind === 'team-resolve' ? 'Submitting answer: ' + (name || 'this') :
+      kind === 'team-board-resolve' ? 'Resolving board write: ' + (name || 'this') :
       (on ? 'Turning on: ' : 'Turning off: ') + (name || 'this');
     document.getElementById('action-code').value = '';
     document.getElementById('err-code').textContent = '';
@@ -2894,6 +3032,29 @@ async function handleActionResult(r, ctx) {
         delete teamEscalationOther[name];
       } else {
         msgEl.textContent = '✕ Error: ' + (data.error || 'could not submit answer');
+        msgEl.className = 'team-msg error';
+      }
+    }
+    return;
+  }
+  if (kind === 'team-board-resolve') {
+    // Its own inline result slot (docs/design.md "Frontend:
+    // handleActionResult() extension"), same pattern as team-resolve above
+    // -- handled before the generic 400 branch below for the same reason
+    // (a wrong-status/invalid-action/two-tab-race 400 belongs in THIS
+    // row's own team-msg slot, not the new-project error field).
+    hideCodeOverlay();
+    const data = await r.json().catch(() => ({}));
+    const msgEl = document.getElementById('team-msg-' + name);
+    if (msgEl) {
+      if (r.ok && data.ok) {
+        msgEl.textContent = '✓ Board write resolved';
+        msgEl.className = 'team-msg success';
+        const team = TEAM_BY_NAME[name];
+        if (team && team.run_id) delete teamInboxCache[team.run_id];
+        delete teamBoardResolveAction[name];
+      } else {
+        msgEl.textContent = '✕ Error: ' + (data.error || 'could not resolve board write');
         msgEl.className = 'team-msg error';
       }
     }
@@ -3989,6 +4150,7 @@ class Handler(BaseHTTPRequestHandler):
                 run = teams.latest_run_for_project(n)
                 team_status = ("idle" if run is None else
                               {"running": "running", "blocked_ask_user": "blocked",
+                               "blocked_board_write": "blocked",
                                "escalated_max_rounds": "blocked", "finished": "finished",
                                "error": "error", "stopped": "idle"}.get(run["status"], "idle"))
                 # Roster & composition UI (backlog item 6e, docs/spec.md) --
@@ -4043,9 +4205,21 @@ class Handler(BaseHTTPRequestHandler):
                 # inbox.json and nothing to resume (docs/spec.md "Open
                 # questions"), which stays under the coarser "blocked"
                 # team_status bucket above instead.
-                waiting_on_you = run is not None and run["status"] == "blocked_ask_user"
+                waiting_on_you = run is not None and run["status"] in (
+                    "blocked_ask_user", "blocked_board_write")
+                # escalation_kind (backlog item 7 part 2, docs/spec.md §1) --
+                # a direct string comparison against run["status"], already
+                # loaded above for team_status/waiting_on_you; distinguishes
+                # the two escalation kinds so the frontend can render
+                # different status-strip copy/panel without an extra round
+                # trip to GET .../team/inbox.
+                escalation_kind = (
+                    "ask_user" if run is not None and run["status"] == "blocked_ask_user" else
+                    "board_write" if run is not None and run["status"] == "blocked_board_write" else
+                    None)
                 inst["team"] = {"status": team_status, "run_id": run["run_id"] if run else None,
-                                "composition": composition, "waiting_on_you": waiting_on_you}
+                                "composition": composition, "waiting_on_you": waiting_on_you,
+                                "escalation_kind": escalation_kind}
                 sync_entry = gitea_sync_by_name.get(n)
                 if sync_entry is not None:
                     inst["gitea_sync"] = {"state": sync_entry.get("sync_state"),
@@ -4167,14 +4341,19 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_team_inbox(self, name: str, query: dict):
         """
         GET /projects/<name>/team/inbox (backlog item 6f part 1, docs/
-        spec.md §2) -- "is there a pending question right now", without the
-        caller having to scan the merged event feed for the latest
-        ask_user entry itself.
+        spec.md §2; extended by backlog item 7 part 2, docs/spec.md §2 for
+        the board_write branch below) -- "is there a pending question/
+        proposal right now", without the caller having to scan the merged
+        event feed for the latest ask_user/board_write entry itself.
         """
         state, err = self._team_events_run_and_ownership(name, query)
         if err is not None:
             return self._json(*err)
-        if state is None or state.get("status") != "blocked_ask_user":
+        if state is None:
+            return self._json({"pending": False})
+        if state.get("status") == "blocked_board_write":
+            return self._handle_team_inbox_board_write(state)
+        if state.get("status") != "blocked_ask_user":
             return self._json({"pending": False})
         run_id = state["run_id"]
         question = header = None
@@ -4198,6 +4377,61 @@ class Handler(BaseHTTPRequestHandler):
             header, options, multi_select = "", [], False
         self._json({"pending": True, "run_id": run_id, "question": question,
                    "header": header, "options": options, "multi_select": multi_select})
+
+    def _handle_team_inbox_board_write(self, state: dict):
+        """
+        The blocked_board_write branch of GET .../team/inbox (backlog item
+        7 part 2, docs/spec.md §2). Reads inbox.json's own board_write shape
+        (same fields resolve_board_write() itself reads) and adds a
+        best-effort, failure-tolerant "subject" enrichment via one
+        taiga_board.get_userstory() read -- current_value never carries the
+        card's title, only a status/description snapshot (docs/spec.md
+        "Background") -- so this is the one place that fetches it for
+        display. Never touches `version` and never affects approve/reject,
+        which stays fully functional even if this read fails.
+        """
+        run_id = state["run_id"]
+        verb = ref = value = note = proposed_at = None
+        current_value = {}
+        try:
+            with open(teams._inbox_path(run_id)) as f:
+                inbox = json.load(f)
+            verb = inbox.get("verb")
+            ref = inbox.get("ref")
+            value = inbox.get("value")
+            note = inbox.get("note")
+            current_value = inbox.get("current_value") or {}
+            proposed_at = inbox.get("proposed_at")
+        except (OSError, ValueError):
+            verb = None
+        if verb is None:
+            # inbox.json missing/unreadable/malformed despite status ==
+            # "blocked_board_write" (docs/spec.md "Edge cases") -- still
+            # "pending": true, with a safe fallback note the panel can
+            # render without crashing; approve/reject still work blind via
+            # the CLI's own team-board-resolve in this rare case.
+            self._json({
+                "pending": True, "run_id": run_id, "kind": "board_write",
+                "verb": None, "ref": None, "value": None,
+                "note": ("The team is waiting on a board-write approval, but the details could "
+                         "not be read -- check `tmux attach` or use the CLI's "
+                         "`team-board-resolve` to approve/reject blind."),
+                "current_value": {}, "proposed_at": None})
+            return
+        payload = {"pending": True, "run_id": run_id, "kind": "board_write",
+                  "verb": verb, "ref": ref, "value": value, "note": note,
+                  "current_value": current_value, "proposed_at": proposed_at}
+        try:
+            base_url, token, project_id = teams.taiga_board.resolve_session()
+            userstory = teams.taiga_board.get_userstory(base_url, token, project_id, ref)
+            payload["subject"] = userstory.get("subject") or None
+        except teams.taiga_board.TaigaPushError:
+            # Best-effort/read-only (docs/spec.md §2, "Edge cases": "Taiga
+            # unreachable") -- every inbox.json-sourced field above is still
+            # returned, "subject" is simply omitted, Approve/Reject remain
+            # fully functional.
+            pass
+        self._json(payload)
 
     def do_POST(self):
         if self.path == "/login":
@@ -4361,7 +4595,15 @@ class Handler(BaseHTTPRequestHandler):
             if name not in instance_names():
                 return self._json({"error": "unknown project"}, 404)
             run = teams.latest_run_for_project(name)
-            if run is None or run["status"] not in ("running", "blocked_ask_user"):
+            # "blocked_board_write" added (backlog item 7 part 2, docs/
+            # spec.md §4) -- previously this tuple only named
+            # "blocked_ask_user", so a run blocked on a pending board-write
+            # proposal fell into the early-return "no team currently
+            # running" branch below and Stop silently did nothing (disclosed
+            # gap, docs/implementation.md "Known limitations"). stop_team()
+            # itself already handles any non-terminal status generically, so
+            # this one-tuple extension is the entire fix.
+            if run is None or run["status"] not in ("running", "blocked_ask_user", "blocked_board_write"):
                 return self._json({"ok": True, "message": "no team currently running for this project"})
             entry = _team_threads_get(name)
             if entry is not None and entry.get("run_id") == run["run_id"]:
@@ -4417,6 +4659,55 @@ class Handler(BaseHTTPRequestHandler):
             # cheap to assert rather than trust, turning an already-
             # impossible race into a clear error instead of two threads
             # driving one run.
+            if _team_threads_get(name) is not None:
+                return self._json({"error": "a team thread is already running for this project"}, 400)
+            cancel_event = threading.Event()
+            t = threading.Thread(target=_run_team_in_background,
+                                 args=(name, run_id, cancel_event), daemon=True)
+            _team_threads_set(name, {"run_id": run_id, "thread": t, "cancel_event": cancel_event})
+            t.start()
+            self._json({"ok": True, "run_id": run_id})
+        elif (parts[0] == "projects" and len(parts) == 4 and parts[2] == "team"
+              and parts[3] == "board-resolve"):
+            # Board-write proposal approve/reject (backlog item 7 part 2,
+            # docs/spec.md §3) -- a NEW, dedicated route (not an overload of
+            # POST .../team/resolve above): resolve_board_write()'s own
+            # input shape (run_id + action enum, no free text) differs
+            # enough from resolve_ask_user()'s (run_id + free-text answer)
+            # that branching one route on two body shapes wasn't worth it.
+            # Mirrors the CLI's own team-board-resolve naming exactly.
+            # Reached through the same shared TOTP gate above -- no new
+            # gating code, same as /team/start|stop|resolve.
+            name = parts[1]
+            if name not in instance_names():
+                return self._json({"error": "unknown project"}, 404)
+            run_id = (body.get("run_id") or "").strip() or None
+            if run_id:
+                # docs/BACKLOG.md item 11(b): same validation, same intake-
+                # point placement, as /team/resolve above.
+                if not teams._RUN_ID_RE.match(run_id):
+                    return self._json({"error": "no run found for this project"}, 400)
+                try:
+                    state = teams._load_state(run_id)
+                except (OSError, ValueError):
+                    return self._json({"error": "no run found for this project"}, 400)
+                if state.get("project_name") != name:
+                    return self._json({"error": "this run belongs to a different project"}, 400)
+            else:
+                state = teams.latest_run_for_project(name)
+                if state is None:
+                    return self._json({"error": "no run found for this project"}, 400)
+                run_id = state["run_id"]
+            if state.get("status") != "blocked_board_write":
+                return self._json({"error": "no pending board write for this project"}, 400)
+            action = body.get("action")
+            if action not in ("approve", "reject"):
+                return self._json({"error": "action must be 'approve' or 'reject'"}, 400)
+            result = teams.resolve_board_write(run_id, action)
+            if not result["ok"]:
+                return self._json({"error": result["error"]}, 400)
+            # Same defensive, should-be-unreachable check /team/resolve
+            # already has above -- cheap to keep consistent.
             if _team_threads_get(name) is not None:
                 return self._json({"error": "a team thread is already running for this project"}, 400)
             cancel_event = threading.Event()
