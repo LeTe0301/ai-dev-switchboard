@@ -850,12 +850,39 @@ own Gitea, talk to that host's own API instead."
   this remote-fetch capability to read the diff/comments) and item 16
   (a project cloned from an arbitrary URL is the primary case this
   applies to).
-- **Scope decision to put to the user before building:** should
-  read-write actions (posting a comment, per item 8) ever be allowed
-  against a project's *external* origin the same way they're allowed
-  against the switchboard's own Gitea, or does touching someone else's
-  GitHub repo warrant an extra confirmation step given it's not
-  infrastructure this switchboard operator fully controls?
+
+**Scope decision — settled (2026-08-14, asked directly this session):**
+read-write actions against a project's external origin (e.g. posting a
+comment on a real GitHub PR) are allowed the SAME WAY they're already
+allowed against the switchboard's own local Gitea — no extra confirmation
+gate. This resolves the open scope question above; item 8's own
+comment-only, non-blocking write verb (posting a PR review as a comment)
+extends to GitHub unchanged once this item's GitHub client exists — no
+separate propose-then-approve step (that pattern belongs to item 7's board
+writes specifically, a different write target with its own settled
+reasoning, not a general policy this item needed to re-litigate).
+
+**Status: part 1 speced (2026-08-14), not yet built.** Given the size (new
+external API integration + auth + rate-limiting + host-detection + item 8
+integration spans what would otherwise be one oversized cycle), this item
+is split the same way items 6d/19/2c were — **part 1** (this session's
+buildable `docs/spec.md`): unprivileged per-project origin detection
+(`git remote get-url origin` + loopback-vs-`github.com`-vs-other host
+classification, no new privilege boundary needed) plus a GitHub REST API
+client (`_github_api`/`_github_api_raw`, mirroring `_gitea_api`'s own
+contract) covering list-open-PRs/PR-diff/list-branches/post-PR-comment,
+real concrete rate-limit handling (a global in-memory cooldown gate driven
+by `X-RateLimit-Remaining`/`X-RateLimit-Reset`/`Retry-After`), and a real
+(not deferred) polling-vs-webhook decision: **polling, no webhook** — the
+original no-webhook reasoning (2c part 1, reaffirmed by item 8) was never
+about implementation convenience, it was "no new inbound listener," which
+applies at least as strongly to a GitHub webhook (a genuinely
+internet-facing endpoint, not a LAN-local Gitea container) as it did to
+the original proposal. Part 1 deliberately ships no poll-loop wiring, no
+UI, and no item 8 integration — those, plus `GITHUB_POLL_INTERVAL_SECONDS`
+and the host-agnostic dispatch layer for item 8's
+`_ai_reviewer_poll_repo()`, are **part 2**, to be speced once part 1 has
+shipped and been reviewed.
 
 ---
 
@@ -1022,3 +1049,51 @@ pairings in `app/app.py` have the same undetected drift — a quick
 contrast audit of the page's full CSS palette might be worth doing in the
 same pass rather than fixing `.team-btn` in isolation and finding a third
 instance later.
+
+---
+
+## 21. Spawn an arbitrary number of AI instances per project via a "+" button
+
+**Added 2026-08-14**, user-requested: "add to backlog that it should be
+possible to spawn any amount of ai instances via a plus button in the
+repos."
+
+**Context — what exists today:** a project currently runs at most one
+engine session at a time (`app/app.py`'s `_session_urls` is keyed by
+project name — one tmux session, one engine, one hosted URL per project;
+item 6's own backlog text flags this exact single-engine assumption).
+Item 6's team feature generalizes this to N tmux **windows** inside one
+team session, but the roster/composition is picked once at team-start
+time and is otherwise fixed for that run's lifetime — there is no "add
+one more" control today, only start-with-a-fixed-roster or stop-the-whole-
+team. Item 19 added the ability to interject a message into an already-
+running team, but not to grow the team itself mid-run.
+
+**Not yet scoped — the request is genuinely ambiguous between two
+different shapes, and picking the right one is a real product-manager
+judgment call for a future session, not something to guess at here:**
+1. **Grow a running team**: a "+" button on an already-started team adds
+   one more teammate engine to the live roster (a new tmux window, a new
+   `agent_run()` participant the lead can `delegate` to) — extends item
+   6/6c's roster machinery rather than replacing it.
+2. **Independent parallel instances, no team framework**: a "+" button
+   spins up additional free-standing, non-team engine sessions against
+   the same project working copy (or separate worktrees, following item
+   6's own worktree-per-agent precedent) — each one a human drives
+   directly, no lead, no delegation, closer to "open another terminal
+   tab" than to growing a team.
+
+**Open questions for whichever shape is picked:**
+- If (1): does the lead need to be told a new teammate just joined
+  mid-round, and does that reuse item 19 part 1's `human.jsonl`-style
+  drain-at-round-boundary delivery mechanism, or does it need its own
+  path?
+- If (2): does each spawned instance get its own git worktree (avoiding
+  concurrent-write conflicts on the same checkout, per item 6's existing
+  per-agent-worktree precedent) or share the project's single working
+  copy?
+- Either way: any real ceiling on "any amount" — host resource limits
+  (CPU/RAM per tmux pane, concurrent engine processes) probably need a
+  configured cap, not literally unbounded spawning from a single button.
+- UI: where does the "+" live — on the existing Teams page, the plain
+  per-project row, or both, depending on which shape (1 vs 2) is chosen?
