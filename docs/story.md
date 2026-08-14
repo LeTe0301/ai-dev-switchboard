@@ -644,8 +644,48 @@ comparable in size/risk to 6b (grounding) or 6d part 1 (backend-only,
 CLI/route-testable); folding a new multi-file tailing/cursor protocol
 *and* a brand-new page's worth of frontend into one dispatch is exactly
 the "DB-migration-plus-several-screens" shape the product-manager's own
-load-balanced-decomposition skill exists to catch. `docs/spec.md` currently
-holds part 1 only; part 2 gets its own spec once part 1 is reviewer-approved.
+load-balanced-decomposition skill exists to catch.
+
+**Part 1 status: done** (reviewer-approved after two fix-and-reapprove
+rounds, commit `378f47c`). Added `GET .../team/events` (cursor-based,
+per-file byte-capped, merges `transcript.jsonl` + each teammate's own
+`agents/<agent>.jsonl`), `GET .../team/inbox`, `POST .../team/resolve`
+(now backed by a shared, race-hardened `teams.resolve_ask_user()`), and
+the additive `waiting_on_you` field on `/status`. 762+ tests green. Full
+spec/implementation/test-review for part 1 preserved in git history at
+commit `07b3052` (spec) and the current `docs/implementation.md` (both the
+original cycle and the round-2 fix are recorded there under their own
+headings). Two non-blocking follow-ups recorded as `docs/BACKLOG.md` item
+11:
+
+- **Stale transcript entry on a losing concurrent resolve** (item 11(a)):
+  `resolve_ask_user()` wrote its `ask_user_resolved` transcript entry
+  before deciding win/lose, so a losing double-submit left a permanent,
+  misleading `tool_result` entry in `transcript.jsonl` — directly visible
+  via the new events feed part 2's UI renders. **Pulled forward and fixed
+  as a small prerequisite, 6f part 1b** (product-manager's call,
+  2026-08-14): see `docs/spec.md`/build cycle below, sequenced before part
+  2 so the UI never has to design around a known, already-diagnosed
+  artifact rather than just fixing the five-line race.
+- **`run_id` not validated against path traversal** on the three new
+  routes (item 11(b)): real project data stays gated by the existing
+  `project_name` check, judged narrow rather than blocking. Left in the
+  backlog, not pulled forward — unrelated to part 2's UI, a server-side
+  hardening item for a future cycle.
+
+**Part 1b — fix the stale-transcript race (item 11(a))**, its own small
+bugfix cycle sequenced between part 1 and part 2: `docs/spec.md` currently
+holds this cycle's spec. Single-function fix in
+`teams.resolve_ask_user()` (reorder `_append_history()` to after the
+`os.replace()` win/lose decision), skips ux-designer (no UI surface,
+same as part 1), reuses the deterministic hook-based repro technique
+already established in `tests/test_team_routes.py`
+(`test_loser_whose_exists_check_lands_after_winner_already_renamed_does_not_report_ok`).
+Part 2 (the Teams page itself) gets its own spec once part 1b is
+reviewer-approved -- the archaeology for it (single-page-app structure,
+exact route contracts, where in `teamRow()` the feed belongs) is already
+captured in this spec's own "Note for the next product-manager iteration"
+section, so that pass should reuse it rather than re-deriving it.
 
 ---
 

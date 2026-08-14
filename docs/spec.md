@@ -1,502 +1,261 @@
-# Spec: Overwatch feed + escalation inbox — part 1: backend API (sub-spec 6f part 1)
+# Spec: 6f part 1b — losing concurrent `/team/resolve` call must not leave a stale transcript entry
 
 ## Summary
-Add the three read/write HTTP endpoints and one additive `/status` field
-that a future overwatch-feed UI (part 2) needs: a bounded, cursor-based
-"give me new events since last time" route merging a run's lead transcript
-and every teammate's own event log into one chronological stream; a
-lightweight "is there a pending question right now" route; and a route that
-answers a blocked `ask_user` and resumes the lead loop off-thread. No
-HTML/CSS/JS in this cycle — see `docs/story.md` §6f for why it's split.
+`teams.resolve_ask_user()` writes its `ask_user_resolved` transcript entry to
+`transcript.jsonl` *before* deciding whether this caller actually won the
+race to resolve the pending question, so a **losing** concurrent resolve
+(two tabs, a double-submit) permanently leaves a spurious `tool_result`
+entry in the run's transcript even though its answer was never accepted —
+fix it by moving that write to after the win/lose decision, so only the
+winner's answer is ever recorded.
 
 ## Goals
-- `GET /projects/<name>/team/events` returns every normalized §4.1 event
-  (`docs/story.md` §4.1) written so far for a project's team run — merged
-  across the lead's own `transcript.jsonl` and each teammate's
-  `agents/<agent>.jsonl` — in chronological order, and on a follow-up call
-  with the previous response's cursors, returns *only* newly-appended
-  events, never re-reading a file from its start.
-- Each file's per-poll read is capped in bytes so a long-running, chatty
-  team's feed stays responsive — never a whole-file read on every poll.
-- `GET /projects/<name>/team/inbox` reports whether the project's current
-  run is blocked on `ask_user` and, if so, the exact structured question
-  (§4.5 shape: question/header/options/multi_select) a UI needs to render
-  it — without the caller having to scan the merged event feed for the
-  latest `ask_user` entry itself.
-- `POST /projects/<name>/team/resolve` answers a pending `ask_user` (free
-  text — the same field a UI's "Other" input and its option buttons both
-  ultimately submit) and resumes the lead loop on a background thread,
-  mirroring `/team/start`'s existing non-blocking discipline: the HTTP
-  response returns immediately, the run continues in the background.
-- `GET /status`'s per-project `team` object gains one new field,
-  `waiting_on_you: bool` — true iff that project's latest run is exactly
-  `blocked_ask_user` — so a future status strip can distinguish "needs your
-  answer, resolvable" from "blocked" (`escalated_max_rounds`, terminal, no
-  inbox to answer). Additive only; every existing `/status` field and value
-  is byte-for-byte unchanged.
-- `_cli_team_resolve`'s existing resolve-and-append logic is extracted into
-  one shared `teams.py` function both the CLI and the new route call —
-  not duplicated — so the two entry points can never drift.
+- `resolve_ask_user()` only calls `_append_history()` (and therefore only
+  writes to `transcript.jsonl` / `state["history"]`) for the call that
+  actually wins the race to resolve a pending `ask_user`.
+- A losing call's behavior is otherwise unchanged: it still returns
+  `{"ok": False, "error": "..."}` with the same three possible reason
+  strings the route/CLI already handle, and it still never touches or
+  persists `state`.
+- Close this before 6f part 2 (Teams page UI) starts, so the merged event
+  feed that part 2 renders never has to special-case a known-buggy,
+  misleading artifact — it can trust that every `ask_user_resolved` entry
+  in the transcript was actually accepted.
 
 ## Non-goals
-- No HTML/CSS/JS, no `docs/design.md` section, no ux-designer step. This
-  cycle has no user-visible surface at all — it ships an API contract for
-  part 2 to build against. (Same precedent as 6d part 1, which also had no
-  design.md section — see `docs/design.md`'s first heading, "sub-spec 6d
-  part 2a", i.e. part 1 never got one.)
-- No merged-timeline rendering, colour-coding, per-agent filter UI, status
-  strip UI, or escalation panel UI. That is 6f part 2, next in the story,
-  built once this part's routes exist and are reviewer-approved.
-- No change to the lead loop, its four tools, or any adapter tier (6c,
-  unchanged) — `POST /team/resolve` only appends the human's answer and
-  flips `status` back to `running`; the lead sees the answer in its next
-  round's context exactly the way `_cli_team_resolve` already makes it see
-  one today, unchanged.
-- No change to grounding, roster, or the composition picker (6b/6e,
-  unchanged).
-- No websocket/SSE push. `/status` itself has always been polled, not
-  pushed (4-second interval, `docs/design.md`'s existing "Status is polled,
-  can be stale" note) — the new events/inbox routes are designed to be
-  polled by part 2's frontend the same way, not a new transport.
-- No general "browse any past run for this project" history UI. `run_id`
-  is accepted as an *optional* override on the events/inbox routes solely
-  to cover one specific edge case (an already-open tab keeps watching an
-  older, now-finished run's history after a newer run starts for the same
-  project) — not as a general run-picker. A real history browser is future
-  work if the user wants one later.
-- No retention/pruning of old run directories. Reading an arbitrarily-old
-  finished run's full event history is in scope (reload rehydration);
-  deleting it is `sweep_dead_teams()`'s existing, unchanged scope.
-- No change to `install.sh`, `engines.d/*.engine`, or any config file
-  format beyond two new `TEAM_*` env vars (see "Affected areas"). The
-  `set_env()` sed-escaping bug (`docs/BACKLOG.md` item 10) is **not**
-  touched here — this cycle never calls `install.sh`'s `set_env()`, and the
-  bug's trigger surface (`--with-ollama`/`--with-deploy-target`-style
-  operator-supplied values written by `install.sh`) is unrelated to this
-  spec's config additions, which are plain `switchboard.env.example`
-  entries with programmer-chosen defaults, never operator input threaded
-  through `sed`. Stays parked in the backlog.
+- Backlog item 11(b) (`run_id` not validated against path traversal on the
+  three `team/*` routes). Unrelated to this bug (it's an input-validation
+  gap, not a race), doesn't affect the UI part 2 is about to build, and
+  stays in `docs/BACKLOG.md` item 11 for a future cycle.
+- Adding a lock/mutex around `resolve_ask_user()`. `docs/spec.md`'s prior
+  (6f part 1) "Edge cases" section already accepts "the first to persist
+  wins, not lock-guarded" as the deliberate design — this fix doesn't
+  relitigate that, it only makes sure the *loser* of that already-accepted
+  race never has an observable side effect.
+- Any change to `_write_inbox()`, `os.replace()`'s own role as the sole
+  win/lose arbiter (already fixed in the prior round-2 fix, see
+  `docs/implementation.md`'s "reviewer fix round" section), or the route
+  layer (`app/app.py`'s `POST .../team/resolve` handler). This is a
+  single-function, single-file fix.
 
 ## Background / current state
-- **Every event source this route needs already exists and is already
-  normalized.** `agent_run()`'s `_Tailer` (`app/teams.py:630-768`) writes
-  one `{ts, agent, seq, kind, text, meta}` envelope per line
-  (`docs/story.md` §4.1) to each teammate's stable log path,
-  `_agent_log_path(run_id, agent)` = `<run_dir>/agents/<agent>.jsonl`
-  (`app/teams.py:3111`). The lead's own actions are logged the same way by
-  `_append_transcript()` (`app/teams.py:2496-2506`) to
-  `_transcript_path(run_id)` = `<run_dir>/transcript.jsonl`
-  (`app/teams.py:2436`), `agent` always `"lead"`. Nothing merges these
-  files today — nothing web-facing reads them at all.
-- **A run's own member list is already in its persisted state.**
-  `_load_state(run_id)` (`app/teams.py:2483`) returns `state["members"]`
-  (list of agent names) and `state["lead"]` — exactly the set of log files
-  to merge for that specific run, not the live roster (a run started
-  earlier keeps its own composition even if `engines.d` changes later).
-- **`latest_run_for_project(project_name)`** (`app/teams.py:3497-3533`)
-  already finds a project's most-recently-updated run by scanning
-  `_leads_root()` and matching `state["project_name"]`; used unchanged as
-  the "no explicit `run_id` given" default for both new GET routes.
-- **The inbox is already written and already has the exact §4.5 shape.**
-  `_write_inbox()` (`app/teams.py:2521-2537`) persists
-  `{question, header, options, multi_select}` to `_inbox_path(run_id)`
-  whenever `team_step()` executes `ask_user` (line 2794) or
-  `_force_ask_user()` escalates on a malformed-retry-budget exhaustion
-  (line 2568); resolved inboxes move to `_inbox_resolved_path(run_id)`.
-- **The resolve-and-resume logic already exists, CLI-only.**
-  `_cli_team_resolve()` (`app/teams.py:3788-3809`) loads state, rejects if
-  `status != "blocked_ask_user"`, appends an `ask_user_resolved` history
-  entry, moves `inbox.json` → `inbox.resolved.json`, sets
-  `status = "running"`, persists, then calls `_drive_and_report(state)`
-  (line 3716) — which blocks the CLI process in the foreground driving
-  `team_run()` to completion. There is no non-blocking equivalent and no
-  HTTP route.
-- **The non-blocking "start work, return fast, keep going on a daemon
-  thread" pattern already exists** for exactly this shape of problem.
-  `POST /team/start` (`app/app.py:3673-3724`) calls `launch_team()`
-  synchronously (fast — no LLM call, just worktree/tmux setup), then spawns
-  `_run_team_in_background(name, run_id, cancel_event)`
-  (`app/app.py:1354-1385`) on a daemon `threading.Thread`, registers it via
-  `_team_threads_set(name, {...})` (line 1321), and returns immediately.
-  `_run_team_in_background()` itself is already generic — it loads a fresh
-  state by `run_id` and calls `teams.team_run(state, cancel_event=...)` —
-  so it needs **no change** to also drive a *resumed* run; `team_run()`'s
-  own `while state["status"] == "running"` loop (`app/teams.py:2849`) picks
-  up wherever the freshly-persisted state says to.
-  `team_run()`'s loop **exits and the thread self-terminates** (via
-  `_team_threads_pop_if_owned()`, line 1331) the moment `team_step()` sets
-  `status` to `blocked_ask_user` — so by the time a human answers, there is
-  no live thread for that project; resolving must spawn a **new** thread,
-  it cannot resume an old one.
-- **`GET /projects/<name>/team/grounding`** (`app/app.py:3552-3567`) is the
-  existing precedent for a small, read-only, project-scoped GET route
-  needing only `_authed()` (no TOTP) — the new `events`/`inbox` routes
-  follow the identical gating and `parts = [...]` routing style.
-- **TOTP gating is structural, not per-route.** Every POST route reaches
-  its own `elif parts[0] == ...` branch (`app/app.py:3607` onward) only
-  after the shared `session_totp_ok(sid)` check just above it
-  (`app/app.py:3599-3605`) — `POST /team/resolve` inherits this for free,
-  the same way `/team/start`/`/team/stop` already do; no new gating code.
-- **A reusable byte-offset incremental-read precedent already exists**,
-  though CLI-only and not directly reusable as-is: `_tail_log_once()`
-  (`app/teams.py:3643-3653`) seeks to a byte offset, reads to EOF, and
-  processes only complete lines (via `splitlines()`, which silently drops
-  any trailing partial line — fine for its own use, printing to stderr on a
-  0.2s loop, but this spec's own bound-per-poll and don't-lose-a-partial-
-  line requirements need a stricter version — see "Proposed approach").
-- **Existing test infrastructure to build on:** `tests/test_team_routes.py`
-  already has a reusable `_RealHTTPTeamTestCase` base class
-  (line 224) that spins up a real `ThreadingHTTPServer` instance and
-  authenticates a real session — the natural home for this cycle's new
-  route tests (a new test class per route, following the file's existing
-  one-class-per-route-or-concern convention: `TeamStartEndpointTests`,
-  `TeamStopEndpointTests`, `TeamGroundingEndpointTests`, etc.).
+`app/teams.py`'s `resolve_ask_user(run_id, answer)` (currently ~line
+3752-3834) is the shared function `POST /team/resolve` (`app/app.py`
+~line 3902) and the CLI's `_cli_team_resolve()` both call. Its current
+order of operations:
+
+1. `state = _load_state(run_id)` (reload fresh from disk — never trusts a
+   caller-supplied state, by design).
+2. If `state["status"] != "blocked_ask_user"`, return `{"ok": False, ...}`
+   immediately (no write at all — this early-exit case is already correct
+   and out of scope for this fix).
+3. **`_append_history(state, round_n, tool="ask_user_resolved", ...,
+   transcript_entries=[("tool_result", answer, {"resolved": True})])`**
+   — this is the bug. `_append_history()` (line 2533) does two things
+   unconditionally: appends to `state["history"]` (in-memory only, at this
+   point) **and** calls `_append_transcript()` (line 2520), which opens
+   `transcript.jsonl` in append mode and writes the entry to disk
+   immediately, synchronously, with no rollback path.
+4. `inbox_path = _inbox_path(run_id)`; `try: os.replace(inbox_path,
+   _inbox_resolved_path(run_id))` — this is the actual win/lose decision
+   point. The winner's `os.replace()` succeeds; a loser's raises
+   `FileNotFoundError` (its target was already renamed away) and is caught,
+   returning `{"ok": False, "error": "... is not blocked on ask_user
+   (status=...)"}`.
+5. Only on the winning path: `state["status"] = "running"; _persist(state)`.
+
+Because step 3 runs *before* step 4's decision, a losing call's in-memory
+`state["history"]` mutation is correctly discarded (step 5 never runs for
+it, so `_persist()` never writes it) — but its `_append_transcript()` call
+in step 3 already hit disk in step 3, unconditionally, and there is no
+corresponding cleanup on the loss path. Confirmed by reading
+`_append_history()`/`_append_transcript()` directly (`app/teams.py:2520-
+2542`): `_append_transcript()` has no caller-visible "undo" and is called
+synchronously inside step 3, strictly before step 4 ever runs.
+
+This is `docs/BACKLOG.md` item 11's first bullet ("Stale transcript
+entry"), found by the 6f part 1 reviewer and recorded as non-blocking at
+the time (it doesn't affect the lead's own decision-making, which reads
+`state["history"]`, not the transcript file) but flagged as something that
+*would* affect 6f part 2's UI, which renders `transcript.jsonl` verbatim
+through `GET .../team/events`. Reviewed now, before part 2 is spec'd, per
+that item's own note and the product-manager's explicit call this
+iteration: fix it as a small prerequisite rather than have the UI design
+around a known, already-diagnosed, cheaply-fixable bug.
+
+**Precedent for the exact repro technique to reuse**: this is the *second*
+race found in this same function this story (see
+`docs/implementation.md`'s "reviewer fix round" section for the first,
+the `os.path.exists()` check-then-act race). Both the deterministic
+one-shot-hook repro (`tests/test_team_routes.py`
+`test_loser_whose_exists_check_lands_after_winner_already_renamed_does_not_report_ok`,
+line 1202) and the genuine two-thread repro (`test_two_concurrent_resolves_
+exactly_one_succeeds`, line 1160) are directly reusable patterns — this fix
+needs the same hook-based deterministic technique, just asserting a
+different final condition (transcript line count / content, not
+`state["history"]` content).
 
 ## Proposed approach
+In `app/teams.py`'s `resolve_ask_user()`, reorder so the history/transcript
+write only happens after `os.replace()` has already succeeded:
 
-### 1. `GET /projects/<name>/team/events`
-Query params (all optional): `run_id` (defaults to
-`latest_run_for_project(name)`), `cursor` (URL-encoded JSON object,
-`{"<agent>": <byte_offset>, ...}`, defaults to `{}` meaning "from the
-start"). Routed via `urllib.parse.urlsplit(self.path)` (the existing
-precedent for a GET/POST route that carries a query string is
-`/projects/upload`, `app/app.py:3585-3587` — extended here to a GET route
-for the first time) plus `urllib.parse.parse_qs` (existing precedent:
-`app/app.py:3351`, TOTP `?code=` parsing).
+1. Keep steps 1-2 (load, status check) exactly as they are.
+2. Move the `round_n = len(state["history"]) + 1` computation and the
+   `_append_history(...)` call to **after** the `try: os.replace(...)
+   except OSError: ...` block succeeds, and **before** `state["status"] =
+   "running"`. Concretely: the loss path (the `except OSError:` branch)
+   returns exactly as it does today, without ever calling
+   `_append_history()`; the win path now runs `_append_history()` then
+   `state["status"] = "running"` then `_persist(state)`, in that order, all
+   after `os.replace()` has already returned without raising.
+3. No change to `_append_history()`'s or `_append_transcript()`'s own
+   signature or behavior — this is purely a call-site reordering within
+   `resolve_ask_user()`.
+4. Extend `resolve_ask_user()`'s docstring with a short paragraph
+   documenting this fix, matching the style of the two paragraphs already
+   there for the prior two races in this function (append, don't rewrite
+   the existing two).
 
-- No run ever started for this project (`latest_run_for_project()` returns
-  `None` and no explicit `run_id` given): `200 {"run_id": null, "events":
-  [], "cursors": {}}` — not an error; a freshly-created project's Teams
-  panel must render an empty state cleanly.
-- Explicit `run_id` given: load via a new small helper,
-  `teams.load_state_for_project(run_id, project_name)`, that calls
-  `_load_state(run_id)` and returns `None` (route replies `404`) if the
-  run doesn't exist *or* `state["project_name"] != project_name` — an
-  ownership boundary, same discipline every other per-project route already
-  applies via `instance_names()` membership checks, extended here to
-  prevent one project's operator from reading another project's run data
-  by guessing/incrementing a `run_id`.
-- For the resolved run, the set of files to merge is `["lead"] +
-  state["members"]`, mapped to `_transcript_path(run_id)` (for `"lead"`)
-  and `_agent_log_path(run_id, agent)` (for each teammate) respectively. A
-  file that doesn't exist yet (a teammate never delegated to) is treated as
-  present-but-empty, offset 0 — not an error.
-- New function `teams.tail_jsonl_events(path, offset, max_bytes)` (a
-  stricter cousin of `_tail_log_once()`, see "Background") →
-  `(events: list[dict], new_offset: int, truncated: bool)`:
-  - Seeks to `offset`, reads at most `max_bytes + 1` bytes past it (the
-    `+1` only to detect "there was more" for the `truncated` flag).
-  - Splits on `b"\n"`; the **last** element (a possibly-partial trailing
-    line) is *never* included in this call's events *and* the returned
-    `new_offset` is walked back to just after the last complete `\n` seen
-    — the same "hold a partial line across polls" discipline `_Tailer`
-    already uses (`app/teams.py:676-679`), so a line split exactly at the
-    byte cap is never parsed truncated and is picked up whole next poll.
-  - Each complete line is `json.loads()`'d; a line that fails to parse (or
-    parses to a non-dict) becomes one synthetic `{"kind": "error", "text":
-    "malformed line in <agent>'s log (json.loads failed)", "meta":
-    {"raw_bytes": len(line)}, ...}` event — mirrors `_Tailer._handle_line`'s
-    own malformed-line discipline (`app/teams.py:691-698`) — never raises,
-    never drops the rest of the poll.
-  - `truncated=True` iff more complete-line data remained beyond
-    `max_bytes` after this call's own read; `new_offset` in that case still
-    lands on a clean line boundary (never mid-line), so the *next* poll
-    with the returned cursor picks up exactly where this one stopped, byte-
-    for-byte, no gap and no duplicate.
-- The route calls this once per file with
-  `TEAM_EVENTS_MAX_BYTES_PER_FILE_PER_POLL` as `max_bytes`, merges every
-  returned event across all files, sorts by `(ts, agent, seq)` (`ts` is a
-  fixed-format ISO-8601 string, lexicographically sortable;
-  `agent`+`seq` is the tie-break for same-second events from different
-  agents), and returns:
-  ```json
-  {"run_id": "<id>", "events": [ {...envelope...}, ... ],
-   "cursors": {"lead": 1234, "claude": 5678, ...},
-   "truncated": {"claude": true}}
-  ```
-  `cursors` always includes every file's *new* offset (even ones with zero
-  new events, so a client's cursor map stays complete across polls without
-  it having to merge partial responses itself). `truncated` only lists
-  agents that hit the per-file cap this call (omitted/empty otherwise) — a
-  client polling immediately again drains the rest.
-- A malformed `cursor` query value (not valid JSON, not an object, an
-  offset that isn't a non-negative int) is treated as `{}` (start from
-  the beginning) rather than a `400` — a stale/hand-crafted cursor should
-  degrade to "re-fetch everything", never break the poll loop.
-
-### 2. `GET /projects/<name>/team/inbox`
-Same `run_id`-defaults-to-latest, same ownership check as above.
-- No run, or resolved run's `status != "blocked_ask_user"`:
-  `200 {"pending": false}`.
-- `status == "blocked_ask_user"`: read `_inbox_path(run_id)`.
-  - Success: `200 {"pending": true, "run_id": "<id>", "question": "...",
-    "header": "...", "options": [...], "multi_select": false}` — the exact
-    persisted shape, passed through unchanged.
-  - `inbox.json` missing or unreadable/malformed despite `status` being
-    `blocked_ask_user` (a real-world corruption/race window, however
-    narrow — e.g. read lands between `_force_ask_user`'s status-set and its
-    `_write_inbox` call in a pathological interleaving, or hand-edited
-    state): **still** `"pending": true`, with a safe synthesized fallback
-    `question` ("The team is waiting for input, but the original question
-    could not be read — check `tmux attach` or answer with any text to
-    unblock it.") and empty `options` — never silently reports `"pending":
-    false"` while the run is genuinely stuck; the whole point of this
-    route is "impossible to miss" (`docs/story.md` §6f AC), and a
-    corrupted inbox file must degrade to a generic-but-still-visible
-    escalation, not an invisible one.
-
-### 3. `POST /projects/<name>/team/resolve`
-Reached through the existing shared TOTP gate (`app/app.py:3589-3605`,
-unchanged) — no new gating code, same as `/team/start`/`/team/stop`.
-Body: `{"answer": "<text>", "run_id": "<optional>"}`.
-- `run_id` (or `latest_run_for_project(name)` if omitted) must resolve to a
-  run with `project_name == name` (ownership check, same as the GET
-  routes) and `status == "blocked_ask_user"` — else `400 {"error":
-  "<specific reason>"}` (`"no run found for this project"` /
-  `"this run belongs to a different project"` /
-  `"no pending question for this project"`), **never** a silent no-op —
-  unlike `/team/stop`'s own "nothing to do" `200`, an answer a caller
-  believes was recorded but wasn't must be a loud error, not swallowed.
-- `answer.strip()` must be non-empty and ≤
-  `TEAM_ASK_USER_ANSWER_MAX_CHARS` chars — else `400`, before any state
-  mutation (mirrors `_validate_prompt_size`'s "validate before touching
-  anything" discipline, `app/teams.py:213-268`, applied to a new field
-  rather than reusing that function directly, since its bound and error
-  shape are tuned for a *prompt*, not a short human answer).
-- New shared function `teams.resolve_ask_user(run_id: str, answer: str) ->
-  dict` extracted from `_cli_team_resolve()`'s body (lines 3798-3808):
-  performs the load/status-check/append-history/inbox-move/status-flip/
-  persist sequence, returns `{"ok": True}` or `{"ok": False, "error":
-  "<reason>"}` (never raises for an ordinary "wrong state" case — same
-  "return a shaped result, don't make the caller catch" convention
-  `validate_composition()`/`launch_team()` already use). `_cli_team_resolve()`
-  is rewritten to call it, then still calls `_drive_and_report(state)` for
-  its own foreground-blocking CLI behavior — **zero change** to
-  `team-resolve`'s observable CLI behavior (exit codes, blocking, output).
-- On `{"ok": True}`: the route spawns a **new** `cancel_event` +
-  `threading.Thread(target=_run_team_in_background, args=(name, run_id,
-  cancel_event))`, registers it via the existing `_team_threads_set(name,
-  {...})` (`app/app.py:3721`, reused verbatim — no new bookkeeping
-  function needed, `_run_team_in_background` is already generic enough to
-  resume as well as start), starts it, and returns `200 {"ok": true,
-  "run_id": run_id}` immediately — the response never waits for the lead's
-  next round, matching `/team/start`'s own non-blocking contract.
-  - Defensive check before spawning: if `_team_threads_get(name)` already
-    shows a live entry, refuse with `400` ("a team thread is already
-    running for this project") instead of spawning a second driver.
-    Should be unreachable in practice — `latest_run_for_project()`'s own
-    invariant (at most one non-terminal run per project,
-    `app/teams.py:3501-3503`) combined with `team_run()`'s loop already
-    exiting (and its thread already popped) the instant a run becomes
-    `blocked_ask_user` means no live thread should exist for a project
-    whose latest run is genuinely `blocked_ask_user` — but cheap to assert
-    rather than trust, and turns an already-impossible race into a clear
-    error instead of two threads driving one run.
-- On `{"ok": False}` (a concurrent resolve already flipped the status
-  between this request's own status check and its persist — see "Edge
-  cases"): `400 {"error": result["error"]}`, no thread spawned.
-
-### 4. `/status`'s additive `waiting_on_you` field
-One-line change inside the existing per-instance loop
-(`app/app.py:3477-3527`): alongside the existing `team_status` computation,
-add `waiting_on_you = (run is not None and run["status"] ==
-"blocked_ask_user")`, and include it in `inst["team"]` as a new key.
-Every existing key/value in that dict (`status`, `run_id`, `composition`)
-is untouched — purely additive, so 6e's own `StatusRosterAndCompositionTests`
-must still pass unmodified (verifies no regression).
+This is a same-file, same-function, no-new-locking change — `os.replace()`
+remains the sole win/lose arbiter (already true after the prior fix round);
+this fix only moves a side effect from before that arbiter's decision to
+after it.
 
 ## Affected areas
-- `app/teams.py` — new `tail_jsonl_events()`, `load_state_for_project()`,
-  `resolve_ask_user()` (extracted from `_cli_team_resolve()`); two new
-  config constants (see below); `_cli_team_resolve()` refactored to call
-  the new shared function (behavior unchanged).
-- `app/app.py` — three new routes (`GET .../team/events`, `GET
-  .../team/inbox`, `POST .../team/resolve`); one new import
-  (`urllib.parse.parse_qs`, already imported elsewhere in the file) used
-  for the first time on a GET route; one new field on `/status`'s
-  per-project `team` object.
-- `config/switchboard.env.example` — `TEAM_EVENTS_MAX_BYTES_PER_FILE_PER_POLL`,
-  `TEAM_ASK_USER_ANSWER_MAX_CHARS`.
-- `tests/test_team_routes.py` — new test classes for the three routes
-  (real-HTTP, via the existing `_RealHTTPTeamTestCase` base) plus one
-  addition to `StatusRosterAndCompositionTests` (or a sibling class)
-  asserting `waiting_on_you`'s two values and that every pre-existing
-  `/status` field is unchanged.
-- No changes to `docs/ADDING_AN_ENGINE.md` or `docs/ARCHITECTURE.md` — no
-  new engine-facing concept, no new architectural primitive (three routes
-  + one field on an existing dict is additive plumbing, not a new
-  subsystem).
+- `app/teams.py` — `resolve_ask_user()` (~line 3752-3834): reorder the
+  `_append_history()` call relative to the `os.replace()` block; docstring
+  addition. No other function in this file needs to change.
+- `tests/test_team_routes.py` — `TeamResolveEndpointTests` (starts line
+  1062): new regression test using the same deterministic one-shot-hook
+  technique as `test_loser_whose_exists_check_lands_after_winner_already_
+  renamed_does_not_report_ok` (line 1202), reused verbatim in mechanism —
+  hook `teams._load_state()` so a real winning `resolve_ask_user()` call
+  runs to completion between the loser's own state read and its subsequent
+  move step, then assert the loser's call did NOT add a transcript entry.
+- No API/route/wire-format change — `app/app.py`'s `POST .../team/resolve`
+  handler is untouched, and this fix is invisible to a well-behaved
+  (non-racing) caller.
 
 ## Edge cases
-- **No run ever started for a project.** Both GET routes return a clean
-  empty/`pending:false` response, not `404`/`500` — a project that has
-  never run a team must still render a sane empty Teams panel later.
-- **Cross-project `run_id` guessing.** An explicit `run_id` belonging to a
-  *different* project is `404` on both GET routes and `400` on the POST
-  route — never serves or mutates another project's run.
-- **Stale tab watching an old run after a new one starts.** Because
-  `run_id` is accepted as an explicit override (not just "always latest"),
-  an already-open tab can keep polling a finished run's full history even
-  after `latest_run_for_project()` would now return a different, newer
-  run — it simply won't see the newer run's events unless the client
-  explicitly asks for its `run_id` instead.
-- **A file with more new data than one poll's byte budget.** Returns
-  `truncated: true` for that agent and a cursor on a clean line boundary;
-  the client's very next poll (even immediately) continues seamlessly —
-  no event is ever skipped or duplicated across a truncation boundary.
-- **A malformed line in an agent's log** (partial write torn by a crash,
-  a future engine's translator bug slipping one bad line through) becomes
-  one `kind: "error"` synthetic event in the merged feed for that position,
-  never a `500` for the whole poll and never silently dropped.
-- **`inbox.json` missing while `status == "blocked_ask_user"`.** Covered
-  above — `GET .../team/inbox` still reports `pending: true` with a safe
-  fallback question rather than under-reporting a real block.
-- **Two concurrent `POST .../team/resolve` calls for the same run**
-  (double-submit, two tabs). Both re-check `status == "blocked_ask_user"`
-  as part of `resolve_ask_user()`'s own load-check-persist sequence; the
-  first to persist wins (status becomes `"running"`), the second's own
-  freshly-reloaded state (loaded inside `resolve_ask_user()`, never a
-  stale value threaded in from the route) sees `status != "blocked_ask_user"`
-  and returns the same `400` ordinary callers get for "nothing pending" —
-  exactly one thread is ever spawned for one answer. (This is check-then-
-  act over two file operations, not lock-guarded — the same single-writer
-  assumption every other run.json mutator in this codebase already carries;
-  not a new risk introduced by this spec, and no worse than the pre-
-  existing CLI `team-resolve` racing a hypothetical second CLI invocation
-  today.)
-- **A resolve racing a concurrent `/team/stop`.** If `/team/stop` tears
-  down the tmux session/worktrees between `resolve_ask_user()`'s persist
-  and the newly-spawned thread's first `agent_run()` call, that call fails
-  the same way any in-flight delegation against a killed session already
-  does today (pre-existing `_run_headless_session()` behavior, unrelated
-  to this spec) — not a new failure mode, not hardened further here.
-- **Oversized or empty `answer`.** Rejected `400` before any file is
-  touched — the pending question is still there, unanswered, and the
-  caller gets a specific reason rather than a generic failure.
-- **A run with zero teammates ever delegated to.** `state["members"]`
-  still lists them (composition, not "who was actually used") — their log
-  files don't exist yet, treated as empty per the "missing file = present,
-  empty, offset 0" rule above, not an error.
+- **Genuinely simultaneous callers (both threads racing, no hook)**: still
+  covered by the existing `test_two_concurrent_resolves_exactly_one_
+  succeeds` (line 1160) — that test doesn't assert transcript content
+  today and should keep passing unmodified; it's the deterministic hook
+  test that needs the new assertion, since only that one pins down which
+  caller is genuinely the loser.
+- **A loser caught at the route layer's own "already running" check**
+  (`app/app.py`'s defensive `if _team_threads_get(name) is not None`)
+  never even reaches `resolve_ask_user()` a second time — unaffected by
+  this fix, already returns before any write.
+- **A loser caught at `resolve_ask_user()`'s own upfront status check**
+  (step 2, `state["status"] != "blocked_ask_user"`) already returns before
+  reaching the `_append_history()` call in today's code too — this fix
+  doesn't change that path's behavior, only the path where the caller gets
+  past step 2 and loses at step 4's `os.replace()`.
+- **The winner's transcript entry and `state["history"]` entry must be
+  byte-for-byte unchanged** from what today's code produces on the winning
+  path — this fix only removes a write from the *losing* path, it doesn't
+  alter the winning path's own output at all (verify by diffing a winning
+  call's persisted `state["history"][-1]` and its transcript line before
+  and after the change).
 
 ## Acceptance criteria
-- [ ] Given a project that has never started a team, when `GET
-      .../team/events` is called with no `run_id`, then it returns `200`
-      with `{"run_id": null, "events": [], "cursors": {}}`.
-- [ ] Given a project's latest run has written events to its lead
-      transcript and two teammates' logs, when `GET .../team/events` is
-      called with an empty cursor, then the response contains every event
-      from all three files, chronologically merged.
-- [ ] Given the cursors returned by the call above, when `GET
-      .../team/events` is called again with those cursors and no new
-      events have been written, then the response's `events` list is
-      empty (no event is ever returned twice).
-- [ ] Given one agent's log has more new bytes pending than
-      `TEAM_EVENTS_MAX_BYTES_PER_FILE_PER_POLL`, when that file is polled,
-      then the response marks that agent `truncated: true`, returns a
-      cursor on a clean line boundary, and a follow-up poll with that
-      cursor returns the remaining events with no gap or duplicate.
-- [ ] Given a deliberately malformed line written into an agent's log
-      file, when that file is polled, then the response includes one
-      `kind: "error"` event for that position and processing continues
-      for the rest of that file and every other file (no exception, no
-      500).
-- [ ] Given a `run_id` that exists but belongs to a different project,
-      when either GET route is called with it for the wrong project name,
-      then the response is `404` and no data from that run is returned.
-- [ ] Given a run whose status is `finished`/`error`/`stopped` (no thread
-      running), when `GET .../team/events` is called, then it still
-      returns that run's full historical event set.
-- [ ] Given a project with no run, or whose latest run's status isn't
-      `blocked_ask_user`, when `GET .../team/inbox` is called, then it
-      returns `{"pending": false}`.
-- [ ] Given a run genuinely blocked on `ask_user`, when `GET
-      .../team/inbox` is called, then it returns `pending: true` plus the
-      exact persisted question/header/options/multi_select.
-- [ ] Given a run blocked on `ask_user` whose `inbox.json` is deleted out
-      from under it, when `GET .../team/inbox` is called, then it still
-      returns `pending: true` with a non-empty fallback question, never
-      `pending: false`.
-- [ ] Given a run genuinely blocked on `ask_user`, when `POST
-      .../team/resolve` is called with a valid non-empty `answer` and a
-      valid TOTP-gated session, then the response returns immediately
-      (before the lead's next round completes), `inbox.json` is moved to
-      `inbox.resolved.json`, `status` becomes `running`, and the lead's
-      next round context includes the submitted answer text.
-- [ ] Given a project whose latest run is not blocked on `ask_user`
-      (idle, running, finished, or no run at all), when `POST
-      .../team/resolve` is called, then it returns `400` with a specific
-      reason and mutates no state.
-- [ ] Given an empty/whitespace-only `answer` or one exceeding
-      `TEAM_ASK_USER_ANSWER_MAX_CHARS`, when `POST .../team/resolve` is
-      called, then it returns `400` before any state is mutated.
-- [ ] Given two concurrent `POST .../team/resolve` calls for the same
-      blocked run, when both are issued back-to-back, then exactly one
-      succeeds (spawns exactly one resume thread) and the other receives
-      the same `400` an ordinary "nothing pending" caller would get.
-- [ ] Given any project, when `GET /status` is polled, then each
-      project's `team` object includes a `waiting_on_you` boolean that is
-      `true` iff that project's latest run status is exactly
-      `blocked_ask_user`, and every field/value `/status` already
-      returned before this change is byte-for-byte unchanged (existing
-      `StatusRosterAndCompositionTests` still pass unmodified).
-- [ ] Given the CLI's `team-resolve` subcommand, when it is invoked the
-      same way it is today, then its observable behavior (blocking,
-      output, exit code) is unchanged, and its resolve-and-append logic is
-      no longer duplicated — verified by both the CLI path and the new
-      route producing identical persisted `run.json` state for the same
-      `run_id`/`answer` input.
+- [ ] Given two genuinely concurrent `POST /team/resolve` calls for the
+      same pending `ask_user` (real-thread race, existing
+      `test_two_concurrent_resolves_exactly_one_succeeds`), when both
+      complete, then exactly one `ask_user_resolved` entry exists in
+      `transcript.jsonl` for that run (today: can be two).
+- [ ] Given the deterministic hook-based repro (loser's `_load_state()`
+      lands after a real winner has already completed), when the loser's
+      `resolve_ask_user()` call returns `{"ok": False, ...}`, then
+      `transcript.jsonl` contains exactly one `ask_user_resolved`
+      (`tool_result`) entry, and it is the winner's answer text — not two
+      entries, and not the loser's text.
+- [ ] Given a single, non-racing `POST /team/resolve` call (the ordinary
+      case), when it succeeds, then the persisted `state["history"]` and
+      `transcript.jsonl` entries are unchanged in shape and content from
+      today's behavior (no regression to the happy path).
+- [ ] The full test suite passes, including the two pre-existing
+      `TeamResolveEndpointTests` races (`test_two_concurrent_resolves_
+      exactly_one_succeeds`, `test_loser_whose_exists_check_lands_after_
+      winner_already_renamed_does_not_report_ok`) and
+      `tests.test_teams_lead.ResolveInSeparateProcessTests` (the CLI's own
+      non-concurrent regression test, which must stay byte-for-byte
+      unaffected since it never exercises the loss path).
 
 ## Open questions
-- **Cursor wire format.** Proceeding with a single URL-encoded JSON object
-  query param (`?cursor={"lead":120,"claude":340}`) rather than one query
-  param per agent, since the agent set is variable per team and this keeps
-  the route's own parsing simple. This is an internal contract between
-  this route and part 2's own frontend (not consumed by the CLI or any
-  other caller), so it's cheap to change later if part 2's ux-designer or
-  developer finds a shape that's easier to drive from `fetch()`. Flagging,
-  not blocking.
-- **`TEAM_EVENTS_MAX_BYTES_PER_FILE_PER_POLL` default (proposing 65536,
-  64 KiB).** Unlike 6b's grounding cap (validated against this repo's own
-  20 KB `BACKLOG.md`, a real measured case), there's no existing "how
-  chatty is one agent's event stream per poll interval" data point yet.
-  Proceeding with a round, conservative default in the same order of
-  magnitude as this module's other per-poll caps
-  (`TEAM_HEADLESS_STDERR_TAIL_BYTES=4096` is much smaller but serves a
-  different purpose — a one-shot tail, not a per-poll budget); it's an env
-  var, so a real deployment can tune it once part 2 shows actual traffic.
-- **`waiting_on_you` semantics for `escalated_max_rounds`.** Proceeding
-  with `waiting_on_you = True` **only** for `blocked_ask_user` (the
-  resolvable case — an `ask_user` this route can actually answer).
-  `escalated_max_rounds` is a *terminal* status with no `inbox.json` and
-  nothing to resume (`_force_ask_user()`'s own docstring, `app/teams.py:
-  2540-2554`, is explicit that these are materially different statuses) —
-  so it stays under whatever part 2's status strip calls its general
-  "blocked" bucket, not "waiting on you". Flagging this reading now so
-  part 2's ux-designer doesn't have to re-derive it from scratch.
-- **Should `POST /team/resolve` also accept a `run_id` explicitly, or
-  only ever act on the project's current latest run?** Proceeding with
-  accepting an optional `run_id` (defaulting to latest) purely for
-  request/response symmetry with the two GET routes and because the
-  ownership check is already needed there regardless — but in practice a
-  resolve for anything other than the current latest run is always
-  rejected anyway (`status != "blocked_ask_user"` for any non-latest run,
-  by the same at-most-one-non-terminal-run invariant). Low-stakes either
-  way; noting the reasoning rather than asking.
+None — this is a small, fully-diagnosed, single-function fix with a
+directly reusable test pattern already in the codebase. Proceeding without
+further sign-off.
 
 ## Risk / rollback notes
-- Every change here is additive: three new routes nothing currently calls,
-  one new field on an existing response object, and a refactor (extract,
-  don't rewrite) of already-reviewer-approved CLI logic with an explicit
-  "identical persisted state" acceptance criterion guarding against
-  behavior drift. Reverting is deleting the new routes/field and the
-  `_cli_team_resolve()` refactor's extraction (restoring its inline body)
-  — no migration, no data format change, no effect on any already-running
-  team if this is rolled back mid-run (the routes are pure additions; a
-  run in progress doesn't depend on them existing).
-- The main risk is the new per-file byte-cap-with-clean-line-boundary
-  logic (`tail_jsonl_events()`) — a subtly wrong offset calculation would
-  either drop or duplicate events across a truncation boundary. Mitigated
-  by dedicated tests exercising a deliberately-oversized log file (mirrors
-  6b's own "test against a realistic oversized file, not a synthetic
-  one" precedent) and asserting the full recovered sequence across
-  multiple bounded polls exactly matches one unbounded read.
+Low risk: one function, no new locking, no wire-format change, no route
+change. If it regresses the happy path, revert the single call-site
+reorder in `resolve_ask_user()` — the diff is small enough that `git
+revert` on the one commit is a complete rollback.
+
+---
+
+## Note for the next product-manager iteration (6f part 2, deferred)
+
+This cycle deliberately does **not** contain 6f part 2 (the Teams page UI:
+merged event feed, per-agent filter, status strip, escalation inbox). Once
+this bugfix lands and is reviewer-approved, the very next product-manager
+turn should write that spec fresh — the archaeology for it is already done
+and should be reused directly rather than re-derived:
+
+- **This is a single-page app, not a multi-page one.** `app/app.py`'s
+  `Handler.do_GET` only ever serves one HTML document at `self.path == "/"`
+  (`PAGE_TEMPLATE`, ~line 1636, with inline `<style>`/`<script>`) — there is
+  no route-per-page mechanism anywhere in this codebase. Story.md's "Teams
+  page" wording should be read the same way 6e's "settings screen" wording
+  was already corrected: **not** a new URL/route, but an expansion of the
+  existing per-project `teamRow()` render (`app/app.py` ~line 2237-2284).
+  Specifically, the `team.status !== 'idle'` branch (line 2272-2283) —
+  which today renders a static `Status: [blocked]` line plus a one-line
+  `"Lead is waiting for input · check tmux attach"` sub — is exactly where
+  the live merged feed, status strip, and escalation panel belong, using
+  the same expand/collapse idiom (`team-configure-row` / `toggleTeamPicker`
+  at line 2262-2265) already established for 6e's lead/teammate picker.
+- **Route contracts already shipped and tested, ready to build against
+  as-is** (no backend changes needed for part 2 beyond this cycle's fix):
+  - `GET /projects/<name>/team/events?run_id=&cursor=` → `{"run_id",
+    "events": [...], "cursors": {"<agent>": <byte_offset>}, "truncated":
+    {"<agent>": true}}` (`app/app.py:3637-3666`). `cursor` is a
+    URL-encoded JSON object `{"<agent>": <byte_offset>}`
+    (`_parse_events_cursor()`, `app/app.py:1388`); a malformed cursor
+    degrades to `{}` rather than a 400. Each event is the §4.1 envelope
+    (`{ts, agent, seq, kind, text, meta}`), `kind` ∈
+    `message|tool_use|tool_result|status|error|handoff`. Bounded per file
+    per poll by `teams.TEAM_EVENTS_MAX_BYTES_PER_FILE_PER_POLL` — the
+    client must keep polling with the returned `cursors` to drain a
+    `truncated: true` file rather than treating one poll as complete.
+  - `GET /projects/<name>/team/inbox?run_id=` →
+    `{"pending": false}` or `{"pending": true, "run_id", "question",
+    "header", "options": [{"label","description"}...], "multi_select"}`
+    (`app/app.py:3668-3701`). Always has a non-empty `question` even if
+    `inbox.json` itself is unreadable (safe fallback text).
+  - `POST /projects/<name>/team/resolve` body `{"run_id"?, "answer",
+    "code"}` (TOTP-gated, same as every other state-changing action) →
+    `{"ok": true, "run_id"}` or `{"error": "..."}`, 400 on no pending
+    question / empty or over-`TEAM_ASK_USER_ANSWER_MAX_CHARS` answer
+    (`app/app.py:3873-3920`).
+  - `GET /status`'s per-project `team` object already carries an additive
+    `waiting_on_you` boolean (`app/app.py:3558`) — true iff
+    `run["status"] == "blocked_ask_user"`. This is the cheapest signal for
+    the status strip's "waiting on you" state; no need to poll `/team/
+    inbox` just to light that indicator.
+- **`fact_check` auditability**: the acceptance criterion "`fact_check`
+  calls appear in the feed with the passage and `file:line`" is already
+  satisfiable from the existing envelope shape — `fact_check` results are
+  written via `_append_history()`'s `transcript_entries` (see
+  `app/teams.py:2811` and grounding's own `file:line` return shape, 6b) —
+  part 2 just needs to render `meta` for that `kind` appropriately, no new
+  backend field.
+- **This fix (1b) removes the one known reason a "resolved" entry in the
+  feed could be misleading** — part 2's spec should NOT need an "ignore
+  stray resolve entries" edge case once this lands.
+- Item 11(b) (`run_id` path traversal on the three `team/*` routes) is
+  still open and unrelated to part 2's UI — worth a one-line mention in
+  part 2's own "Non-goals" so it isn't silently forgotten a second time,
+  but it does not block or shape the UI work.
