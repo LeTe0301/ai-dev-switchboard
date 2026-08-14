@@ -3460,6 +3460,66 @@ def _remove_worktree(project_workdir: str, path: str) -> str:
     return "error"
 
 
+# Matches _create_worktree()'s own "team-{run_id}-{agent}" naming convention
+# (app/teams.py:3428) exactly, reusing _RUN_ID_RE's own run_id shape (rather
+# than a looser "team-<anything>-<anything>" split) so a hand-created branch
+# that merely starts with "team-" -- or an agent name containing its own
+# hyphens -- is never misparsed into a bogus run_id/agent pair: the run_id
+# group can only match a string _run_id() could actually have generated,
+# whatever's left (including embedded hyphens) is the agent name verbatim.
+_TEAM_BRANCH_RE = re.compile(r"^team-([0-9]+-[0-9a-f]{12})-(.+)$")
+
+
+def list_team_branches(project_workdir: str) -> list[dict]:
+    """
+    Read-only: `git branch --list 'team-*'` against project_workdir
+    (backlog item 13, docs/spec.md). Returns one dict per matching branch:
+      {"branch": str, "run_id": str|None, "agent": str|None,
+       "commit": str, "subject": str, "committer_date": str}
+    run_id/agent are parsed from the "team-{run_id}-{agent}" naming
+    convention (_create_worktree()'s own format, via _TEAM_BRANCH_RE) on a
+    best-effort basis -- both None if a branch name doesn't match (e.g. a
+    hand-created branch that happens to start with "team-"); never raises on
+    a parse miss.
+
+    Plain subprocess.run(["git", "-C", project_workdir, ...]), the same
+    read-your-own-checkout-directly convention _validate_project_for_team()
+    already establishes above -- not _run_run_user_command(): this reads the
+    switchboard's own project checkout, no RUN_USER privilege crossing
+    needed.
+
+    Returns [] if project_workdir isn't a git repo, has zero matching
+    branches, or the git command fails for any reason (including a missing
+    git binary) -- this is a read-only convenience listing, not load-bearing
+    for any run's own state, so it degrades silently rather than raising.
+    """
+    fmt = "%(refname:short)\t%(objectname)\t%(committerdate:iso-strict)\t%(subject)"
+    try:
+        r = subprocess.run(
+            ["git", "-C", project_workdir, "branch", "--list", "team-*", f"--format={fmt}"],
+            capture_output=True, text=True)
+    except OSError:
+        return []
+    if r.returncode != 0:
+        return []
+    branches = []
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 4:
+            continue  # never raises on a malformed/unexpected line
+        branch, commit, committer_date, subject = parts
+        m = _TEAM_BRANCH_RE.match(branch)
+        branches.append({
+            "branch": branch,
+            "run_id": m.group(1) if m else None,
+            "agent": m.group(2) if m else None,
+            "commit": commit,
+            "subject": subject,
+            "committer_date": committer_date,
+        })
+    return branches
+
+
 def _agent_log_path(run_id: str, agent: str) -> str:
     return os.path.join(_run_dir(run_id), "agents", f"{agent}.jsonl")
 
@@ -4544,6 +4604,17 @@ def _cli_team_reap(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_team_branches(args: argparse.Namespace) -> int:
+    """Backlog item 13, docs/spec.md -- prints list_team_branches()'s result
+    as JSON. No run_id argument (scoped to a project directory, not a run,
+    same as `grounding`'s own CLI shape). Exits 0 even when the list is
+    empty -- list_team_branches() itself never raises, so there is no error
+    branch to handle here, unlike _cli_team_status()'s FileNotFoundError
+    catch."""
+    print(json.dumps(list_team_branches(args.workdir), indent=2))
+    return 0
+
+
 def _parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="teams.py",
@@ -4632,6 +4703,10 @@ def _parse_args(argv=None) -> argparse.Namespace:
                                      "sweep stale worktrees/sessions past their TTL (backlog "
                                      "item 6d part 1).")
 
+    p_team_branches = sub.add_parser("team-branches", help="List surviving team-* git branches "
+                                     "for a project directory as JSON (backlog item 13).")
+    p_team_branches.add_argument("workdir", help="Project directory to list team-* branches in.")
+
     return p.parse_args(argv)
 
 
@@ -4662,6 +4737,8 @@ def main(argv=None) -> int:
             return _cli_team_launch(args)
         if args.command == "team-stop":
             return _cli_team_stop(args)
+        if args.command == "team-branches":
+            return _cli_team_branches(args)
         return _cli_team_reap(args)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)

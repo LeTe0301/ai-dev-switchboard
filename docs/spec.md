@@ -1,145 +1,117 @@
-# Spec: AI merge-request reviewer, triggered by a Gitea "ready for review" tag (backlog item 8, Gitea-only)
+# Spec: BACKLOG item 13 — surviving team branch discoverability
 
-## Summary
-Extend the existing Gitea poll (`app.py`'s `_gitea_poll_if_due`, backlog item 2c part 1) to watch each switchboard-registered project's open Gitea PRs for a configurable label (default `ready for review`); on the edge where that label transitions from absent to present, fetch the PR's diff, run it through an operator-selected roster model (reusing item 6's roster + item 6b's read-only grounding), and post the review back as a single, clearly-marked, comment-only PR comment — never a block/approve/merge action.
+Orchestrator-authored (not a full product-manager dispatch) per the
+Entwicklung workflow's right-sizing rule 1: `docs/BACKLOG.md` item 13
+already fully diagnosed this at the multi-agent-teams story's completion
+triage — the safety property (nothing is ever silently lost) is already
+implemented, the gap is pure discoverability, and the "shape of a future
+fix" paragraph in the backlog is detailed enough to build from directly.
+No architecture judgment call remains to make.
 
-## Goals
-- Detect a "ready for review" label appearing on an open PR within one Gitea poll interval (`GITEA_POLL_INTERVAL_SECONDS`, default 45s), no webhook, no new listener.
-- Generate a code-consistency review grounded in the project's own auto-discovered docs (reusing `teams.load_grounding()`, item 6b) and post it as one Gitea PR comment.
-- Let the operator pick which roster model (any `engines.d` entry or the configured Ollama model, item 6's roster) does the reviewing, via config.
-- Re-fire only when the label is explicitly removed and re-added — never on every new commit while the label stays present.
-- Handle a diff that exceeds what's reasonable to send to the model: truncate, and say so plainly in the posted comment.
-- Never touch the project's real working copy while generating a review.
+## Problem
 
-## Non-goals
-- **GitHub support.** Item 17 (tracking a project's real non-Gitea origin) doesn't exist yet. This spec is Gitea-only; once item 17 lands, a future item routes this same reviewer at whichever host a project's origin actually is. Stated here explicitly per the backlog's own instruction, not an oversight.
-- **Any blocking/approving/merging action.** Comment-only, matching "deploy is manual-click only" and every other unattended-write precedent in this project. No code path in this feature ever calls a Gitea PR-approve, PR-merge, or branch-write endpoint.
-- **A web UI for model/label selection or a reviewed-PRs list.** This spec is backend-only: config is via `switchboard.env` (same pattern `TEAM_LLM_MODEL`/`GITEA_LABEL`/`GITEA_POLL_INTERVAL_SECONDS` already use), and the review's only visible surface is the Gitea PR comment itself, viewable through the Gitea link the switchboard UI already exposes (`gitea_url`). A runtime dropdown to change the model/label without editing `switchboard.env`, and any switchboard-side history/status of past reviews, is real, separable follow-on work (natural "part 2", parallel to how 2c part 1 shipped poll/sync before 2c part 2 added a UI button) — not needed for this feature to work end to end, so it's out of scope here rather than force-split into a same-cycle part 2.
-- **Reviewing PRs on repos the switchboard doesn't already know about.** Only repos present in `GITEA_REPO_MAP_FILE` (i.e., registered as switchboard projects via `create_project()`'s Gitea flow, item 2b) are watched. A Gitea repo that exists in the same Gitea instance but was never registered as a switchboard project is out of scope — this reuses the existing project↔repo registration surface rather than inventing a second one.
-- **Live tool-calling / multi-round review.** Review generation is one bounded, one-shot call per PR (diff + grounding digest in, review text out) — not a lead-loop session, no `board_read`/`board_write`/`ask_user`, no live `fact_check` round-trips. See "Why roster tiers don't matter here" below.
-- **Checking out the PR's actual branch/files anywhere.** The diff is fetched as text via Gitea's API and embedded directly in the prompt; nothing ever runs `git checkout`/`git fetch` against the PR branch, on the project's real working copy or otherwise.
+`app/teams.py`'s `stop_team()` removes a stopped/finished run's worktree
+directories (`git worktree remove`, no `--force` — refuses on dirty state)
+and, on success, drops that agent's entry from `state["worktrees"]`. The
+branch itself (`team-{run_id}-{agent}`, see `_create_worktree()` at
+`app/teams.py:3428`) is never deleted — nothing an agent commits is ever
+lost — but once the worktree entry is dropped, the switchboard itself no
+longer tracks that the branch exists. There is no UI panel, CLI field, or
+docs pointing an operator at `git branch --list 'team-*'` as the way to
+find and review/merge/discard a past run's teammate work.
 
-## Background / current state
-- `app/app.py`'s `_gitea_poll_if_due()` (line ~799) is called from every `/status` request, throttled to its own `GITEA_POLL_INTERVAL_SECONDS` (default 45s) via `_gitea_poll_last_at` + `_gitea_poll_lock`. When due, it iterates `_load_gitea_repo_map()` (`GITEA_REPO_MAP_FILE`, `owner/repo -> {name, branch, sync_state, sync_at, remote_sha}`) and calls `_gitea_poll_one(owner_repo, entry)` per registered project, which checks whether the branch's SHA moved and, if so, spawns `_gitea_sync_bg()` on its own thread (non-blocking, per-project non-reentrant lock via `_gitea_sync_lock_for()`). A malformed response for one repo is swallowed (`except Exception: pass`) so it can't kill polling for every other project — the exact must-fix the reviewer caught in 2c part 1.
-- `_gitea_api(method, path, body=None)` (line ~676) is the one authenticated Gitea REST client: always parses the response body as JSON, raises `ConnectionError` on transport failure. It is not usable as-is for Gitea's `.diff` endpoint, which returns raw diff text, not JSON.
-- `scripts/gitea-configure-api.sh` mints `GITEA_API_TOKEN` with scopes `write:repository,write:user` (Gitea 1.27.1's granular scoped-token model, v1.23+). Posting an issue/PR comment is a `POST /repos/{owner}/{repo}/issues/{index}/comments` call — in Gitea's scope model this is under the **issue** scope family, distinct from **repository**. The existing token almost certainly does not cover it.
-- `app/teams.py` (item 6) already has everything this feature needs to reuse, with zero new lower-level primitives required:
-  - `roster()` (line 1827): every headless-eligible `engines.d` entry plus the configured Ollama model, each tagged `kind` (`"engine"`|`"ollama"`) and a lead-adapter `tier` (1/2/3).
-  - `load_grounding(workdir)` (line 1571): read-only (guarded by both a runtime monkeypatch and a static AST scan, per 6b) auto-discovery of a project's own docs, returning `{"digest": <hard-byte-capped text>, "files": [...], ...}`.
-  - `agent_run(engine, workdir, prompt, *, timeout, ...)` (line 993): one bounded, non-interactive turn of a headless-eligible `engines.d` entry, run inside its own throwaway tmux session (via the existing `RUN_USER`-privileged `TMUX` sudoers rule), returning `{"ok", "text", "exit_code", ...}`. This already IS "run a one-shot task against an engine and get text back" — exactly what an engine-kind review needs.
-  - `_lead_tier1_call()` / `_tier1_call_with_retry()` / `_tier1_raw_text()` (lines 2297-2360): the tier-1 (Ollama, native `/v1/chat/completions`) HTTP call, already parameterized by an arbitrary `tools` list — passing `tools=[]` turns it into a plain completion call with no behavior change needed.
-  - `_run_run_user_command(argv, cwd, timeout)` (line 3135): runs an argv as `RUN_USER` synchronously — already used by `_create_worktree()`/`_remove_worktree()` for exactly the "I need a directory RUN_USER's tmux pane can read/write" problem this feature also has.
-- Item 7 part 1 shows the precedent for extending `_LEAD_TOOL_NAMES`/`_lead_tools()` when new capability is genuinely lead-driven (`board_read`/`board_write`). This feature is deliberately **not** shaped that way — see "Standalone, not a lead tool" below.
+## Scope
 
-## Proposed approach
+Read-only discoverability only. No new git operations beyond `git branch
+--list` (read-only, no state mutation). Explicitly NOT in scope: any
+merge/delete UI action (item 13's own triage already settled "left for the
+human, permanently" — a list view, not an action panel).
 
-### Standalone poll-triggered mechanism, not a lead-loop tool
-A PR can be tagged "ready for review" with no team session running at all for that project — there is no lead, no `run_id`, no round loop to attach a tool to. This is a background action triggered purely by Gitea poll state, structurally identical in shape to `_gitea_sync_bg()` (item 2c part 1), not to `board_read`/`board_write` (item 7 part 1, which are tools a *running* lead calls mid-loop). All new code lives in `app.py` (Gitea-specific polling/API/state, mirroring where `_gitea_poll_one`/`_gitea_sync_run` already live) plus one new self-contained function in `teams.py` (`review_pr_diff()`, mirroring where `agent_run()`/`fact_check()` already live as roster/grounding-consuming primitives) — no changes to `_LEAD_TOOL_NAMES`, `_lead_tools()`, or any lead-loop state machine.
+## Changes
 
-### Why roster tiers don't matter here
-The roster's `tier` field (1 native tool-calling / 2 schema-constrained / 3 prose-parse) exists to answer "can this model reliably drive the four/six-tool lead loop." Review generation never drives that loop — it's one prompt in, one text blob out. `AI_REVIEWER_MODEL` may therefore name **any** roster entry regardless of `tier`/`delegate_capable`/`schema_flag_error` (including a tier-3 engine, which `default_team_composition()` deliberately refuses to auto-pick as a *lead* — that refusal doesn't apply here since nothing here is leading a team). This directly answers the backlog's own open question: the roster is reused for *listing available models*, not for its tiering.
+### `app/teams.py`
 
-### Config (new, all in `config/switchboard.env.example` + `app.py`)
-```
-AI_REVIEWER_ENABLED=0                    # off by default, same opt-in posture as every other feature here
-AI_REVIEWER_LABEL="ready for review"     # configurable; matched by exact string equality against Gitea label names
-AI_REVIEWER_MODEL=                       # "kind:name", e.g. "ollama:qwen3:8b" or "engine:claude" -- split on the FIRST ':' only, since an Ollama tag can itself contain ':'
-AI_REVIEWER_MAX_DIFF_BYTES=40000         # hard truncation cap on the diff text sent to the model
-AI_REVIEWER_MAX_ATTEMPTS=3               # consecutive failed attempts for one label-add episode before giving up until the label cycles
-AI_REVIEWER_STATE_FILE=/var/lib/ai-dev-switchboard/ai-reviewer-state.json
-```
-`AI_REVIEWER_MODEL` is validated against a live `teams.roster()` lookup at trigger time, not at startup — same "engines.d is meant to be edited without a restart" philosophy `roster()` itself documents. `AI_REVIEWER_ENABLED=1` with `AI_REVIEWER_MODEL` unset or naming a roster entry that no longer exists is a per-repo, per-poll-pass no-op (logged, not fatal) — same tolerance `_gitea_poll_one`'s malformed-response handling already establishes. Reuses `GITEA_POLL_INTERVAL_SECONDS` for cadence and `TEAM_LLM_TIMEOUT_SECONDS`/`TEAM_LLM_TRANSPORT_RETRY_BUDGET`/`TEAM_HEADLESS_TIMEOUT_SECONDS` (already-existing constants) for the underlying model calls — no new timeout/retry knobs invented.
+New function, placed near `_remove_worktree()`/`stop_team()`:
 
-### Token scope
-`scripts/gitea-configure-api.sh`'s `--scopes` argument grows from `write:repository,write:user` to `write:repository,write:user,read:issue,write:issue` (issue-family scope covers PR label reads and issue/PR comment writes in Gitea's granular scoped-token model; PRs are backed by issues in Gitea's own data model, hence `.../issues/{index}/comments` for PR comments). The script is already documented "safe to re-run: generates a fresh token and overwrites the old one" — an operator picking this feature up re-runs it once to widen the existing token's scope. Flagged as the one piece of this design most worth confirming against the real instance during the reviewer's live-testing pass (same "verified live against real Gitea 1.27.1" precedent 2b/2c already set) rather than trusted blind — if Gitea rejects a call with 403 for insufficient scope, that's the first thing to check.
-
-### The poll extension (`app.py`)
-1. **`_gitea_api_raw(method, path)`** — new, small: identical shape to `_gitea_api()` but returns `(status, text)` without attempting `json.loads` on the body (needed for the `.diff` endpoint, which returns plain text, not JSON — `_gitea_api()` itself would misclassify a non-JSON 2xx body as `ConnectionError`, per its own `except (URLError, TimeoutError, ValueError)` catching `json.loads`'s `ValueError` too).
-2. **State file** (`AI_REVIEWER_STATE_FILE`): `{"owner/repo#number": {"label_present": bool, "attempts": int, "reviewed_at": iso|null, "last_error": str|null}}`. Same tmp-file-then-`os.replace()` atomic-write idiom as `_save_gitea_repo_map_entry`, guarded by its own `_ai_reviewer_state_lock` (mirrors `_gitea_map_lock`). `_load_ai_reviewer_state()` tolerates a missing/corrupt file the same way `_load_gitea_repo_map()` does (`-> {}`).
-3. **`_ai_reviewer_poll_repo(owner_repo, entry)`** — called from inside `_gitea_poll_if_due()`'s existing per-repo loop, right alongside the existing `_gitea_poll_one(owner_repo, entry)` call, wrapped in its own `try/except Exception: pass` (same "one bad repo/response can't kill the pass" discipline), gated on `AI_REVIEWER_ENABLED`:
-   - `GET /repos/{owner_repo}/pulls?state=open` (one call per registered repo per poll pass, same cost class as the existing per-repo branch check).
-   - For each PR: `pr_key = f"{owner_repo}#{pr['number']}"`, `label_present = AI_REVIEWER_LABEL in [l.get("name") for l in pr.get("labels") or []]`, `prev = state.get(pr_key, {})`.
-   - **Not present now:** if `prev.get("label_present")` was true (or the PR is unseen), write `{label_present: False, attempts: 0, reviewed_at: prev.get("reviewed_at"), last_error: None}` — this *arms* the next add as a fresh episode. No-op if already recorded absent.
-   - **Present now, and it was NOT present last poll (or the PR has never been seen before):** this is the trigger edge — first, **synchronously** (before any slow work) write `{label_present: True, attempts: prev.get("attempts", 0), reviewed_at: prev.get("reviewed_at"), last_error: None}` to the state file, so no other/later poll pass can re-decide this is a fresh edge while the review is in flight (closes the double-post race without needing the per-PR lock below to also cover state visibility). Then spawn `_ai_reviewer_review_bg(owner_repo, entry, pr)`.
-   - **Present now, was already present, `attempts < AI_REVIEWER_MAX_ATTEMPTS`:** a previous attempt for this same episode failed and hasn't exhausted its budget — spawn `_ai_reviewer_review_bg()` again (retry), same trigger path.
-   - **Present now, was already present, `attempts >= AI_REVIEWER_MAX_ATTEMPTS`:** give up silently until the label cycles (removed, then re-added) — `last_error` stays in the state file for operator inspection (no UI in this spec, but a human with shell access can read the JSON file, same as `GITEA_REPO_MAP_FILE` today).
-4. **`_ai_reviewer_review_bg(owner_repo, entry, pr)`** — non-blocking dispatch, mirrors `_gitea_sync_bg()` exactly: acquire `_ai_reviewer_pr_lock_for(pr_key)` (new dict of per-PR `threading.Lock`s, same `_gitea_sync_locks` pattern), and if already held (a previous attempt for this PR is still running), return immediately — the next poll interval will see `attempts` unchanged and retry. Otherwise spawn a daemon thread running `_ai_reviewer_review_run()`.
-5. **`_ai_reviewer_review_run(owner_repo, entry, pr)`** — the real work, off the request thread:
-   - `status, diff_text = _gitea_api_raw("GET", f"/repos/{owner_repo}/pulls/{pr['number']}.diff")`. Non-200 or empty → record failure (see below) and return.
-   - Truncate: `diff_truncated = len(diff_text.encode("utf-8")) > AI_REVIEWER_MAX_DIFF_BYTES`; if so, `diff_text = diff_text.encode("utf-8")[:AI_REVIEWER_MAX_DIFF_BYTES].decode("utf-8", errors="ignore")` (same encode-slice-decode pattern `build_digest()` already uses for its own hard cap).
-   - Resolve the roster entry: split `AI_REVIEWER_MODEL` on the first `:`, look it up in `teams.roster()` by `(kind, name)`. Not found/unset → record failure `"AI_REVIEWER_MODEL '...' not found in roster"` and return.
-   - `result = teams.review_pr_diff(model_entry, workdir=os.path.join(PROJECTS_DIR, entry["name"]), pr_title=pr.get("title", ""), pr_body=pr.get("body") or "", diff_text=diff_text, diff_truncated=diff_truncated)`.
-   - `result["ok"]` false → record failure (`result["error"]`) and return.
-   - Compose the comment body (see "Comment format" below) and `POST /repos/{owner_repo}/issues/{pr['number']}/comments` with `{"body": comment}`. Non-2xx → record failure. 2xx → record success: `{label_present: True, attempts: 0, reviewed_at: now, last_error: None}`.
-   - **Record failure** = re-read current state entry, `attempts += 1`, `last_error = <message>`, `label_present` left as `True` (already set synchronously in step 3 — never touched again on failure, so the "was already present" branch of step 3 is what drives the retry, not a re-trigger).
-
-### `teams.review_pr_diff()` (new, in `app/teams.py`, next to `agent_run()`/`fact_check()`)
-```
-def review_pr_diff(model: dict, workdir: str, pr_title: str, pr_body: str,
-                   diff_text: str, diff_truncated: bool) -> dict:
-    """{"ok": True, "text": <review markdown>} or {"ok": False, "error": "..."}."""
-```
-- `digest = load_grounding(workdir)["digest"]` — `workdir` here is the project's REAL directory (`PROJECTS_DIR/<name>`), read via the existing read-only-guaranteed grounding path (6b's monkeypatch + AST scan already prove nothing under this call path can write). This is the concrete reuse of "6b's grounding... for consistent with the project's own documented conventions" the backlog asks for.
-- `prompt = _build_review_prompt(pr_title, pr_body, diff_text, diff_truncated, digest)` — new pure string-builder function (no I/O), unit-testable directly. Content: role framing ("You are reviewing a pull request for code consistency with this project's own documented conventions — not a general code review"), the grounding digest verbatim, the (possibly-truncated) diff, an explicit truncation notice when `diff_truncated`, and output-format instructions (short markdown review: a brief overall assessment plus specific, cited observations; explicitly told this is comment-only advisory feedback, never phrased as blocking).
-- `model["kind"] == "ollama"`: `payload, err = _tier1_call_with_retry(TEAM_LLM_BASE_URL, model["name"], system=<short reviewer system string>, user=prompt, tools=[], timeout=TEAM_LLM_TIMEOUT_SECONDS, retry_budget=TEAM_LLM_TRANSPORT_RETRY_BUDGET)`. `err` → `{"ok": False, "error": err}`. Else `{"ok": True, "text": _tier1_raw_text(payload)}`.
-- `model["kind"] == "engine"`: **never runs against `workdir` itself** — creates a throwaway scratch directory via `_run_run_user_command(["mkdir", "-p", scratch], cwd=TEAM_STATE_DIR)` (so it's `RUN_USER`-owned from creation, matching exactly how `_create_worktree()` already solves "a directory `agent_run()`'s `RUN_USER`-privileged tmux pane needs to read/write" — no chmod gymnastics, no new privilege path), under `TEAM_STATE_DIR/_ai_reviewer_scratch/<token_hex(8)>`, then `agent_run(model["name"], scratch, prompt, timeout=TEAM_HEADLESS_TIMEOUT_SECONDS)`, then **unconditionally** removes the scratch dir via `_run_run_user_command(["rm", "-rf", scratch], cwd=TEAM_STATE_DIR)` in a `finally`. `result["ok"]` false → `{"ok": False, "error": result.get("error") or "engine review failed"}`. Else `{"ok": True, "text": result["text"]}`.
-  - **This is the load-bearing safety property of this whole spec**, worth stating plainly: the reviewing engine is never given the project's real working copy, so even a rogue/over-eager headless invocation that ignores its instructions and tries to edit files can only ever touch a directory that's deleted seconds later — no worktree, no branch, no risk to the human's checkout. This goes beyond a prompt-level "don't edit files" instruction (which the diff+grounding-only prompt also says, for a well-behaved model) with an actual structural guarantee, matching this project's existing standard of pairing a permissive-sounding instruction with a real enforced boundary (6b's grounding guard is the direct precedent).
-
-### Comment format
-```
-**AI code review** (model: `{kind}:{name}`, via ai-dev-switchboard)
-
-{note if diff_truncated: "> Note: this diff was truncated to the first {N} bytes before review — some changes may not have been evaluated."}
-
-{review text from the model, verbatim}
-
----
-_Comment-only — this review never blocks, approves, or merges this PR._
+```python
+def list_team_branches(project_workdir: str) -> list[dict]:
+    """
+    Read-only: `git branch --list 'team-*'` against project_workdir.
+    Returns one dict per matching branch:
+      {"branch": str, "run_id": str|None, "agent": str|None,
+       "commit": str, "subject": str, "committer_date": str}
+    run_id/agent are parsed from the "team-{run_id}-{agent}" naming
+    convention (_create_worktree()'s own format) on a best-effort basis --
+    None if a branch name doesn't match (e.g. hand-created branches that
+    happen to start with "team-"), never raises on a parse miss.
+    Returns [] if project_workdir isn't a git repo or the command fails --
+    this is a read-only convenience listing, not load-bearing for any
+    run's own state, so it degrades silently rather than raising.
+    """
 ```
 
-## Affected areas
-- `app/app.py`: new config reads (`AI_REVIEWER_*`), `_gitea_api_raw()`, state-file load/save + lock, per-PR lock dict, `_ai_reviewer_poll_repo()`/`_ai_reviewer_review_bg()`/`_ai_reviewer_review_run()`, one new call site inside the existing `_gitea_poll_if_due()` per-repo loop. No new routes, no new UI.
-- `app/teams.py`: one new public function `review_pr_diff()` plus a private `_build_review_prompt()` and the two `_run_run_user_command`-based scratch-dir helpers. No changes to `_LEAD_TOOL_NAMES`/`_lead_tools()`/any lead-loop state machine.
-- `scripts/gitea-configure-api.sh`: `--scopes` widened to add `read:issue,write:issue`.
-- `config/switchboard.env.example`: new `AI_REVIEWER_*` documented block, same style as the existing `GITEA_*`/`TEAM_LLM_*` blocks.
-- New test file `tests/test_ai_reviewer.py`, following `tests/test_gitea_poll.py`'s convention (monkeypatch `_gitea_api`/`_gitea_api_raw`/`subprocess.run`, no real Docker/network/Gitea calls) plus a focused set of `teams.review_pr_diff()`/`_build_review_prompt()` tests in the style of `tests/test_teams_headless.py`/`tests/test_teams_grounding.py` (monkeypatch `agent_run`/`_lead_tier1_call`, assert the grounding digest and diff text both land in the constructed prompt).
-- No data model / schema change beyond the two new flat JSON files (state file; no DB in this project).
-- No API/route changes — this is entirely a poll-side background feature plus one outbound Gitea write (the comment POST).
+Implementation: one `subprocess.run(["git", "-C", project_workdir,
+"branch", "--list", "team-*", "--format=%(refname:short)\t%(objectname)\t
+%(committerdate:iso-strict)\t%(subject)"], ...)` call, tab-split per line.
+Reuses this codebase's existing plain-`git`-subprocess convention (not
+`_run_run_user_command()` — this reads the switchboard's own project
+checkout directly, the same way existing project-list `git log`/`git
+status` calls already do; no privilege boundary crossed).
 
-## Edge cases
-- **Diff exceeds the model's context.** Settled: hard-truncate to `AI_REVIEWER_MAX_DIFF_BYTES`, note the truncation explicitly both in the prompt (so the model doesn't claim false completeness) and in the posted comment (so a human reader knows the review may be partial).
-- **PR closed/merged between label-add-detection and the background review actually running.** The `.diff` fetch or comment POST will simply 404/fail against Gitea — treated as an ordinary failure (`attempts += 1`, retried next poll up to `AI_REVIEWER_MAX_ATTEMPTS`, then given up on until the label cycles, which can't happen on a closed PR — a permanently-stuck-but-harmless state, not a crash).
-- **Label removed and re-added within the same poll interval** (faster than `GITEA_POLL_INTERVAL_SECONDS`) — indistinguishable from "never removed" at this poll's resolution; the next poll simply sees `label_present: True` again with no intervening `False` observed, so no new episode fires. Documented as the same "as soon as" == "within one poll interval" tradeoff item 2c/8 already accept.
-- **Same label name matched by exact string equality**, not a regex/substring — a project using a *different* label containing the configured word as a substring (e.g. "not ready for review") does not spuriously trigger.
-- **Empty diff** (e.g. a PR with no net changes against its base) — still reviewed; the model gets an empty diff and grounding digest and is free to say so; not treated as an error.
-- **`AI_REVIEWER_MODEL` unset while `AI_REVIEWER_ENABLED=1`** — per-repo no-op every poll pass, silent beyond the state file's `last_error`, never crashes the poll for other repos.
-- **Token scope insufficient** (403 from Gitea on the PR-list, diff, or comment call) — surfaces as an ordinary recorded failure via the same `attempts`/`last_error` path, not a crash; the fix (widen the token's scope, re-run `gitea-configure-api.sh`) is an operational step, not something this code needs to detect specially.
-- **Concurrent poll passes for the same PR** — closed by the synchronous `label_present: True` write in `_ai_reviewer_poll_repo()` (step 3 above) *before* any slow work starts, plus the per-PR non-blocking lock in `_ai_reviewer_review_bg()` as defense in depth against a still-in-flight retry attempt overlapping itself.
-- **Malformed/unexpected Gitea API response shape** (mid-restart, non-list `pulls` body, etc.) for one repo — caught by the existing outer `try/except Exception: pass` around the per-repo loop; other registered repos' polls are unaffected, matching the must-fix precedent from 2c part 1.
-- **State file missing or corrupt** — treated as `{}`, same tolerance as `_load_gitea_repo_map()`.
-- **A PR whose repo isn't in `GITEA_REPO_MAP_FILE`** — never inspected; out of scope by construction (the poll only iterates the repo map).
-- **Two roster entries with the same `name` but different `kind`** (e.g. an `engines.d` entry happens to share a name with the configured Ollama model) — `AI_REVIEWER_MODEL`'s `"kind:name"` format disambiguates explicitly; `roster()` lookup is keyed on `(kind, name)`, same as `validate_composition()` already does.
+### CLI
+
+New subcommand `team-branches <project_workdir>`, printing
+`list_team_branches()`'s result as JSON (`_cli_team_branches()`, follows
+`_cli_team_status()`'s exact shape: one function, registered in the
+`argparse` subparser block, no run_id argument since this is scoped to a
+project, not a run).
+
+### `app/app.py` (web UI)
+
+New route `GET /projects/<name>/team/branches` returning
+`list_team_branches()`'s JSON (same auth/project-scoping guard every other
+`/team/*` route already applies). Teams page gains a small read-only
+"Past team branches" panel (collapsed/expandable, or a simple list below
+the existing team status panel) listing branch name, short commit hash,
+commit subject, and relative commit date — fetched once on page load
+(this data changes only when a team run stops, not continuously, so it
+does NOT need to join the existing 4s `/status` poll cycle). No new
+interaction model: reuses the page's existing list/row typography, no new
+component. `ux-designer` is skipped for this cycle — this is a passive
+read-only list appended to an existing panel, not a new interaction
+pattern, consistent with the right-sizing rule for changes that don't
+introduce new UI surface shape.
+
+### Docs
+
+Short new section in `docs/ARCHITECTURE.md` ("Reviewing a team's work
+after it stops"), documenting the plain `git log team-<run_id>-<agent>`,
+`git merge team-<run_id>-<agent>`, `git branch -D team-<run_id>-<agent>`
+commands an operator uses once they've found a branch via the new UI
+panel or `team-branches` CLI output — per the backlog's own suggested doc
+shape.
 
 ## Acceptance criteria
-- [ ] Given `AI_REVIEWER_ENABLED=0` (the default), when a registered project's open PR gets the configured label, then no PR-listing/diff/comment calls happen and no review is posted.
-- [ ] Given `AI_REVIEWER_ENABLED=1`, a valid `AI_REVIEWER_MODEL`, and a registered project's open PR whose label set changes from not containing `AI_REVIEWER_LABEL` to containing it, when the next due poll runs, then within that poll pass a comment is posted to that PR via `POST /repos/{owner}/{repo}/issues/{number}/comments`, and the state file records `label_present: true` for that PR.
-- [ ] Given the same PR polled again with the label still present (never removed in between), when polled repeatedly, then no second comment-post call happens.
-- [ ] Given the label is removed and then re-added on a previously-reviewed PR, when polled after the re-add, then exactly one new review-trigger fires (a second, independent episode).
-- [ ] Given a diff whose UTF-8 byte length exceeds `AI_REVIEWER_MAX_DIFF_BYTES`, when reviewed, then the text sent to the model is truncated to that many bytes and the posted comment contains an explicit truncation note.
-- [ ] Given `AI_REVIEWER_MODEL` names a roster entry that doesn't exist (unset, or removed from `engines.d` since configured), when a review would be triggered, then no exception propagates out of the poll pass, the repo's `last_error` is recorded, and other registered repos' polls in the same pass are unaffected.
-- [ ] Given a review-generation failure (model call error, diff-fetch failure, or comment-post failure), when it happens, then `attempts` increments and `label_present` stays `true` (no duplicate trigger from the add-edge), and after `AI_REVIEWER_MAX_ATTEMPTS` consecutive failures for one episode, no further attempts are made until the label is removed and re-added.
-- [ ] Given an `engine`-kind `AI_REVIEWER_MODEL`, when a review runs, then `agent_run()` is invoked with a freshly-created scratch directory (not `PROJECTS_DIR/<name>`) as its `workdir`, and that scratch directory no longer exists once the review call returns, regardless of success or failure.
-- [ ] Given an `ollama`-kind `AI_REVIEWER_MODEL`, when a review runs, then the call goes through `_tier1_call_with_retry()` with `tools=[]` (a plain completion, no tool-calling behavior).
-- [ ] Given a PR on a Gitea repo not present in `GITEA_REPO_MAP_FILE`, when polled, then it is never inspected for the review label.
-- [ ] Given a project with auto-discovered grounding docs, when a review is generated, then the constructed prompt contains the grounding digest text (verifiable directly against `teams.load_grounding()`'s output in a unit test, without needing a live model call).
-- [ ] No code path introduced by this feature calls any Gitea PR-approve, PR-merge, or repo-branch-write endpoint.
+
+1. `list_team_branches()` returns every `team-*` branch in a project's
+   repo with correct commit metadata, parses `run_id`/`agent` out of the
+   naming convention where it matches, and returns `[]` (not an
+   exception) for a non-git directory or a repo with zero matching
+   branches.
+2. `team-branches <project_workdir>` CLI subcommand prints the same data
+   as JSON; exits 0 even when the list is empty.
+3. `GET /projects/<name>/team/branches` is reachable through the existing
+   project-scoping/auth guard and returns the same JSON shape.
+4. The Teams page shows a "Past team branches" panel populated from that
+   route, with no action buttons (list-only, per scope).
+5. `docs/ARCHITECTURE.md` gains the new section with the three commands
+   named above.
+6. No existing test regresses; new tests cover `list_team_branches()`
+   (multiple branches, zero branches, non-git dir, a branch name that
+   doesn't match the naming convention) and the new CLI subcommand and
+   route.
 
 ## Open questions
-- **Token scope exact requirement** — proceeding under the assumption that Gitea's `issue` scope family (`read:issue`/`write:issue`) is what's needed for PR-label reads and PR-comment writes, alongside the existing `write:repository`. This is the one piece of the design most worth confirming live against the real Gitea 1.27.1 instance during the reviewer's testing pass (same live-verification precedent 2b/2c already established) — not a blocker, since a wrong scope surfaces cleanly as a recorded 403 failure per the edge cases above, not a crash or silent misbehavior.
-- **Whether a wrong scope should abort `gitea-configure-api.sh`'s existing run or just widen it going forward** — assumption: just widen the `--scopes` argument in place; the script is already documented as idempotent/re-runnable, so no new decision is needed there.
 
-## Risk / rollback notes
-- **Off by default** (`AI_REVIEWER_ENABLED=0`) — zero behavior change for any existing install until an operator opts in.
-- **Worst case if something goes wrong**: a spurious or low-quality comment gets posted to a PR — reversible (delete the comment in Gitea's own UI) and never mixed with any write to code, branches, or PR state. No data-loss risk, no risk to the project's real working copy (see the scratch-directory design above).
-- **Rollback**: set `AI_REVIEWER_ENABLED=0` (or leave it unset); no schema/file needs cleanup — the state file and scratch directories are self-contained and harmless to leave in place or delete.
-- **Cost/rate risk** (noted for the future, not gated on here): reviewing every tagged PR against a hosted/paid model has a real per-review cost; the operator controls this entirely today via which roster model `AI_REVIEWER_MODEL` names (an Ollama/local model has none) — no rate limiting is added in this spec since Gitea is self-hosted with no external rate limit to respect, per the backlog's own "Scope is Gitea-only for now" framing.
+None — this is discoverability polish over an already-settled safety
+decision, no further user input needed.

@@ -197,7 +197,16 @@ function statusWith(instances, roster) {
   };
 }
 
-async function setupCase(instances, roster) {
+// Bootstraps a case through the same two-step bootstrap-refresh()-then-
+// real-refresh() dance setupCase() below performs, but stops there --
+// leaves any per-project /team/branches fetch (backlog item 13) that
+// refresh() just triggered UNresolved and pending. Used directly by the
+// "Past team branches panel" tests further down, which need to control
+// that fetch's own payload/timing themselves; setupCase() itself instead
+// auto-drains it with a default empty-array response (see its own doc
+// comment) so the rest of this file's tests -- which don't care about this
+// panel -- see a clean pendingFetches list.
+async function bootstrapCase(instances, roster) {
   const c = createCase();
   // Drain the script's own unawaited bootstrap refresh() call at load time.
   c.resolveFetch((f) => f.url === '/status', 200, statusWith([]));
@@ -207,6 +216,24 @@ async function setupCase(instances, roster) {
   const p = c.call('refresh');
   c.resolveFetch((f) => f.url === '/status', 200, statusWith(instances, roster));
   await p;
+  return c;
+}
+
+async function setupCase(instances, roster) {
+  const c = await bootstrapCase(instances, roster);
+  // Past team branches panel (backlog item 13, docs/spec.md) -- every
+  // project row fires its own one-time /team/branches fetch as a side
+  // effect of rendering (see fetchTeamBranches()'s own doc comment in
+  // app/app.py, and renderTeamBranches() which triggers it). Drained here
+  // with an empty-array default -- fetchTeamBranches() deliberately does
+  // NOT re-render itself once resolved, so this drain has no cascading
+  // effect on pendingFetches beyond removing this one entry.
+  for (const inst of (instances || [])) {
+    if (c.pendingFetches.some((f) => f.url === '/projects/' + inst.name + '/team/branches')) {
+      c.resolveFetch((f) => f.url === '/projects/' + inst.name + '/team/branches', 200, []);
+    }
+  }
+  await tick();
   return c;
 }
 
@@ -808,6 +835,19 @@ async function deliverTeamInbox(c, name, runId, instances, payload) {
   await tick();
   await tick();
   await tick();
+}
+
+// Past team branches panel (backlog item 13, docs/spec.md) -- resolves the
+// project's own pending /team/branches fetch with `payload`, then drives an
+// explicit further refresh() (rerenderRow()) to observe it rendered --
+// unlike deliverTeamInbox() above, fetchTeamBranches() itself does NOT
+// trigger its own refresh() (see that function's own doc comment in
+// app/app.py for why), so there is no automatic cascade to wait on here.
+async function deliverTeamBranches(c, name, instances, payload) {
+  await waitForFetch(c, (f) => f.url === '/projects/' + name + '/team/branches');
+  c.resolveFetch((f) => f.url === '/projects/' + name + '/team/branches', 200, payload);
+  await tick();
+  await rerenderRow(c, instances);
 }
 
 test('running renders the "Working" status strip, not the old "Status: [running]" wording', async () => {
@@ -1611,6 +1651,70 @@ test('a team stopping (going idle) clears its feed/escalation client state', asy
   // stay wherever it was left before going idle.
   const c2 = await setupCase([inst('proj', { status: 'running', run_id: 'run-clear-2' })]);
   assert.ok(c2.instanceRowHtml('proj').includes('Hide live feed'));
+});
+
+// ─── Past team branches panel (backlog item 13) ────────────────────────
+
+test('idle row fetches team branches once and shows a loading placeholder first', async () => {
+  const c = await bootstrapCase([inst('proj', null)]);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('Loading past team branches'), 'expected the loading placeholder, got: ' + html);
+  assert.ok(c.pendingFetches.some((f) => f.url === '/projects/proj/team/branches'),
+    'expected a /team/branches fetch to have been dispatched');
+});
+
+test('empty branch list renders "No past team branches"', async () => {
+  const instances = [inst('proj', null)];
+  const c = await bootstrapCase(instances);
+  await deliverTeamBranches(c, 'proj', instances, []);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('No past team branches'), 'got: ' + html);
+});
+
+test('branch entries render name/short commit/subject/date, no action buttons', async () => {
+  const instances = [inst('proj', null)];
+  const c = await bootstrapCase(instances);
+  const branches = [{
+    branch: 'team-1700000000-abc123def456-claude', run_id: '1700000000-abc123def456',
+    agent: 'claude', commit: 'deadbeefcafefeed1234567890abcdef12345678',
+    subject: 'teammate commit', committer_date: '2026-08-01T10:00:00+00:00',
+  }];
+  await deliverTeamBranches(c, 'proj', instances, branches);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('team-1700000000-abc123def456-claude'), 'expected branch name, got: ' + html);
+  assert.ok(html.includes('deadbee'), 'expected short (7-char) commit, got: ' + html);
+  assert.ok(!html.includes('deadbeefcafefeed'), 'commit must be shortened, not the full hash, got: ' + html);
+  assert.ok(html.includes('teammate commit'), 'expected commit subject, got: ' + html);
+  assert.ok(html.includes('2026-08-01'), 'expected date, got: ' + html);
+  assert.ok(!/<button[^>]*>/.test(html.slice(html.indexOf('team-branches'))),
+    'no action buttons for the branches panel (list-only, per scope), got: ' + html);
+});
+
+test('a fetch failure (non-ok status) renders "Past team branches unavailable"', async () => {
+  const instances = [inst('proj', null)];
+  const c = await bootstrapCase(instances);
+  await waitForFetch(c, (f) => f.url === '/projects/proj/team/branches');
+  c.resolveFetch((f) => f.url === '/projects/proj/team/branches', 500, {});
+  await tick();
+  await rerenderRow(c, instances);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('Past team branches unavailable'), 'got: ' + html);
+});
+
+test('team branches are fetched only once per project, cached across later poll cycles', async () => {
+  const instances = [inst('proj', null)];
+  const c = await bootstrapCase(instances);
+  await deliverTeamBranches(c, 'proj', instances, []);
+  await rerenderRow(c, instances);
+  assert.ok(!c.pendingFetches.some((f) => f.url === '/projects/proj/team/branches'),
+    'must not re-fetch team branches on a later 4s poll cycle -- this data does not join that cycle');
+});
+
+test('a running team row also renders the past branches panel', async () => {
+  const c = await setupCase([inst('proj', { status: 'running', run_id: 'run-b' })]);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('class="team-branches"'),
+    'expected the branches panel to render for a running team too, got: ' + html);
 });
 
 // ─── run ────────────────────────────────────────────────────────────────

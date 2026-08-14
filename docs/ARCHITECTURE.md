@@ -112,3 +112,33 @@ one shared, tested behavior — `run_startup_watch()`, implemented once in
 Python and once in bash, but driven by the same file format both places. A
 new engine, or a fix to how startup prompts get handled, is one file that
 both code paths pick up.
+
+## Reviewing a team's work after it stops
+
+`stop_team()` (`app/teams.py`) removes each teammate's git worktree
+directory once the run stops or finishes, but deliberately never deletes
+the branch that worktree was checked out onto (`team-{run_id}-{agent}`,
+created by `_create_worktree()`) — nothing a teammate committed is ever
+silently lost. Once the worktree is gone, though, the switchboard itself no
+longer tracks that branch anywhere in its own run state; the Teams page's
+"Past team branches" panel (and the `team-branches <project_workdir>` CLI
+subcommand, both backed by `teams.list_team_branches()`) exist purely to
+help you *find* it again — neither one offers a merge/delete action, by
+design (backlog item 13): reviewing, merging, and cleaning up is left to
+you, using plain git, directly against the project's own repository:
+
+```sh
+# See what a teammate actually did, before deciding whether to keep any of it.
+git -C <project_dir> log team-<run_id>-<agent>
+
+# Bring it into your current branch, exactly like reviewing any other branch.
+git -C <project_dir> merge team-<run_id>-<agent>
+
+# Once you're done with it (merged, or decided to discard it), the branch
+# does not clean itself up -- delete it explicitly when you're ready.
+git -C <project_dir> branch -D team-<run_id>-<agent>
+```
+
+A branch left unreviewed costs nothing beyond `git branch --list`'s own
+output growing by one line over time — there is no TTL, sweep, or
+auto-deletion for `team-*` branches anywhere in this codebase, on purpose.

@@ -2021,6 +2021,17 @@ PAGE_TEMPLATE = """<!doctype html>
                          padding: 4px 8px; background: #1c1c1c; }
   .team-grounding { font-size: 12px; color: #888; }
   .team-validation-error { font-size: 12px; color: #ff6b6b; min-height: 14px; }
+  /* Past team branches panel (backlog item 13, docs/spec.md) -- read-only,
+     list-only, no action buttons. Same font-size/color tokens as
+     .team-grounding above, its closest existing precedent (a small,
+     muted, informational list already living in this same team panel
+     area). */
+  .team-branches { font-size: 12px; color: #888; margin-top: 6px;
+                    display: flex; flex-direction: column; gap: 4px; }
+  .team-branches-title { color: #aaa; }
+  .team-branch-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .team-branch-name { color: #eee; font-family: monospace; }
+  .team-branch-commit { font-family: monospace; }
   /* Live event feed + escalation inbox (backlog item 6f part 2, docs/
      design.md) -- status strip replaces the old plain "Status: [label]"
      line the non-idle branch used to render; escalation panel and the
@@ -2453,6 +2464,13 @@ let teamPickerInitialized = {}; // name -> bool, true once seeded from inst.team
 let teamPickerLead = {};        // name -> {kind, name} | null
 let teamPickerMembers = {};     // name -> Set<string> (engine names)
 let teamGroundingCache = {};    // name -> {files, skipped} | null (fetch failed) | undefined (not fetched yet)
+// Past team branches panel (backlog item 13, docs/spec.md) -- name -> branch[]
+// | null (fetch failed) | undefined (not fetched yet). Fetched once per
+// project the first time its row renders (see renderTeamBranches() below),
+// NOT joined to the existing 4s /status poll cycle -- this data only
+// changes when a team run stops, so a single fetch per project per page
+// load is enough (docs/spec.md).
+let teamBranchesCache = {};
 
 // Live event feed + escalation inbox (backlog item 6f part 2, docs/spec.md
 // / docs/design.md) -- per-project client state, all keyed by project name
@@ -2533,6 +2551,56 @@ async function fetchTeamGrounding(name) {
     teamGroundingCache[name] = null;
   }
   refresh();
+}
+// Past team branches panel (backlog item 13, docs/spec.md) -- fetched once
+// per project, the first time renderTeamBranches() below finds no cache
+// entry for it yet. Deliberately does NOT call refresh() itself once
+// resolved (unlike fetchTeamGrounding()/fetchTeamInbox() above, both of
+// which are triggered by a direct operator action expecting immediate
+// feedback): this fetch fires passively as a side effect of a normal row
+// render, and docs/spec.md itself says this data "does NOT need to join
+// the existing 4s /status poll cycle" -- the already-running setInterval(
+// refresh, 4000) picks up the now-cached result on its own next tick
+// regardless, so forcing an extra immediate refresh() here would only add
+// an unnecessary redundant render for every project on every page load.
+async function fetchTeamBranches(name) {
+  try {
+    const r = await fetch('/projects/' + encodeURIComponent(name) + '/team/branches');
+    teamBranchesCache[name] = r.ok ? await r.json() : null;
+  } catch (e) {
+    teamBranchesCache[name] = null;
+  }
+}
+// List-only, no action buttons (docs/spec.md scope). Always rendered (idle
+// or not) since a project's past branches are independent of any run
+// currently in progress. committer_date is shown as its own YYYY-MM-DD date
+// (the ISO-strict string's own date portion) -- no relative-time formatting
+// dependency added for a small, informational, once-per-load list.
+function renderTeamBranches(name) {
+  const id = 'team-branches-' + esc(name);
+  if (teamBranchesCache[name] === undefined) {
+    fetchTeamBranches(name);  // picked up by the next normal refresh() poll
+    return '<div class="team-branches" id="' + id + '">Loading past team branches…</div>';
+  }
+  const branches = teamBranchesCache[name];
+  if (branches === null) {
+    return '<div class="team-branches" id="' + id + '">Past team branches unavailable</div>';
+  }
+  if (branches.length === 0) {
+    return '<div class="team-branches" id="' + id + '">No past team branches</div>';
+  }
+  const rows = branches.map(b => {
+    const shortCommit = (b.commit || '').slice(0, 7);
+    const dateLabel = b.committer_date ? b.committer_date.slice(0, 10) : '';
+    return '<div class="team-branch-row">' +
+      '<span class="team-branch-name">' + esc(b.branch) + '</span>' +
+      '<span class="team-branch-commit">' + esc(shortCommit) + '</span>' +
+      '<span class="team-branch-subject">' + esc(b.subject || '') + '</span>' +
+      '<span class="team-branch-date">' + esc(dateLabel) + '</span>' +
+      '</div>';
+  }).join('');
+  return '<div class="team-branches" id="' + id + '">' +
+    '<div class="team-branches-title">Past team branches</div>' + rows + '</div>';
 }
 function toggleTeamPicker(name) {
   teamPickerOpen[name] = !teamPickerOpen[name];
@@ -3113,7 +3181,7 @@ function teamRow(name, team) {
         '<div class="team-msg error">✕ No roster members available. Add an engine to engines.d ' +
         'or configure TEAM_LLM_BASE_URL/TEAM_LLM_MODEL.</div>' +
         '<div class="team-actions"><button class="team-btn" id="start-btn-' + esc(name) + '" disabled>' +
-        'Start team</button></div>' + msgSlot + '</div>';
+        'Start team</button></div>' + msgSlot + renderTeamBranches(name) + '</div>';
     }
     const open = composition !== undefined && !!teamPickerOpen[name];
     const configureRow = composition !== undefined ?
@@ -3125,7 +3193,7 @@ function teamRow(name, team) {
       '<div class="team-actions"><button class="team-btn" id="start-btn-' + esc(name) + '"' +
       (startDisabled ? ' disabled' : '') +
       ' onclick="doTeamStart(' + "'" + name + "'" + ')">Start team</button></div>' +
-      msgSlot + '</div>';
+      msgSlot + renderTeamBranches(name) + '</div>';
   }
   // Overwatch feed + escalation inbox (backlog item 6f part 2, docs/
   // spec.md / docs/design.md) -- 4-state status strip, an escalation-answer
@@ -3146,7 +3214,7 @@ function teamRow(name, team) {
     feedToggle + feedPanel +
     '<div class="team-actions"><button class="team-btn" onclick="doTeamStop(' +
     "'" + name + "'" + ')">Stop team</button></div>' +
-    msgSlot + '</div>';
+    msgSlot + renderTeamBranches(name) + '</div>';
 }
 function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverride, showBadge, gitSync, deploy, team) {
   // subOverride lets a singleton-toggle row (Taiga/Gitea — see refresh())
@@ -4550,6 +4618,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._handle_team_events(parts[1], query)
             if len(parts) == 4 and parts[0] == "projects" and parts[2] == "team" and parts[3] == "inbox":
                 return self._handle_team_inbox(parts[1], query)
+            if len(parts) == 4 and parts[0] == "projects" and parts[2] == "team" and parts[3] == "branches":
+                # Backlog item 13, docs/spec.md -- read-only surviving-
+                # branch discoverability. Same gating as /team/grounding
+                # above: no TOTP needed (_authed() only, already checked at
+                # the top of do_GET), same project-scoping 404.
+                name = parts[1]
+                if name not in instance_names():
+                    return self._json({"error": "unknown project"}, 404)
+                return self._json(teams.list_team_branches(os.path.join(PROJECTS_DIR, name)))
             self.send_response(404)
             self.end_headers()
 

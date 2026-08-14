@@ -1,3 +1,176 @@
+# Implementation: Backlog item 13 -- surviving team branch discoverability
+
+## Summary
+Read-only discoverability for `team-*` git branches that survive a stopped
+team run's `stop_team()`-driven worktree removal (`_create_worktree()`
+creates each teammate's branch as `team-{run_id}-{agent}`, and the branch is
+deliberately never deleted once its worktree is removed -- the existing
+safety property this cycle surfaces, not changes). Three new surfaces, all
+read-only, backed by one new function:
+- `teams.list_team_branches(project_workdir)` -- one `git branch --list
+  'team-*'` subprocess call, parsed into `{branch, run_id, agent, commit,
+  subject, committer_date}` dicts, `run_id`/`agent` parsed best-effort from
+  the naming convention, `[]` on any failure (never raises).
+- `team-branches <project_workdir>` CLI subcommand -- prints the same list
+  as JSON.
+- `GET /projects/<name>/team/branches` web route, same auth/project-scoping
+  guard as every other `/team/*` route, plus a "Past team branches" panel on
+  the Teams page (list-only, no action buttons, fetched once per project
+  page-load, not joined to the 4s `/status` poll).
+
+No new git operations beyond the one read-only `git branch --list` call; no
+merge/delete UI action, per scope.
+
+## Root cause
+Not applicable (new feature/discoverability polish, not a bugfix) --
+`docs/BACKLOG.md` item 13 already diagnosed the gap at the multi-agent-teams
+story's completion triage: the safety property (branches are never deleted)
+was already implemented; nothing surfaced that those branches exist once
+their worktree entry is dropped from `state["worktrees"]`.
+
+## Changes by file
+- `app/teams.py`:
+  - `_TEAM_BRANCH_RE` -- new module-level regex, right before
+    `list_team_branches()`, reusing `_RUN_ID_RE`'s own `[0-9]+-[0-9a-f]{12}`
+    run_id shape (not a looser `"team-<anything>-<anything>"` split) so a
+    hand-created branch merely starting with `"team-"`, or an agent name
+    containing its own hyphens, is never misparsed.
+  - `list_team_branches(project_workdir)` -- new, placed right after
+    `_remove_worktree()` per docs/spec.md. Plain
+    `subprocess.run(["git", "-C", project_workdir, "branch", "--list",
+    "team-*", "--format=..."], ...)` (the same read-your-own-checkout-
+    directly convention `_validate_project_for_team()` already establishes
+    above it -- no `_run_run_user_command()`/`RUN_USER` crossing needed).
+    Tab-split per line into the five fields docs/spec.md specifies; a
+    non-git directory, a missing `git` binary, or zero matching branches
+    all degrade to `[]`, never an exception.
+  - `_cli_team_branches(args)` -- new, right after `_cli_team_reap()`,
+    prints `list_team_branches(args.workdir)` as JSON, always exits 0 (the
+    underlying function never raises, so there's no error branch to
+    handle, unlike `_cli_team_status()`'s `FileNotFoundError` catch).
+  - New `team-branches <workdir>` subparser + dispatch arm in
+    `_parse_args()`/`main()`, following the existing subcommand list's
+    exact registration shape.
+- `app/app.py`:
+  - New `GET /projects/<name>/team/branches` branch inside `do_GET()`'s
+    existing `urllib.parse.urlsplit()`-routed `else` block, alongside
+    `/team/grounding`/`/team/events`/`/team/inbox` -- same "no TOTP,
+    `_authed()` only, unknown-project 404" gating as `/team/grounding`.
+    Returns `teams.list_team_branches(...)`'s list directly as the JSON
+    body (not wrapped in an object), matching docs/spec.md's own "returns
+    the same JSON shape" acceptance criterion.
+  - New CSS block (`.team-branches`/`.team-branches-title`/
+    `.team-branch-row`/`.team-branch-name`/`.team-branch-commit`), reusing
+    `.team-grounding`'s own font-size/color tokens -- its closest existing
+    precedent (a small, muted, informational list already living in this
+    same team panel area).
+  - `teamBranchesCache` (new client-side cache, `name -> branch[] | null |
+    undefined`, alongside `teamGroundingCache`), `fetchTeamBranches(name)`,
+    `renderTeamBranches(name)` -- new functions, placed next to
+    `fetchTeamGrounding()`/`renderTeamGrounding()`. `renderTeamBranches()`
+    is called from both branches of `teamRow()` (idle -- including the "no
+    roster members" early return -- and non-idle), so the panel is always
+    present regardless of whether a run is currently active.
+- `docs/ARCHITECTURE.md`: new "Reviewing a team's work after it stops"
+  section (see docs/spec.md's own required content) -- `git log`/`git
+  merge`/`git branch -D` against a `team-<run_id>-<agent>` branch.
+- New tests: `tests/test_teams_lifecycle.py` (`ListTeamBranchesRealGitTests`,
+  6 tests; `CliTeamBranchesTests`, 2 tests), `tests/test_team_routes.py`
+  (`TeamBranchesEndpointTests`, 4 tests), `tests/test_team_frontend.js` (6
+  tests) -- see "How to verify locally" below.
+
+## Key decisions / tradeoffs
+- **`fetchTeamBranches()` deliberately does NOT call `refresh()` itself
+  once resolved**, unlike `fetchTeamGrounding()`/`fetchTeamInbox()` (both
+  triggered by a direct operator action -- opening the picker, an
+  escalation appearing -- that expects immediate visual feedback). This
+  fetch instead fires passively as a side effect of a normal row render
+  (every project, every time its row first renders with no cache entry
+  yet), and docs/spec.md itself says this data "does NOT need to join the
+  existing 4s `/status` poll cycle" -- the already-running
+  `setInterval(refresh, 4000)` picks up the now-cached result on its own
+  next tick regardless, so forcing an extra immediate `refresh()` here
+  would add a redundant render on every page load for every project, for a
+  panel whose own freshness requirement docs/spec.md already relaxed. In
+  the worst case this means up to ~4s between the fetch resolving and the
+  panel visually updating -- accepted as consistent with the spec's own
+  stated timing tolerance for this specific panel.
+- **`renderTeamBranches()` is called unconditionally from every `teamRow()`
+  return path** (idle, the "no roster members" refusal, and non-idle) --
+  not gated on `team.status`. A project's past branches are a property of
+  its git history, independent of whether a run happens to be active right
+  now, so hiding the panel in any one state would be an arbitrary
+  restriction docs/spec.md never asked for.
+- **The web route returns the bare list, not `{"branches": [...]}`** --
+  docs/spec.md's acceptance criterion 3 says the route "returns the same
+  JSON shape" as `list_team_branches()`, which itself returns a bare list;
+  wrapping it in an object would be an unrequested shape change.
+
+## Deviations from spec
+None. Implemented per docs/spec.md's own literal command/shape
+specification (`--format=%(refname:short)\t%(objectname)\t
+%(committerdate:iso-strict)\t%(subject)`, full (not abbreviated)
+`%(objectname)`) -- the Teams-page panel shortens the commit hash to 7
+characters client-side for display only (docs/spec.md's own UI description:
+"branch name, **short** commit hash, commit subject, and relative commit
+date"), the full hash is still the one `list_team_branches()`/the route/the
+CLI all return. "Relative commit date" is rendered as the ISO-strict
+string's own `YYYY-MM-DD` date portion, not a "3 days ago"-style relative
+string -- no relative-time formatting dependency existed anywhere in this
+codebase already, and adding one for a small, once-per-load, informational
+list was judged out of proportion to the ask; flagged here as the one place
+this reading is not perfectly literal.
+
+## Known limitations
+- **No relative-time ("3 days ago") formatting** -- see "Deviations from
+  spec" above; the panel shows a plain ISO date instead.
+- **No live-updating branch list while a project's row stays open** -- by
+  design (see "Key decisions" above): the panel reflects whatever was true
+  the moment its one-time fetch resolved, refreshed only on this
+  process/tab's next full page reload's own first render per project (the
+  cache is keyed by project name and never invalidated). A branch created
+  or deleted by an operator running plain `git` commands directly (per the
+  new `docs/ARCHITECTURE.md` section) will not appear/disappear from an
+  already-open tab until it's reloaded.
+
+## How to verify locally
+```
+# Full existing suite, including this cycle's new tests, all green:
+python3 -m unittest discover -s tests
+# Ran 932 tests ... OK
+
+# Just this cycle's new backend tests (12):
+python3 -m unittest tests.test_teams_lifecycle.ListTeamBranchesRealGitTests \
+  tests.test_teams_lifecycle.CliTeamBranchesTests \
+  tests.test_team_routes.TeamBranchesEndpointTests -v
+# Ran 12 tests ... OK
+
+# Frontend tests (extracts the real, rendered <script> from
+# app.render_page() via a Python subprocess, runs it in a Node vm sandbox
+# with stub document/fetch/confirm -- no browser, no headless Chrome),
+# including this cycle's new 6 tests:
+node tests/test_team_frontend.js
+# ALL PASS (80/80)
+
+# Manual smoke test against a real project:
+#   1. Start the app.py server, log in.
+#   2. Start and stop a team run against a project (Start team -> let it
+#      run or delegate at least once -> Stop team), so a teammate's
+#      worktree gets removed but its branch survives.
+#   3. Reload the Teams page -- the project's row should show a "Past team
+#      branches" panel listing team-<run_id>-<agent>, a short commit hash,
+#      the commit subject, and a YYYY-MM-DD date -- no buttons.
+#   4. From a shell: `python3 app/teams.py team-branches <project_dir>`
+#      prints the same data as JSON.
+#   5. `curl` (with a valid session cookie)
+#      `/projects/<name>/team/branches` returns the same JSON as a bare
+#      array.
+#   6. Follow docs/ARCHITECTURE.md's new "Reviewing a team's work after it
+#      stops" section's three commands against that branch -- confirm
+#      `git log`/`git merge`/`git branch -D` all work as documented.
+```
+
+
 # Implementation: Backlog item 8 -- AI merge-request reviewer, Gitea-only
 
 ## Summary
