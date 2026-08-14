@@ -395,3 +395,116 @@ already-merged issue (inherited from backlog item 16's own design doc, not
 introduced by this diff, and out of scope for this cycle's own non-goals),
 so it is filed as a non-blocking follow-up rather than a blocker. No
 must-fix issues found.
+
+# Test & Review: Backlog item 20 -- `.team-btn`/`.deploy-btn` WCAG AA contrast fix
+
+## Scope
+Covers all three acceptance criteria in `docs/spec.md` for this cycle: the
+`.deploy-btn, .team-btn` shared CSS rule's text/background contrast ratio,
+no regressions in any test that references these selectors, and correction
+of `docs/design.md`'s two known-wrong contrast claims for this pairing
+(this is the follow-up filed at the end of the item 19 part 2 review above).
+Branch: `backlog/team-btn-contrast-20`. Single-line CSS change
+(`app/app.py`) plus two `docs/design.md` text corrections. Nothing
+committed by the developer; nothing committed by this review.
+
+## Test cases
+
+| # | Criterion / case | Method | Result | Evidence |
+|---|---|---|---|---|
+| 1 | `.deploy-btn, .team-btn`'s shipped rule now reads `color: #111` (not `#fff`), `background: #34c759` and every other property unchanged | automated (grep + diff read) | pass | `git diff app/app.py` shows exactly the one-line change; `grep -n "deploy-btn, .team-btn" app/app.py` confirms shipped rule |
+| 2 | Independently recomputed contrast ratio for `#111` text on `#34c759` background meets/exceeds WCAG AA's 4.5:1 | automated, hand-verified against WCAG relative-luminance formula from raw hex values (not trusting the developer's stated 8.51:1) | pass | Python script computing `lin()`/`lum()`/contrast per W3C formula: `L(#111)=0.005605`, `L(#34c759)=0.42298`, ratio = **8.506:1** (rounds to 8.51:1, matches implementation.md's claim exactly) -- passes AA (4.5:1) and AAA (7:1) |
+| 3 | Old `#fff`-on-`#34c759` pairing actually failed AA (confirms the bug was real, not a false alarm) | automated, same script | pass | ratio = **2.220:1**, well under 4.5:1 -- matches implementation.md's "~2.2:1" claim |
+| 4 | No other background variant of `.team-btn`/`.deploy-btn` (hover/disabled/state) exists that `#111` text would now fail against | manual code read | pass | `grep -n "team-btn\|deploy-btn"` across `app/app.py`: only the one shared rule (line 2160) sets `background`/`color` for these classes; the only `:disabled` CSS rule in the file (`.clone-form input:disabled, .clone-form button:disabled`) does not target `.team-btn`/`.deploy-btn`, and no `:hover`/`:active`/`:focus` rule targets them either -- disabled team/deploy buttons render with the same explicit `background:#34c759; color:#111`, same 8.51:1 ratio |
+| 5 | `docs/design.md`'s two corrected claims (item 16 and item 19 part 2 sections) state the accurate color/ratio | automated, same script | pass | Both corrected lines claim `#111` / **8.51:1** -- matches the independently recomputed 8.506:1; both also correctly note the old `#fff`/~2.2:1 figure as failing AA, matching the independently recomputed 2.220:1 |
+| 6 | No existing test hardcodes the old `#fff` color for `.team-btn`/`.deploy-btn` (so nothing needed updating, and nothing now silently mismatches) | automated | pass | `grep -n "deploy-btn\|color" tests/test_deploy_frontend.js`: only two assertions, both check class-string presence/absence, not color; full-text search of `tests/*.js`/`tests/*.py` for any `#fff` tied to these selectors found none |
+| 7 | Full existing JS frontend suite unaffected | automated | pass | `node tests/test_team_frontend.js` -- ALL PASS (94/94) |
+| 8 | Full existing Python backend suite unaffected | automated | pass, on 2nd run (see Regression check) | `python3 -m unittest discover -s tests` -- 1034/1034 |
+| 9 | `app/app.py` still parses as valid Python (inline HTML/CSS string, no syntax break) | automated | pass | `python3 -m py_compile app/app.py` -- OK |
+
+## Regression check
+Full existing suite run twice:
+- `node tests/test_team_frontend.js` -- ALL PASS (94/94), one run.
+- `python3 -m unittest discover -s tests` -- **run 1: 1034 tests, 1 failure**
+  (`RealTmuxHeadlessTests.test_run_sh_and_prompt_file_are_world_readable_under_a_strict_umask`,
+  `AssertionError: False is not true` on `results["r"]["ok"]`), preceded in
+  the log by repeated `duplicate session: team-sessionrace-p<pid>` lines from
+  unrelated tests in the same run. Investigated before accepting as
+  pre-existing flakiness rather than shrugging it off:
+  - Re-ran that single test in isolation: passed (`Ran 1 test ... OK`).
+  - Re-ran the whole `tests/test_teams_headless.py` file alone (91 tests):
+    all passed, no failure.
+  - Re-ran the **entire** `python3 -m unittest discover -s tests` suite a
+    second time, byte-for-byte the same code: **1034 tests, 0 failures,
+    OK** -- the failure did not reproduce.
+  - `git log -- tests/test_teams_headless.py` surfaces commit `dfac08c`
+    ("Scope real-tmux test sessions per process...") on this same branch
+    history, which explicitly documents this exact class of failure as a
+    known, partially-fixed, real-tmux cross-process session-race flake
+    ("had been failing roughly 2 runs in 17 while always passing in
+    isolation... attributed to unrelated flakiness for four review
+    cycles").
+  - Conclusion: this is the same known pre-existing environmental flake,
+    not a regression introduced by this cycle's diff -- the diff touches
+    only a CSS color literal in `app/app.py`'s inline template string and
+    has no code path anywhere near `teams.py`'s tmux session handling.
+    Not filed as a defect against this cycle; not blocking.
+- `python3 -m py_compile app/app.py` -- OK.
+
+## Spec coverage
+| Acceptance criterion (docs/spec.md) | Implemented? | Tested? | Gap? |
+|---|---|---|---|
+| 1. `.deploy-btn, .team-btn` pairing computes to >=4.5:1, verified by real calculation | Yes (`color: #111`) | Yes -- independently recomputed by hand from raw hex, not trusted from the developer's figure (case 2) | None |
+| 2. No existing test breaks; any hardcoded old-color assertion updated | Yes (none existed to update, confirmed by search) | Yes (case 6, and full suite regression run) | None |
+| 3. `docs/design.md`'s known-wrong contrast claims corrected | Yes, both sections | Yes -- both corrected figures independently recomputed and confirmed accurate (case 5) | None |
+
+All three acceptance criteria implemented and independently verified. No
+criterion left uncovered.
+
+## Findings (most severe first)
+None. No must-fix, should-fix, or nit findings from this review pass.
+
+- Correctness: the one-line change is exactly what the spec/implementation
+  describe; no other property in the shared rule was touched; no other
+  selector pairs this green with white text anywhere in `app/app.py`
+  (verified by grep across the full file for `#34c759` -- every other use
+  already pairs with `#111` or is a non-text usage like `.deploy-msg.success`'s
+  own text-on-dark-background color, unrelated to this button pairing).
+- Security: none applicable -- pure CSS literal, no user input, no new
+  attack surface.
+- Simplicity/scope: minimal, in-scope diff -- one CSS value plus two
+  factual doc corrections, matching the spec's explicit "no new color value
+  needed, single shared rule" framing. No speculative generality, no dead
+  code, no scope creep.
+- The developer's own choice to correct the item-16 design.md claim as well
+  (even though that specific button, `.new-project-row button`, never
+  actually shipped with the buggy `#fff` value) is consistent with the
+  spec's literal wording ("the two (at least) known-wrong contrast claims
+  for this pairing," not "the one tied to the shipped bug") and independently
+  verified as the right call -- leaving it uncorrected would have left a
+  second wrong number for a future design pass to copy.
+
+## Follow-ups (non-blocking)
+- The real-tmux session-race flake documented in commit `dfac08c` still
+  reproduces occasionally under full-suite concurrent runs (this session:
+  1 failure in 2 full runs) despite that commit's fix. Not this cycle's
+  scope (no `teams.py`/tmux code touched here), but worth a dedicated
+  look given it's now been observed failing in at least two separate
+  review sessions.
+
+## Overall verdict
+**Approve.** All three acceptance criteria in `docs/spec.md` are
+implemented and independently verified this session: the shipped CSS
+change was confirmed byte-for-byte via `git diff`, the 8.51:1 contrast
+figure was recomputed from raw hex values using the WCAG relative-luminance
+formula (not trusted from the developer's claim) and matched to three
+decimal places, the old failing ~2.2:1 figure was independently confirmed
+as well, both `docs/design.md` corrections were checked against the same
+independently-computed numbers and are accurate, no other `.team-btn`/
+`.deploy-btn` state or background variant exists that would make `#111`
+text fail elsewhere, and no test hardcodes the old color. The one
+Python-suite failure encountered was investigated (isolated re-run, full
+file re-run, full-suite re-run) and traced to a known, already-documented,
+pre-existing real-tmux session-race flake unrelated to this diff, not a
+regression -- filed as a non-blocking follow-up rather than a blocker. No
+must-fix or should-fix issues found in the diff itself.

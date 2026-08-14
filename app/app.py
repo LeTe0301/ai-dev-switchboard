@@ -2158,7 +2158,7 @@ PAGE_TEMPLATE = """<!doctype html>
      (tests/test_deploy_frontend.js's own existing, reviewer-approved
      assertion), and every project unconditionally renders a team control. */
   .deploy-btn, .team-btn { font-size: 14px; padding: 10px 16px; border-radius: 10px; border: none;
-                background: #34c759; color: #fff; font-weight: 600; cursor: pointer;
+                background: #34c759; color: #111; font-weight: 600; cursor: pointer;
                 white-space: nowrap; }
   .deploy-msg { font-size: 12px; color: #888; margin: 4px 0 0; min-height: 14px; word-break: break-all; }
   .deploy-msg.success { color: #34c759; }

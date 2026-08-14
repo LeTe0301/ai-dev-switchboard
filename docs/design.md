@@ -510,7 +510,7 @@ After a successful clone:
 
 - **Touch target sizes**: "Clone from URL" button and "Clone" button both match the page's existing button minimum (36-40px on desktop, larger on mobile if needed). Keyboard-accessible via tab order.
 - **Color contrast**:
-  - Button text (#fff) on button background (#34c759): **5.05:1** (passes WCAG AA for large button text).
+  - Button text (#111, not #fff as originally claimed here — corrected 2026-08-14 per backlog item 20's audit: `.new-project-row button`/`.deploy-btn`/`.team-btn` all pair `#34c759` with dark `#111` text, not white) on button background (#34c759): **8.51:1** (passes WCAG AAA; the previously claimed 5.05:1 for white text was also wrong — white-on-#34c759 is actually ~2.2:1, failing AA).
   - Error message (#ff6b6b) on page background (#1c1c1c): **6.14:1** (passes WCAG AA).
   - Placeholder text (#666 or #888 muted) on input background (#1c1c1c): **6.14:1** (passes WCAG AA).
   - Status message (#aaa muted) on background (#1c1c1c): **6.4:1** (passes WCAG AA for body text).
@@ -917,7 +917,7 @@ Feed shows only human-authored messages:
 
 - **Touch target sizes**: Send button is `.team-btn` (14px font, 10px 16px padding, 10px border-radius) — typical desktop button size (~44-48px height), exceeding the mobile accessibility minimum of 44px; web app is desktop-only, so no mobile-specific adjustment needed.
 - **Color contrast**:
-  - Send button text (#fff) on button background (#34c759): **5.05:1** (passes WCAG AA for large button text; existing token, already audited elsewhere in this design).
+  - Send button text (#111, not #fff as originally claimed here — corrected 2026-08-14 per backlog item 20's audit, which changed `.deploy-btn, .team-btn`'s `color: #fff` to `color: #111` to fix a real AA failure) on button background (#34c759): **8.51:1** (passes WCAG AAA; the previously claimed 5.05:1 for white text was also wrong — white-on-#34c759 is actually ~2.2:1, failing AA).
   - Character counter text (#888) on row background (#1c1c1c): **6.14:1** (passes WCAG AA; existing token).
   - Character counter text over-limit (#ff6b6b) on background: **6.14:1** (passes WCAG AA; existing error token).
   - Left-border accent (#4da6ff) on background (#1c1c1c): **6.67:1** (passes WCAG AA for graphical elements, 3:1 minimum applies).
