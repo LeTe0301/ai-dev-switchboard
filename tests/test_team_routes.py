@@ -1952,6 +1952,181 @@ class TeamResolveEndpointTests(_RealHTTPTeamTestCase):
         self.assertEqual(cli_hist, route_hist)
 
 
+# ─── POST /projects/<name>/team/interject -- backlog item 19 part 1 ───────
+class TeamInterjectEndpointTests(_RealHTTPTeamTestCase):
+    def _make_run(self, name=_PROJ, status="running"):
+        os.makedirs(os.path.join(self.projects_dir, name), exist_ok=True)
+        run_id = teamsmod._run_id()
+        state = teamsmod._new_state(run_id, os.path.join(self.projects_dir, name),
+                                    {"kind": "ollama", "name": "m", "tier": 1}, [], "task",
+                                    project_name=name)
+        state["status"] = status
+        teamsmod._persist(state)
+        return run_id
+
+    def test_unknown_project_404(self):
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/nope/team/interject", cookie,
+                                     {"text": "hi", "code": code})
+        self.assertEqual(status, 404)
+
+    def test_no_run_at_all_400_specific_reason(self):
+        os.makedirs(os.path.join(self.projects_dir, _PROJ))
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/interject", cookie,
+                                     {"text": "hi", "code": code})
+        self.assertEqual(status, 400)
+        self.assertIn("no run found", payload["error"])
+
+    def test_explicit_run_id_for_a_different_project_400_specific_reason(self):
+        run_a = self._make_run(name=_PROJ_A)
+        os.makedirs(os.path.join(self.projects_dir, _PROJ_B))
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ_B}/team/interject", cookie,
+                                     {"text": "hi", "run_id": run_a, "code": code})
+        self.assertEqual(status, 400)
+        self.assertIn("different project", payload["error"])
+
+    # ── run_id path-traversal validation (docs/BACKLOG.md item 11(b)) ───
+
+    def test_path_traversal_run_id_400_planted_file_never_opened(self):
+        os.makedirs(os.path.join(self.projects_dir, _PROJ))
+        planted = _plant_traversal_target(self.tmp)
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = _get_forbidding_open_of(
+            self, planted,
+            lambda: self._post(f"/projects/{_PROJ}/team/interject", cookie,
+                               {"text": "hi", "run_id": TRAVERSAL_RUN_ID, "code": code}))
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "no run found for this project"})
+
+    def test_malformed_non_traversal_run_id_400_no_500(self):
+        os.makedirs(os.path.join(self.projects_dir, _PROJ))
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/interject", cookie,
+                                     {"text": "hi", "run_id": "not-a-real-run", "code": code})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "no run found for this project"})
+
+    # ── length/emptiness validation (this route's own layer, mirroring
+    # /team/resolve's own TEAM_ASK_USER_ANSWER_MAX_CHARS check) ─────────
+
+    def test_empty_text_400_teams_interject_never_called(self):
+        run_id = self._make_run()
+        calls = {"n": 0}
+        orig = teamsmod.interject
+
+        def counting(*a, **kw):
+            calls["n"] += 1
+            return orig(*a, **kw)
+        teamsmod.interject = counting
+        self.addCleanup(setattr, teamsmod, "interject", orig)
+
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/interject", cookie,
+                                     {"text": "   ", "run_id": run_id, "code": code})
+        self.assertEqual(status, 400)
+        self.assertEqual(calls["n"], 0)
+        self.assertFalse(os.path.exists(teamsmod._human_log_path(run_id)))
+
+    def test_oversized_text_400_teams_interject_never_called(self):
+        run_id = self._make_run()
+        orig_max = teamsmod.TEAM_INTERJECT_MAX_CHARS
+        teamsmod.TEAM_INTERJECT_MAX_CHARS = 5
+        self.addCleanup(setattr, teamsmod, "TEAM_INTERJECT_MAX_CHARS", orig_max)
+        calls = {"n": 0}
+        orig = teamsmod.interject
+
+        def counting(*a, **kw):
+            calls["n"] += 1
+            return orig(*a, **kw)
+        teamsmod.interject = counting
+        self.addCleanup(setattr, teamsmod, "interject", orig)
+
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/interject", cookie,
+                                     {"text": "way too long", "run_id": run_id, "code": code})
+        self.assertEqual(status, 400)
+        self.assertIn("at most 5 characters", payload["error"])
+        self.assertEqual(calls["n"], 0)
+
+    # ── success path ──────────────────────────────────────────────────
+
+    def test_valid_running_run_returns_ok_appends_no_thread_started(self):
+        run_id = self._make_run(status="running")
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/interject", cookie,
+                                     {"text": "please check the docs first", "run_id": run_id,
+                                      "code": code})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"ok": True, "run_id": run_id})
+        with open(teamsmod._human_log_path(run_id)) as f:
+            envelope = json.loads(f.readline())
+        self.assertEqual(envelope["agent"], "human")
+        self.assertEqual(envelope["kind"], "message")
+        self.assertEqual(envelope["text"], "please check the docs first")
+        # Unlike /team/resolve|board-resolve, interject never spins up a
+        # background driving thread (docs/spec.md "Proposed approach" §5).
+        self.assertIsNone(appmod._team_threads_get(_PROJ))
+
+    def test_run_id_omitted_defaults_to_latest_run_for_project(self):
+        run_id = self._make_run(status="running")
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/interject", cookie,
+                                     {"text": "hi", "code": code})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["run_id"], run_id)
+
+    def test_blocked_ask_user_run_accepts_an_interjection_too(self):
+        # docs/spec.md "Edge cases" -- a message posted while blocked simply
+        # sits in human.jsonl until a future resolve action restarts the
+        # driving thread; interject() itself does not reject this status.
+        run_id = self._make_run(status="blocked_ask_user")
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/interject", cookie,
+                                     {"text": "hi while blocked", "run_id": run_id, "code": code})
+        self.assertEqual(status, 200)
+        self.assertTrue(os.path.isfile(teamsmod._human_log_path(run_id)))
+        self.assertIsNone(appmod._team_threads_get(_PROJ))
+
+    def test_terminal_status_400_specific_reason(self):
+        run_id = self._make_run(status="finished")
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/interject", cookie,
+                                     {"text": "hi", "run_id": run_id, "code": code})
+        self.assertEqual(status, 400)
+        self.assertIn("finished", payload["error"])
+        self.assertFalse(os.path.exists(teamsmod._human_log_path(run_id)))
+
+    # ── merges into GET .../team/events (docs/spec.md "Proposed approach" §4)
+
+    def test_posted_message_appears_in_team_events_feed(self):
+        run_id = self._make_run(status="running")
+        cookie = self._login()
+        code = self._totp_code()
+        status, _ = self._post(f"/projects/{_PROJ}/team/interject", cookie,
+                               {"text": "hello from a human", "run_id": run_id, "code": code})
+        self.assertEqual(status, 200)
+        status2, payload = self._get(f"/projects/{_PROJ}/team/events?run_id={run_id}", cookie)
+        self.assertEqual(status2, 200)
+        human_events = [e for e in payload["events"] if e["agent"] == "human"]
+        self.assertEqual(len(human_events), 1)
+        self.assertEqual(human_events[0]["kind"], "message")
+        self.assertEqual(human_events[0]["text"], "hello from a human")
+        self.assertIn("human", payload["cursors"])
+
+
 # ─── POST /projects/<name>/team/start with a submitted composition ────────
 class TeamStartWithCompositionEndpointTests(_RealHTTPTeamTestCase):
     def _roster_engines(self):

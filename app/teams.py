@@ -187,6 +187,26 @@ TEAM_ASK_USER_ANSWER_MAX_CHARS = int(os.environ.get("TEAM_ASK_USER_ANSWER_MAX_CH
 # human answer/explanation would need.
 TEAM_BOARD_WRITE_VALUE_MAX_CHARS = int(os.environ.get("TEAM_BOARD_WRITE_VALUE_MAX_CHARS", "8000"))
 
+# Max length of the free-text `text` POST /team/interject accepts -- a
+# short unsolicited human message injected into a RUNNING lead's next round,
+# a materially different action from TEAM_ASK_USER_ANSWER_MAX_CHARS's own
+# "answer to a question the lead itself asked" even though both are short
+# human free text (same "materially different case, kept a separate,
+# independently tunable constant" precedent TEAM_BOARD_WRITE_VALUE_MAX_CHARS
+# already set against TEAM_ASK_USER_ANSWER_MAX_CHARS). Same 2000-char
+# default -- no evidence yet that this needs a different budget (backlog
+# item 19 part 1).
+TEAM_INTERJECT_MAX_CHARS = int(os.environ.get("TEAM_INTERJECT_MAX_CHARS", "2000"))
+
+# Per-round byte cap tail_jsonl_events() reads past state["human_cursor"]
+# when team_step() drains human.jsonl at the top of a round (backlog item 19
+# part 1) -- same "round, conservative default" precedent
+# TEAM_EVENTS_MAX_BYTES_PER_FILE_PER_POLL already set for a poll of the same
+# file family, just scoped to one team_step() drain instead of one GET
+# .../team/events poll.
+TEAM_HUMAN_MSG_MAX_BYTES_PER_ROUND = int(
+    os.environ.get("TEAM_HUMAN_MSG_MAX_BYTES_PER_ROUND", str(64 * 1024)))
+
 # Bash's own `$?` convention for a foreground child killed by signal N is
 # 128+N (POSIX, confirmed live for SIGTERM against `claude -p` during this
 # sub-spec's Tier 3 verification -- see docs/implementation.md). Generic
@@ -2253,6 +2273,23 @@ _BOARD_WRITE_MITIGATION = (
     "while one is already pending will be rejected)."
 )
 
+# Required verbatim (or materially equivalent) in _system_framing(), every
+# tier (backlog item 19 part 1, docs/spec.md "Proposed approach" §3) --
+# states explicitly what a "human_interject" round history entry means and
+# does not mean, the same "make it explicit and salient, don't leave it to
+# be inferred" discipline the three mitigation clauses above already
+# establish.
+_INTERJECT_MITIGATION = (
+    "A round history entry with tool human_interject is an unsolicited "
+    "message the human sent you WHILE you were working -- it is not a reply "
+    "to a question you asked (that would be ask_user_resolved), and it does "
+    "not mean your current plan is wrong. Read it, and let it inform what "
+    "you do next: it may be new information, a correction, a change of "
+    "priority, or a request to stop and explain your progress. If it "
+    "changes what you should be doing, adjust; if it doesn't, briefly "
+    "acknowledge it (in your reasoning, not a tool call) and continue."
+)
+
 
 def _tool_prose(team_members: list) -> str:
     """Prose tool descriptions for tier 2/3 (tier 1 gets these for free from
@@ -2320,6 +2357,7 @@ def _system_framing(workdir: str, team_members: list, tier: int) -> str:
     parts.append(_FACT_CHECK_MITIGATION)
     parts.append(_DELEGATION_HISTORY_MITIGATION)
     parts.append(_BOARD_WRITE_MITIGATION)
+    parts.append(_INTERJECT_MITIGATION)
     return "\n\n".join(parts)
 
 
@@ -2674,6 +2712,15 @@ def _transcript_path(run_id: str) -> str:
     return os.path.join(_run_dir(run_id), "transcript.jsonl")
 
 
+def _human_log_path(run_id: str) -> str:
+    # backlog item 19 part 1, docs/spec.md "Proposed approach" §1 -- a
+    # dedicated append-only file, deliberately NOT a run.json field: the
+    # request thread handling POST /team/interject only ever appends here,
+    # never touches run.json, so there is nothing for the driving thread's
+    # own end-of-round _persist(state) call to race or clobber.
+    return os.path.join(_run_dir(run_id), "human.jsonl")
+
+
 def _inbox_path(run_id: str) -> str:
     return os.path.join(_run_dir(run_id), "inbox.json")
 
@@ -2697,6 +2744,13 @@ def _new_state(run_id: str, workdir: str, lead: dict, members: list, task: str,
         # shape 6c's own tests already persist. Only launch_team() ever
         # supplies real values.
         "project_name": project_name, "worktrees": worktrees or {},
+        # backlog item 19 part 1, docs/spec.md "Proposed approach" §2:
+        # byte offset into human.jsonl that team_step()'s own drain
+        # checkpoint has already consumed. Additive, same "missing key
+        # defaults to 0" precedent worktrees/project_name already
+        # established for runs persisted before this field existed --
+        # state.get("human_cursor", 0) wherever it's read.
+        "human_cursor": 0,
     }
 
 
@@ -2725,6 +2779,20 @@ def _load_state(run_id: str) -> dict:
 def _next_transcript_seq(run_id: str) -> int:
     try:
         with open(_transcript_path(run_id), "rb") as f:
+            return sum(1 for _ in f) + 1
+    except FileNotFoundError:
+        return 1
+
+
+def _next_human_seq(run_id: str) -> int:
+    # Same "count existing lines" idiom _next_transcript_seq() already uses,
+    # scoped to human.jsonl instead of transcript.jsonl (backlog item 19
+    # part 1). `seq` here is a display/sort tiebreaker only -- see
+    # interject()'s own docstring for the narrow, accepted "two genuinely
+    # simultaneous posts could compute the same seq once" race, the same
+    # class _next_transcript_seq() already carries for the lead's own file.
+    try:
+        with open(_human_log_path(run_id), "rb") as f:
             return sum(1 for _ in f) + 1
     except FileNotFoundError:
         return 1
@@ -2921,7 +2989,36 @@ def team_step(state: dict, *, cancel_event: threading.Event = None) -> dict:
     wins over a malformed/failed lead call); immediately after the delegate
     branch's own agent_run() call returns (before the existing SUCCEEDED/
     FAILED history framing).
+
+    Drains human.jsonl (backlog item 19 part 1, docs/spec.md "Proposed
+    approach" §2) as the VERY FIRST thing this function does each round --
+    earlier than the cancel_event checkpoints above, and before the lead is
+    ever called, since this checkpoint can save an LLM call entirely (same
+    "cheapest possible checkpoint" rationale team_run()'s own max-rounds
+    check already follows). Any message queued since state["human_cursor"]
+    becomes its own "human_interject" history round (transcript_entries=[]
+    -- the message is already durably recorded in human.jsonl itself, which
+    GET .../team/events merges in directly, so no second copy is written to
+    transcript.jsonl); the lead is NOT called on a round that only drained
+    messages. If several messages queued up since the last round, each
+    becomes its own history round in file order within this one call.
     """
+    new_events, new_cursor, _ = tail_jsonl_events(
+        _human_log_path(state["run_id"]), state.get("human_cursor", 0),
+        TEAM_HUMAN_MSG_MAX_BYTES_PER_ROUND, agent="human")
+    if new_events:
+        for ev in new_events:
+            drain_round_n = len(state["history"]) + 1
+            text = ev.get("text") or ""
+            _append_history(state, drain_round_n, tool="human_interject",
+                            args_summary=f'human_interject("{text[:60]}")',
+                            outcome_summary=f"human said: {text[:80]}",
+                            full_result_text=text, log_path=None,
+                            transcript_entries=[])
+        state["human_cursor"] = new_cursor
+        _persist(state)
+        return state
+
     round_n = len(state["history"]) + 1
     tier = state["lead"]["tier"]
     system = _system_framing(state["workdir"], state["members"], tier)
@@ -4141,6 +4238,66 @@ def tail_jsonl_events(path: str, offset: int, max_bytes: int, agent: str = None)
     return events, new_offset, truncated
 
 
+def interject(run_id: str, text: str) -> dict:
+    """
+    Queue a free-text human message for a run's LEAD (backlog item 19 part
+    1, docs/spec.md "Proposed approach" §1) -- the human's third lever on a
+    live team run, alongside answering a pending ask_user/board_write and
+    stopping the run outright. Same {"ok": True, ...} / {"ok": False,
+    "error": ...} return shape resolve_ask_user()/resolve_board_write()
+    already establish.
+
+    Deliberately NEVER calls _persist(state) and never mutates
+    state["history"] -- it only reloads state to check status, then appends
+    ONE envelope to this run's own human.jsonl. This is the whole fix for
+    the race docs/spec.md "Background" describes: a naive "load state,
+    append to state['history'], persist" implementation would very likely
+    be clobbered by the driving thread's own next round-end _persist(state)
+    call (this codebase's already-accepted "no lock on run.json, last
+    writer wins" tradeoff, mark_run_error()'s own docstring). Writing to a
+    file the driving thread does not otherwise touch during a round leaves
+    nothing for that last-writer-wins race to clobber. team_step()'s own
+    drain checkpoint (top of the function) is what actually delivers a
+    queued message into state["history"], on the driving thread itself, at
+    the next round boundary.
+
+    Allowed for "running", "blocked_ask_user", and "blocked_board_write" --
+    a message posted while blocked simply sits in human.jsonl until the run
+    is next resumed and drains it (docs/spec.md "Edge cases"). Rejected for
+    any terminal status ("finished", "escalated_max_rounds", "error",
+    "stopped" -- the same tuple stop_team()/sweep_dead_teams() already treat
+    as terminal) with a clear error naming the run's actual status; nothing
+    is written to human.jsonl for a rejected call.
+
+    Each concurrent caller's own append is one independent open(...,"a") +
+    one bounded write() call, safely under Linux's PIPE_BUF (4 KiB) given
+    TEAM_INTERJECT_MAX_CHARS's own 2000-char default -- so two humans
+    posting at the same instant (two tabs) both land, in whatever order the
+    OS serializes the two write() calls, with no data loss. `seq` is
+    computed the same "count existing lines" way _next_transcript_seq()
+    already does for the lead's own file, so a genuinely simultaneous pair
+    could in principle compute the same seq once -- the same narrow,
+    accepted race _next_transcript_seq() itself already has; cosmetic only
+    (seq is a display/sort tiebreaker, ts plus insertion order in the merged
+    feed is still correct), not a data-loss or misdelivery risk.
+    """
+    try:
+        state = _load_state(run_id)
+    except FileNotFoundError:
+        return {"ok": False, "error": f"no such run_id: {run_id}"}
+    status = state.get("status")
+    if status in ("finished", "escalated_max_rounds", "error", "stopped"):
+        return {"ok": False,
+                "error": f"run {run_id} is not accepting messages (status={status})"}
+    envelope = {"ts": _now_iso(), "agent": "human", "seq": _next_human_seq(run_id),
+               "kind": "message", "text": text, "meta": {}}
+    path = _human_log_path(run_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(envelope) + "\n")
+    return {"ok": True, "run_id": run_id}
+
+
 def resolve_ask_user(run_id: str, answer: str) -> dict:
     """
     Extracted from _cli_team_resolve()'s own body (backlog item 6f part 1,
@@ -4537,6 +4694,26 @@ def _cli_team_board_resolve(args: argparse.Namespace) -> int:
     return _drive_and_report(result["state"])
 
 
+def _cli_team_interject(args: argparse.Namespace) -> int:
+    """
+    Thin CLI wrapper over interject() (backlog item 19 part 1, docs/spec.md
+    "Proposed approach" §5). Deliberately does NOT call _drive_and_report()
+    the way _cli_team_resolve()/_cli_team_board_resolve() do -- those resume
+    a loop that had already stopped; team-interject never starts or resumes
+    driving anything (there may already be a live driver, in this process
+    or another team-start/team-resume invocation, and double-driving one
+    run_id is exactly the bug class POST /team/resolve's own defensive
+    _team_threads_get check exists to prevent at the web layer). It queues
+    and returns, full stop.
+    """
+    result = interject(args.run_id, args.text)
+    if not result["ok"]:
+        print(f"error: {result['error']}", file=sys.stderr)
+        return 1
+    print(f"queued for run {result['run_id']}")
+    return 0
+
+
 def _cli_team_resume(args: argparse.Namespace) -> int:
     try:
         state = _load_state(args.run_id)
@@ -4675,6 +4852,12 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p_team_board_resolve.add_argument("--run-id", required=True)
     p_team_board_resolve.add_argument("--action", required=True, choices=["approve", "reject"])
 
+    p_team_interject = sub.add_parser("team-interject", help="Queue a free-text message for a "
+                                      "running lead's next round, without driving the run "
+                                      "(backlog item 19 part 1).")
+    p_team_interject.add_argument("run_id")
+    p_team_interject.add_argument("text", help="The message text, delivered as-is to the lead.")
+
     p_team_resume = sub.add_parser("team-resume", help="Resume a running/crashed run "
                                    "from persisted state, not from memory.")
     p_team_resume.add_argument("run_id")
@@ -4731,6 +4914,8 @@ def main(argv=None) -> int:
             return _cli_team_resolve(args)
         if args.command == "team-board-resolve":
             return _cli_team_board_resolve(args)
+        if args.command == "team-interject":
+            return _cli_team_interject(args)
         if args.command == "team-resume":
             return _cli_team_resume(args)
         if args.command == "team-launch":
