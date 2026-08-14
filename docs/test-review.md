@@ -2376,3 +2376,514 @@ follow-up: `docs/design.md`'s "Idle, Picker Closed" bullet and the
 "Tier-3-Only Roster" mockup should be updated to match the actual (correct)
 collapsed-by-default, caveat-on-selection behavior — cosmetic
 documentation drift, not a functional gap, and does not block this cycle.
+
+---
+
+# Test & Review: Overwatch feed + escalation inbox — backend API (sub-spec 6f part 1)
+
+## Scope
+Testing pass against `docs/spec.md`'s 16 acceptance criteria for the three
+new routes (`GET .../team/events`, `GET .../team/inbox`, `POST
+.../team/resolve`) and the additive `/status.team.waiting_on_you` field,
+plus independent adversarial probing of the two areas the developer's own
+`docs/implementation.md` flagged as risk: the concurrent-`POST
+/team/resolve` crash fix, and the `tail_jsonl_events()` byte-cap/cursor
+logic. No `docs/design.md` section exists for this cycle (backend-only,
+same precedent as 6d part 1) — no UI to exercise.
+
+## Test cases
+
+| # | Criterion / case | Method | Result | Evidence |
+|---|---|---|---|---|
+| 1 | No run ever started → `GET .../team/events` returns clean empty state | Automated | pass | `TeamEventsEndpointTests.test_no_run_ever_started_returns_clean_empty_state` — ran directly, green |
+| 2 | Lead + 2 teammate logs merged, chronologically sorted | Automated | pass | `TeamEventsEndpointTests.test_events_from_lead_and_teammates_merged_and_sorted_chronologically` — ran directly, green |
+| 3 | Repeat poll with returned cursors, no new writes → empty `events`, no duplicate | Automated | pass | `TeamEventsEndpointTests.test_cursor_returns_only_new_events_on_repeat_poll_no_event_returned_twice` (3-poll sequence: initial → same cursor/no new data → same cursor after a new append) — ran directly, green |
+| 4 | Byte-cap truncation: oversized file → `truncated:true`, clean line boundary, follow-up poll drains the rest with no gap/dup | Automated | pass | `TeamEventsEndpointTests.test_truncated_agent_reports_flag_and_follow_up_poll_drains_the_rest` (route level) + `TailJsonlEventsTests.test_oversized_file_truncates_on_a_clean_line_boundary_and_next_poll_gets_the_rest` (unit level, exact-line-width byte math) — both ran directly, green |
+| 5 | Malformed line in an agent log → one `kind:"error"` event, rest of file/poll unaffected, no 500 | Automated | pass | `TeamEventsEndpointTests.test_malformed_line_becomes_one_error_event_no_500_for_whole_poll` + `TailJsonlEventsTests.test_malformed_line_becomes_one_error_event_processing_continues` + `.test_non_dict_json_line_also_becomes_an_error_event` — ran directly, green |
+| 6 | Cross-project `run_id` → `404`, no data leaked (both GET routes) | Automated | pass | `TeamEventsEndpointTests.test_cross_project_run_id_404_no_data_leaked`, `TeamInboxEndpointTests.test_cross_project_run_id_404` — ran directly, green |
+| 7 | `finished`/`error`/`stopped` run (no thread) still returns full history | Automated | pass | `TeamEventsEndpointTests.test_finished_run_no_thread_running_still_returns_full_history` — ran directly, green |
+| 8 | No run / not-blocked run → `GET .../team/inbox` returns `{"pending": false}` | Automated | pass | `TeamInboxEndpointTests.test_no_run_ever_started_pending_false`, `.test_run_not_blocked_pending_false` — ran directly, green |
+| 9 | Genuinely blocked run → exact persisted question/header/options/multi_select | Automated | pass | `TeamInboxEndpointTests.test_genuinely_blocked_returns_exact_persisted_question_shape` — ran directly, green |
+| 10 | `inbox.json` missing/malformed while `blocked_ask_user` → still `pending:true`, non-empty fallback | Automated | pass | `TeamInboxEndpointTests.test_missing_inbox_json_still_pending_true_with_fallback_question`, `.test_malformed_inbox_json_still_pending_true_with_fallback_question` — ran directly, green |
+| 10b | Inbox reflects only genuinely pending across a resolve→re-poll sequence (not explicitly in spec's own test list — reviewer-added) | Automated (reviewer-written) | pass | `TeamInboxEndpointTests.test_inbox_reflects_only_genuinely_pending_across_a_resolve_and_repoll_sequence` (new, this pass) — pending:true → resolve → pending:false, real HTTP round trip — ran directly, green |
+| 11 | Valid resolve on a genuinely blocked run: returns immediately, moves `inbox.json`→`inbox.resolved.json`, flips status, answer reaches lead's next-round context | Automated | pass | `TeamResolveEndpointTests.test_genuinely_blocked_valid_answer_resolves_and_returns_immediately` — ran directly, green |
+| 12 | Not-blocked / no-run resolve → `400` specific reason, no mutation | Automated | pass | `TeamResolveEndpointTests.test_not_blocked_400_specific_reason_no_state_mutated`, `.test_no_run_at_all_400_specific_reason`, `.test_explicit_run_id_for_a_different_project_400_specific_reason` — ran directly, green |
+| 13 | Empty/whitespace or oversized `answer` → `400` before mutation | Automated | pass | `TeamResolveEndpointTests.test_empty_answer_400_before_any_mutation`, `.test_oversized_answer_400_before_any_mutation` — ran directly, green |
+| 14 | Two concurrent `POST .../team/resolve` for the same blocked run → exactly one succeeds, one clean 400, never a crash | Automated (developer's) + adversarial (reviewer-written) | **FAIL** | See Defect 1 below |
+| 15 | `/status` `waiting_on_you` true only for `blocked_ask_user`, never `escalated_max_rounds`; every pre-existing field/value unchanged | Automated | pass | `StatusRosterAndCompositionTests.test_waiting_on_you_true_only_for_blocked_ask_user_never_for_escalated_max_rounds` + full `StatusRosterAndCompositionTests`/`TeamStopEndpointTests` classes (incl. the updated full-dict `assertEqual`) — ran directly, all green |
+| 16 | CLI `team-resolve` behavior (blocking, exit code, output) unchanged; CLI and route produce identical persisted state for same input | Automated | pass | `tests.test_teams_lead.ResolveInSeparateProcessTests` (real separate-process subprocess CLI run, unmodified) — ran directly, green; `TeamResolveEndpointTests.test_cli_and_route_produce_identical_persisted_state_for_same_input` — ran directly, green |
+
+## Regression check
+Full existing suite run: `python3 -m unittest discover -s tests` (includes
+this pass's own +2 new reviewer-written tests) — **764 passed, 0
+failures/errors** (762 pre-existing, matching the developer's own reported
+baseline exactly, + 1 reviewer-written inbox-resolve-repoll test + 1
+reviewer-written concurrency-defect repro test = 764).
+Also independently re-ran: `TailJsonlEventsTests` (8), `TeamEventsEndpointTests`
+(10), `TeamInboxEndpointTests` (7+1 new), `TeamResolveEndpointTests` (9+1 new),
+`StatusRosterAndCompositionTests` (6), `TeamStopEndpointTests` (6),
+`tests.test_teams_lead.ResolveInSeparateProcessTests` (2) — all green in
+isolation, not just as part of the full-suite run. Ran
+`test_two_concurrent_resolves_exactly_one_succeeds` 15/15 clean in a
+standalone loop (consistent with the developer's own reported 20/20) —
+confirms the originally-reported crash fix holds and the specific race
+window the developer's own test exercises is not the same one this pass
+found (see Defect 1).
+
+## Defects found
+
+### Defect 1: `resolve_ask_user()`'s move-then-persist race has a second, unhandled failure mode beyond the one already fixed — a losing concurrent caller can silently report `{"ok": True}`, overwriting the winner's persisted answer/history
+
+- **Severity: must-fix (blocks approval).** Violates `docs/spec.md`'s own
+  stated edge case ("the first to persist wins, the second's own
+  freshly-reloaded state ... sees `status != "blocked_ask_user"` and
+  returns the same `400`") and acceptance criterion #14 above ("exactly
+  one succeeds ... the other receives the same 400").
+- **Where**: `app/teams.py`, `resolve_ask_user()` (the new function, right
+  after the `_append_history(...)` call):
+  ```python
+  inbox_path = _inbox_path(run_id)
+  try:
+      if os.path.exists(inbox_path):
+          os.replace(inbox_path, _inbox_resolved_path(run_id))
+      state["status"] = "running"
+      _persist(state)
+  except OSError:
+      ...
+      return {"ok": False, "error": f"run {run_id} is not blocked on ask_user (status={status_now})"}
+  return {"ok": True, "state": state}
+  ```
+- **Root cause**: the already-shipped fix (the `try/except OSError` around
+  this block) only catches the case where the LOSER's own `os.replace()`
+  call itself collides with the winner's (both attempt the rename, the
+  second raises `FileNotFoundError`). It does not close a second,
+  narrower-but-real window: if the loser's `os.path.exists(inbox_path)`
+  check happens to run *after* the winner has already completed its own
+  `os.replace()` (a real, reachable interleaving under genuine
+  concurrency — the same class of timing the developer's own docstring on
+  this function explicitly reasons about for the first case), then `if
+  os.path.exists(inbox_path):` is simply `False`. No `os.replace()` is
+  attempted, no exception is raised. The loser falls straight through to
+  `state["status"] = "running"; _persist(state)` using its own **stale**
+  in-memory `state` object (loaded before the winner ever ran, so it does
+  not contain the winner's own `ask_user_resolved` history entry), and
+  returns `{"ok": True, "state": state}` — reporting success for an
+  answer whose actual effect (the inbox move, and the winner's history
+  entry) is then silently clobbered by the loser's own subsequent
+  `_persist()` call.
+- **Repro** (deterministic, no thread-timing flakiness — added as
+  `TeamResolveEndpointTests.test_loser_whose_exists_check_lands_after_winner_already_renamed_does_not_report_ok`
+  in `tests/test_team_routes.py`, confirmed to reproduce every run): hook
+  the loser's own `_load_state()` call so that, at the exact moment the
+  loser has read its still-`blocked_ask_user` snapshot but before it
+  proceeds, a real winning `resolve_ask_user()` call is run to completion
+  first (real `os.replace()`, real persist) — exactly the interleaving
+  `docs/spec.md`'s own prose already assumes is possible, made
+  deterministic instead of thread-scheduled. Result: `loser_result["ok"]
+  == True`, and the final persisted `run.json` history contains only the
+  *loser's* `ask_user_resolved` entry ("loser answer") — the winner's own
+  entry ("winner answer") is gone.
+- **Expected vs. actual**: expected — the loser gets the same shaped `400`
+  every other "nothing pending"/"already resolved" caller gets, and the
+  winner's persisted answer/history survives untouched. Actual — the
+  loser gets `{"ok": True}`, and the winner's already-persisted history
+  entry is silently overwritten/lost.
+- **Downstream consequence at the route level** (`app/app.py`, `POST
+  .../team/resolve`): because `resolve_ask_user()` can return `ok:True`
+  for both callers under this timing, the route's own defensive
+  `_team_threads_get(name) is not None` check (meant to catch an
+  already-impossible double-spawn) is the *only* remaining guard against
+  spawning two `_run_team_in_background` threads for the same `run_id` —
+  and that guard only helps if the winner's thread registration
+  (`_team_threads_set`) has already landed by the time the loser's own
+  check runs, which is not guaranteed by anything in the code (it is two
+  independent request-handler threads racing each other, with no
+  ordering relationship enforced between one's `resolve_ask_user()` call
+  and the other's `_team_threads_get()` check). In the worst case this
+  can result in two threads independently calling `team_run()` against
+  the same `run_id` concurrently — direct violation of the "exactly one
+  thread is ever spawned for one answer" invariant `docs/spec.md`'s own
+  "Edge cases" section states as the actual guarantee (not the specific
+  `400` string, which the spec already, correctly, leaves unpinned).
+- **Note on real-world likelihood**: this window is narrow — 15/15
+  standalone re-runs and the developer's own reported 20/20 of the real
+  two-genuinely-simultaneous-threads HTTP test never hit it (the file
+  operations involved are fast and close together). But "rare under real
+  OS scheduling" is not the same as "closed" — the deterministic repro
+  proves the code path exists and is reachable, and the realistic trigger
+  (two browser tabs both submitting an answer to the same escalation
+  within milliseconds of each other) is exactly the scenario `docs/spec.md`
+  itself calls out as the one this code path must handle correctly.
+- **Suggested direction (not prescriptive — developer's call)**: don't
+  gate the "did I win" decision on `os.path.exists(inbox_path)`'s return
+  value at all — that call is inherently a second, independent
+  check-then-act race on top of the first. Re-check `state["status"]`
+  against a freshly-reloaded value (or catch `FileNotFoundError` from an
+  unconditional `os.replace()` call, removing the `if os.path.exists(...)`
+  guard entirely so the OS's own atomicity on the rename is the sole
+  arbiter of "did I actually win," the same way the already-fixed crash
+  case relies on `os.replace()`'s own atomicity rather than a separate
+  existence check).
+
+## Overall verdict
+
+**Blocked.** One must-fix defect (Defect 1) in the concurrent-resolve
+path — a real, deterministically-reproducible violation of `docs/spec.md`'s
+own stated edge-case guarantee and acceptance criterion #14, found via
+adversarial testing beyond the developer's own (still-valid, but
+insufficient) concurrency test. Every other acceptance criterion (1-13,
+15-16) passed on independent re-execution, and the full regression suite
+is clean (763/763, including this pass's own two new tests). Per process,
+the review pass (spec-traceability/correctness/security/simplicity) is
+deferred — routing back to the developer with the specific repro above.
+Two test files were left extended in place for the developer's own re-run
+convenience: `tests/test_team_routes.py` gains
+`TeamInboxEndpointTests.test_inbox_reflects_only_genuinely_pending_across_a_resolve_and_repoll_sequence`
+(passes; no action needed beyond keeping it) and
+`TeamResolveEndpointTests.test_loser_whose_exists_check_lands_after_winner_already_renamed_does_not_report_ok`
+(the Defect 1 repro — currently asserts the *buggy* behavior so it stays
+green as documentation of the bug; once fixed, this test's own final two
+assertions must be inverted to assert the *correct* behavior — the loser
+gets `{"ok": False}` and the winner's history entry survives untouched —
+rather than deleted, so the fix has a permanent regression guard).
+
+---
+
+## Re-review: Defect 1 fix, plus the deferred full review pass
+
+New cycle, same sub-spec (6f part 1). Picks up where the "Blocked" verdict
+above left off: re-verifies the developer's fix for Defect 1 with fresh,
+independent adversarial testing (not just re-trusting the report), then —
+since testing came back clean — runs the full review pass that was
+explicitly deferred last round (spec-to-code traceability across all 16
+ACs, correctness, security, simplicity, against the *complete* diff, not
+just this fix's diff).
+
+### 1. Re-verifying the fix itself
+
+Read `app/teams.py:3752-3834` (`resolve_ask_user()`) directly. Confirmed
+exactly as reported: the separate `if os.path.exists(inbox_path):` guard is
+gone; `os.replace(inbox_path, _inbox_resolved_path(run_id))` is now called
+unconditionally inside the existing `try/except OSError` block; and
+`state["status"] = "running"; _persist(state)` now run *after* that block,
+on the success path only — there is no remaining code path where `state`
+is mutated/persisted without a corresponding successful rename immediately
+preceding it. Matches the report exactly, not just a summary of it.
+
+**Re-ran the developer's inverted repro test 30/30 clean** (own loop, not a
+single run):
+```
+for i in $(seq 1 30); do uv run --with pytest python -m pytest \
+  tests/test_team_routes.py::TeamResolveEndpointTests::test_loser_whose_exists_check_lands_after_winner_already_renamed_does_not_report_ok -q; done
+# 30/30: "1 passed in 0.52s"
+```
+
+**Re-ran the genuine two-thread concurrent test 40/40 clean** (own loop,
+double the developer's own 20):
+```
+for i in $(seq 1 40); do uv run --with pytest python -m pytest \
+  tests/test_team_routes.py::TeamResolveEndpointTests::test_two_concurrent_resolves_exactly_one_succeeds -q; done
+# 40/40 passed
+```
+
+**Wrote and ran a third adversarial interleaving** the fix's own two
+existing tests don't exercise: instead of hooking the loser's
+`_load_state()` call (the exists()-check race, already covered) or letting
+two real OS threads race unpredictably (the genuinely-simultaneous test,
+already covered), I hooked `os.replace()` itself so that BOTH callers pass
+the upfront status check with a *fresh*, still-`blocked_ask_user` load, and
+then deterministically force the ORIGINAL crash-fix scenario — both
+callers reaching `os.replace()` for real, one colliding with the other's
+already-completed rename — the specific case the coordinator asked me to
+re-check directly rather than assume still holds after the collapse to one
+code path:
+```python
+# caller A's os.replace() is patched to run caller B to completion FIRST,
+# then call the real os.replace() -- so A's own rename genuinely collides
+# with B's already-renamed target, deterministically, every time.
+a_result = teams.resolve_ask_user(run_id, "A answer")
+# a_result == {"ok": False, "error": "...is not blocked on ask_user (status=running)"}
+# final run.json history: exactly 1 ask_user_resolved entry, "B answer"
+# final status: "running" -- no crash, no corruption
+```
+Confirmed: the original crash case (both callers genuinely racing
+`os.replace()` itself, not just the `exists()` pre-check) still resolves
+cleanly post-fix — one clean `{"ok": False}`, the winner's answer alone
+survives in `run.json`'s own `history`. No regression from collapsing the
+two independent check-then-act windows into one.
+
+**A real, adjacent gap found by this adversarial pass (not the race the fix
+targeted) — see Finding 1 below.** The coordinator's own question ("does
+the except-OSError path now correctly do nothing / return a clean 400 with
+zero side effects, not just 'no crash'?") turned up a genuine "not zero
+side effects" case: `_append_history()` — and, inside it,
+`_append_transcript()`, a real, unconditional disk write to
+`transcript.jsonl` — runs *before* the win/lose decision point, for both
+winner and loser alike, in every interleaving (confirmed directly: my own
+third-variant repro above shows 2 `tool_result` transcript entries,
+"A answer" and "B answer", even though only "B answer" is ever persisted
+into `run.json`'s own `history`). This is not new to this fix round (the
+call order was already this way in the code under the original "Blocked"
+verdict — `_append_history()` was called "right after" in that verdict's
+own snippet too) — it survives the collapse-to-one-`os.replace()`-call fix
+unchanged, because the fix never touched anything before the `os.replace()`
+call. See Finding 1.
+
+### 2. Full regression suite, run myself
+
+```
+uv run --with pytest python -m pytest tests/ -q
+# Run 1: 764 passed, 14 warnings in 136.18s
+# Run 2: 764 passed, 14 warnings in 136.21s
+```
+Both runs clean, no flake, `RealTmuxHeadlessTests::test_run_sh_and_prompt_
+file_are_world_readable_under_a_strict_umask` did not reproduce failing in
+either of my two runs. Investigated it directly rather than waving it away:
+read the test itself (`tests/test_teams_headless.py:1357-1401`) — it's a
+real-thread, real-tmux, 10s-deadline poll racing a background `sleep(5)`
+subprocess under a strict `umask(0o077)`, i.e. genuinely timing-sensitive
+by construction, not a logic bug. `git diff --stat -- tests/test_teams_
+headless.py` shows **112 insertions, 0 deletions** — purely additive
+(`TailJsonlEventsTests`, this cycle's own new pure-unit test class,
+inserted elsewhere in the file) — the flaky test's own body is untouched
+by this cycle's diff, and by the fix round's diff (which touches only
+`app/teams.py`'s `resolve_ask_user()` and one existing test's assertions in
+`tests/test_team_routes.py`). Consistent with round 3's own prior
+disclosure of this same test as a one-off environment timing flake,
+unrelated to `app/teams.py`'s substitution/worktree code that round. Judged
+genuinely unrelated and non-blocking — confirmed by reading, not assumed.
+
+`tests/test_team_routes.py -q` alone: **67 passed** (65 developer-reported
++ my own 2 reviewer-written tests from the prior "Blocked" pass, both still
+present and green).
+
+### 3. Full review pass (deferred from the "Blocked" verdict, now run)
+
+#### Spec-to-code traceability — all 16 acceptance criteria
+
+Re-read `docs/spec.md`'s "Acceptance criteria" section directly (16
+checkbox items) against the Test cases table above (1-16, plus the
+reviewer-added 10b) and the actual diff:
+
+- **AC #14** (two concurrent resolves, exactly one succeeds, the other gets
+  an ordinary 400) — was the sole failing criterion in the "Blocked" pass;
+  now independently re-verified passing under three separate adversarial
+  interleavings (§1 above), not just the developer's own two tests.
+- **AC #11** ("...with a valid non-empty answer and a **valid TOTP-gated
+  session**...") — independently confirmed `POST .../team/resolve` goes
+  through the shared TOTP gate: `do_POST` checks `session_totp_ok(sid)`
+  before reaching any route body (`app/app.py:3703-3733`), and
+  `TeamResolveEndpointTests` calls `self._totp_code()` for every request —
+  this specific clause of AC #11 (not just "valid non-empty answer") is
+  genuinely exercised, not just assumed from the route existing.
+- All other 15 criteria: each maps 1:1 to a passing test case in the table
+  above, independently re-read (not just re-run) this round for the ones
+  I hadn't already read line-by-line in the "Blocked" pass — no gaps found.
+  `waiting_on_you`'s "every other field/value byte-for-byte unchanged"
+  clause (AC #15) is specifically covered by the one pre-existing test in
+  the repo asserting `inst["team"]`'s *entire* shape by exact equality
+  (`TeamStopEndpointTests.test_status_idle_when_no_run_ever_started`,
+  updated in this diff) — confirmed this really is the only such
+  exact-equality test (`grep -rn '\["team"\]' tests/`), so this isn't a
+  narrower check than it looks.
+
+**No acceptance criterion is unimplemented or untested.**
+
+#### Correctness
+
+Read the complete diff (`app/teams.py` +226/-23, `app/app.py` +186/-0,
+`config/switchboard.env.example` +19), not just the fix-round diff.
+
+- `tail_jsonl_events()`'s byte-cap/cursor math re-derived by hand against
+  `TailJsonlEventsTests`' own exact-line-width fixture (6 equal-width
+  lines, a 3-line cap) — `new_offset` walks back to the last complete
+  `\n` inside the `max_bytes`-bounded read, `truncated` is set from the
+  `+1`-byte overread without that extra byte ever being parsed — logic
+  matches its own docstring's claims exactly.
+- `_parse_events_cursor()` degrades any malformed `?cursor=` value (not
+  JSON, not an object, a non-int/bool/negative value) to `{}` rather than a
+  `400` — confirmed by reading, matches spec's own "never breaks a
+  client's poll loop" intent; `isinstance(v, bool)` is explicitly excluded
+  from the int check (Python's `bool` is an `int` subclass, so `True`/
+  `False` would otherwise silently pass an `isinstance(v, int)` check) —
+  a small, correct, easy-to-miss detail, confirmed deliberate by the
+  explicit `or isinstance(v, bool)` clause.
+- `_team_events_run_and_ownership()`'s `(state, error_response)` two-tuple
+  contract is used consistently at both call sites (`_handle_team_events`/
+  `_handle_team_inbox`), each doing `if err is not None: return
+  self._json(*err)` — no path where both are `None` or both are non-`None`.
+- One genuine, if narrow, gap found beyond Finding 1 — see **Finding 2**
+  below (unsanitized `run_id` used directly in filesystem path
+  construction across all three new routes).
+
+#### Security
+
+- **XSS / unsafe serialization of agent-transcript content to HTTP
+  clients**: confirmed **not an issue at this layer**. `_json()`
+  (`app/app.py:3330-3338`) always sets `Content-Type: application/json`
+  and encodes via `json.dumps()` — arbitrary agent-transcript text
+  (potentially attacker-influenced, since it originates from LLM/tool
+  output) is safely escaped as JSON string content and never reflected as
+  `text/html`. No route in this diff uses `_html()`. Any actual DOM-
+  insertion risk is entirely a 6f **part 2** frontend concern (not yet
+  built), correctly out of scope here.
+- **Project-name validation**: the `name` URL path segment on all three
+  routes is checked against `instance_names()` (a whitelist of configured
+  projects) before any use — confirmed no path-traversal surface via
+  `name` itself.
+- **`run_id` path traversal — real, reproducible, found by direct testing,
+  not reachable in the ordinary flow but worth fixing. See Finding 2.**
+
+#### Simplicity / scope
+
+- `resolve_ask_user()`'s extraction genuinely eliminates duplication (CLI
+  and route now share one function) rather than adding a parallel
+  abstraction — confirmed `_cli_team_resolve()` is now a thin 6-line
+  wrapper, no dead code left behind from the old inline body.
+  `load_state_for_project()` vs. the POST route's own direct
+  `_load_state()` call is a deliberate, documented, justified split (the
+  two GET routes need one collapsed 404 reason, POST needs three distinct
+  ones) — not needless duplication.
+  `_team_events_run_and_ownership()` is shared correctly, not
+  copy-pasted between the two GET handlers.
+- No speculative generality: `tail_jsonl_events()`'s optional `agent`
+  keyword is small, additive, and used; no unused parameters, no
+  premature configurability beyond the two new env vars the spec's own
+  "Open questions" already anticipates needing to be tunable.
+- `app/app.py`'s diff is scoped exactly to what the spec names (three
+  routes, one additive `/status` field, the `?query=` parsing needed to
+  support them) — no unrelated refactoring folded in.
+
+### Findings (new this round)
+
+#### 1. [should-fix, non-blocking] A losing `resolve_ask_user()` caller writes a permanent, spurious `tool_result` transcript entry before the win/lose decision point — not "zero side effects"
+- File: `app/teams.py:3817-3821` (`_append_history()` call inside
+  `resolve_ask_user()`, which internally calls `_append_transcript()`,
+  `app/teams.py:2520-2530` — an unconditional `open(path, "a")` disk
+  write), relative to the `os.replace()` decision point at
+  `app/teams.py:3823-3831`.
+- Issue: `_append_history(state, ...)` — and, inside it,
+  `_append_transcript()`, which unconditionally appends one JSON envelope
+  to `transcript.jsonl` on disk — runs *before* `resolve_ask_user()` knows
+  whether this caller will win or lose the race. A losing caller (either
+  interleaving: the already-tested `exists()`-timing case, or the
+  `os.replace()`-collision case I additionally reproduced this round) still
+  performs this write. The write is never rolled back on the subsequent
+  `OSError`/`{"ok": False}` return.
+- Concrete failure scenario, independently reproduced (both my own repro
+  script and my third-variant `os.replace()`-collision repro above): two
+  users answer the same escalation within the real race window (rare, but
+  the same window `docs/spec.md`'s own "Edge cases" section explicitly
+  anticipates and this exact function was hardened for). The winner's
+  answer is correctly the sole entry in `run.json`'s own `history`. But
+  `transcript.jsonl` — the file `GET .../team/events` (this very sub-spec's
+  own deliverable) reads and merges into the overwatch feed — permanently
+  contains **both** answers as `tool_result` envelopes with
+  `meta: {"resolved": true}`, with no indication that one of them was
+  actually rejected. A human watching the overwatch feed (6f part 2's own
+  stated purpose) would see two "resolved" answers for one question, one
+  of which was never actually accepted.
+- Not reachable from the lead's own reasoning (`team_step()`'s prompt
+  assembly reads `state["history"]`, the persisted `run.json`, never
+  `transcript.jsonl` — confirmed by grep) — this is a display/audit-trail
+  inconsistency, not a decision-making bug, and not a data-loss bug (the
+  winner's answer is correctly and exclusively persisted). Not new to this
+  fix round — the call ordering was already this way in the code under the
+  original "Blocked" verdict; the fix round's diff never touched anything
+  before the `os.replace()` call, so this survived unchanged. No acceptance
+  criterion in `docs/spec.md` covers transcript-write atomicity on the
+  losing path, so this doesn't block any AC.
+- Suggested (non-blocking): move the `_append_history()`/
+  `_append_transcript()` call to *after* `os.replace()` has succeeded
+  (i.e., inside the same "we won" branch that flips `state["status"]` and
+  calls `_persist()`), or make the transcript-write itself conditional on
+  having won — either would give the loser genuinely zero observable
+  side effects, matching the "the loser fails cleanly" intent AC #14 and
+  `docs/spec.md`'s own "Edge cases" section already describe.
+
+#### 2. [should-fix, non-blocking] `run_id` from client input is used directly in filesystem path construction with no format/containment check — real, reproducible traversal, narrow practical exploitability
+- Files: `app/app.py:3629` (`_team_events_run_and_ownership`, feeds
+  `teams.load_state_for_project`), `app/app.py:3882-3888` (`POST
+  .../team/resolve`, feeds `teams._load_state()` directly), and
+  `app/teams.py`'s `_run_dir()`/`_run_json_path()`/`_transcript_path()`/
+  `_inbox_path()`/`_inbox_resolved_path()` (all `os.path.join(_leads_root(),
+  run_id, ...)`, `run_id` never validated against `_run_id()`'s own actual
+  shape — `f"{int(time.time())}-{secrets.token_hex(6)}"`, i.e. never
+  containing `/` — anywhere on any of these three new routes).
+- Issue: none of the three new routes validate that a client-supplied
+  `run_id` (`?run_id=` on the two GETs, `body["run_id"]` on the POST) is
+  shaped like a real run id before using it to build a filesystem path.
+  A `run_id` containing `../` segments is joined verbatim and can resolve
+  outside `_leads_root()` entirely.
+- Independently reproduced (own script, not the test suite): planted a
+  `run.json`-shaped file (`{"project_name": "proj", "status": "running",
+  ...}`) at a scratch path outside `_leads_root()`, then called
+  `teams.load_state_for_project("../../outside/evilrun", "proj")` directly
+  — it returned the planted file's full contents, successfully escaping
+  the intended directory:
+  ```python
+  state = teamsmod.load_state_for_project("../../outside/evilrun", "proj")
+  # -> {'project_name': 'proj', 'status': 'running', 'members': [], 'run_id': 'x'}
+  ```
+  The identical pattern reaches `POST .../team/resolve` too (via
+  `teams._load_state(run_id)` directly), and if the planted file also has
+  `status: "blocked_ask_user"` and a matching `inbox.json` sits alongside
+  it, `resolve_ask_user()` will write (`_append_transcript()`,
+  `_persist()`) to that same traversed, out-of-tree location.
+- **Practical exploitability is narrow, which is why this is should-fix,
+  not must-fix.** Every *real* run this app ever creates lives flatly
+  under `_leads_root()/<run_id>/`, and cross-project access to those real
+  runs is already correctly blocked by the `project_name` equality check
+  (AC #6, independently verified passing) — traversal doesn't unlock any
+  additional *real* app data. Exploiting it meaningfully requires either
+  (a) the attacker already having filesystem write access somewhere else
+  on the host to plant a matching fake `run.json` — at which point they
+  already have more direct capability than this bug grants — or (b) a
+  coincidentally-existing external JSON file with a `project_name` key
+  matching a real configured project name, which is unlikely by
+  construction. `GET .../team/events`/`.../team/inbox` additionally require
+  only cookie/session auth, no TOTP (an explicit, existing, documented
+  design choice matching `/team/grounding`'s own precedent) — so the
+  practical bar to reach this code is "any logged-in switchboard user,"
+  consistent with this whole subsystem's established "trusted operator,
+  not lock-guarded, accepted at this project's scale" threat model
+  (`docs/spec.md` "Edge cases", carried from 6d).
+- No acceptance criterion covers `run_id` format validation.
+- Suggested (non-blocking, cheap to close): validate `run_id` against
+  `_run_id()`'s own actual shape (e.g.
+  `re.fullmatch(r"\d+-[0-9a-f]{12}", run_id)`) before use in all three
+  routes/helpers, or normalize the resolved path and assert it's still
+  contained under `_leads_root()` (`os.path.commonpath`) before opening it
+  — either closes this structurally rather than by pattern-matching
+  specific bad inputs.
+
+## Overall verdict
+
+**Approved, with two non-blocking follow-ups (Findings 1 and 2 above).**
+
+Defect 1 (the must-fix from the prior "Blocked" verdict) is genuinely
+fixed: the separate `os.path.exists()` check-then-act window is deleted,
+`os.replace()`'s own atomicity is now the sole arbiter of "did I win" for
+*both* races, and this holds under three independent adversarial checks
+this round (30/30 on the inverted repro, 40/40 on the genuine two-thread
+test, and a new third interleaving I constructed and ran myself forcing
+both callers to reach `os.replace()` for real) — not just re-trusted from
+the developer's report. All 16 acceptance criteria in `docs/spec.md` have
+real implementation and real test coverage, independently re-checked this
+round against the complete diff, not just the fix's diff. The full
+regression suite is clean (764/764, run twice this session), and the one
+pre-existing, disclosed `RealTmuxHeadlessTests` flake is confirmed
+genuinely timing-sensitive-by-construction and untouched by this cycle's
+diff (its own test file's diff is purely additive, 0 deletions).
+
+The full review pass (deferred from the "Blocked" verdict) surfaced two
+real, genuine findings — a spurious transcript write on a losing resolve
+caller (Finding 1), and an unsanitized `run_id` path-traversal input
+across all three new routes (Finding 2) — both should-fix, both non-
+blocking: neither violates an acceptance criterion, both have narrow real-
+world reachability given this app's own established "trusted operator,
+single-writer, accepted at this project's scale" threat model, and both
+are cheap, well-scoped fixes for a future follow-up rather than reasons to
+send this cycle back to the developer. No must-fix findings. Correctness,
+security (beyond Finding 2), and simplicity all check out on direct
+reading of the complete diff.

@@ -549,3 +549,38 @@ shells out user-controlled text through `sed`'s pattern language at all
 `/models` response handling). Fix once in the shared helper — every
 `--with-*` block that writes an operator-supplied value benefits, no
 per-block workaround needed.
+
+---
+
+## 11. 6f part 1 follow-ups: stale transcript entry on losing resolve, `run_id` path validation
+
+Both found by the reviewer during 6f part 1 (overwatch event feed +
+escalation inbox), approved as non-blocking rather than fixed in that
+cycle.
+
+**Stale transcript entry.** `app/teams.py`'s `resolve_ask_user()` calls
+`_append_history()`/`_append_transcript()` unconditionally, before the
+win/lose decision point. A losing caller in a genuine concurrent-resolve
+race therefore leaves a permanent, spurious `tool_result` entry in
+`transcript.jsonl` — visible via the new `GET .../team/events` feed this
+sub-spec introduced — even though its answer was never accepted into
+`run.json`'s history. Doesn't affect the lead's own decision-making
+(reads `state["history"]`, not the transcript file), but it's a
+misleading artifact in the overwatch feed 6f part 2's UI will render.
+Shape of the fix: move the transcript/history append to after the
+win/lose decision, so only the winner's answer is ever recorded.
+
+**`run_id` path validation.** The three new routes (`GET .../team/events`,
+`GET .../team/inbox`, `POST .../team/resolve`) accept a client-supplied
+`run_id` and use it directly in filesystem path construction
+(`app/teams.py`'s path helpers, called from `app/app.py:3629,3882`) with
+no format/containment validation — reproduced directly: a `run_id` of
+`"../../outside/evilrun"` successfully read a planted file outside
+`_leads_root()`. Real project data stays correctly gated by the existing
+`project_name` check on these routes, and exploiting this meaningfully
+would need pre-existing filesystem write access elsewhere, so this was
+judged narrow rather than blocking — but it's a real, cheap-to-fix gap.
+Shape of the fix: validate `run_id` the same way other user-supplied
+identifiers in this codebase already are (reject path separators / `..`
+segments, or match against a known-safe character set) before it ever
+reaches a path-join.

@@ -750,6 +750,118 @@ class TailerTests(unittest.TestCase):
         self.assertEqual(tailer.session_id, "sid-early")
 
 
+# ─── tail_jsonl_events() -- overwatch events route (backlog item 6f part 1,
+# docs/spec.md §1) -- a stricter, per-poll-bounded cousin of _tail_log_once()
+# (no byte cap, silently drops a trailing partial line via splitlines()),
+# purpose-built for GET .../team/events, whose own acceptance criteria
+# require never dropping and never duplicating an event across a poll
+# boundary, and never a whole-file read on every poll. ─────────────────────
+class TailJsonlEventsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="switchboard-tail-jsonl-events-")
+        self.path = os.path.join(self.tmp, "log.jsonl")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _envelope(self, seq, kind="message", text="x"):
+        return {"ts": "2026-08-14T00:00:00Z", "agent": "claude", "seq": seq,
+               "kind": kind, "text": text, "meta": {}}
+
+    def _write(self, *envelopes):
+        with open(self.path, "a") as f:
+            for e in envelopes:
+                f.write(json.dumps(e) + "\n")
+
+    def test_missing_file_returns_empty_not_an_error(self):
+        events, offset, truncated = teamsmod.tail_jsonl_events(
+            os.path.join(self.tmp, "nope.jsonl"), 0, 65536)
+        self.assertEqual(events, [])
+        self.assertEqual(offset, 0)
+        self.assertFalse(truncated)
+
+    def test_reads_every_complete_line_from_the_start(self):
+        self._write(self._envelope(1), self._envelope(2), self._envelope(3))
+        events, offset, truncated = teamsmod.tail_jsonl_events(self.path, 0, 65536)
+        self.assertEqual([e["seq"] for e in events], [1, 2, 3])
+        self.assertFalse(truncated)
+        self.assertEqual(offset, os.path.getsize(self.path))
+
+    def test_second_call_with_returned_offset_sees_only_new_events(self):
+        self._write(self._envelope(1), self._envelope(2))
+        events1, offset1, _ = teamsmod.tail_jsonl_events(self.path, 0, 65536)
+        self.assertEqual(len(events1), 2)
+        events2, offset2, _ = teamsmod.tail_jsonl_events(self.path, offset1, 65536)
+        self.assertEqual(events2, [])  # no event is ever returned twice
+        self.assertEqual(offset2, offset1)
+        self._write(self._envelope(3))
+        events3, offset3, _ = teamsmod.tail_jsonl_events(self.path, offset2, 65536)
+        self.assertEqual([e["seq"] for e in events3], [3])
+
+    def test_trailing_partial_line_is_held_across_polls(self):
+        with open(self.path, "a") as f:
+            f.write(json.dumps(self._envelope(1)) + "\n")
+            f.write('{"seq": 2, "text": "incomplete')  # no trailing newline -- a torn write
+        events, offset, truncated = teamsmod.tail_jsonl_events(self.path, 0, 65536)
+        self.assertEqual([e["seq"] for e in events], [1])
+        self.assertFalse(truncated)
+        # offset must land right after event 1's own newline, never consuming
+        # the still-partial trailing fragment.
+        with open(self.path, "rb") as f:
+            f.seek(offset)
+            self.assertEqual(f.read(), b'{"seq": 2, "text": "incomplete')
+        with open(self.path, "a") as f:
+            f.write('"}\n')
+        events2, offset2, _ = teamsmod.tail_jsonl_events(self.path, offset, 65536)
+        self.assertEqual([e["seq"] for e in events2], [2])
+
+    def test_malformed_line_becomes_one_error_event_processing_continues(self):
+        with open(self.path, "a") as f:
+            f.write(json.dumps(self._envelope(1)) + "\n")
+            f.write("not valid json at all\n")
+            f.write(json.dumps(self._envelope(3)) + "\n")
+        events, offset, truncated = teamsmod.tail_jsonl_events(self.path, 0, 65536, agent="claude")
+        self.assertEqual(len(events), 3)
+        self.assertEqual(events[0]["seq"], 1)
+        self.assertEqual(events[1]["kind"], "error")
+        self.assertEqual(events[2]["seq"], 3)
+        self.assertFalse(truncated)  # a malformed line must never fail the whole poll
+
+    def test_non_dict_json_line_also_becomes_an_error_event(self):
+        with open(self.path, "a") as f:
+            f.write(json.dumps([1, 2, 3]) + "\n")
+        events, offset, truncated = teamsmod.tail_jsonl_events(self.path, 0, 65536)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "error")
+
+    def test_oversized_file_truncates_on_a_clean_line_boundary_and_next_poll_gets_the_rest(self):
+        # Six events, all with a 2-digit seq -- fixed line length, so the
+        # byte-cap math below is exact, not approximate.
+        envs = [self._envelope(seq) for seq in range(10, 16)]
+        self._write(*envs)
+        line_len = len(json.dumps(self._envelope(10)).encode()) + 1  # +1 for the newline
+        cap = line_len * 3  # exactly 3 whole lines' worth
+        events1, offset1, truncated1 = teamsmod.tail_jsonl_events(self.path, 0, cap)
+        self.assertEqual([e["seq"] for e in events1], [10, 11, 12])
+        self.assertTrue(truncated1)
+        self.assertEqual(offset1, cap)  # clean boundary -- exactly 3 lines consumed
+        all_events = list(events1)
+        offset = offset1
+        for _ in range(5):  # bounded -- draining 3 more lines takes at most one more call
+            events, offset, truncated = teamsmod.tail_jsonl_events(self.path, offset, cap)
+            all_events.extend(events)
+            if not truncated:
+                break
+        self.assertEqual([e["seq"] for e in all_events], [10, 11, 12, 13, 14, 15])
+
+    def test_never_reads_more_than_max_bytes_plus_one_past_the_offset(self):
+        self._write(*[self._envelope(i, text="x" * 200) for i in range(1, 500)])
+        events, offset, truncated = teamsmod.tail_jsonl_events(self.path, 0, 1000)
+        self.assertTrue(truncated)
+        self.assertLessEqual(offset, 1000)
+        self.assertLess(offset, os.path.getsize(self.path))  # never a whole-file read
+
+
 # ─── Tier 1: agent_run() validation -- nothing spawned on any failure ─────
 class AgentRunValidationNoSpawnTests(unittest.TestCase):
     def setUp(self):

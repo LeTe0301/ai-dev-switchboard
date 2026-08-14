@@ -1385,6 +1385,30 @@ def _run_team_in_background(name: str, run_id: str, cancel_event: threading.Even
         _team_threads_pop_if_owned(name, run_id)
 
 
+def _parse_events_cursor(raw: str) -> dict:
+    """
+    GET .../team/events' own `?cursor=` query param (backlog item 6f part
+    1, docs/spec.md §1 "Open questions" -- cursor wire format): a single
+    URL-encoded JSON object, {"<agent>": <byte_offset>, ...}. A malformed
+    value -- not valid JSON, not a JSON object, or any value that isn't a
+    non-negative int -- degrades to {} ("from the start") rather than a
+    400: a stale/hand-crafted cursor should never break a client's poll
+    loop, only cost it a full re-fetch.
+    """
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    for v in obj.values():
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            return {}
+    return obj
+
+
 _team_reap_lock = threading.Lock()
 _team_reap_last_at = 0.0
 
@@ -3523,8 +3547,17 @@ class Handler(BaseHTTPRequestHandler):
                         composition = {"lead": None, "members": []}
                     else:
                         composition = None
+                # Overwatch feed + escalation inbox (backlog item 6f part 1,
+                # docs/spec.md §4) -- additive only. True iff a human can
+                # actually resolve this project's current run right now via
+                # POST .../team/resolve -- deliberately NOT true for
+                # "escalated_max_rounds", a terminal status with no
+                # inbox.json and nothing to resume (docs/spec.md "Open
+                # questions"), which stays under the coarser "blocked"
+                # team_status bucket above instead.
+                waiting_on_you = run is not None and run["status"] == "blocked_ask_user"
                 inst["team"] = {"status": team_status, "run_id": run["run_id"] if run else None,
-                                "composition": composition}
+                                "composition": composition, "waiting_on_you": waiting_on_you}
                 sync_entry = gitea_sync_by_name.get(n)
                 if sync_entry is not None:
                     inst["gitea_sync"] = {"state": sync_entry.get("sync_state"),
@@ -3555,8 +3588,15 @@ class Handler(BaseHTTPRequestHandler):
             # ship a project's full doc text to the browser for what's
             # meant to be a before-you-start summary, not a viewer). No
             # TOTP needed, matching /status's own gating -- _authed() only,
-            # already checked above.
-            parts = [unquote(p) for p in self.path.strip("/").split("/")]
+            # already checked above. Also: overwatch feed + escalation
+            # inbox (backlog item 6f part 1, docs/spec.md §1/§2) --
+            # /team/events and /team/inbox, the first GET routes to carry a
+            # query string (?run_id=/?cursor=), routed via urllib.parse.
+            # urlsplit()/parse_qs() the same way /projects/upload's own POST
+            # branch and the shared TOTP `?code=` parsing already do.
+            split = urllib.parse.urlsplit(self.path)
+            parts = [unquote(p) for p in split.path.strip("/").split("/")]
+            query = urllib.parse.parse_qs(split.query)
             if len(parts) == 4 and parts[0] == "projects" and parts[2] == "team" and parts[3] == "grounding":
                 name = parts[1]
                 if name not in instance_names():
@@ -3565,8 +3605,100 @@ class Handler(BaseHTTPRequestHandler):
                 files = [{"label": f["label"], "relpath": f["relpath"], "byte_count": f["byte_count"]}
                         for f in g["files"]]
                 return self._json({"files": files, "skipped": g["skipped"]})
+            if len(parts) == 4 and parts[0] == "projects" and parts[2] == "team" and parts[3] == "events":
+                return self._handle_team_events(parts[1], query)
+            if len(parts) == 4 and parts[0] == "projects" and parts[2] == "team" and parts[3] == "inbox":
+                return self._handle_team_inbox(parts[1], query)
             self.send_response(404)
             self.end_headers()
+
+    def _team_events_run_and_ownership(self, name: str, query: dict):
+        """
+        Shared "which run, does the caller own it" resolution for both GET
+        .../team/events and GET .../team/inbox (docs/spec.md §1/§2, same
+        run_id-defaults-to-latest, same ownership check). Returns (state,
+        error_response) -- exactly one of the two is non-None: state is the
+        resolved run's persisted dict (possibly None with no error, meaning
+        "no run exists yet for this project" -- not an error for either
+        route), error_response is an already-built (payload, status) tuple
+        the caller should return via self._json(*error_response) for an
+        unknown project or a cross-project run_id.
+        """
+        if name not in instance_names():
+            return None, ({"error": "unknown project"}, 404)
+        run_id = (query.get("run_id") or [None])[0]
+        if run_id:
+            state = teams.load_state_for_project(run_id, name)
+            if state is None:
+                return None, ({"error": "unknown run_id for this project"}, 404)
+            return state, None
+        return teams.latest_run_for_project(name), None
+
+    def _handle_team_events(self, name: str, query: dict):
+        """
+        GET /projects/<name>/team/events (backlog item 6f part 1, docs/
+        spec.md §1) -- cursor-based, per-file byte-capped merge of a run's
+        lead transcript.jsonl and every teammate's own agents/<agent>.jsonl,
+        chronologically sorted. No TOTP needed, read-only, same gating as
+        /team/grounding above.
+        """
+        state, err = self._team_events_run_and_ownership(name, query)
+        if err is not None:
+            return self._json(*err)
+        if state is None:
+            return self._json({"run_id": None, "events": [], "cursors": {}})
+        run_id = state["run_id"]
+        cursor = _parse_events_cursor((query.get("cursor") or [None])[0])
+        files = [("lead", teams._transcript_path(run_id))]
+        files += [(m, teams._agent_log_path(run_id, m)) for m in state.get("members", [])]
+        all_events = []
+        cursors = {}
+        truncated = {}
+        for agent, path in files:
+            offset = cursor.get(agent, 0)
+            events, new_offset, was_truncated = teams.tail_jsonl_events(
+                path, offset, teams.TEAM_EVENTS_MAX_BYTES_PER_FILE_PER_POLL, agent=agent)
+            all_events.extend(events)
+            cursors[agent] = new_offset
+            if was_truncated:
+                truncated[agent] = True
+        all_events.sort(key=lambda e: (e.get("ts", ""), e.get("agent", ""), e.get("seq", 0)))
+        self._json({"run_id": run_id, "events": all_events, "cursors": cursors, "truncated": truncated})
+
+    def _handle_team_inbox(self, name: str, query: dict):
+        """
+        GET /projects/<name>/team/inbox (backlog item 6f part 1, docs/
+        spec.md §2) -- "is there a pending question right now", without the
+        caller having to scan the merged event feed for the latest
+        ask_user entry itself.
+        """
+        state, err = self._team_events_run_and_ownership(name, query)
+        if err is not None:
+            return self._json(*err)
+        if state is None or state.get("status") != "blocked_ask_user":
+            return self._json({"pending": False})
+        run_id = state["run_id"]
+        question = header = None
+        options, multi_select = [], False
+        try:
+            with open(teams._inbox_path(run_id)) as f:
+                inbox = json.load(f)
+            question = inbox.get("question") or None
+            header = inbox.get("header") or ""
+            options = inbox.get("options") or []
+            multi_select = bool(inbox.get("multi_select", False))
+        except (OSError, ValueError):
+            question = None
+        if not question:
+            # inbox.json missing/unreadable/malformed despite status ==
+            # "blocked_ask_user" (docs/spec.md "Edge cases") -- still
+            # "pending": true with a safe, non-empty fallback question,
+            # never silently under-reports a real block.
+            question = ("The team is waiting for input, but the original question could not "
+                        "be read -- check `tmux attach` or answer with any text to unblock it.")
+            header, options, multi_select = "", [], False
+        self._json({"pending": True, "run_id": run_id, "question": question,
+                   "header": header, "options": options, "multi_select": multi_select})
 
     def do_POST(self):
         if self.path == "/login":
@@ -3738,6 +3870,54 @@ class Handler(BaseHTTPRequestHandler):
             result = teams.stop_team(run["run_id"])
             self._json({"ok": True, "session_removed": result["session_removed"],
                        "worktrees": result["worktrees"]})
+        elif parts[0] == "projects" and len(parts) == 4 and parts[2] == "team" and parts[3] == "resolve":
+            # Overwatch feed + escalation inbox (backlog item 6f part 1,
+            # docs/spec.md §3) -- answers a pending ask_user and resumes the
+            # lead loop on a background thread, mirroring /team/start's own
+            # non-blocking discipline. Reached through the shared TOTP gate
+            # above -- no new gating code, same as /team/start|stop.
+            name = parts[1]
+            if name not in instance_names():
+                return self._json({"error": "unknown project"}, 404)
+            run_id = (body.get("run_id") or "").strip() or None
+            if run_id:
+                try:
+                    state = teams._load_state(run_id)
+                except (OSError, ValueError):
+                    return self._json({"error": "no run found for this project"}, 400)
+                if state.get("project_name") != name:
+                    return self._json({"error": "this run belongs to a different project"}, 400)
+            else:
+                state = teams.latest_run_for_project(name)
+                if state is None:
+                    return self._json({"error": "no run found for this project"}, 400)
+                run_id = state["run_id"]
+            if state.get("status") != "blocked_ask_user":
+                return self._json({"error": "no pending question for this project"}, 400)
+            answer = (body.get("answer") or "").strip()
+            if not answer or len(answer) > teams.TEAM_ASK_USER_ANSWER_MAX_CHARS:
+                return self._json(
+                    {"error": f"answer must be non-empty and at most "
+                              f"{teams.TEAM_ASK_USER_ANSWER_MAX_CHARS} characters"}, 400)
+            result = teams.resolve_ask_user(run_id, answer)
+            if not result["ok"]:
+                return self._json({"error": result["error"]}, 400)
+            # Defensive, should-be-unreachable check (docs/spec.md §3): at
+            # most one non-terminal run per project (launch_team()'s own
+            # invariant) plus team_run()'s loop already exiting (and its
+            # thread already popped) the instant a run goes
+            # blocked_ask_user means no live thread should exist here --
+            # cheap to assert rather than trust, turning an already-
+            # impossible race into a clear error instead of two threads
+            # driving one run.
+            if _team_threads_get(name) is not None:
+                return self._json({"error": "a team thread is already running for this project"}, 400)
+            cancel_event = threading.Event()
+            t = threading.Thread(target=_run_team_in_background,
+                                 args=(name, run_id, cancel_event), daemon=True)
+            _team_threads_set(name, {"run_id": run_id, "thread": t, "cancel_event": cancel_event})
+            t.start()
+            self._json({"ok": True, "run_id": run_id})
         else:
             self.send_response(404)
             self.end_headers()

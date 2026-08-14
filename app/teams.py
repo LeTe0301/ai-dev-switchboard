@@ -152,6 +152,30 @@ TEAM_WORKTREE_OP_TIMEOUT_SECONDS = float(os.environ.get("TEAM_WORKTREE_OP_TIMEOU
 # docstring and docs/spec.md "Open questions".
 TEAM_SESSION_STALE_TTL_SECONDS = int(os.environ.get("TEAM_SESSION_STALE_TTL_SECONDS", "86400"))
 
+# Overwatch feed + escalation inbox (backlog item 6f part 1, docs/spec.md).
+# Per-file, per-poll byte cap for GET .../team/events -- tail_jsonl_events()
+# never reads more than this many new bytes past a file's own cursor on any
+# one call, regardless of how much a chatty team has actually appended.
+# 65536 (64 KiB) -- a round, conservative default in the same order of
+# magnitude as this module's other per-poll caps (there's no existing
+# "how chatty is one agent's event stream per poll interval" measured data
+# point the way 6b's own grounding cap had against this repo's real
+# BACKLOG.md -- docs/spec.md "Open questions" -- so this is proceeding
+# unmeasured, tunable via this env var once part 2 shows real traffic).
+TEAM_EVENTS_MAX_BYTES_PER_FILE_PER_POLL = int(
+    os.environ.get("TEAM_EVENTS_MAX_BYTES_PER_FILE_PER_POLL", str(64 * 1024)))
+
+# Max length of the free-text `answer` POST /team/resolve accepts (docs/
+# spec.md §3) -- a short human answer to a pending ask_user question, not a
+# prompt (TEAM_HEADLESS_PROMPT_MAX_BYTES/TEAM_HEADLESS_ARG_PROMPT_MAX_BYTES
+# are a materially different budget for a materially different kind of
+# text, see _validate_prompt_size()'s own docstring for why this spec
+# deliberately doesn't reuse that function). 2000 chars is generous for a
+# free-text answer/explanation while still catching an obviously-wrong
+# paste (an entire file, a whole prompt) before it's appended to the run's
+# history and folded into the lead's next-round context.
+TEAM_ASK_USER_ANSWER_MAX_CHARS = int(os.environ.get("TEAM_ASK_USER_ANSWER_MAX_CHARS", "2000"))
+
 # Bash's own `$?` convention for a foreground child killed by signal N is
 # 128+N (POSIX, confirmed live for SIGTERM against `claude -p` during this
 # sub-spec's Tier 3 verification -- see docs/implementation.md). Generic
@@ -3639,6 +3663,177 @@ def sweep_dead_teams() -> list:
     return results
 
 
+# ─── Overwatch feed + escalation inbox (backlog item 6f part 1, docs/spec.md) ──
+def load_state_for_project(run_id: str, project_name: str) -> dict | None:
+    """
+    docs/spec.md §1's ownership check, shared by GET .../team/events and
+    GET .../team/inbox for their own optional, explicit `run_id` override:
+    loads run_id's state and returns it iff it both exists AND belongs to
+    project_name, else None -- the two GET routes reply 404 either way,
+    collapsing "no such run" and "wrong project" into one outcome (unlike
+    POST /team/resolve, docs/spec.md §3, which needs to tell those two
+    apart for its own error message, so that route calls _load_state()
+    directly instead of this helper). Same "an unreadable/corrupt run.json
+    is skipped, not fatal" discipline latest_run_for_project() already
+    applies, here surfaced as "not found" rather than a 500.
+    """
+    try:
+        state = _load_state(run_id)
+    except (OSError, ValueError):
+        return None
+    if state.get("project_name") != project_name:
+        return None
+    return state
+
+
+def tail_jsonl_events(path: str, offset: int, max_bytes: int, agent: str = None) -> tuple:
+    """
+    docs/spec.md §1's stricter, per-poll-bounded cousin of _tail_log_once()
+    (see below) -- that CLI-only tailer has no byte cap and silently drops
+    a trailing partial line via splitlines(), fine for its own
+    print-to-stderr-on-a-0.2s-loop use but not for GET .../team/events's
+    own "never lose, never duplicate a partial line across a poll
+    boundary" requirement.
+
+    Reads at most max_bytes + 1 bytes starting at `offset` -- the +1 solely
+    to detect whether more complete-line data exists beyond the cap (the
+    `truncated` return value); that extra byte, if read, is never itself
+    parsed as part of any event. Splits on b"\\n"; the LAST element (a
+    possibly-partial trailing line -- including the case where this call's
+    own bounded read stopped mid-line exactly at max_bytes) is never turned
+    into an event, and `new_offset` is walked back to just after the last
+    complete "\\n" actually seen in the (at-most-max_bytes) portion this
+    call processes -- so the very next call, given the returned new_offset,
+    picks up exactly where this one stopped, on a clean line boundary,
+    byte-for-byte (no gap, no duplicate) -- the same "hold a partial line
+    across polls" discipline _Tailer.poll() already uses
+    (app/teams.py:673-679).
+
+    A line that fails to parse as JSON, or parses to something other than a
+    JSON object, becomes one synthetic {"kind": "error", ...} envelope for
+    that position rather than raising or being silently dropped -- mirrors
+    _Tailer._handle_line's own malformed-line discipline
+    (app/teams.py:691-698); the rest of this call's lines, and every other
+    file's own poll, are unaffected.
+
+    Returns (events: list[dict], new_offset: int, truncated: bool).
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            raw = f.read(max_bytes + 1)
+    except FileNotFoundError:
+        return [], offset, False
+    truncated = len(raw) > max_bytes
+    data = raw[:max_bytes] if truncated else raw
+    lines = data.split(b"\n")
+    trailing_partial = lines.pop()  # never parsed this call -- held for the next poll
+    new_offset = offset + (len(data) - len(trailing_partial))
+    events = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line.decode("utf-8", "replace"))
+        except ValueError:
+            obj = None
+        if not isinstance(obj, dict):
+            label = agent or os.path.basename(path)
+            events.append({
+                "ts": _now_iso(), "agent": label, "seq": 0, "kind": "error",
+                "text": f"malformed line in {label}'s log (json.loads failed)",
+                "meta": {"raw_bytes": len(line)},
+            })
+            continue
+        events.append(obj)
+    return events, new_offset, truncated
+
+
+def resolve_ask_user(run_id: str, answer: str) -> dict:
+    """
+    Extracted from _cli_team_resolve()'s own body (backlog item 6f part 1,
+    docs/spec.md §3) so the CLI and the new POST /team/resolve route share
+    exactly one load-check-append-move-flip-persist sequence and can never
+    drift apart. Always reloads state fresh via _load_state(run_id) itself
+    -- never accepts a caller-supplied state dict -- so a concurrent
+    resolve for the same run_id (two tabs, a double-submit) always
+    re-checks status against what is ACTUALLY on disk at the moment this
+    call runs, not a value the caller read earlier (docs/spec.md "Edge
+    cases", two concurrent POST /team/resolve calls: the first to persist
+    wins, the second's own freshly-reloaded state here sees
+    status != "blocked_ask_user" and returns the same ordinary "nothing
+    pending" outcome any other caller gets).
+
+    Returns {"ok": True, "state": state} (the just-persisted state, e.g.
+    for the CLI's own _drive_and_report() to keep driving, or the route to
+    read run_id back off) on success, or {"ok": False, "error": "<reason>"}
+    for the ordinary "wrong state" case -- never raises for that case, same
+    "return a shaped result, don't make the caller catch" convention
+    validate_composition()/launch_team() already use. The exact "no such
+    run_id"/"is not blocked on ask_user" error text below matches
+    _cli_team_resolve()'s own pre-extraction messages byte-for-byte, since
+    the CLI's own printed error line is `f"error: {result['error']}"`
+    (see _cli_team_resolve()) and must stay observably unchanged.
+
+    The move step below is wrapped in its own try/except OSError -- found
+    live, via TeamResolveEndpointTests' own two-genuinely-simultaneous-
+    callers test (backlog item 6f part 1): the pre-extraction body's status
+    check above narrows the race window but does not close it -- two
+    callers can both pass it before either writes, and the SECOND to reach
+    os.replace(inbox_path, ...) then raises FileNotFoundError (its own
+    target was already renamed away by the first), an unhandled exception
+    that reached all the way out through do_POST and reset the client's
+    connection instead of returning a clean 400. This is still the exact
+    same not-lock-guarded, single-writer-assumption race docs/spec.md
+    "Edge cases" already accepts and declines to harden further -- "the
+    first to persist wins" -- this change only ensures the LOSER of that
+    race gets the shaped {"ok": False, ...} result the design always
+    intended for it, instead of an unhandled exception; it adds no new
+    locking and does not change who wins.
+
+    A second, narrower instance of the same race survived that first fix:
+    an earlier version of this function gated the move on a separate
+    `if os.path.exists(inbox_path):` check-then-act, and a loser whose
+    exists() call happened to land AFTER the winner had already renamed the
+    file away would simply see False -- no exception raised at all -- fall
+    through to flip its own stale in-memory state to "running", persist
+    it (clobbering the winner's just-persisted ask_user_resolved history
+    entry), and report {"ok": True} for an answer nobody recorded. Fixed by
+    deleting the separate exists() check entirely and calling
+    os.replace(inbox_path, ...) unconditionally: os.replace() is now the
+    SOLE atomic arbiter of "did I win" (via FileNotFoundError on the loser
+    side), so there is exactly one check-then-act decision point instead of
+    two independent ones layered on top of each other. state["status"] is
+    only flipped and persisted after os.replace() has already succeeded, so
+    a loser never touches state at all.
+    """
+    try:
+        state = _load_state(run_id)
+    except FileNotFoundError:
+        return {"ok": False, "error": f"no such run_id: {run_id}"}
+    if state.get("status") != "blocked_ask_user":
+        return {"ok": False,
+                "error": f"run {run_id} is not blocked on ask_user (status={state.get('status')})"}
+    round_n = len(state["history"]) + 1
+    _append_history(state, round_n, tool="ask_user_resolved",
+                    args_summary="ask_user_resolved(...)",
+                    outcome_summary=f"answered: {answer[:80]}", full_result_text=answer, log_path=None,
+                    transcript_entries=[("tool_result", answer, {"resolved": True})])
+    inbox_path = _inbox_path(run_id)
+    try:
+        os.replace(inbox_path, _inbox_resolved_path(run_id))
+    except OSError:
+        try:
+            status_now = _load_state(run_id).get("status", "unknown")
+        except (OSError, ValueError):
+            status_now = "unknown"
+        return {"ok": False,
+                "error": f"run {run_id} is not blocked on ask_user (status={status_now})"}
+    state["status"] = "running"
+    _persist(state)
+    return {"ok": True, "state": state}
+
+
 # ─── CLI ────────────────────────────────────────────────────────────────
 def _tail_log_once(log_path: str, offset: int) -> int:
     try:
@@ -3786,27 +3981,18 @@ def _cli_team_status(args: argparse.Namespace) -> int:
 
 
 def _cli_team_resolve(args: argparse.Namespace) -> int:
-    try:
-        state = _load_state(args.run_id)
-    except FileNotFoundError:
-        print(f"error: no such run_id: {args.run_id}", file=sys.stderr)
+    """
+    Thin CLI wrapper over the shared resolve_ask_user() (backlog item 6f
+    part 1, docs/spec.md §3) -- zero change to this subcommand's own
+    observable behavior (exit codes, blocking, stderr/stdout) from before
+    the extraction: the same two error strings, still foreground-blocking
+    via _drive_and_report() on success.
+    """
+    result = resolve_ask_user(args.run_id, args.answer)
+    if not result["ok"]:
+        print(f"error: {result['error']}", file=sys.stderr)
         return 1
-    if state["status"] != "blocked_ask_user":
-        print(f"error: run {args.run_id} is not blocked on ask_user (status={state['status']})",
-             file=sys.stderr)
-        return 1
-    round_n = len(state["history"]) + 1
-    answer = args.answer
-    _append_history(state, round_n, tool="ask_user_resolved",
-                    args_summary="ask_user_resolved(...)",
-                    outcome_summary=f"answered: {answer[:80]}", full_result_text=answer, log_path=None,
-                    transcript_entries=[("tool_result", answer, {"resolved": True})])
-    inbox_path = _inbox_path(state["run_id"])
-    if os.path.exists(inbox_path):
-        os.replace(inbox_path, _inbox_resolved_path(state["run_id"]))
-    state["status"] = "running"
-    _persist(state)
-    return _drive_and_report(state)
+    return _drive_and_report(result["state"])
 
 
 def _cli_team_resume(args: argparse.Namespace) -> int:

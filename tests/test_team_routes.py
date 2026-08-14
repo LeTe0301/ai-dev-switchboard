@@ -15,6 +15,10 @@ extraction technique), and the explicit regression guard that the CLI's
 --lead still accepts a tier-3 lead even though the web route's DEFAULT
 composition refuses one (docs/spec.md "Acceptance criteria").
 
+Also covers the overwatch feed + escalation inbox's backend routes
+(backlog item 6f part 1, docs/spec.md -- TeamEventsEndpointTests,
+TeamInboxEndpointTests, TeamResolveEndpointTests), same real-HTTP harness.
+
 Run with:
     python3 -m unittest discover -s tests -v
 """
@@ -30,6 +34,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -81,6 +86,22 @@ def _write_script(dirpath, filename, body):
         f.write(textwrap.dedent(body))
     os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
     return path
+
+
+def _envelope(agent, seq, kind="message", text="x", ts="2026-01-01T00:00:00Z"):
+    """One §4.1-shaped event envelope, written directly to a run's own
+    transcript.jsonl/agents/<agent>.jsonl for TeamEventsEndpointTests/
+    TeamInboxEndpointTests -- a fixed `ts` by default so ordering-sensitive
+    assertions are deterministic, not dependent on real wall-clock
+    resolution."""
+    return {"ts": ts, "agent": agent, "seq": seq, "kind": kind, "text": text, "meta": {}}
+
+
+def _append_jsonl(path, *envelopes):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        for e in envelopes:
+            f.write(json.dumps(e) + "\n")
 
 
 def _git(cwd, *args, check=True):
@@ -635,9 +656,11 @@ class TeamStopEndpointTests(_RealHTTPTeamTestCase):
         # all (no engines.d entries in this test's own scratch engines_dir,
         # no Ollama configured) means default_team_composition() itself
         # refuses, so composition is None here (no saved composition
-        # either).
+        # either). "waiting_on_you" (backlog item 6f part 1) is additive
+        # too -- False, no run at all.
         self.assertEqual(by_name["proj"]["team"],
-                         {"status": "idle", "run_id": None, "composition": None})
+                         {"status": "idle", "run_id": None, "composition": None,
+                          "waiting_on_you": False})
 
 
 # ─── Roster & composition UI (backlog item 6e, docs/spec.md) ──────────────
@@ -742,6 +765,29 @@ class StatusRosterAndCompositionTests(_RealHTTPTeamTestCase):
         self.assertEqual(s["roster"], [])
         self.assertIsNone(by_name["proj"]["team"]["composition"])
 
+    def test_waiting_on_you_true_only_for_blocked_ask_user_never_for_escalated_max_rounds(self):
+        # docs/spec.md §4/"Open questions": additive-only field, true iff
+        # the project's LATEST run status is exactly "blocked_ask_user" --
+        # every existing /status field/value stays byte-for-byte unchanged
+        # (this test only checks the one new key; the full-dict exact-match
+        # tests above/elsewhere already pin the rest).
+        repo = self._project("proj")
+        result = teamsmod.launch_team(repo, "task", {"kind": "ollama", "name": "m", "tier": 1}, [])
+        run_id = result["run_id"]
+        cookie = self._login()
+        cases = {
+            "running": False, "blocked_ask_user": True,
+            "escalated_max_rounds": False, "finished": False,
+            "error": False, "stopped": False,
+        }
+        for raw_status, expected in cases.items():
+            state = teamsmod._load_state(run_id)
+            state["status"] = raw_status
+            teamsmod._persist(state)
+            s = self._get_status(cookie)
+            by_name = {i["name"]: i for i in s["instances"]}
+            self.assertEqual(by_name["proj"]["team"]["waiting_on_you"], expected, raw_status)
+
 
 # ─── GET /projects/<name>/team/grounding (backlog item 6e) ─────────────────
 class TeamGroundingEndpointTests(_RealHTTPTeamTestCase):
@@ -785,6 +831,473 @@ class TeamGroundingEndpointTests(_RealHTTPTeamTestCase):
                                      headers={"Cookie": cookie})
         resp = urllib.request.urlopen(req)
         self.assertEqual(resp.status, 200)
+
+
+# ─── GET /projects/<name>/team/events (backlog item 6f part 1, docs/spec.md) ──
+class TeamEventsEndpointTests(_RealHTTPTeamTestCase):
+    """Hand-constructs run.json + raw .jsonl log files directly (no real
+    launch_team()/tmux session needed -- this route only ever reads
+    already-persisted state and log files) so event content/ordering/
+    cursor behavior is deterministic and independent of a real lead loop."""
+
+    def _make_run(self, name="proj", members=None, status="running"):
+        os.makedirs(os.path.join(self.projects_dir, name), exist_ok=True)
+        run_id = teamsmod._run_id()
+        state = teamsmod._new_state(run_id, os.path.join(self.projects_dir, name),
+                                    {"kind": "ollama", "name": "m", "tier": 1},
+                                    members or [], "task", project_name=name)
+        state["status"] = status
+        teamsmod._persist(state)
+        return run_id
+
+    def test_unknown_project_404(self):
+        cookie = self._login()
+        status, payload = self._get("/projects/nope/team/events", cookie)
+        self.assertEqual(status, 404)
+
+    def test_no_run_ever_started_returns_clean_empty_state(self):
+        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        cookie = self._login()
+        status, payload = self._get("/projects/proj/team/events", cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"run_id": None, "events": [], "cursors": {}})
+
+    def test_events_from_lead_and_teammates_merged_and_sorted_chronologically(self):
+        run_id = self._make_run(members=["claude"])
+        _append_jsonl(teamsmod._transcript_path(run_id),
+                     _envelope("lead", 1, text="first", ts="2026-01-01T00:00:00Z"),
+                     _envelope("lead", 2, text="third", ts="2026-01-01T00:00:02Z"))
+        _append_jsonl(teamsmod._agent_log_path(run_id, "claude"),
+                     _envelope("claude", 1, text="second", ts="2026-01-01T00:00:01Z"))
+        cookie = self._login()
+        status, payload = self._get("/projects/proj/team/events", cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["run_id"], run_id)
+        self.assertEqual([e["text"] for e in payload["events"]], ["first", "second", "third"])
+        # A member that never delegated to (no log file yet) is present-but-
+        # empty, offset 0 -- not an error, and still gets its own cursor
+        # entry so a client's cursor map stays complete across polls.
+        self.assertEqual(payload["cursors"]["claude"], os.path.getsize(teamsmod._agent_log_path(run_id, "claude")))
+        self.assertIn("lead", payload["cursors"])
+
+    def test_a_member_with_no_log_file_yet_is_present_but_empty(self):
+        run_id = self._make_run(members=["neverdelegated"])
+        cookie = self._login()
+        status, payload = self._get("/projects/proj/team/events", cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["events"], [])
+        self.assertEqual(payload["cursors"].get("neverdelegated"), 0)
+
+    def test_cursor_returns_only_new_events_on_repeat_poll_no_event_returned_twice(self):
+        run_id = self._make_run()
+        lead_path = teamsmod._transcript_path(run_id)
+        _append_jsonl(lead_path, _envelope("lead", 1, text="one"))
+        cookie = self._login()
+        status, payload = self._get("/projects/proj/team/events", cookie)
+        self.assertEqual(len(payload["events"]), 1)
+        cursor_q = urllib.parse.quote(json.dumps(payload["cursors"]))
+        status2, payload2 = self._get(f"/projects/proj/team/events?cursor={cursor_q}", cookie)
+        self.assertEqual(payload2["events"], [])
+        _append_jsonl(lead_path, _envelope("lead", 2, text="two"))
+        status3, payload3 = self._get(f"/projects/proj/team/events?cursor={cursor_q}", cookie)
+        self.assertEqual([e["text"] for e in payload3["events"]], ["two"])
+
+    def test_malformed_cursor_falls_back_to_a_full_replay_not_a_400(self):
+        run_id = self._make_run()
+        _append_jsonl(teamsmod._transcript_path(run_id), _envelope("lead", 1, text="one"))
+        cookie = self._login()
+        status, payload = self._get("/projects/proj/team/events?cursor=not-json", cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual([e["text"] for e in payload["events"]], ["one"])
+
+    def test_truncated_agent_reports_flag_and_follow_up_poll_drains_the_rest(self):
+        run_id = self._make_run()
+        one_line = json.dumps(_envelope("lead", 1, text="a")) + "\n"
+        cap = len(one_line.encode()) * 2  # exactly 2 whole lines' worth
+        orig_cap = teamsmod.TEAM_EVENTS_MAX_BYTES_PER_FILE_PER_POLL
+        teamsmod.TEAM_EVENTS_MAX_BYTES_PER_FILE_PER_POLL = cap
+        self.addCleanup(setattr, teamsmod, "TEAM_EVENTS_MAX_BYTES_PER_FILE_PER_POLL", orig_cap)
+        _append_jsonl(teamsmod._transcript_path(run_id),
+                     _envelope("lead", 1, text="a"), _envelope("lead", 2, text="b"),
+                     _envelope("lead", 3, text="c"))
+        cookie = self._login()
+        status, payload = self._get("/projects/proj/team/events", cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual([e["text"] for e in payload["events"]], ["a", "b"])
+        self.assertEqual(payload["truncated"], {"lead": True})
+        cursor_q = urllib.parse.quote(json.dumps(payload["cursors"]))
+        status2, payload2 = self._get(f"/projects/proj/team/events?cursor={cursor_q}", cookie)
+        self.assertEqual([e["text"] for e in payload2["events"]], ["c"])
+        self.assertEqual(payload2["truncated"], {})
+
+    def test_malformed_line_becomes_one_error_event_no_500_for_whole_poll(self):
+        run_id = self._make_run()
+        path = teamsmod._transcript_path(run_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(_envelope("lead", 1, text="ok-before")) + "\n")
+            f.write("not valid json at all\n")
+            f.write(json.dumps(_envelope("lead", 3, text="ok-after")) + "\n")
+        cookie = self._login()
+        status, payload = self._get("/projects/proj/team/events", cookie)
+        self.assertEqual(status, 200)
+        kinds = [e["kind"] for e in payload["events"]]
+        self.assertIn("error", kinds)
+        self.assertEqual(len(payload["events"]), 3)
+
+    def test_cross_project_run_id_404_no_data_leaked(self):
+        run_a = self._make_run(name="proj-a")
+        os.makedirs(os.path.join(self.projects_dir, "proj-b"))
+        cookie = self._login()
+        status, payload = self._get(f"/projects/proj-b/team/events?run_id={run_a}", cookie)
+        self.assertEqual(status, 404)
+
+    def test_finished_run_no_thread_running_still_returns_full_history(self):
+        run_id = self._make_run(status="finished")
+        _append_jsonl(teamsmod._transcript_path(run_id), _envelope("lead", 1, text="done"))
+        cookie = self._login()
+        status, payload = self._get("/projects/proj/team/events", cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual([e["text"] for e in payload["events"]], ["done"])
+
+
+# ─── GET /projects/<name>/team/inbox (backlog item 6f part 1, docs/spec.md) ──
+class TeamInboxEndpointTests(_RealHTTPTeamTestCase):
+    def _make_run(self, name="proj", status="blocked_ask_user"):
+        os.makedirs(os.path.join(self.projects_dir, name), exist_ok=True)
+        run_id = teamsmod._run_id()
+        state = teamsmod._new_state(run_id, os.path.join(self.projects_dir, name),
+                                    {"kind": "ollama", "name": "m", "tier": 1}, [], "task",
+                                    project_name=name)
+        state["status"] = status
+        teamsmod._persist(state)
+        return run_id
+
+    def test_unknown_project_404(self):
+        cookie = self._login()
+        status, payload = self._get("/projects/nope/team/inbox", cookie)
+        self.assertEqual(status, 404)
+
+    def test_no_run_ever_started_pending_false(self):
+        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        cookie = self._login()
+        status, payload = self._get("/projects/proj/team/inbox", cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"pending": False})
+
+    def test_run_not_blocked_pending_false(self):
+        self._make_run(status="running")
+        cookie = self._login()
+        status, payload = self._get("/projects/proj/team/inbox", cookie)
+        self.assertEqual(payload, {"pending": False})
+
+    def test_genuinely_blocked_returns_exact_persisted_question_shape(self):
+        run_id = self._make_run()
+        inbox = {"question": "which way?", "header": "Choice", "multi_select": False,
+                 "options": [{"label": "a", "description": "a"}, {"label": "b", "description": "b"}]}
+        with open(teamsmod._inbox_path(run_id), "w") as f:
+            json.dump(inbox, f)
+        cookie = self._login()
+        status, payload = self._get("/projects/proj/team/inbox", cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"pending": True, "run_id": run_id, **inbox})
+
+    def test_missing_inbox_json_still_pending_true_with_fallback_question(self):
+        self._make_run()  # blocked, but inbox.json never written
+        cookie = self._login()
+        status, payload = self._get("/projects/proj/team/inbox", cookie)
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["pending"])
+        self.assertTrue(payload["question"])  # non-empty fallback, never blank
+        self.assertEqual(payload["options"], [])
+
+    def test_malformed_inbox_json_still_pending_true_with_fallback_question(self):
+        run_id = self._make_run()
+        with open(teamsmod._inbox_path(run_id), "w") as f:
+            f.write("not valid json")
+        cookie = self._login()
+        status, payload = self._get("/projects/proj/team/inbox", cookie)
+        self.assertTrue(payload["pending"])
+        self.assertTrue(payload["question"])
+
+    def test_cross_project_run_id_404(self):
+        run_a = self._make_run(name="proj-a")
+        os.makedirs(os.path.join(self.projects_dir, "proj-b"))
+        cookie = self._login()
+        status, payload = self._get(f"/projects/proj-b/team/inbox?run_id={run_a}", cookie)
+        self.assertEqual(status, 404)
+
+    def test_inbox_reflects_only_genuinely_pending_across_a_resolve_and_repoll_sequence(self):
+        # Reviewer-added: docs/spec.md never explicitly walks a
+        # resolve-then-re-poll sequence for GET .../team/inbox -- confirm
+        # the route doesn't keep reporting a just-resolved question as
+        # still pending. Uses the same no-op _run_team_in_background
+        # monkeypatch idiom TeamResolveEndpointTests' own
+        # test_cli_and_route_produce_identical_persisted_state_for_same_input
+        # already establishes, so the assertion below isn't racing an
+        # unrelated background drive.
+        orig_drive = appmod._run_team_in_background
+        appmod._run_team_in_background = lambda *a, **kw: None
+        self.addCleanup(setattr, appmod, "_run_team_in_background", orig_drive)
+
+        run_id = self._make_run()
+        with open(teamsmod._inbox_path(run_id), "w") as f:
+            json.dump({"question": "which way?", "header": "Choice",
+                       "options": [], "multi_select": False}, f)
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._get("/projects/proj/team/inbox", cookie)
+        self.assertTrue(payload["pending"])
+
+        status2, payload2 = self._post("/projects/proj/team/resolve", cookie,
+                                       {"answer": "go left", "code": code})
+        self.assertEqual(status2, 200, payload2)
+
+        status3, payload3 = self._get("/projects/proj/team/inbox", cookie)
+        self.assertEqual(status3, 200)
+        self.assertEqual(payload3, {"pending": False})
+
+
+# ─── POST /projects/<name>/team/resolve (backlog item 6f part 1, docs/spec.md) ──
+class TeamResolveEndpointTests(_RealHTTPTeamTestCase):
+    def _make_run(self, name="proj", status="blocked_ask_user", write_inbox=True):
+        os.makedirs(os.path.join(self.projects_dir, name), exist_ok=True)
+        run_id = teamsmod._run_id()
+        state = teamsmod._new_state(run_id, os.path.join(self.projects_dir, name),
+                                    {"kind": "ollama", "name": "m", "tier": 1}, [], "task",
+                                    project_name=name)
+        state["status"] = status
+        teamsmod._persist(state)
+        if write_inbox and status == "blocked_ask_user":
+            with open(teamsmod._inbox_path(run_id), "w") as f:
+                json.dump({"question": "q?", "header": "Q", "options": [], "multi_select": False}, f)
+        return run_id
+
+    def test_unknown_project_404(self):
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/nope/team/resolve", cookie,
+                                     {"answer": "yes", "code": code})
+        self.assertEqual(status, 404)
+
+    def test_not_blocked_400_specific_reason_no_state_mutated(self):
+        run_id = self._make_run(status="running", write_inbox=False)
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/proj/team/resolve", cookie,
+                                     {"answer": "yes", "code": code})
+        self.assertEqual(status, 400)
+        self.assertIn("no pending question", payload["error"])
+        self.assertEqual(teamsmod._load_state(run_id)["status"], "running")
+
+    def test_no_run_at_all_400_specific_reason(self):
+        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/proj/team/resolve", cookie,
+                                     {"answer": "yes", "code": code})
+        self.assertEqual(status, 400)
+        self.assertIn("no run found", payload["error"])
+
+    def test_explicit_run_id_for_a_different_project_400_specific_reason(self):
+        run_a = self._make_run(name="proj-a")
+        os.makedirs(os.path.join(self.projects_dir, "proj-b"))
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/proj-b/team/resolve", cookie,
+                                     {"answer": "yes", "run_id": run_a, "code": code})
+        self.assertEqual(status, 400)
+        self.assertIn("different project", payload["error"])
+
+    def test_empty_answer_400_before_any_mutation(self):
+        run_id = self._make_run()
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/proj/team/resolve", cookie,
+                                     {"answer": "   ", "code": code})
+        self.assertEqual(status, 400)
+        self.assertEqual(teamsmod._load_state(run_id)["status"], "blocked_ask_user")
+        self.assertTrue(os.path.isfile(teamsmod._inbox_path(run_id)))
+
+    def test_oversized_answer_400_before_any_mutation(self):
+        run_id = self._make_run()
+        orig = teamsmod.TEAM_ASK_USER_ANSWER_MAX_CHARS
+        teamsmod.TEAM_ASK_USER_ANSWER_MAX_CHARS = 5
+        self.addCleanup(setattr, teamsmod, "TEAM_ASK_USER_ANSWER_MAX_CHARS", orig)
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/proj/team/resolve", cookie,
+                                     {"answer": "way too long", "code": code})
+        self.assertEqual(status, 400)
+        self.assertEqual(teamsmod._load_state(run_id)["status"], "blocked_ask_user")
+
+    def test_genuinely_blocked_valid_answer_resolves_and_returns_immediately(self):
+        run_id = self._make_run()
+        cookie = self._login()
+        code = self._totp_code()
+        start = time.time()
+        status, payload = self._post("/projects/proj/team/resolve", cookie,
+                                     {"answer": "Yes, proceed", "code": code})
+        elapsed = time.time() - start
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["run_id"], run_id)
+        self.assertLess(elapsed, 3.0)  # never waits for the lead's next round
+        # Poll until the background thread has actually persisted the move.
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if not os.path.isfile(teamsmod._inbox_path(run_id)):
+                break
+            time.sleep(0.05)
+        self.assertFalse(os.path.isfile(teamsmod._inbox_path(run_id)))
+        self.assertTrue(os.path.isfile(teamsmod._inbox_resolved_path(run_id)))
+        state = teamsmod._load_state(run_id)
+        self.assertNotEqual(state["status"], "blocked_ask_user")
+        answered = [h for h in state["history"] if h["tool"] == "ask_user_resolved"]
+        self.assertEqual(len(answered), 1)
+        self.assertEqual(answered[0]["full_result_text"], "Yes, proceed")
+
+    def test_two_concurrent_resolves_exactly_one_succeeds(self):
+        run_id = self._make_run()
+        cookie = self._login()
+        code = self._totp_code()
+        results = []
+
+        def _do_post():
+            results.append(self._post("/projects/proj/team/resolve", cookie,
+                                      {"answer": "an answer", "code": code}))
+
+        t1 = threading.Thread(target=_do_post)
+        t2 = threading.Thread(target=_do_post)
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+        statuses = sorted(r[0] for r in results)
+        self.assertEqual(statuses, [200, 400])
+        loser = next(r for r in results if r[0] == 400)
+        # docs/spec.md "Edge cases" own check-then-act window (deliberately
+        # not lock-guarded -- "the same single-writer assumption every
+        # other run.json mutator in this codebase already carries"): for
+        # two GENUINELY simultaneous callers (both threads start with zero
+        # synchronization here, tighter than a realistic back-to-back
+        # double-submit), the loser can be caught at any of three points --
+        # resolve_ask_user()'s own upfront status check, its own move-then-
+        # persist step losing the race (an OSError caught and turned into
+        # the same shaped result -- see resolve_ask_user()'s own docstring,
+        # found live by this exact test), or the route's own defensive
+        # "already running" check right before it would otherwise spawn a
+        # second driving thread. Whichever one catches it, the loser always
+        # gets a clean, shaped 400 (never an unhandled exception/connection
+        # reset) and the one invariant docs/spec.md actually guarantees --
+        # "exactly one thread is ever spawned for one answer" -- holds;
+        # which of the three reasons the loser gets is timing-dependent,
+        # not part of that guarantee.
+        self.assertTrue(
+            "no pending question" in loser[1]["error"]
+            or "already running" in loser[1]["error"]
+            or "is not blocked on ask_user" in loser[1]["error"],
+            loser[1]["error"])
+
+    def test_loser_whose_exists_check_lands_after_winner_already_renamed_does_not_report_ok(self):
+        # Reviewer-added repro (docs/spec.md "Edge cases": "the second's own
+        # freshly-reloaded state ... sees status != blocked_ask_user and
+        # returns [a] 400"). resolve_ask_user() used to only raise OSError
+        # when its OWN os.replace() call collided with another rename in
+        # flight (the crash the developer already fixed). But a genuinely-
+        # concurrent loser whose own `_load_state()` read completed BEFORE
+        # the winner persisted, and whose own `os.path.exists(inbox_path)`
+        # check then landed AFTER the winner's real os.replace() had already
+        # completed, hit neither guard: `if os.path.exists(inbox_path):` was
+        # simply False, no os.replace() was attempted, no OSError was
+        # raised -- the loser fell straight through to
+        # `state["status"] = "running"; _persist(state)` and returned
+        # {"ok": True}, built from its own STALE in-memory state, silently
+        # overwriting the winner's already-persisted history. Fixed by
+        # removing the separate exists() check entirely and making the
+        # unconditional os.replace() call the sole arbiter of "did I win"
+        # (see resolve_ask_user()'s own docstring). This test is now the
+        # permanent regression guard for that fix.
+        #
+        # Reproduced deterministically (no thread-timing flakiness) via a
+        # one-shot hook on the loser's own `_load_state()` call: at the
+        # exact moment the loser has read its (still blocked_ask_user)
+        # snapshot but before it proceeds, a REAL winning resolve_ask_user()
+        # call is run to completion for real (real os.replace(), real
+        # persist) -- exactly the interleaving the spec's own prose assumes
+        # can happen, just made deterministic instead of thread-scheduled.
+        run_id = self._make_run()
+        orig_load_state = teamsmod._load_state
+        hook_fired = []
+
+        def _patched_load_state(rid):
+            snapshot = orig_load_state(rid)
+            if rid == run_id and not hook_fired:
+                hook_fired.append(True)
+                teamsmod._load_state = orig_load_state  # avoid re-entering this hook
+                winner_result = teamsmod.resolve_ask_user(run_id, "winner answer")
+                self.assertTrue(winner_result["ok"], winner_result)
+                teamsmod._load_state = _patched_load_state
+            return snapshot
+
+        teamsmod._load_state = _patched_load_state
+        self.addCleanup(setattr, teamsmod, "_load_state", orig_load_state)
+
+        loser_result = teamsmod.resolve_ask_user(run_id, "loser answer")
+
+        final_state = teamsmod._load_state(run_id)
+        answered = [h for h in final_state["history"] if h["tool"] == "ask_user_resolved"]
+
+        # This is the permanent regression guard for the fix that closed
+        # this exact race: resolve_ask_user() no longer gates the move on a
+        # separate `if os.path.exists(inbox_path):` check-then-act -- it
+        # calls os.replace() unconditionally and lets THAT call's own
+        # FileNotFoundError be the sole arbiter of "did I win". So the
+        # loser in this timing now hits the same OSError branch the
+        # genuinely-simultaneous-callers race already exercises: it reports
+        # {"ok": False, ...} and never touches (let alone persists) its own
+        # stale in-memory state, so the winner's already-persisted
+        # ask_user_resolved history entry survives untouched.
+        self.assertFalse(loser_result["ok"], loser_result)
+        self.assertEqual(len(answered), 1)
+        self.assertEqual(answered[0]["full_result_text"], "winner answer")  # winner's entry survives
+
+    def test_cli_and_route_produce_identical_persisted_state_for_same_input(self):
+        # docs/spec.md's own acceptance criterion: the CLI's team-resolve
+        # and this route both funnel through the same shared
+        # teams.resolve_ask_user() -- proven by comparing each path's own
+        # persisted output immediately after ITS OWN resolve step. The
+        # route's subsequent background-thread DRIVE (team_run(), which
+        # this project's own "ollama" test lead fails immediately without
+        # TEAM_LLM_BASE_URL configured) is a separate, deliberately ASYNC
+        # concern (unlike the CLI's own synchronous _drive_and_report()) --
+        # comparing FULL final state after however long that unrelated
+        # background thread happens to take would conflate two different
+        # things this criterion isn't about, so it's neutralized here via a
+        # harmless no-op patch (same monkeypatch idiom _patch_tmux() above
+        # already establishes for this exact class of "swap out a real
+        # side effect for a no-op" need).
+        orig_drive = appmod._run_team_in_background
+        appmod._run_team_in_background = lambda *a, **kw: None
+        self.addCleanup(setattr, appmod, "_run_team_in_background", orig_drive)
+
+        run_id_cli = self._make_run(name="proj")
+        result_cli = teamsmod.resolve_ask_user(run_id_cli, "same answer")
+        self.assertTrue(result_cli["ok"])
+        state_cli = teamsmod._load_state(run_id_cli)
+
+        run_id_route = self._make_run(name="proj")
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/proj/team/resolve", cookie,
+                                     {"answer": "same answer", "run_id": run_id_route, "code": code})
+        self.assertEqual(status, 200)
+        state_route = teamsmod._load_state(run_id_route)
+
+        self.assertEqual(state_cli["status"], state_route["status"])
+        cli_hist = [{k: v for k, v in h.items() if k != "log_path"} for h in state_cli["history"]]
+        route_hist = [{k: v for k, v in h.items() if k != "log_path"} for h in state_route["history"]]
+        self.assertEqual(cli_hist, route_hist)
 
 
 # ─── POST /projects/<name>/team/start with a submitted composition ────────

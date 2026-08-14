@@ -2870,4 +2870,478 @@ python3 app/teams.py roster   # confirms: prose, tier 3
 # GET /status and confirm inst.team.composition for "demo" is
 # {"lead": null, "members": []}, not null.
 ```
+
+---
+
+# Implementation: Overwatch feed + escalation inbox -- backend API (sub-spec 6f part 1)
+
+## Summary
+
+Adds the three read/write HTTP routes and one additive `/status` field
+`docs/spec.md` scopes for this part -- no HTML/CSS/JS, no `docs/design.md`
+section, same precedent as 6d part 1: `GET /projects/<name>/team/events`
+(cursor-based, per-file byte-capped, merges `transcript.jsonl` + every
+teammate's own `agents/<agent>.jsonl` into one chronological stream), `GET
+/projects/<name>/team/inbox` ("is there a pending question right now"), and
+`POST /projects/<name>/team/resolve` (answers a pending `ask_user` and
+resumes the lead loop on a background thread, mirroring `/team/start`'s own
+non-blocking discipline). `_cli_team_resolve()`'s resolve-and-resume logic
+is extracted into a new shared `teams.resolve_ask_user()` so the CLI and the
+new route call the same code, verified identical rather than assumed.
+
+Testing this for real (a genuinely-concurrent, zero-synchronization
+double-`POST /team/resolve` test) surfaced a real, previously-nonexistent
+crash bug in the extracted `resolve_ask_user()` -- an unhandled
+`FileNotFoundError` from a lost `os.replace()` race that reset the client's
+HTTP connection instead of returning a clean `400`. Fixed with a narrow
+`try/except OSError` around the move-then-persist step (see "Key
+decisions") -- not a new lock, just converting an already-anticipated race's
+loser into the shaped result the design already intended for it.
+
+## Changes by file
+
+- **`app/teams.py`** (new "Overwatch feed + escalation inbox" section,
+  inserted between `sweep_dead_teams()` and the `# ─── CLI ───` marker;
+  `_cli_team_resolve()` rewritten in place):
+  - `load_state_for_project(run_id, project_name) -> dict | None` --
+    `_load_state(run_id)` plus an ownership check
+    (`state["project_name"] == project_name`), collapsing "no such run" and
+    "wrong project" into one `None` outcome; used by both new `GET` routes
+    (which reply `404` either way). `POST /team/resolve` needs the two
+    reasons told apart for its own error message (docs/spec.md §3), so
+    that route calls `_load_state()` directly instead.
+  - `tail_jsonl_events(path, offset, max_bytes, agent=None) -> (events,
+    new_offset, truncated)` -- the stricter, per-poll-bounded cousin of
+    `_tail_log_once()` docs/spec.md §1 specifies: reads at most `max_bytes
+    + 1` bytes past `offset` (the `+1` solely to detect `truncated`, never
+    itself parsed), holds a trailing partial line across calls (never
+    parses it, walks `new_offset` back to the last complete `\n`), and
+    turns a malformed/non-dict JSON line into one synthetic `kind: "error"`
+    envelope rather than raising or dropping the rest of the file. The
+    `agent` keyword (not in the spec's own 3-arg prose description) is a
+    small, additive convenience used only to label the synthetic
+    malformed-line envelope's `text`/`agent` fields more usefully than a
+    bare file basename would; omitting it still works (falls back to
+    `os.path.basename(path)`).
+  - `resolve_ask_user(run_id, answer) -> {"ok": True, "state": state} |
+    {"ok": False, "error": str}` -- extracted from `_cli_team_resolve()`'s
+    own body (docs/spec.md §3): always reloads state fresh via
+    `_load_state(run_id)` itself (never accepts a caller-supplied state
+    dict), so a concurrent resolve for the same `run_id` always re-checks
+    status against what's actually on disk at call time. The move-then-
+    persist step is wrapped in its own `try/except OSError` -- see "Key
+    decisions" for why this was added beyond the spec's own literal
+    pseudocode.
+  - Two new config constants: `TEAM_EVENTS_MAX_BYTES_PER_FILE_PER_POLL`
+    (default 65536, unmeasured per docs/spec.md's own "Open questions" --
+    same reasoning as that section gives) and
+    `TEAM_ASK_USER_ANSWER_MAX_CHARS` (default 2000 -- not pinned by the
+    spec itself, chosen as "generous for a free-text answer, still catches
+    an obviously-wrong paste," same order of magnitude as this module's
+    other short-text caps).
+  - `_cli_team_resolve()` is now a thin wrapper: calls `resolve_ask_user()`,
+    prints `f"error: {result['error']}"` and returns `1` on failure, else
+    calls `_drive_and_report(result["state"])` -- zero change to the
+    subcommand's own observable behavior (verified by the pre-existing,
+    unmodified `ResolveInSeparateProcessTests`, still green, plus this
+    cycle's own CLI-vs-route identical-persisted-state test).
+- **`app/app.py`**:
+  - `do_GET`'s `else` branch (the "not `/status`" fallthrough) now computes
+    `split = urllib.parse.urlsplit(self.path)` and `query =
+    urllib.parse.parse_qs(split.query)` once, routes on `split.path`
+    instead of the bare `self.path` (the `/team/grounding` branch is
+    otherwise unchanged) -- the first GET route in this file to carry a
+    query string (`?run_id=`/`?cursor=`).
+  - `_handle_team_events(name, query)` / `_handle_team_inbox(name, query)`
+    (new handler methods) plus a shared `_team_events_run_and_ownership()`
+    helper for the "which run, does the caller own it, defaults to
+    `latest_run_for_project()`" resolution both routes need identically.
+    `_handle_team_events` merges `[("lead", teams._transcript_path(run_id))]
+    + [(m, teams._agent_log_path(run_id, m)) for m in state["members"]]`
+    via one `teams.tail_jsonl_events()` call per file, sorts by `(ts, agent,
+    seq)`, and returns `{"run_id", "events", "cursors", "truncated"}`
+    exactly as docs/spec.md §1 shapes it. `_handle_team_inbox` reads
+    `inbox.json` directly for the `blocked_ask_user` case, falling back to
+    the spec's own fixed "check `tmux attach`" question on any
+    `OSError`/`ValueError` (missing/corrupt file) -- always `pending: true`
+    in that state, never a false `pending: false`.
+  - New module-level `_parse_events_cursor(raw) -> dict` -- a malformed
+    `?cursor=` value (not JSON, not an object, a non-int/negative offset)
+    degrades to `{}`, never a `400`.
+  - `POST /projects/<name>/team/resolve` (new route, inserted after
+    `/team/stop`): ownership + `run_id`-defaults-to-latest (via
+    `teams._load_state()` directly, not `load_state_for_project()`, so the
+    three distinct error reasons docs/spec.md §3 names -- "no run found for
+    this project" / "this run belongs to a different project" / "no
+    pending question for this project" -- stay distinguishable), then
+    `answer.strip()` non-empty/≤`TEAM_ASK_USER_ANSWER_MAX_CHARS` validation
+    *before* calling `teams.resolve_ask_user()`, then (on `{"ok": True}`) a
+    defensive `_team_threads_get(name) is not None` check before spawning a
+    **new** `cancel_event` + `threading.Thread(target=
+    _run_team_in_background, ...)` and returning `200 {"ok": true,
+    "run_id"}` immediately -- reuses `_team_threads_set()`/
+    `_run_team_in_background()` verbatim, no new bookkeeping.
+  - `GET /status`'s per-instance loop: one new line, `waiting_on_you = run
+    is not None and run["status"] == "blocked_ask_user"`, added to the
+    existing `inst["team"]` dict -- every other key/value untouched.
+- **`config/switchboard.env.example`** -- new "Optional: overwatch feed +
+  escalation inbox (6f part 1)" section documenting both new env vars,
+  following the file's existing per-subsystem section convention.
+- **`tests/test_teams_headless.py`** (+8 tests, new `TailJsonlEventsTests`
+  class inserted right after `TailerTests`, its own direct precedent):
+  pure unit tests, no HTTP/tmux -- missing file; reads every complete line
+  from a fresh start; a second call with the returned offset sees only new
+  events (no event returned twice); a trailing partial (torn-write) line is
+  held across polls and picked up whole once its newline arrives; a
+  malformed line becomes one `error` event with processing continuing for
+  the rest of the file; a non-dict-JSON line is treated the same way; an
+  oversized file (six same-width lines, an exact 3-line byte cap) truncates
+  on a clean line boundary and a bounded sequence of follow-up polls
+  recovers the full, non-duplicated sequence; a large file is never read in
+  one call past `max_bytes + 1`.
+- **`tests/test_team_routes.py`** (+27 tests across 3 new classes, +1 in
+  `StatusRosterAndCompositionTests`, +1 existing full-dict `assertEqual`
+  updated for the additive `waiting_on_you` field; module gains `import
+  urllib.parse` and two shared helpers, `_envelope()`/`_append_jsonl()`):
+  - `TeamEventsEndpointTests` (10) -- unknown project 404; no run ever
+    started returns the exact clean empty-state shape; lead + teammate
+    events merged and sorted chronologically (fixed `ts` values, not
+    wall-clock-dependent); a member with no log file yet is present but
+    empty; a repeat poll with the returned cursor returns zero events, no
+    duplication; a malformed `?cursor=` value falls back to a full replay,
+    not a `400`; a truncated agent reports the flag and a follow-up poll
+    with the returned cursor drains the remainder with no gap/duplicate; a
+    malformed log line becomes one `error` event, not a `500`; a
+    cross-project `run_id` is `404` with no data leaked; a `finished` run
+    (no thread running) still returns its full history.
+  - `TeamInboxEndpointTests` (7) -- unknown project 404; no run
+    `pending: false`; a non-blocked run `pending: false`; a genuinely
+    blocked run returns the exact persisted question/header/options/
+    multi_select shape; a missing `inbox.json` and a malformed one both
+    still report `pending: true` with a non-empty fallback question and
+    empty options; cross-project `run_id` 404.
+  - `TeamResolveEndpointTests` (9) -- unknown project 404; not-blocked
+    returns the specific "no pending question" `400` with no state
+    mutation; no run at all returns "no run found"; an explicit `run_id`
+    for a different project returns "this run belongs to a different
+    project"; empty/oversized `answer` are rejected `400` before any
+    mutation (`inbox.json` still present, status still
+    `blocked_ask_user`); a genuinely blocked run with a valid answer
+    resolves and returns in well under 3s, moves `inbox.json` →
+    `inbox.resolved.json`, flips `status` off `blocked_ask_user`, and
+    records one `ask_user_resolved` history entry with the submitted text;
+    two genuinely-simultaneous (zero-synchronization) concurrent resolves
+    always produce exactly one `200` and one `400` (see "Key decisions" for
+    why the loser's exact reason is intentionally not pinned to one
+    string); the CLI's `resolve_ask_user()` call and the route's own call
+    produce identical `status`/`history` for the same `run_id`/`answer`
+    input (the route's own background drive is neutralized via a no-op
+    monkeypatch of `_run_team_in_background` so it can't race the
+    comparison -- see "Key decisions").
+  - `StatusRosterAndCompositionTests` +1 --
+    `test_waiting_on_you_true_only_for_blocked_ask_user_never_for_
+    escalated_max_rounds` walks all six run statuses, asserting
+    `waiting_on_you` is `True` for exactly `blocked_ask_user`.
+  - `TeamStopEndpointTests.test_status_idle_when_no_run_ever_started`'s
+    pre-existing full-dict `assertEqual` updated to include
+    `"waiting_on_you": False` -- the only pre-existing test in the repo
+    asserting `inst["team"]`'s *entire* shape by exact equality (found via
+    `grep -rn '\["team"\]' tests/`); every other pre-existing team-status
+    test asserts individual keys and needed no change.
+
+## Key decisions / tradeoffs
+
+- **The genuinely-crashing race, found live, is fixed with a narrow
+  `try/except OSError`, not a lock.** docs/spec.md "Edge cases" explicitly
+  anticipates two concurrent `POST /team/resolve` calls and explicitly
+  declines to lock-guard the load-check-persist sequence ("the same
+  single-writer assumption every other run.json mutator in this codebase
+  already carries... not a new risk introduced by this spec"). Testing
+  that exact scenario with two genuinely simultaneous threads (no
+  synchronization at all -- tighter than a realistic double-click) found
+  something the spec's own prose didn't anticipate: the status-check race
+  window is narrow but real, and the LOSER's `os.replace(inbox_path,
+  _inbox_resolved_path(run_id))` call can hit a `FileNotFoundError` (its
+  own target already renamed away by the winner) that propagated
+  unhandled all the way out through `do_POST`, resetting the client's TCP
+  connection instead of returning a clean `400`. This is squarely "fix it
+  yourself, don't leave it for the reviewer to catch" (an unhandled
+  exception reaching a request handler is a real robustness gap, newly and
+  plausibly reachable via two browser tabs, that the pure-CLI-only
+  predecessor never exposed this concretely). The fix wraps only the
+  move-then-persist step in `try/except OSError`, converting the loser
+  into the exact `{"ok": False, "error": "...is not blocked on ask_user
+  (status=...)"}` shape the design already intended for "someone else got
+  there first" -- it adds no new locking primitive and does not change WHO
+  wins the race, only ensures the loser never crashes the connection.
+  `TeamResolveEndpointTests.test_two_concurrent_resolves_exactly_one_
+  succeeds` was run 20/20 clean after the fix (was crashing or failing on
+  the majority of runs before it, both via the raw exception and via a
+  test assertion that was initially too narrow about which of three
+  legitimate 400 reasons the loser could get -- see that test's own
+  in-line comment for all three).
+- **`_team_events_run_and_ownership()` returns `(state, error_response)`
+  rather than raising or returning a bare `None`.** Both `_handle_team_
+  events`/`_handle_team_inbox` need to tell apart three outcomes (a real
+  error to return immediately, "no run at all" -- not an error, an empty/
+  `pending: false` response, or a real resolved state) with different
+  follow-up handling per route; a two-tuple with an explicit `error_
+  response` slot keeps both call sites a simple `if err is not None:
+  return self._json(*err)` one-liner rather than a bespoke exception type
+  for a route-local concern.
+- **`POST /team/resolve`'s three distinct error strings required NOT
+  reusing `load_state_for_project()`.** That helper (built for the two GET
+  routes, which reply `404` for either "no such run" or "wrong project"
+  identically) collapses both into `None`. The POST route's own spec text
+  names three different strings for three different causes, so it calls
+  `teams._load_state()` directly (same already-precedented pattern
+  `_run_team_in_background()` itself uses, `app/app.py:1377`) and checks
+  `state.get("project_name") != name` itself, rather than stretching one
+  shared helper to serve two routes with different error-shape contracts.
+- **The two-concurrent-resolves test neutralizes `_run_team_in_background`
+  for the identical-persisted-state test, not for the concurrency test
+  itself.** The concurrency test deliberately lets the real background
+  thread run (an "ollama" lead with no `TEAM_LLM_BASE_URL` configured
+  fails fast, `status` → `"error"`) since that's the realistic end-to-end
+  behavior being verified; only the identical-persisted-state comparison
+  (which needs to isolate `resolve_ask_user()`'s own effect from the
+  UNRELATED, deliberately-async `team_run()` drive that follows it) patches
+  `_run_team_in_background` to a no-op, via the same monkeypatch idiom
+  `_patch_tmux()` already establishes in this file.
+
+## Deviations from spec
+
+- **`tail_jsonl_events()` gained an optional 4th `agent` keyword** beyond
+  the spec's own literal 3-argument description (`path, offset, max_bytes`)
+  -- used only to produce a more informative malformed-line message
+  (`"malformed line in <agent>'s log..."`, matching the spec's own prose
+  example verbatim) than a bare `os.path.basename(path)` fallback would.
+  Omitting it still works exactly as the spec describes; this is additive,
+  not a behavior change to anything the spec pins down.
+- **The move-then-persist `try/except OSError` inside `resolve_ask_user()`**
+  (see "Key decisions") is not in the spec's own "Proposed approach"
+  pseudocode, which only describes the load-check-append-move-flip-persist
+  sequence in the happy path plus a bare "the first to persist wins" for
+  the race. Added because real concurrent testing found the race's loser
+  could crash the request thread, not just lose gracefully as the spec's
+  prose assumed -- flagged here rather than silently expanding scope,
+  since it's a genuine (if narrow) behavior change from the spec's literal
+  pseudocode, even though it doesn't change which caller "wins."
+- **No other deviations.** Every route shape, status code, error-message
+  wording, response field, and the `waiting_on_you` semantics (`true` only
+  for `blocked_ask_user`, never `escalated_max_rounds`, per the spec's own
+  settled "Open questions" reading) follow `docs/spec.md` "Proposed
+  approach" directly. No `docs/design.md` section exists for this cycle,
+  per spec (matching 6d part 1's precedent) -- no frontend code was
+  written.
+
+## Known limitations
+
+- **The exact `400` reason a losing concurrent `POST /team/resolve` call
+  gets is timing-dependent** (any of three legitimate strings -- see "Key
+  decisions"/the test's own in-line comment) -- the spec's own acceptance
+  criterion only pins "exactly one succeeds, the other gets an ordinary
+  400," which this satisfies; it does not pin one specific string, and
+  this implementation doesn't force one either (that would require the new
+  locking the spec explicitly declines to add).
+- **No merged-timeline rendering, filter UI, status strip, or escalation
+  panel** -- explicitly out of scope for this part (6f part 2, next in the
+  story, per `docs/spec.md` "Non-goals").
+- **The `TEAM_EVENTS_MAX_BYTES_PER_FILE_PER_POLL` (65536) and
+  `TEAM_ASK_USER_ANSWER_MAX_CHARS` (2000) defaults are both unmeasured**,
+  same as the spec's own "Open questions" already flags for the byte cap;
+  the answer-length default has no spec-pinned number at all and was
+  chosen using the same "round, conservative, same order of magnitude as
+  sibling caps" reasoning, not a measured real-traffic case -- both are
+  plain env vars, tunable once 6f part 2's frontend shows real traffic.
+
+## Verification status
+
+| Check | Command | Result |
+|---|---|---|
+| Syntax | `python3 -c "import ast; ast.parse(open('app/app.py').read())"` / same for `teams.py` | clean |
+| New `tail_jsonl_events()` unit tests alone | `python3 -m unittest tests.test_teams_headless.TailJsonlEventsTests -v` | **8 passed** |
+| New route test classes alone | `python3 -m unittest tests.test_team_routes.TeamEventsEndpointTests tests.test_team_routes.TeamInboxEndpointTests tests.test_team_routes.TeamResolveEndpointTests -v` | **26 passed** |
+| Concurrency test alone, repeated | `for i in $(seq 1 20); do python3 -m unittest tests.test_team_routes.TeamResolveEndpointTests.test_two_concurrent_resolves_exactly_one_succeeds; done` | **20/20 passed** (post-fix; was crashing/failing on most runs pre-fix) |
+| Extended route test file alone | `python3 -m unittest tests.test_team_routes -v` | **65 passed** (was 38 before this cycle) |
+| Pre-existing CLI-resolve regression (unmodified) | `python3 -m unittest tests.test_teams_lead.ResolveInSeparateProcessTests -v` | **2 passed**, unchanged |
+| `StatusRosterAndCompositionTests` unmodified pass (per spec's own requirement) | `python3 -m unittest tests.test_team_routes.StatusRosterAndCompositionTests -v` | **6 passed** (5 pre-existing + 1 new `waiting_on_you` test) |
+| Full Python suite | `python3 -m unittest discover -s tests -v` | **762 passed**, 0 failures/errors (was 727 before this cycle; +35 new tests, 0 removed) |
+
+## How to verify locally
+
+```bash
+# Syntax
+python3 -c "import ast; ast.parse(open('app/app.py').read())"
+python3 -c "import ast; ast.parse(open('app/teams.py').read())"
+
+# This cycle's own new tests
+python3 -m unittest tests.test_teams_headless.TailJsonlEventsTests -v
+python3 -m unittest tests.test_team_routes.TeamEventsEndpointTests \
+  tests.test_team_routes.TeamInboxEndpointTests \
+  tests.test_team_routes.TeamResolveEndpointTests -v
+
+# The concurrency fix, repeated (flaky before the fix; deterministic after)
+for i in $(seq 1 20); do \
+  python3 -m unittest tests.test_team_routes.TeamResolveEndpointTests.test_two_concurrent_resolves_exactly_one_succeeds; \
+done
+
+# Confirm the CLI's team-resolve is byte-for-byte unchanged
+python3 -m unittest tests.test_teams_lead.ResolveInSeparateProcessTests -v
+
+# Confirm /status's pre-existing fields are untouched
+python3 -m unittest tests.test_team_routes.StatusRosterAndCompositionTests -v
+
+# Full suite
+python3 -m unittest discover -s tests -v
+```
+```
+
+# Implementation: Overwatch feed + escalation inbox -- backend API (sub-spec 6f part 1) -- reviewer fix round (loser's `os.path.exists()` check racing past the winner's rename)
+
+## Summary
+
+Fixes the reviewer's must-fix finding against the 6f part 1 cycle above:
+the developer's own prior fix wrapped `resolve_ask_user()`'s
+move-then-persist step in `try/except OSError` around `os.replace()`,
+which correctly turned the LOSER's own colliding `os.replace()` call into
+a clean `{"ok": False, ...}` instead of an unhandled `FileNotFoundError`
+reaching all the way out through `do_POST`. That fix left a second,
+narrower instance of the same underlying check-then-act race unclosed:
+the loser's own `if os.path.exists(inbox_path):` guard is itself a
+separate check-then-act window, independent of the `os.replace()` call it
+gates. A loser whose `os.path.exists()` call happens to land AFTER the
+winner has already renamed the inbox file away simply observes `False` --
+no exception anywhere, `os.replace()` is never even attempted -- and falls
+straight through to flipping its own STALE in-memory `state["status"]` to
+`"running"` and persisting it, silently clobbering the winner's
+already-persisted `ask_user_resolved` history entry, and reporting
+`{"ok": True}` for an answer that was never actually recorded. Fixed by
+deleting the separate `os.path.exists()` guard entirely and calling
+`os.replace()` unconditionally, so `os.replace()`'s own atomicity (via
+`FileNotFoundError` on whichever caller loses) is the SOLE arbiter of "did
+I win" -- collapsing the two independent check-then-act windows into one,
+exactly as the already-fixed crash case relies on. `state["status"]` is
+now only flipped and persisted AFTER `os.replace()` has already succeeded,
+so a losing caller never touches (let alone persists) `state` at all.
+
+## Changes by file
+
+- **`app/teams.py`** (`resolve_ask_user()`, ~line 3752): removed the
+  `if os.path.exists(inbox_path):` guard around the `os.replace()` call.
+  `os.replace(inbox_path, _inbox_resolved_path(run_id))` is now called
+  unconditionally inside the existing `try/except OSError` block; on
+  success, `state["status"] = "running"` and `_persist(state)` now run
+  AFTER the `try` block (previously both ran unconditionally inside it,
+  reachable even when the `if` guard's own `os.path.exists()` check was
+  `False` and no rename was attempted at all). On `OSError` (now including
+  the case that used to silently fall through the `if` guard, since there
+  is no longer a separate `if` to fall through), the function returns
+  `{"ok": False, ...}` exactly as it already did for the previously-fixed
+  crash case, without touching `state`. Docstring extended with a new
+  paragraph documenting this second race and its fix, alongside the
+  existing paragraph documenting the first (crash) fix.
+- **`tests/test_team_routes.py`**
+  (`TeamResolveEndpointTests::test_loser_whose_exists_check_lands_after_winner_already_renamed_does_not_report_ok`):
+  this is the reviewer's own deterministic (hook-based, not
+  thread-timing-dependent) repro for the race above, added during the
+  reviewer's testing pass and deliberately asserting the BUGGY behavior at
+  the time so it stayed green as a documented repro pending the fix.
+  Inverted its final two assertions to prove the FIXED behavior instead:
+  `loser_result["ok"]` is now asserted `False` (was `True`), and the
+  final persisted state's sole `ask_user_resolved` history entry is now
+  asserted to be the WINNER's own answer (`"winner answer"`, was asserting
+  the loser's `"loser answer"` had clobbered it). The in-line comment block
+  above the assertions, and the docstring-style comment at the top of the
+  test describing the repro mechanism, were updated to describe the fix
+  and mark this test as the permanent regression guard for it, rather than
+  a live bug report. The hook mechanism itself (patching `_load_state()`
+  so a real winning `resolve_ask_user()` call runs to completion between
+  the loser's own state read and its subsequent move/persist step) is
+  unchanged.
+
+## Key decisions / tradeoffs
+
+- **Deleted the `os.path.exists()` guard rather than re-checking `state`
+  against a freshly-reloaded value before acting.** The reviewer's finding
+  offered both as acceptable shapes ("your call, as long as the two
+  independent check-then-act windows collapse into one atomic decision
+  point"). Deleting the guard was chosen because it is the smaller,
+  more local change -- `os.replace()` was already present and already the
+  actual arbiter for the first (crash) race; making it the arbiter for
+  this second race too needed no new read, no new comparison, and no new
+  failure mode to reason about, just removing a redundant, racy check in
+  front of an operation that is already atomic on its own. A fresh
+  `_load_state()` re-check immediately before acting would have
+  reintroduced its own (much narrower, but structurally identical)
+  check-then-act gap between that reload and the subsequent
+  `os.replace()` call -- strictly worse for "one atomic decision point,"
+  not better.
+- **`state["status"] = "running"; _persist(state)` moved to after the
+  `try/except` block, not left inside it.** Previously both statements ran
+  unconditionally inside the `try` (reachable via the `if` guard's `False`
+  branch, which is exactly how the bug manifested); now they only run on
+  the success path, after `os.replace()` has already returned without
+  raising -- so there is no code path left where `state` is mutated or
+  persisted without a corresponding successful rename immediately
+  preceding it.
+- **No change to the shape of the returned dict, the error-message text,
+  or the CLI's own observable behavior.** `_cli_team_resolve()` calls this
+  same function and is unaffected -- its own regression test
+  (`tests.test_teams_lead.ResolveInSeparateProcessTests`) is a single,
+  non-concurrent caller and never exercises either race, so this fix
+  changes nothing it can observe.
+
+## Deviations from spec / design
+
+None beyond what the 6f part 1 cycle above already discloses under its own
+"Deviations from spec" (the `try/except OSError` itself being a
+narrow, undisclosed-in-the-original-pseudocode addition, already flagged
+there). This fix closes a second window of that same already-disclosed,
+already-accepted "the first to persist wins, not lock-guarded" race --
+it does not change who wins, does not add new locking, and does not
+introduce any behavior the spec's own "Edge cases" section doesn't already
+describe (the loser now actually gets the ordinary 400 that section says
+it always intended for it, in every timing, not just the ones the first
+fix round already covered).
+
+## Known limitations
+
+Same as the 6f part 1 cycle above -- no new limitations introduced by this
+fix. The exact reason string a losing concurrent `POST /team/resolve` call
+receives is still timing-dependent (the same three legitimate strings);
+this fix changes which of those three the previously-unclosed timing
+window now produces (the `os.replace()`-raised "is not blocked on
+ask_user" branch, same as the already-covered crash case), not whether the
+loser gets a clean, shaped result at all.
+
+## Verification status
+
+| Check | Command | Result |
+|---|---|---|
+| Fixed function's own test class alone | `/home/dev/.local/bin/uv run --with pytest python -m pytest tests/test_team_routes.py::TeamResolveEndpointTests -q`, 5 consecutive runs | **10 passed** every run |
+| The reviewer's repro, inverted assertions | `/home/dev/.local/bin/uv run --with pytest python -m pytest tests/test_team_routes.py::TeamResolveEndpointTests::test_loser_whose_exists_check_lands_after_winner_already_renamed_does_not_report_ok -q` | 1 passed -- confirms `loser_result["ok"] is False` and the winner's `ask_user_resolved` history entry survives |
+| Genuine two-thread concurrent test, isolated re-runs | `/home/dev/.local/bin/uv run --with pytest python -m pytest tests/test_team_routes.py::TeamResolveEndpointTests::test_two_concurrent_resolves_exactly_one_succeeds -q`, 20 consecutive runs | **20/20 passed**, no regression from collapsing the two check-then-act windows into one |
+| Full Python suite, before this fix round | `/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q` | 763 passed, 1 failed (`RealTmuxHeadlessTests::test_run_sh_and_prompt_file_are_world_readable_under_a_strict_umask` -- pre-existing, disclosed flake in `tests/test_teams_headless.py`, a file untouched by this fix round's own diff; confirmed to pass in isolation immediately after) |
+| Full Python suite, re-run after this fix round | `/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q` | **764 passed**, 0 failures/errors (764 = the reviewer's own pre-fix baseline count, unchanged -- this round edits existing code and one existing test's assertions, it adds no new test) |
+
+## How to verify locally
+
+```bash
+# The fix-scoped regression tests
+/home/dev/.local/bin/uv run --with pytest python -m pytest \
+  tests/test_team_routes.py::TeamResolveEndpointTests -q
+
+# The reviewer's own repro, now proving the FIXED behavior
+/home/dev/.local/bin/uv run --with pytest python -m pytest \
+  tests/test_team_routes.py::TeamResolveEndpointTests::test_loser_whose_exists_check_lands_after_winner_already_renamed_does_not_report_ok -v
+
+# The genuine two-thread concurrent race, repeated
+for i in $(seq 1 20); do \
+  /home/dev/.local/bin/uv run --with pytest python -m pytest \
+    tests/test_team_routes.py::TeamResolveEndpointTests::test_two_concurrent_resolves_exactly_one_succeeds -q; \
+done
+
+# Full suite
+/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q
 ```
