@@ -256,3 +256,395 @@ After `/projects/<name>/team/stop` completes:
 8. **Styling**: `.team-row`, `.team-textarea`, `.team-status`, `.team-msg` classes, following page's existing BEM-lite naming (e.g., `deploy-row`, `deploy-msg`). No new component library.
 
 9. **Polling refresh**: No new timer. Existing `refresh()` every 4s already re-fetches `/status` and re-renders the row via the new `team` field in the status dict.
+
+---
+
+# Design: Roster & composition UI (sub-spec 6e)
+
+## Summary
+
+Extend the idle-state team row with a lead/teammate picker that allows the operator to select which roster members lead and which are teammates before starting a team. The picker lives inside the existing per-project idle-state row (preserving the one-page architecture), replacing the 6d design's minimal row with an expanded, collapsible picker panel. The roster is fetched fresh from `/status` (no cache) and reflects `engines.d` live; each member shows its lead-adapter tier (1/2/3) and, for tier 3, a plain-language reliability caveat. Before-start grounding discovery shows which of the four discovery files were found, alerting the operator to absences (e.g., no `ARCHITECTURE.md`). Client-side validation mirrors the server's own rules: non-empty members, no duplicates, no lead-also-a-teammate exclusion. Submitted compositions are persisted to `TEAM_STATE_DIR/compositions.json` and pre-populate the picker on the next `/status` poll, surviving service restarts.
+
+## Open questions — resolved decisions
+
+**Question 1: Can an engine be selected as lead AND as a delegate-target teammate simultaneously?**
+
+**Decision: No.** Lead's name must not also appear in `members`. This rule mirrors `default_team_composition()`'s own existing exclusion of its picked engine-lead from the members list, applied here as a code rule rather than an accident of how the default is built.
+
+**Rationale:**
+- Matches existing precedent: `default_team_composition()` never includes its chosen lead in the members list, and applying the same rule here keeps the mental model consistent across the codebase.
+- Simplicity: A lead that's also a teammate would require reasoning about which worktree/session is leading vs. delegating to itself, introducing subtle questions about context and state.
+- The one-line change to relax this rule in `validate_composition()` is trivial if evidence emerges that the use case is real and valued — the technical cost of keeping it tight is minimal.
+
+A future relaxation (if the delegation-to-same-engine-fresh-worktree use case proves essential) is a compatible, backward-compatible change with no migration required.
+
+**Question 2: Where does the roster/composition UI live?**
+
+**Decision: Inside the per-project idle-state teamRow(), as an expanded picker section.**
+
+**Rationale:**
+- The app is one-page architecture; `render_page()` serves a static shell with everything rendered client-side from `/status`. Adding a new page breaks this design.
+- The picker needs project context: which project are we configuring? The idle row already carries that.
+- The grounding files are project-specific; they belong in a per-project context.
+- The existing 6d row already lives here; extending it with picker UI reuses the render pattern rather than inventing a new surface.
+- An operator would naturally look for composition config where they see the team control — in the project row itself — not in a separate settings page.
+
+## ui-ux-pro-max choices
+
+- **Style**: Expanded picker panel within the existing idle-state team row, using a collapsible/expandable pattern to keep the UI compact unless actively configured.
+- **Palette**: Reuses existing page tokens (`#4da6ff` for tier labels, `#cccccc`/`#aaaaaa` for disabled checkboxes, `#34c759` for saved-composition confirmation). No new color tokens for the picker UI itself (tier-3 caveat text uses existing `#ffb648` warning orange, computed for 9.77:1 contrast with `#1c1c1c`).
+- **Typography**: Existing page font sizes and weights; no new typefaces. Tier labels as small `.badge` elements (existing pattern from 6d for status labels). Checkbox labels use body text.
+- **Relevant UX guidelines applied**:
+  - Checkboxes for multi-select (teammate list): standard, unchecked by default; only valid saved-composition pre-populates them.
+  - Radio or select for single-choice (lead): select-dropdown preferred for space efficiency given roster can grow to many engines.
+  - Tier labels as visual chips/badges: colors and short text ("tier 1", "tier 2", "tier 3") make the tradeoff visible at a glance.
+  - Tier-3 caveat as a tooltip or collapsible note (kept close to the tier label, not a separate field): "This engine relies on prose parsing for tool-calling decisions, which is less reliable than native tool support (tier 1) or constrained-output JSON (tier 2). Use this if no tier-1 or tier-2 lead is available."
+  - Grounding summary: a simple list of file names with checkmarks/crosses or "found"/"not found" status (read-only, no action here — just discovery).
+  - Validation messaging: client-side mirrors server rules inline before submission; server-side validation is the source of truth.
+  - Pre-selection from saved composition: if `inst.team.composition` exists (from `/status`), pre-select those lead/members in the picker; else fall back to `default_team_composition()`'s pick if available.
+
+## Component reuse
+
+- **Reused**: Existing HTML/CSS/JS patterns from `teamRow()` (6d) — inline row rendering, same `.team-row` / `.team-msg` classes, direct `fetch()` POST plumbing to `/projects/<name>/team/start`.
+- **Reused**: Existing `/status` poll (every 4 seconds) — roster and pre-selected composition come from `/status`'s new `roster` and `inst.team.composition` fields; no new timer.
+- **Reused**: Existing grounding route call pattern — new `GET /projects/<name>/team/grounding` route (backend-defined in spec) is called once on row render/refresh, similar to how the existing page fetches project data.
+- **Reused**: Existing TOTP code-overlay machinery for the Start button (same as 6d).
+- **Reused**: Existing error/success message slot (`.team-msg` id pattern).
+- **New (none)**: No new component library, no new external dependencies. Plain HTML (select, input checkboxes, labels) + inline CSS (no new CSS classes beyond `.team-lead-picker`, `.team-grounding`, etc., following BEM-lite naming).
+
+## States
+
+### Idle, Picker Closed (initial)
+Rendered when `team.status === "idle"` or team is `null`, picker not yet expanded:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Team                                                        │
+│                                                             │
+│ <textarea placeholder="Task description...">...</textarea>  │
+│ [ Configure team... ] (toggles picker open)                │
+│                                                             │
+│ <button disabled/enabled>Start team</button>               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Styling**: Textarea unchanged from 6d. A small inline link or button "Configure team..." appears below the textarea, styled to look clickable (color: `#4da6ff`, cursor: pointer, no background). Clicking it toggles the picker panel open. If no saved composition exists, the button text is "Configure team..."; if a saved composition exists, the button text is "Reconfigure team" (optional — same button text works fine).
+
+**Behavior**:
+- Roster and grounding are fetched on picker open (not on every 4s poll, but on the click that opens the picker).
+- If roster is empty (no engines, no Ollama), show "No roster members available" and disable configure button.
+- If default composition is rejected but the roster is non-empty (e.g., tier-3-only), `/status` sends `composition: {"lead": null, "members": []}` rather than `null` — the picker behaves exactly like any other unconfigured composition: collapsed behind "Configure team...", nothing pre-selected, no auto-expand and no special-cased always-visible caveat. See "Tier-3-Only Roster" below, corrected post-implementation.
+
+### Idle, Picker Expanded
+Rendered when operator clicks "Configure team..." and the picker opens:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Team                                                        │
+│                                                             │
+│ <textarea placeholder="Task description...">...</textarea>  │
+│                                                             │
+│ [ ▼ Hide configuration ] (click to close picker)           │
+│                                                             │
+│ ┌─ Lead ────────────────────────────────────────┐          │
+│ │ <select id="team-lead-<name>">                │          │
+│ │   <option value="">Choose a lead...           │          │
+│ │   <option value='{"kind":"engine","name":"claude"}'>     │
+│ │     claude (tier 2 - schema constrained)     │          │
+│ │   <option ...>ollama (tier 1 - native tools) │          │
+│ │   <option ...>aider (tier 3 - prose parse... │          │
+│ │ </select>                                     │          │
+│ └───────────────────────────────────────────────┘          │
+│                                                             │
+│ ┌─ Tier 3 Caveat (shown if tier-3 lead selected) ─┐        │
+│ │ ⚠ This engine's reliability is lower due to    │        │
+│ │   prose-parsing tool-calling. Use only if no   │        │
+│ │   tier-1 or tier-2 lead is available.          │        │
+│ └───────────────────────────────────────────────────┘      │
+│                                                             │
+│ ┌─ Teammates ────────────────────────────────────┐          │
+│ │ ☐ claude (tier 2 - schema constrained)        │          │
+│ │ ☐ codex (tier 2 - schema constrained)         │          │
+│ │ ☑ aider (tier 3 - prose parse, unreliable)    │          │
+│ │ [current lead not listed — excluded]          │          │
+│ └───────────────────────────────────────────────┘          │
+│                                                             │
+│ ┌─ Grounding Files ──────────────────────────────┐          │
+│ │ ✓ docs/ARCHITECTURE.md (1.2 KB)               │          │
+│ │ ✓ docs/BACKLOG.md (3.5 KB)                    │          │
+│ │ ✗ CLAUDE.md / AGENTS.md (not found)           │          │
+│ │ ✓ README.md (2.1 KB)                          │          │
+│ └───────────────────────────────────────────────┘          │
+│                                                             │
+│ [validation error, if any: "Lead is required"]            │
+│                                                             │
+│ <button disabled/enabled>Start team</button>               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Lead picker (select dropdown)**:
+- Label: "Lead"
+- Options: each roster member, rendered as `<option value='{"kind":"engine"|"ollama","name":"..."}'>NAME (tier X - DESCRIPTION)</option>`.
+- Default: `<option value="">Choose a lead...</option>` (pre-select to empty if no saved composition; pre-select to saved lead if composition exists).
+- On change: immediately show/hide tier-3 caveat if tier-3 is selected; recompute teammate checkboxes to exclude the newly selected lead; rerun client-side validation.
+
+**Tier-3 caveat** (conditional):
+- Shown only if the selected lead is tier 3.
+- Layout: small alert box (background: `#1c1c1c` darkened slightly, border: `#ffb648` left edge, padding: `0.5em`).
+- Icon: optional ⚠ (warning icon, `#ffb648`).
+- Text: "This engine's reliability is lower due to prose-parsing tool-calling. Use only if no tier-1 or tier-2 lead is available."
+- Contrast: `#ffb648` text on `#1c1c1c` background = **9.77:1** (passes WCAG AAA).
+
+**Teammate checkboxes (multi-select)**:
+- Label: "Teammates"
+- Options: each roster member with `delegate_capable: true`, rendered as `<label><input type="checkbox" id="team-mate-..."> NAME (tier X - DESCRIPTION)</label>`.
+- Excluded: the currently selected lead (cannot be a teammate of itself).
+- Excluded: Ollama entry (it's not delegate_capable, per the spec).
+- Default: unchecked, unless a saved composition pre-populates them.
+- On change: rerun client-side validation (must have at least one teammate selected).
+- Visual feedback: disabled checkboxes (for non-delegate-capable members and the lead) are greyed out, not removed.
+
+**Grounding summary**:
+- Label: "Grounding Files"
+- Layout: list of four file checks, each as a row: `[✓/✗] FILENAME (size)` or `[✓/✗] FILENAME (not found)`.
+- Files displayed (in this order, always):
+  1. `docs/ARCHITECTURE.md`
+  2. `docs/BACKLOG.md`
+  3. `CLAUDE.md` (or `AGENTS.md` if CLAUDE.md not found)
+  4. `README.md`
+- Icons: `✓` (green, `#34c759`) for found files; `✗` (red, `#ff6b6b`) for not found.
+- Information: size in KB/MB if file is found; `(not found)` if not.
+- Behavior: read-only list, no action here. Fetched from `GET /projects/<name>/team/grounding` on picker open.
+- If no grounding files are found: "No grounding files discovered" (still allows team start, per spec).
+- If grounding fetch fails: show "Grounding unavailable" (does not block team start).
+
+**Client-side validation** (shown inline before submit):
+- If lead is not selected: "Lead is required" (red text, below lead picker).
+- If teammates are empty: "At least one teammate is required" (red text, below teammate checkboxes).
+- If lead's name is also in teammates: "Lead cannot also be a teammate" (red text, clarifying the exclusion rule).
+- Validation runs on lead/teammate change and before submit; Start button is disabled if any validation error exists.
+
+**Copy**:
+- Configure button: "Configure team..."
+- Lead label: "Lead"
+- Teammates label: "Teammates"
+- Grounding label: "Grounding Files"
+- Tier-3 caveat: "This engine's reliability is lower due to prose-parsing tool-calling. Use only if no tier-1 or tier-2 lead is available."
+
+### Composition Saved
+After `/projects/<name>/team/start` succeeds with a submitted composition (POST body includes `lead` and `members`):
+
+```
+[same as Idle, Picker Expanded, but]
+✓ Composition saved and team started
+```
+
+**Styling**: Green success message (color: `#34c759`, same as 6d's finish status) appears below the Start button, persists until next `/status` poll, then fades when status changes to `running`.
+
+### No Roster Available
+If `roster()` returns empty (no engines, no Ollama, or all are non-headless):
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Team                                                        │
+│                                                             │
+│ <textarea placeholder="Task description...">...</textarea>  │
+│                                                             │
+│ ✕ No roster members available. Add an engine to            │
+│   engines.d or configure TEAM_LLM_BASE_URL/TEAM_LLM_MODEL.│
+│                                                             │
+│ <button disabled>Start team</button> [disabled permanently]│
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Styling**: Error message (red, `#ff6b6b`) replaces the configure button. Start button is disabled with no option to enable. No picker shown.
+
+### Tier-3-Only Roster (no tier-1 or tier-2)
+If only tier-3 members are available and no saved composition:
+
+```
+[Idle, Picker Closed — same as any unconfigured composition]
+[ Configure team... ]
+```
+
+**Corrected post-implementation** (this section originally described an
+auto-expanded picker with an always-visible caveat; that didn't match what
+was actually built, and the reviewer's second pass flagged the drift —
+tracked here rather than silently rewritten). The actual behavior: `/status`
+sends `composition: {"lead": null, "members": []}` for this roster shape —
+identical in kind to any other project with no saved composition yet. The
+picker stays collapsed behind "Configure team..." like normal; once opened,
+the Lead dropdown lists only the tier-3 option(s) (there's nothing else to
+list), and the tier-3 caveat appears the same way it does for any tier-3
+selection elsewhere — conditionally, once that lead is actually chosen, not
+pinned open by default. This is simpler than the original design and still
+satisfies the spec's acceptance criterion: tier-3 is selectable as lead,
+never blocked.
+
+### Server Validation Error
+If `POST /projects/<name>/team/start` with composition returns `400 {"error": "..."}`:
+
+```
+[Picker still expanded with last-selected values retained]
+✕ Error: <server error message>
+[Start button remains enabled]
+```
+
+**Styling**: Red error message (same as 6d), appears below the button, persists until the operator makes a change or next refresh. Specific error messages from `validate_composition()`:
+- "Lead is required"
+- "At least one teammate is required"
+- "Teammate list contains duplicates"
+- "Lead cannot also be a teammate"
+- "Unknown lead: {name}" (if a saved composition references a removed engine)
+- "Unknown teammate: {name}" (if a saved composition references a removed engine)
+- "Teammate {name} is not delegate-capable" (Ollama, or non-headless engine)
+
+## Accessibility & platform notes
+
+- **Touch target sizes**: Select dropdown and checkboxes follow native browser defaults (36-40px minimum hit area on desktop). Checkbox labels are clickable (wrap label around input, or use `for` attribute).
+- **Color contrast**:
+  - Lead/teammate tier labels (`#4da6ff` on `#1c1c1c`): **6.67:1**, passes WCAG AA for normal text.
+  - Tier-3 caveat header (`#ffb648` on `#1c1c1c`): **9.77:1**, passes WCAG AAA.
+  - Grounding "found" icons (`#34c759` on `#1c1c1c`): **7.68:1**, passes WCAG AAA (graphical element, 3:1 minimum).
+  - Grounding "not found" icons (`#ff6b6b` on `#1c1c1c`): **6.14:1**, passes WCAG AA (graphical element, 3:1 minimum).
+  - Validation error text (`#ff6b6b` on `#1c1c1c`): **6.14:1**, passes WCAG AA.
+- **Web vs. native**: This is a web app (HTML/CSS/JS in Flask template), desktop-only. No mobile optimization.
+- **Keyboard interaction**:
+  - Tab into lead select → arrow keys to change lead or Enter to open dropdown (browser default).
+  - Tab into each teammate checkbox → Space to toggle.
+  - Tab into "Start team" button → Enter to submit (disabled if validation error exists).
+  - Escape key (optional, browser default) closes select dropdown.
+- **Screen reader accessibility**: Select and checkboxes are native HTML, screen-reader-accessible by default. Labels are associated via `<label>` or `for` attribute. Tier and validation messages are plain text in `aria-live` regions for async updates (optional, but recommended for validation errors that appear after picker interaction).
+- **Disabled state**: Disabled checkboxes (for non-delegate-capable members, the lead) are visually greyed out and not keyboard-focusable. Disabled Start button is greyed out when validation fails.
+
+## Traceability to spec (6e acceptance criteria)
+
+| Acceptance criterion | Where it's addressed in this design |
+|---|---|
+| Roster reflects `engines.d` live (re-read per request) | Roster fetched from `/status` response on picker open; no cache. Lead/teammate options show live engine/Ollama list with tiers. |
+| Every member selectable as lead | Lead dropdown includes all roster members (tier 1/2/3). No blocking; tier 3 shows a plain-language reliability caveat, not a disable. |
+| Tier shown for each roster member | Each lead/teammate option includes tier label: "tier 1 - native tools", "tier 2 - schema constrained", "tier 3 - prose parse". |
+| Tier-3 member shows plain-language note | Tier-3 lead shows caveat: "This engine's reliability is lower due to prose-parsing..." Tier-3 teammate label includes "(prose parse, unreliable)". |
+| Grounding files shown before start | New `GET /projects/<name>/team/grounding` returns list of which four files were found; picker displays them as a checklist with ✓/✗ icons. |
+| Absent file is visible, not silent | A missing `ARCHITECTURE.md`, e.g., is marked with ✗ and "(not found)" label; visible to operator before start. |
+| Saved composition persists across restarts | Composition submitted via POST body is saved to `TEAM_STATE_DIR/compositions.json` by backend; `/status` poll returns it in `inst.team.composition` field; picker pre-selects it on next poll. Verified by restarting service in test. |
+| Empty teammate list rejected with clear reason | Client-side validation shows "At least one teammate is required" inline; server rejects with 400 {"error": "..."} if somehow empty list is submitted. |
+| Duplicate teammate rejected | Client-side validation shows "Teammate list contains duplicates" if same teammate is checked twice (structurally impossible via checkboxes, but spec-required). Server rejects with specific message. |
+| Lead also in members rejected | Client-side validation shows "Lead cannot also be a teammate" if lead's name is in selected teammates. Server rejects with specific message. |
+| Unknown roster member rejected | If a saved composition references a removed engine, server rejects with "Unknown lead: {name}" or "Unknown teammate: {name}". Never silently substituted. |
+| No usable roster member shows error, no picker | If `default_team_composition()` returns an error (tier-3 only, or empty roster), the picker area shows the error text inline; Start button is disabled; no picker controls shown. |
+| Grounding route called per project | `GET /projects/<name>/team/grounding` called once on picker open, not on every poll. Result cached client-side until picker is closed/reopened. |
+| No lead/member picker shown when team is running | When `team.status !== "idle"`, the entire picker/configure panel is hidden; only the running status/stop button is shown (unchanged from 6d). |
+
+## Implementation notes for the developer
+
+### Backend (Python / app/teams.py + app/app.py)
+
+1. **New functions in app/teams.py**:
+   - `validate_composition(lead: dict, members: list) -> str | None` — returns None if valid, else error message.
+   - `_compositions_path() -> str` — path to `TEAM_STATE_DIR/compositions.json`.
+   - `load_compositions() -> dict` — `{project_name: {"lead": {...}, "members": [...], "saved_at": iso}}`.
+   - `save_composition(project_name: str, lead: dict, members: list) -> None` — atomic write via `.tmp` + `os.replace()`.
+
+2. **Extended functions**:
+   - `roster()` already exists (line ~1777); called by `GET /status` to return all roster members with tier/delegate_capable.
+   - `load_grounding(workdir)` already exists; `GET /projects/<name>/team/grounding` calls it and returns `{"files": [...], "skipped": [...]}`.
+   - `POST /projects/<name>/team/start` extended: reads optional `lead`/`members` from body, calls `validate_composition()`, saves if valid, uses them for `launch_team()` instead of `default_team_composition()`.
+
+3. **GET /status** (extended):
+   - Top-level: add `"roster": teams.roster()`.
+   - Per-instance `inst["team"]`: add `"composition"` — saved composition if exists, else `default_team_composition()`'s result if ok, else None.
+
+4. **GET /projects/<name>/team/grounding** (new):
+   - 404 if `name` not a known project.
+   - Calls `teams.load_grounding(workdir)`.
+   - Returns `{"files": [{"label", "relpath", "byte_count"}, ...], "skipped": [...]}` — never `content`/`digest`.
+   - No TOTP needed (read-only, like `/status`).
+
+5. **POST /projects/<name>/team/start** (extended):
+   - Body gains optional `lead` and `members`.
+   - If both present: validate, save, use for `launch_team()`.
+   - If neither present: unchanged from 6d (backward compatible).
+
+### Frontend (JavaScript in app/app.py template)
+
+1. **Picker toggle and expand/collapse**:
+   - Add event listener to "Configure team..." button: `openTeamCompositionPicker(name)`.
+   - Button text changes to "Hide configuration" when picker is open.
+   - Click toggles `.team-picker` panel visibility (display: none/block).
+
+2. **Lead dropdown (`<select id="team-lead-<name>">`)**:
+   - Populate from `roster` array in `/status` response.
+   - Format: `<option value='{"kind":"...","name":"..."}'>NAME (tier X - DESC)</option>`.
+   - On change: call `updateTeammateCheckboxes(name)` (filter to exclude selected lead).
+   - On change: call `showTier3Caveat(name)` (show/hide caveat based on selected lead's tier).
+   - On change: call `validateTeamComposition(name)` (rerun validation).
+
+3. **Tier-3 caveat (`<div class="team-tier-3-caveat">`)**:
+   - Hidden by default (`display: none`).
+   - Shown when selected lead's tier is 3.
+   - Contains fixed text: "This engine's reliability is lower...".
+
+4. **Teammate checkboxes (`<input type="checkbox" id="team-mate-...">`)**:
+   - Populate from roster, filtered to delegate_capable entries and excluding current lead.
+   - Each checkbox state tracked in memory or derived from checked property.
+   - On change: call `validateTeamComposition(name)`.
+
+5. **Grounding summary (`<div class="team-grounding">`)**:
+   - Fetch `GET /projects/<name>/team/grounding` on picker open.
+   - Display as list: `✓ FILENAME (size)` or `✗ FILENAME (not found)`.
+   - If fetch fails, show "Grounding unavailable" (non-blocking).
+
+6. **Client-side validation** (`validateTeamComposition(name)`):
+   - Lead required: if lead select is empty, show error.
+   - Teammates required: if no teammate checkbox is checked, show error.
+   - No duplicates: structural impossibility via checkboxes, but check anyway.
+   - Lead not in teammates: if lead name equals any checked teammate, show error.
+   - Disable Start button if any error; enable if valid.
+
+7. **doTeamStart() extended**:
+   - Read lead select value and teammate checkbox states.
+   - If picker is open (composition is configured), build `lead`/`members` JSON objects and include in POST body.
+   - If picker is closed (using default), omit `lead`/`members` from body (backward compatible).
+   - On 400 response, parse error message and show in `.team-msg` slot.
+
+8. **Client state persistence** (from 6d):
+   - `teamTaskText[name]` already holds textarea text across polls.
+   - Add `teamPickerState[name]` to hold lead/members selection across polls (or re-derive from `.team-msg` on each refresh).
+
+9. **Styling classes** (new):
+   - `.team-picker` — wrapper for the entire picker panel.
+   - `.team-picker-open` — variant when expanded (optional, for CSS state-based styling).
+   - `.team-lead-picker` — lead select container.
+   - `.team-tier-3-caveat` — tier-3 warning box.
+   - `.team-mates-picker` — teammates checkboxes container.
+   - `.team-grounding` — grounding files list.
+   - `.team-validation-error` — inline error message (reuse from 6d).
+
+10. **API shape for composition in JSON**:
+    - Lead: `{"kind": "engine" | "ollama", "name": str}`
+    - Members: `[{"kind": "engine", "name": str}, ...]`
+    - Example: `{"lead": {"kind": "engine", "name": "claude"}, "members": [{"kind": "engine", "name": "codex"}]}`
+
+11. **Backward compatibility**:
+    - If `lead`/`members` are omitted from POST body, server uses `default_team_composition()` (unchanged from 6d).
+    - Stale client that doesn't send `lead`/`members` still works.
+    - New client with old server (missing validation) will get a 400 or generic error, which is acceptable.
+
+### State diagram (client-side)
+
+```
+Idle, status === 'idle'
+├─ Picker closed (default)
+│  └─ Click "Configure team..." → Picker opens, fetches roster+grounding
+│
+└─ Picker open
+   ├─ Select lead (optional, starts empty)
+   ├─ Check teammates (optional, starts unchecked)
+   ├─ View grounding (read-only)
+   ├─ Validation error shown if present
+   └─ Click "Start team" → POST with {task, lead, members}
+      ├─ Success (200) → Composition saved, team started, status → running
+      └─ Error (400) → Error message shown, picker remains open, can retry
+```
+

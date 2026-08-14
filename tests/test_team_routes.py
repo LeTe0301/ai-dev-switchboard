@@ -296,6 +296,18 @@ class _RealHTTPTeamTestCase(unittest.TestCase):
         resp = urllib.request.urlopen(req)
         return json.loads(resp.read())
 
+    def _get(self, path, cookie):
+        req = urllib.request.Request(f"{self.base}{path}", headers={"Cookie": cookie})
+        try:
+            resp = urllib.request.urlopen(req)
+            return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                return e.code, json.loads(raw)
+            except ValueError:
+                return e.code, {}
+
     def _post(self, path, cookie, body=None):
         req = urllib.request.Request(
             f"{self.base}{path}", method="POST",
@@ -619,7 +631,378 @@ class TeamStopEndpointTests(_RealHTTPTeamTestCase):
         cookie = self._login()
         s = self._get_status(cookie)
         by_name = {i["name"]: i for i in s["instances"]}
-        self.assertEqual(by_name["proj"]["team"], {"status": "idle", "run_id": None})
+        # docs/spec.md 6e: "composition" is additive -- no roster member at
+        # all (no engines.d entries in this test's own scratch engines_dir,
+        # no Ollama configured) means default_team_composition() itself
+        # refuses, so composition is None here (no saved composition
+        # either).
+        self.assertEqual(by_name["proj"]["team"],
+                         {"status": "idle", "run_id": None, "composition": None})
+
+
+# ─── Roster & composition UI (backlog item 6e, docs/spec.md) ──────────────
+class StatusRosterAndCompositionTests(_RealHTTPTeamTestCase):
+    """GET /status's two additive fields: top-level "roster" and per-
+    instance inst.team.composition (saved composition, else
+    default_team_composition()'s own pick, else None)."""
+
+    def test_roster_reflects_engines_d_live_no_cache(self):
+        self._project("proj")
+        cookie = self._login()
+        s = self._get_status(cookie)
+        self.assertEqual(s["roster"], [])  # nothing in engines_dir yet
+        _write_engine_file(self.engines_dir, "helper.engine", """\
+            LABEL=Helper
+            CMD=unused
+            HEADLESS_CMD=echo unused
+            HEADLESS_FORMAT=plain
+            HEADLESS_PROMPT=arg
+            """)
+        s2 = self._get_status(cookie)
+        names = [e["name"] for e in s2["roster"]]
+        self.assertIn("helper", names)  # picked up without a restart
+
+    def test_composition_falls_back_to_default_when_none_saved(self):
+        self._project("proj")
+        self._write_fast_finisher_engine("lead2")
+        _write_engine_file(self.engines_dir, "helper.engine", """\
+            LABEL=Helper
+            CMD=unused
+            HEADLESS_CMD=echo unused
+            HEADLESS_FORMAT=plain
+            HEADLESS_PROMPT=arg
+            """)
+        cookie = self._login()
+        s = self._get_status(cookie)
+        by_name = {i["name"]: i for i in s["instances"]}
+        self.assertEqual(by_name["proj"]["team"]["composition"],
+                         {"lead": {"kind": "engine", "name": "lead2", "tier": 2}, "members": ["helper"]})
+
+    def test_composition_prefers_saved_over_default(self):
+        self._project("proj")
+        self._write_fast_finisher_engine("lead2")
+        _write_engine_file(self.engines_dir, "helper.engine", """\
+            LABEL=Helper
+            CMD=unused
+            HEADLESS_CMD=echo unused
+            HEADLESS_FORMAT=plain
+            HEADLESS_PROMPT=arg
+            """)
+        # A saved composition that differs from what default_team_
+        # composition() would itself pick (helper as lead instead).
+        teamsmod.save_composition("proj", {"kind": "engine", "name": "helper"},
+                                  [{"kind": "engine", "name": "lead2"}])
+        cookie = self._login()
+        s = self._get_status(cookie)
+        by_name = {i["name"]: i for i in s["instances"]}
+        self.assertEqual(by_name["proj"]["team"]["composition"],
+                         {"lead": {"kind": "engine", "name": "helper"}, "members": ["lead2"]})
+
+    def test_composition_not_none_for_tier3_only_roster_with_no_saved_composition(self):
+        # Reviewer-found defect (docs/implementation.md's "6e fix" cycle):
+        # default_team_composition() refuses for THREE distinct reasons --
+        # an empty roster, a single already-picked-lead engine with nothing
+        # left to delegate to, or (this test's own case) a real roster
+        # that's tier-3-only, which 6d part 2 settled must never be
+        # auto-picked as the DEFAULT lead. Before the fix, all three
+        # collapsed into composition=None, which the frontend's
+        # `composition === null` check can't tell apart from "no roster
+        # member at all" -- it rendered a permanently-disabled Start button
+        # with no way to ever open the picker for exactly this case. This
+        # reproduces the reviewer's own live repro: one tier-3 engines.d
+        # entry, no Ollama configured, no saved composition.
+        self._project("proj")
+        _write_engine_file(self.engines_dir, "prose.engine", """\
+            LABEL=Prose
+            CMD=unused
+            HEADLESS_CMD=echo hi
+            HEADLESS_FORMAT=plain
+            HEADLESS_PROMPT=arg
+            """)
+        cookie = self._login()
+        s = self._get_status(cookie)
+        by_name = {i["name"]: i for i in s["instances"]}
+        # roster() itself is unaffected -- one real, pickable tier-3 entry.
+        self.assertEqual([e["name"] for e in s["roster"]], ["prose"])
+        # composition must be a real (non-None) object with nothing
+        # pre-selected -- the frontend opens the picker off this, not off
+        # default_team_composition()'s own "ok" flag.
+        self.assertEqual(by_name["proj"]["team"]["composition"], {"lead": None, "members": []})
+
+    def test_composition_stays_none_for_a_genuinely_empty_roster(self):
+        # Contrast case for the fix above -- no engines.d entries, no
+        # Ollama configured, so roster() itself is empty and composition
+        # must remain None (the frontend's permanent-refusal, disabled-
+        # Start state is still correct here; only the tier-3-only/single-
+        # engine cases above changed).
+        self._project("proj")
+        cookie = self._login()
+        s = self._get_status(cookie)
+        by_name = {i["name"]: i for i in s["instances"]}
+        self.assertEqual(s["roster"], [])
+        self.assertIsNone(by_name["proj"]["team"]["composition"])
+
+
+# ─── GET /projects/<name>/team/grounding (backlog item 6e) ─────────────────
+class TeamGroundingEndpointTests(_RealHTTPTeamTestCase):
+    def test_unknown_project_404(self):
+        cookie = self._login()
+        status, payload = self._get("/projects/nope/team/grounding", cookie)
+        self.assertEqual(status, 404)
+
+    def test_no_grounding_files_returns_empty_list_not_an_error(self):
+        # A bare repo (no README/ARCHITECTURE/BACKLOG/CLAUDE.md) -- unlike
+        # _project()'s own helper, which writes a real README.md via
+        # _init_repo(), this is the genuine "none of the four files exist"
+        # case (docs/spec.md "Edge cases": load_grounding() already returns
+        # files: [], empty: True).
+        os.makedirs(os.path.join(self.projects_dir, "bare"))
+        cookie = self._login()
+        status, payload = self._get("/projects/bare/team/grounding", cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["files"], [])
+
+    def test_found_files_shape_never_leaks_content_digest_or_headings(self):
+        repo = self._project("proj")
+        with open(os.path.join(repo, "README.md"), "w") as f:
+            f.write("# Title\n\nSecret internal detail that must never reach the browser.\n")
+        cookie = self._login()
+        status, payload = self._get("/projects/proj/team/grounding", cookie)
+        self.assertEqual(status, 200)
+        readme = next(f for f in payload["files"] if f["relpath"] == "README.md")
+        self.assertEqual(set(readme.keys()), {"label", "relpath", "byte_count"})
+        self.assertGreater(readme["byte_count"], 0)
+        body = json.dumps(payload)
+        self.assertNotIn("Secret internal detail", body)
+        self.assertNotIn("digest", payload)
+
+    def test_read_only_no_totp_required(self):
+        # Matches /status's own gating -- _authed() only, unlike every
+        # mutating POST route (docs/spec.md "Read-only, no TOTP needed").
+        self._project("proj")
+        cookie = self._login()
+        req = urllib.request.Request(f"{self.base}/projects/proj/team/grounding",
+                                     headers={"Cookie": cookie})
+        resp = urllib.request.urlopen(req)
+        self.assertEqual(resp.status, 200)
+
+
+# ─── POST /projects/<name>/team/start with a submitted composition ────────
+class TeamStartWithCompositionEndpointTests(_RealHTTPTeamTestCase):
+    def _roster_engines(self):
+        self._write_fast_finisher_engine("lead2")
+        _write_engine_file(self.engines_dir, "helper.engine", """\
+            LABEL=Helper
+            CMD=unused
+            HEADLESS_CMD=echo unused
+            HEADLESS_FORMAT=plain
+            HEADLESS_PROMPT=arg
+            """)
+        _write_engine_file(self.engines_dir, "other.engine", """\
+            LABEL=Other
+            CMD=unused
+            HEADLESS_CMD=echo unused
+            HEADLESS_FORMAT=plain
+            HEADLESS_PROMPT=arg
+            """)
+
+    def test_valid_submitted_composition_used_instead_of_default_and_persisted(self):
+        self._project("proj")
+        self._roster_engines()
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/proj/team/start", cookie, {
+            "task": "do it", "code": code,
+            "lead": {"kind": "engine", "name": "helper"},
+            "members": [{"kind": "engine", "name": "lead2"}, {"kind": "engine", "name": "other"}],
+        })
+        self.assertEqual(status, 200, payload)
+        # NOT default_team_composition()'s own pick (which would choose
+        # lead2 as lead, tier 2) -- the operator's own submitted choice won.
+        self.assertEqual(payload["lead"], {"kind": "engine", "name": "helper", "tier": 3})
+        self.assertEqual(sorted(payload["members"]), ["lead2", "other"])
+        state = teamsmod._load_state(payload["run_id"])
+        self.assertEqual(state["lead"], {"kind": "engine", "name": "helper", "tier": 3})
+        comps = teamsmod.load_compositions()
+        self.assertEqual(comps["proj"]["lead"], {"kind": "engine", "name": "helper"})
+        self.assertEqual(sorted(comps["proj"]["members"]), ["lead2", "other"])
+
+    def test_empty_members_rejected_no_launch_no_side_effects(self):
+        self._project("proj")
+        self._roster_engines()
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/proj/team/start", cookie, {
+            "task": "do it", "code": code,
+            "lead": {"kind": "engine", "name": "helper"}, "members": [],
+        })
+        self.assertEqual(status, 400)
+        self.assertFalse(os.path.isdir(teamsmod._leads_root()))
+        self.assertEqual(teamsmod.load_compositions(), {})
+
+    def test_duplicate_member_rejected(self):
+        self._project("proj")
+        self._roster_engines()
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/proj/team/start", cookie, {
+            "task": "do it", "code": code,
+            "lead": {"kind": "engine", "name": "helper"},
+            "members": [{"kind": "engine", "name": "lead2"}, {"kind": "engine", "name": "lead2"}],
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("duplicate", payload["error"].lower())
+
+    def test_lead_also_in_members_rejected(self):
+        self._project("proj")
+        self._roster_engines()
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/proj/team/start", cookie, {
+            "task": "do it", "code": code,
+            "lead": {"kind": "engine", "name": "helper"},
+            "members": [{"kind": "engine", "name": "helper"}],
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("also be a teammate", payload["error"])
+
+    def test_unknown_lead_rejected_naming_it_never_falls_back_to_default(self):
+        self._project("proj")
+        self._roster_engines()
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/proj/team/start", cookie, {
+            "task": "do it", "code": code,
+            "lead": {"kind": "engine", "name": "ghost-engine-removed-since-saved"},
+            "members": [{"kind": "engine", "name": "helper"}],
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("ghost-engine-removed-since-saved", payload["error"])
+        # Never silently substituted with default_team_composition()'s pick.
+        self.assertFalse(os.path.isdir(teamsmod._leads_root()))
+
+    def test_stale_saved_composition_referencing_a_removed_engine_is_rejected(self):
+        # Edge case (docs/spec.md): a composition saved while an engine
+        # existed, then that engine's engines.d file is removed before the
+        # next start -- rejected, not silently substituted.
+        self._project("proj")
+        self._roster_engines()
+        teamsmod.save_composition("proj", {"kind": "engine", "name": "helper"},
+                                  [{"kind": "engine", "name": "other"}])
+        os.remove(os.path.join(self.engines_dir, "helper.engine"))
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/proj/team/start", cookie, {
+            "task": "do it", "code": code,
+            "lead": {"kind": "engine", "name": "helper"},
+            "members": [{"kind": "engine", "name": "other"}],
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("helper", payload["error"])
+
+    def test_no_lead_members_in_body_is_byte_for_byte_unchanged_default_behavior(self):
+        self._project("proj")
+        self._roster_engines()
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/proj/team/start", cookie,
+                                     {"task": "do it", "code": code})
+        self.assertEqual(status, 200, payload)
+        # default_team_composition()'s own pick (lead2, tier 2).
+        self.assertEqual(payload["lead"], {"kind": "engine", "name": "lead2", "tier": 2})
+        # No composition read or written for this call.
+        self.assertEqual(teamsmod.load_compositions(), {})
+
+    def test_saved_on_validated_start_even_if_launch_team_itself_later_fails(self):
+        # docs/spec.md: "saved on successful validation, independent of
+        # whether launch_team() itself later succeeds" -- simulated here by
+        # a team session name collision (a real, already-running team).
+        self._project("proj")
+        self._roster_engines()
+        result = teamsmod.launch_team(os.path.join(self.projects_dir, "proj"), "already running",
+                                      {"kind": "ollama", "name": "m", "tier": 1}, ["helper"])
+        self.assertTrue(result["ok"], result)
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/proj/team/start", cookie, {
+            "task": "do it", "code": code,
+            "lead": {"kind": "engine", "name": "other"},
+            "members": [{"kind": "engine", "name": "helper"}],
+        })
+        self.assertEqual(status, 400)  # launch_team() itself refuses (session already taken)
+        comps = teamsmod.load_compositions()
+        self.assertEqual(comps["proj"]["lead"], {"kind": "engine", "name": "other"})
+
+
+# ─── Restart persistence for a saved composition (docs/spec.md acceptance
+# criteria: "verified by restarting the process in a test, not just
+# re-calling the function in-process") ──────────────────────────────────────
+@unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
+class CompositionSurvivesRealProcessRestartTests(_RealHTTPTeamTestCase):
+    """load_compositions() has no in-memory cache at all -- it re-reads
+    TEAM_STATE_DIR/compositions.json from disk on every single call, so
+    there is nothing a same-process re-call could get subtly wrong that a
+    fresh process wouldn't also get right. Still, the acceptance criterion
+    explicitly calls for a genuine process-boundary crossing (guards
+    against a FUTURE regression that adds an in-memory cache with no
+    invalidation) -- proven here with a real, separate `python3` subprocess
+    running its OWN fresh ThreadingHTTPServer instance against the exact
+    same TEAM_STATE_DIR/PROJECTS_DIR/ENGINES_DIR this test's own server
+    uses, the same "impractical to literally kill+restart this process, so
+    prove the property that actually matters via a genuinely independent
+    process" reasoning ServiceRestartSimulationTests' own docstring already
+    establishes for the analogous _team_threads case."""
+
+    def test_get_status_from_a_freshly_started_separate_process_reflects_the_saved_composition(self):
+        self._project("proj")
+        self._write_fast_finisher_engine("lead2")
+        _write_engine_file(self.engines_dir, "helper.engine", """\
+            LABEL=Helper
+            CMD=unused
+            HEADLESS_CMD=echo unused
+            HEADLESS_FORMAT=plain
+            HEADLESS_PROMPT=arg
+            """)
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/proj/team/start", cookie, {
+            "task": "do it", "code": code,
+            "lead": {"kind": "engine", "name": "helper"},
+            "members": [{"kind": "engine", "name": "lead2"}],
+        })
+        self.assertEqual(status, 200, payload)
+
+        script = textwrap.dedent(f"""\
+            import sys, json, threading, urllib.request
+            sys.path.insert(0, {APP_DIR!r})
+            import app as appmod
+            from http.server import ThreadingHTTPServer
+            server = ThreadingHTTPServer(("127.0.0.1", 0), appmod.Handler)
+            port = server.server_address[1]
+            t = threading.Thread(target=server.serve_forever, daemon=True)
+            t.start()
+            base = "http://127.0.0.1:%d" % port
+            req = urllib.request.Request(base + "/login", method="POST",
+                data=json.dumps({{"username": "testuser", "password": "testpass"}}).encode(),
+                headers={{"Content-Type": "application/json"}})
+            resp = urllib.request.urlopen(req)
+            cookie = resp.headers.get("Set-Cookie").split(";")[0]
+            req2 = urllib.request.Request(base + "/status", headers={{"Cookie": cookie}})
+            resp2 = urllib.request.urlopen(req2)
+            sys.stdout.write(resp2.read().decode())
+            server.shutdown()
+            """)
+        env = dict(os.environ)
+        env["PROJECTS_DIR"] = self.projects_dir
+        env["ENGINES_DIR"] = self.engines_dir
+        env["TEAM_STATE_DIR"] = self.state_dir
+        r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                           env=env, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = json.loads(r.stdout)
+        by_name = {i["name"]: i for i in s["instances"]}
+        self.assertEqual(by_name["proj"]["team"]["composition"],
+                         {"lead": {"kind": "engine", "name": "helper"}, "members": ["lead2"]})
 
 
 # ─── Service-restart simulation ────────────────────────────────────────────

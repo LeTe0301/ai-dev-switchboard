@@ -2309,4 +2309,565 @@ python3 -m http.server --bind 127.0.0.1 0   # or any script serving
                                              # {"data":[{"id":"qwen3:8b"}]}
                                              # at /v1/models
 ```
+
+---
+
+# Implementation: Roster & composition UI (sub-spec 6e)
+
+## Summary
+
+Adds a lead/teammate picker inside the existing per-project idle-state team
+row (docs/design.md), backed by three new `app/teams.py` functions
+(`validate_composition()`, `load_compositions()`/`save_composition()`) and
+three additive `app/app.py` route changes: `GET /status` gains a top-level
+`roster` field and a per-instance `inst.team.composition` field, a new
+read-only `GET /projects/<name>/team/grounding` route exposes discovery
+metadata only, and `POST /projects/<name>/team/start` gains two optional
+body keys (`lead`/`members`) that are validated, persisted to
+`TEAM_STATE_DIR/compositions.json`, and used in place of
+`default_team_composition()`'s pick -- byte-for-byte unchanged when both
+keys are absent. `default_team_composition()`, `roster()`, and
+`load_grounding()` are all reused unmodified; no new backend concepts.
+
+## Changes by file
+
+- **`app/teams.py`** (3 new functions, ~100 lines, everything else reused
+  unmodified):
+  - `validate_composition(lead, members) -> str | None` -- operates
+    directly on the raw wire-format objects a POST body carries (`lead`:
+    `{"kind", "name"}`, each `members` entry: `{"kind", "name"}`), calls
+    `roster()` once internally, and checks, in order: lead is a dict naming
+    a real `(kind, name)` roster entry; if that entry is tier 2, its
+    `schema_flag_error` must be falsy (same protection `_cli_team_start()`
+    already gives the CLI, now shared); `members` is a non-empty list, each
+    entry naming a real roster entry with `kind == "engine"` (this is what
+    keeps the Ollama entry, if any, from ever being accepted as a
+    teammate -- it's never `delegate_capable`); no duplicate names; the
+    lead's name is not also a member's name. Never checks tier against a
+    hardcoded threshold -- a tier-3 lead is accepted exactly like tier 1/2
+    (docs/spec.md goal: "a real option, not a token one").
+  - `_compositions_path()`, `load_compositions()`, `save_composition()` --
+    same `.tmp` + `os.replace()` atomic-write shape as `app.py`'s own
+    `_load_desc_cache()`/`_save_desc_cache()`, at
+    `TEAM_STATE_DIR/compositions.json` (no new env var). `load_compositions()`
+    returns `{}` on a missing or corrupt file (`try/except (OSError,
+    ValueError)`), never a 500. `save_composition()` stores only
+    `{"kind", "name"}` for the lead (never `tier`/`schema_flag_error`,
+    always re-derived live from `roster()` at read time) and stores
+    `members` as a plain list of engine-name strings -- the same shape
+    `default_team_composition()` already returns for `members`, so
+    `/status`'s `inst.team.composition.members` is homogeneous regardless
+    of whether it came from a save or a default fallback (see "Key
+    decisions").
+- **`app/app.py`**:
+  - `GET /status`: `roster = teams.roster()` computed once per poll
+    (top-level `"roster"` key in the response, alongside the existing
+    `engines` field); `compositions = teams.load_compositions()` read once
+    per poll (same "read once, avoid staleness" precedent `_load_deploy_map()`
+    already establishes); per-instance `inst["team"]["composition"]` is the
+    saved composition if one exists for that project, else
+    `default_team_composition()`'s own pick if `ok`, else `None` -- computed
+    unconditionally for every project regardless of `status`, matching
+    `team`'s own existing "always present" treatment.
+  - `GET /projects/<name>/team/grounding` (new): inserted into `do_GET`'s
+    existing `else` branch (the "not `/status`" fallthrough), 404 if `name`
+    isn't in `instance_names()`, else calls `teams.load_grounding()` and
+    returns only `{"files": [{"label", "relpath", "byte_count"}, ...],
+    "skipped": [...]}` -- never `content`/`digest`/`headings`. No TOTP
+    check (matches `/status`'s own `_authed()`-only gating, already
+    satisfied by the time this branch is reached).
+  - `POST /projects/<name>/team/start`: if `"lead" in body and "members" in
+    body`, validates via `teams.validate_composition()`, saves via
+    `teams.save_composition()` on success (**before** calling
+    `launch_team()`, so a later launch failure -- e.g. a dirty tree or
+    session collision -- never discards the operator's picker choice),
+    re-derives the lead's live `tier` from a second `teams.roster()` call
+    (the wire format never carries `tier` -- see "Key decisions"), and
+    extracts plain member-name strings for `launch_team()`. If either key
+    is absent, behavior is byte-for-byte unchanged from 6d:
+    `default_team_composition()` is used, `compositions.json` is neither
+    read nor written. The response always includes `lead`/`members` in the
+    same shape either path produces (lead with `tier`, members as a plain
+    string list).
+  - New CSS: `.team-configure-row`, `.team-configure-btn`,
+    `.team-picker`, `.team-lead-picker`, `.team-mates-picker`,
+    `.team-grounding`, `.team-tier-3-caveat`, `.team-validation-error` --
+    reuses every existing color token (`#4da6ff`, `#ffb648`, `#34c759`,
+    `#ff6b6b`) docs/design.md's own contrast analysis already covers; no
+    new tokens.
+  - New JS: `ROSTER`/`TEAM_BY_NAME` globals (populated in `refresh()`,
+    mirroring `ENGINE_LABELS`'s own pattern); `teamPickerOpen`/
+    `teamPickerInitialized`/`teamPickerLead`/`teamPickerMembers`/
+    `teamGroundingCache` per-project client state (mirroring `teamTaskText`'s
+    own "survives `refresh()`'s full-row re-render" pattern);
+    `teamCompositionError()` (client-side mirror of
+    `validate_composition()`'s rules); `toggleTeamPicker()`,
+    `onTeamLeadChange()`, `onTeamMateToggle()`, `fetchTeamGrounding()`,
+    `renderTeamGrounding()`, `renderTeamPicker()`, `updateTeamStartButton()`
+    (new); `teamRow()` extended with the composition-aware idle branch;
+    `actionBody()`'s `kind === 'team-start'` branch extended to include
+    `lead`/`members` only when the picker is open with a currently-valid
+    composition; `doTeamStart()` extended to run the client-side
+    composition check before dispatch.
+- **`tests/test_teams_composition.py`** (new, 19 tests) -- `validate_composition()`
+  against every rule (valid tier-1/2/3 lead, missing/unknown/misconfigured
+  lead, empty/duplicate/unknown/non-delegate-capable members, lead-also-a-
+  member, an Ollama lead excluding nothing from members since it isn't
+  itself an `engines.d` entry) and `load_compositions()`/`save_composition()`
+  (missing-file, corrupt-file, round-trip, tier/schema_flag_error stripped
+  from a persisted lead, multi-project upsert, no leftover `.tmp` file).
+- **`tests/test_team_routes.py`** (extended, +16 new tests across 4 new
+  classes -- corrected count, per the reviewer's own recount (3 + 4 + 8 + 1
+  = 16); originally miswritten as "+11" -- 1 existing assertion updated for
+  the additive `composition` field): `StatusRosterAndCompositionTests`
+  (3 tests: roster reflects `engines.d`
+  live with no cache; composition falls back to default when nothing is
+  saved; composition prefers a saved value over the default),
+  `TeamGroundingEndpointTests` (4 tests: 404 on an unknown project; an
+  empty-repo project returns `files: []`, not an error; a found file's
+  response shape is exactly `{label, relpath, byte_count}`, and the
+  response body never contains the file's real content or a `digest` key;
+  no TOTP prompt), `TeamStartWithCompositionEndpointTests` (8 tests: a
+  submitted composition wins over the default and is persisted; empty
+  members/duplicate members/lead-also-a-member/unknown-lead are each
+  rejected with no worktree or session created; a stale saved composition
+  referencing a since-removed engine is rejected, never silently
+  substituted; omitting `lead`/`members` is byte-for-byte the unchanged 6d
+  default path, confirmed by asserting `compositions.json` is neither read
+  into nor written by that call; a composition is saved even when
+  `launch_team()` itself later refuses because a team is already running
+  for that project), `CompositionSurvivesRealProcessRestartTests` (1 test;
+  see "Key decisions" for why this spawns a genuinely separate `python3`
+  subprocess rather than just re-calling `load_compositions()`
+  in-process).
+- **`tests/test_team_frontend.js`** (extended, +11 new tests, plus
+  `statusWith()`/`setupCase()` gained an optional `roster` parameter and two
+  new test-harness helpers, `waitForFetch()`/`openPicker()`, for the
+  picker's two-fetch open sequence -- see "Key decisions"): a saved
+  composition renders the "Configure team..." link with the panel still
+  closed; `composition === null` renders the refusal text, omits the
+  configure link, and disables Start with no picker at all; opening the
+  picker fetches grounding and lists every roster member as a lead option;
+  the saved composition pre-selects the lead and excludes it from the
+  teammate checkboxes; a tier-3 lead shows the caveat and is never blocked;
+  the Ollama roster entry never appears as a teammate checkbox; grounding
+  renders as a fixed four-slot checklist with an absent file explicitly
+  marked "not found"; deselecting the last teammate shows the validation
+  error and disables Start; a valid open composition is included in the
+  POST body; a closed picker omits `lead`/`members` entirely (unchanged 6d
+  body shape); an invalid open composition blocks dispatch client-side with
+  the specific reason shown inline.
+- **`docs/design.md`**: not edited by the developer stage -- already
+  contained the ux-designer's 6e section (colors/copy/markup/state diagram)
+  at the start of this cycle; implemented as written, no deviations to the
+  visual spec itself (see "Deviations from spec" for the one behavioral gap
+  the design itself left unresolved).
+
+## Key decisions / tradeoffs
+
+- **`inst.team.composition.members` is always a plain list of engine-name
+  strings, never the wire format's list-of-dicts.** The spec's own
+  "Proposed approach" doesn't pin the exact shape `load_compositions()`
+  stores for `members` (only that `lead` stores `kind`+`name`), and the
+  design doc's "API shape for composition in JSON" section describes the
+  *outgoing POST body* shape (`[{"kind": "engine", "name": str}, ...]`),
+  not the `/status` read-back shape. Rather than inventing a second,
+  inconsistent members shape for persisted/default-fallback state, both
+  `save_composition()`'s stored `members` and `default_team_composition()`'s
+  pre-existing `members` (list of plain strings) now agree, so the
+  frontend's pre-selection logic (`new Set(comp.members)` /
+  `members.includes(lead.name)`) never has to branch on where the
+  composition came from. The wire format the browser actually POSTs
+  (`{"kind": "engine", "name": str}` per member) is preserved exactly as
+  designed -- this only affects the read-back/persisted shape, which the
+  design doc doesn't specify either way.
+- **The `POST /team/start` route re-derives the lead's live `tier` via a
+  second `teams.roster()` call, rather than trusting the client's own
+  submitted composition or reusing `validate_composition()`'s internal
+  roster snapshot.** `state["lead"]["tier"]` is read directly by
+  `_call_lead()`'s tier-dispatch (`app/teams.py` line ~2504/2558) -- a
+  `lead` dict without a `tier` key would raise `KeyError` the first time
+  the driving thread ran. The wire format's `lead` object deliberately
+  carries no `tier` (docs/spec.md: composition storage strips it, "always
+  re-derived live from `roster()`"), so the route must resolve it itself,
+  the same way `_cli_team_start()`/`_cli_team_launch()` already resolve a
+  CLI-supplied `--lead`'s tier from `_lead_tier_for_engine()` before
+  building their own `lead` dict. This is a second `roster()` call
+  (`validate_composition()`'s own internal one, plus this one) -- the same
+  "one extra directory scan, not worth threading a pre-loaded roster
+  through for" cost the spec already accepts for `/status`'s `roster` field
+  next to `default_team_composition()`'s own internal call.
+- **`CompositionSurvivesRealProcessRestartTests` spawns a real, separate
+  `python3` subprocess running its own fresh `ThreadingHTTPServer`,
+  pointed at the same `TEAM_STATE_DIR`/`PROJECTS_DIR`/`ENGINES_DIR`.**
+  `load_compositions()` has no in-memory cache at all -- it re-reads
+  `compositions.json` from disk on every single call, so there's nothing a
+  same-process re-call could get subtly wrong that a fresh process
+  wouldn't also get right *today*. The acceptance criterion is explicit
+  that this be "verified by restarting the process in a test, not just
+  re-calling the function in-process" -- read as a guard against a FUTURE
+  regression (an in-memory cache added later with no invalidation), so the
+  test spawns a genuinely independent OS process rather than taking the
+  weaker in-process shortcut, going further than `ServiceRestartSimulationTests`'
+  own documented "impractical to literally restart, so prove the property
+  that actually matters via the closest equivalent" compromise for the
+  analogous `_team_threads` case (that test's own docstring explicitly
+  flags a real separate-process restart as impractical for THAT case,
+  which involves a live tmux session + background thread this test's own
+  case doesn't -- compositions.json is a plain file, so a real subprocess
+  boundary is both achievable and the more faithful proof here).
+- **The picker's two-fetch open sequence (`fetchTeamGrounding()` then its
+  own trailing `refresh()`) needed a `waitForFetch()` test helper, not a
+  fixed tick count.** `toggleTeamPicker()` is not itself `async` (it calls
+  `fetchTeamGrounding()` fire-and-forget so the picker can render
+  immediately with a "Loading grounding files…" placeholder rather than
+  blocking); a test awaiting `c.call('toggleTeamPicker', name)` therefore
+  awaits nothing real. `waitForFetch()` polls `pendingFetches` with `tick()`
+  until the wanted URL actually appears, rather than guessing how many
+  microtask ticks deep the real chain resolves to -- the same generally
+  more robust pattern already used once padding was needed, now named and
+  reused across every new test that opens the picker (`openPicker()`).
+- **The DOM stub's `.disabled` property is not a reliable post-`refresh()`
+  assertion target.** `refresh()` replaces `#rows.innerHTML` with a raw
+  HTML string; the test harness's `document.innerHTML` setter (shared with
+  `tests/test_deploy_frontend.js`) stores that string verbatim without
+  parsing it into stub elements, so a `document.getElementById('start-btn-
+  proj')` call afterward returns an unrelated, never-touched stub whose
+  `.disabled` is still its default `false` -- not what the rendered markup
+  actually says. Fixed by slicing the button's own markup out of the
+  rendered HTML string and asserting on the literal `disabled` attribute's
+  presence, the same technique the pre-existing "idle (team null)... a
+  disabled Start team button" test already used; only spots that DIRECTLY
+  set `.disabled` via `getElementById` (`updateTeamStartButton()`,
+  `handleActionResult()`) can be asserted through the stub itself.
+- **The `composition === null` ("no usable roster member at all") case
+  reuses the exact fixed message from docs/design.md's "No Roster
+  Available" state, not the real `default_team_composition()` error text.**
+  `/status`'s `composition` field is `None` whenever `default_team_
+  composition()` returns `{"ok": False, ...}` -- its actual `error` string
+  is discarded, per spec's own "Proposed approach" wording ("else
+  `default_team_composition()`'s result if `ok`, else `None`"), which never
+  says to thread the error text itself through `/status`. The spec's
+  "Proposed approach" §3 separately says the frontend should "render its
+  error text in place of the picker," which isn't literally satisfiable
+  from a bare `None` -- design.md resolves this gap with a fixed, generic
+  message ("No roster members available. Add an engine to engines.d or
+  configure TEAM_LLM_BASE_URL/TEAM_LLM_MODEL."), which is what's
+  implemented here (see "Deviations from spec"). The real, specific
+  `default_team_composition()` error text is still reachable in practice:
+  it's the composition===null case's own Start button that's omitted
+  (matching the design), but the plain 6d `POST .../team/start` path
+  (`lead`/`members` both absent) still surfaces the exact backend message
+  through the existing `team-msg` slot if a caller ever POSTs one directly
+  (e.g. a stale client) -- this cycle didn't need to add a mechanism for
+  that since 6d's own error-message plumbing already covers it.
+
+## Deviations from spec
+
+- **`composition === null`'s frontend message is a fixed, generic string,
+  not the real `default_team_composition()` error text the spec's own
+  "Proposed approach" §3 literally asks for ("render its error text").**
+  See "Key decisions" above for why this is unsatisfiable as literally
+  written (the error text is never threaded through `/status`) and why
+  design.md's own resolution (a fixed message, matching its "No Roster
+  Available" state) is what's implemented. This is a faithful reading of
+  the design doc, which is more specific than the spec on this exact
+  point and was written after the spec to resolve open questions like this
+  one -- flagging it here rather than silently picking one interpretation,
+  since the spec's own prose and the design's own rendered mockup disagree
+  on it.
+- **No other deviations.** Every route shape, validation rule, error
+  message wording, and picker markup/class name follows docs/spec.md
+  §"Proposed approach" and docs/design.md's own "Implementation notes for
+  the developer" section directly.
+
+## Known limitations
+
+- **CORRECTED (reviewer fix round -- see the appended section at the end of
+  this document): the claim below, as originally written, was wrong about
+  the "Tier-3-Only Roster" state and is kept here struck through/replaced
+  rather than silently rewritten, since it was the reviewer's own must-fix
+  finding.** Original claim: "'Tier-3-Only Roster' falls out automatically
+  ... no special-case branch needed ... confirmed by `test_team_frontend.js`'s
+  'a tier-3 lead shows the plain-language reliability caveat, never
+  blocked' test." That test's own roster was `[prose3 (tier 3), helper
+  (tier 2)]` with a pre-supplied, already-non-null saved composition
+  (`comp = {lead: {kind: 'engine', name: 'prose3'}, members: ['helper']}`)
+  -- it only ever exercised `renderTeamPicker()`'s per-member rendering
+  once the picker was already reachable, never the actual no-saved-
+  composition, roster-is-real-but-tier-3-only path `docs/design.md`'s
+  "Tier-3-Only Roster" state is written for. That path routed through
+  `GET /status`'s own `composition` computation, which DID need a real,
+  new branch: before the fix, `default_team_composition()` refusing (which
+  it always does for a tier-3-only roster, per 6d part 2's settled "never
+  auto-pick a tier-3 lead as the default" rule) collapsed straight to
+  `composition = None`, indistinguishable from a genuinely empty roster,
+  which permanently disabled the Start button with no way to ever open the
+  picker at all -- confirmed live (reviewer's own repro, independently
+  reproduced) and now fixed; see the appended section for the actual fix
+  and its own regression tests (`StatusRosterAndCompositionTests.
+  test_composition_not_none_for_tier3_only_roster_with_no_saved_composition`
+  in `tests/test_team_routes.py`, and `test_team_frontend.js`'s "a
+  tier-3-only roster with no saved composition still shows a Configure
+  link... and the picker opens with tier-3 selectable" test). Once past
+  that `/status` branch, the rendered *picker itself* (`renderTeamPicker()`/
+  `teamRow()`) genuinely is the same generic per-member-tier logic with no
+  dedicated all-tier-3 code path -- that part of the original claim holds;
+  it was the upstream `/status` gate that was wrong, not the picker's own
+  render logic.
+- **"Composition Saved" (the green "✓ Composition saved and team started"
+  message) is the same `handleActionResult()`/`.team-msg.success` path 6d
+  already built for every successful start, unchanged by 6e**, since a 200
+  response from `POST .../team/start` looks identical to the frontend
+  whether or not the body included a submitted composition. (This part of
+  the original claim was correct and is unaffected by the fix above.)
+- **No dedicated "save composition without starting" route.** Exactly as
+  scoped by the spec's own "Open questions" -- a composition is only ever
+  saved as a side effect of a validated `POST .../team/start` call.
+- **Per-teammate `--allowedTools`/`--sandbox` scoping remains out of
+  scope**, per the spec's own "Non-goals" -- untouched by this cycle.
+- **The picker's client-side `teamCompositionError()` intentionally has no
+  duplicate-teammate check** -- structurally impossible via checkboxes (a
+  `Set`), matching docs/design.md's own explicit note. The server's
+  `validate_composition()` still checks it (reachable only via a
+  hand-crafted request or a stale saved composition, never via the real
+  UI).
+
+## Verification status
+
+| Check | Command | Result |
+|---|---|---|
+| Syntax | `python3 -c "import ast; ast.parse(open('app/app.py').read())"` / same for `teams.py` | clean |
+| New backend test file alone | `python3 -m unittest tests.test_teams_composition -v` | **19 passed** |
+| Extended route test file alone | `python3 -m unittest tests.test_team_routes -v` | **36 passed** (was 20 before this cycle) |
+| Backend regression sweep (composition + routes + lead + lifecycle + grounding + headless + cancel) | `python3 -m unittest tests.test_team_routes tests.test_teams_composition tests.test_teams_lead tests.test_teams_lifecycle tests.test_teams_grounding tests.test_teams_headless tests.test_teams_cancel -v` | **420 passed** |
+| Full Python suite, twice (once via `unittest discover`, once via `pytest`) | `python3 -m unittest discover -s tests` / `uv run --with pytest python -m pytest tests/ -q` | **725 passed** both runs (was 674 before 6d part 2b's `--with-ollama` cycle added 16; unchanged by 6e itself since only new/extended files, no removals) |
+| Extended frontend suite alone | `node tests/test_team_frontend.js` | **28/28 passed** (was 17 before this cycle) |
+| Full Node suite sweep (confirm no cross-feature regression) | `node tests/test_{team,deploy,singleton_toggle,upload}_frontend.js` | 28/28, 9/9, 15/15, 8/8 -- all pass |
+
+## How to verify locally
+
+```bash
+# Syntax
+python3 -c "import ast; ast.parse(open('app/app.py').read())"
+python3 -c "import ast; ast.parse(open('app/teams.py').read())"
+
+# New backend test file alone
+python3 -m unittest tests.test_teams_composition -v
+
+# Extended route test file alone (roster/composition /status fields, the
+# new grounding route, the extended /team/start body handling, and the
+# real-separate-process restart-persistence test)
+python3 -m unittest tests.test_team_routes -v
+
+# Full Python suite (either runner works; both were run this cycle)
+python3 -m unittest discover -s tests
+/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q
+
+# Extended frontend suite alone
+node tests/test_team_frontend.js
+
+# Full Node suite (confirm no cross-feature regression)
+node tests/test_team_frontend.js
+node tests/test_deploy_frontend.js
+node tests/test_singleton_toggle_frontend.js
+node tests/test_upload_frontend.js
+```
+
+---
+
+# Implementation: Roster & composition UI (sub-spec 6e) -- reviewer fix round (`composition === null` over-collapse)
+
+## Summary
+
+Fixes the reviewer's must-fix finding against the 6e cycle above:
+`GET /status`'s `inst.team.composition` computation collapsed THREE
+distinct `default_team_composition()` refusal reasons (a genuinely empty
+roster, a single already-picked-lead engine with nothing left to delegate
+to, and a real-but-tier-3-only roster -- the case 6d part 2 settled must
+never be auto-picked as the automatic DEFAULT lead) into the same bare
+`composition = None`. The frontend's `composition === null` check can't
+tell these apart, so a project with one real tier-3 `engines.d` entry and
+no saved composition rendered the permanent "No roster members available"
+refusal with a disabled Start button and no way to ever open the picker --
+directly breaking this sub-spec's own headline acceptance criterion
+("tier-3 must be selectable as lead, never blocked") for exactly the
+scenario `docs/design.md`'s own "Tier-3-Only Roster" state was written to
+cover. Fixed by computing `composition` off `roster()` being non-empty
+(the reviewer's own suggested direction) rather than off
+`default_team_composition()["ok"]` alone: when the roster has at least one
+real member but the automatic default declined to pick one, `/status` now
+returns `composition = {"lead": None, "members": []}` -- a real, non-null
+object with nothing pre-selected, mirroring `docs/design.md`'s own "Choose
+a lead..." empty-select default -- so the frontend still opens the picker
+and lets the operator pick explicitly. `composition` stays `None` only for
+a genuinely empty roster (no `engines.d` entries at all, no Ollama
+configured), where the "No roster members available" permanent-refusal
+state is still correct.
+
+## Changes by file
+
+- **`app/app.py`** (`GET /status`, the `inst["team"]["composition"]`
+  computation, ~line 3489 as of the 6e cycle above): the `else` branch (no
+  saved composition) now branches three ways instead of two --
+  `default_team_composition()["ok"]` (unchanged: use its pick),
+  `elif roster:` (**new** -- `roster` is this same `/status` call's own
+  already-computed top-level list, the authoritative "does a real,
+  pickable member exist at all" signal, independent of whether the
+  automatic default could use one) set `composition = {"lead": None,
+  "members": []}`, `else` (genuinely empty roster, unchanged behavior)
+  `composition = None`. No other route, no validation rule, no persistence
+  mechanism touched -- `validate_composition()`, the grounding route, and
+  `save_composition()`/`load_compositions()` are exactly as the 6e cycle
+  above left them, per the reviewer's own explicit "don't re-touch" scope
+  for this fix.
+- **`tests/test_team_routes.py`** (+2 tests in
+  `StatusRosterAndCompositionTests`, now 5 tests total in that class --
+  16 + 2 = 18 new tests total across the 4 classes 6e's "Changes by file"
+  section above names):
+  - `test_composition_not_none_for_tier3_only_roster_with_no_saved_composition`
+    -- the actual regression test for the reviewer's own live repro: one
+    tier-3 `engines.d` entry, no Ollama, no saved composition. Asserts
+    `s["roster"]` still has the one real entry (`roster()` itself was
+    never broken) and `inst.team.composition == {"lead": None, "members":
+    []}` (not `None`).
+  - `test_composition_stays_none_for_a_genuinely_empty_roster` -- the
+    contrast case, proving the fix didn't overcorrect: no `engines.d`
+    entries, no Ollama, `s["roster"] == []`, and `composition` is still
+    `None`.
+- **`tests/test_team_frontend.js`** (+1 test, now 29 tests total in this
+  file, up from the 28 the 6e cycle above reports): "a tier-3-only roster
+  with no saved composition still shows a Configure link (not the
+  permanent refusal), and the picker opens with tier-3 selectable" --
+  drives the exact `composition = {lead: null, members: []}` shape
+  `/status` now sends through `teamRow()`/`toggleTeamPicker()`/
+  `renderTeamPicker()` directly (same "call the exported function, no
+  renderer needed" technique this file's own header describes), asserting
+  (1) the closed-picker row shows "Configure team..." and NOT "No roster
+  members available", (2) opening the picker renders `prose3` as a
+  selectable, non-`disabled` lead `<option>`, and (3) actually selecting
+  it as lead succeeds (`teamCompositionError()` returns the separate
+  "At least one teammate is required" reason, not a lead-selection block --
+  this single-tier-3-engine roster has no OTHER engine left to be a
+  teammate, so a real start still isn't reachable here, but the lead pick
+  itself is never blocked, which is the property this fix restores).
+- **`docs/implementation.md`** (this file): corrected the 6e cycle's own
+  "Known limitations" claim about the "Tier-3-Only Roster" design state
+  "falling out automatically... no special-case branch needed" -- that
+  claim's own cited proof (`test_team_frontend.js`'s pre-existing tier-3-
+  caveat test) used a roster of `[prose3 (tier 3), helper (tier 2)]` with
+  an already-non-null, pre-supplied saved composition, and never actually
+  exercised the no-saved-composition path that was broken. Left the
+  original wrong claim in place, marked corrected, rather than silently
+  rewriting history (see the "Known limitations" section above). Also
+  corrected "Changes by file"'s arithmetic error: `tests/test_team_routes.py`
+  gained +16 new tests across the 4 new classes this cycle (3 + 4 + 8 + 1,
+  the reviewer's own recount), not the originally-written "+11".
+
+## Key decisions / tradeoffs
+
+- **Nothing pre-selected (`lead: None, members: []`), not the roster's
+  first entry, for the "real roster, no automatic pick" case.** The
+  reviewer's finding left this as the developer's own call ("nothing
+  pre-selected, or the first roster member pre-selected -- your call on
+  which reads better against docs/design.md's existing state"). Nothing-
+  pre-selected was chosen because it's a direct, literal read of
+  `docs/design.md`'s own "Idle, Picker Expanded" state, which already
+  specifies `<option value="">Choose a lead...</option>` as the default
+  when there's no saved composition and no automatic default to seed from
+  -- auto-selecting the first roster entry would be inventing a NEW
+  implicit default the design doc never describes (and would risk
+  silently picking a tier-3 lead on the operator's behalf without them
+  ever having chosen it, which cuts against the same "never auto-pick
+  tier-3" principle 6d part 2 settled for the non-picker default path).
+- **The fix branches on `roster` (the `/status` handler's own
+  already-computed top-level list), not on a fresh `teams.roster()`
+  call.** `roster()` has no cache and is meant to be re-read every call
+  (`engines.d` can be hand-edited without a restart), but `/status` already
+  computes it exactly once per poll for the top-level `"roster"` field --
+  reusing that same list for the per-project branch avoids a second,
+  redundant directory scan inside the per-instance loop, the same "don't
+  thread a pre-loaded value through, but don't call the scanning function
+  twice in the same handler either" balance the 6e cycle above already
+  struck for `default_team_composition()`'s own internal `roster()` call.
+- **No change to `default_team_composition()`, `validate_composition()`,
+  or any persistence function.** The fix is entirely local to `/status`'s
+  own read-side computation of what to show the picker -- the three
+  refusal reasons `default_team_composition()` itself distinguishes
+  internally (empty roster / single-engine-already-lead / tier-3-only) are
+  unchanged; `/status` just stopped discarding the distinction between
+  "roster is empty" and "roster is real but the default declined."
+
+## Deviations from spec / design
+
+None. `docs/spec.md`'s own "Proposed approach" §2 already says `/status`'s
+composition field is "`default_team_composition()`'s result if `ok`, else
+`None`" -- read literally, this fix is a correction of an under-specified
+edge case in that same sentence (the spec doesn't separately address what
+should happen when the roster is real-but-declined vs. genuinely empty),
+resolved in the direction the spec's own Goal #3 ("tier-3 must be
+selectable as lead, never blocked") and the design's own dedicated
+"Tier-3-Only Roster" state both require. Not a new deviation beyond what
+the 6e cycle above already discloses.
+
+## Known limitations
+
+No new known limitations introduced by this fix. The single-tier-3-engine
+scenario this fix's own regression tests exercise (one tier-3 engine, no
+Ollama, no other engine) still cannot actually START a team -- picking that
+engine as lead leaves zero possible teammates, so `teamCompositionError()`
+always reports "At least one teammate is required" for that specific
+roster shape. This is not a defect: it's the same structural requirement
+`validate_composition()`/`default_team_composition()` already enforce (a
+team needs a lead AND at least one teammate) -- the fix's own scope is
+"the picker must be reachable and the tier-3 lead pick itself must never
+be blocked," not "every possible roster shape can complete a start,"
+which was never true even before this defect (a single-engine roster of
+ANY tier has always had this same limit, per `default_team_composition()`'s
+own pre-existing "only one headless-eligible engine... selected as lead"
+refusal message).
+
+## Verification status
+
+| Check | Command | Result |
+|---|---|---|
+| Fix-scoped route tests | `python3 -m unittest tests.test_team_routes.StatusRosterAndCompositionTests -v` | **5 passed** (3 pre-existing + 2 new) |
+| Extended route test file alone | `python3 -m unittest tests.test_team_routes -v` | **38 passed** (was 36 before this fix round) |
+| Extended frontend suite alone | `node tests/test_team_frontend.js` | **29/29 passed** (was 28 before this fix round) |
+| Full Node suite sweep (confirm no cross-feature regression) | `node tests/test_{team,deploy,singleton_toggle,upload}_frontend.js` | 29/29, 9/9, 15/15, 8/8 -- all pass (61 total) |
+| Full Python suite | `python3 -m unittest discover -s tests -v` | **727 passed**, 0 failures/errors (was 725 before this fix round; +2 for the two new `StatusRosterAndCompositionTests` cases) |
+
+## How to verify locally
+
+```bash
+# The fix-scoped regression tests (both languages)
+python3 -m unittest tests.test_team_routes.StatusRosterAndCompositionTests -v
+node tests/test_team_frontend.js
+
+# Full suites
+python3 -m unittest discover -s tests -v
+node tests/test_team_frontend.js
+node tests/test_deploy_frontend.js
+node tests/test_singleton_toggle_frontend.js
+node tests/test_upload_frontend.js
+
+# Manual reproduction of the fixed scenario (same shape as the reviewer's
+# own live repro): a project with one tier-3 engines.d entry, no Ollama,
+# no saved composition -- confirm GET /status now returns a real
+# composition object (not null) with nothing pre-selected.
+export TOTP_SECRET=JBSWY3DPEHPK3PXP AUTH_MODE=simple SIMPLE_USERNAME=x SIMPLE_PASSWORD=x
+export ENGINES_DIR=/tmp/scratch-engines-6e-fix PROJECTS_DIR=/tmp/scratch-projects-6e-fix
+mkdir -p "$ENGINES_DIR" "$PROJECTS_DIR/demo"
+cat > "$ENGINES_DIR/prose.engine" <<'EOF'
+LABEL=Prose
+CMD=unused
+HEADLESS_CMD=echo hi
+HEADLESS_FORMAT=plain
+HEADLESS_PROMPT=arg
+EOF
+python3 app/teams.py roster   # confirms: prose, tier 3
+# (start the web app, log in, then) curl the authenticated session's
+# GET /status and confirm inst.team.composition for "demo" is
+# {"lead": null, "members": []}, not null.
+```
 ```

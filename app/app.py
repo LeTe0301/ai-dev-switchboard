@@ -1699,6 +1699,25 @@ PAGE_TEMPLATE = """<!doctype html>
   .team-msg { font-size: 12px; color: #888; margin: 0; min-height: 14px; word-break: break-all; }
   .team-msg.success { color: #34c759; }
   .team-msg.error { color: #ff6b6b; }
+  /* Roster & composition UI (backlog item 6e, docs/design.md) -- the
+     idle-state row's "Configure team..." picker panel. No new color
+     tokens beyond .team-tier-3-caveat's #ffb648 (design.md: "no existing
+     warning/orange token was already in use on this page"); everything
+     else reuses tokens already established by the 6d rows above. */
+  .team-configure-row { margin-top: 2px; }
+  .team-configure-btn { color: #4da6ff; cursor: pointer; font-size: 12px;
+                         background: none; border: none; padding: 0; text-decoration: underline; }
+  .team-picker { display: flex; flex-direction: column; gap: 8px; margin-top: 4px;
+                 padding: 8px 10px; border: 1px solid #333; border-radius: 8px; background: #181818; }
+  .team-lead-picker, .team-mates-picker, .team-grounding { display: flex; flex-direction: column; gap: 4px; }
+  .team-lead-picker label, .team-mates-picker > label:first-child { font-size: 12px; color: #aaa; }
+  .team-lead-picker select { font-size: 13px; padding: 6px 8px; border-radius: 8px;
+                              border: 1px solid #333; background: #1c1c1c; color: #eee; font-family: inherit; }
+  .team-mates-picker label { font-size: 13px; color: #eee; display: flex; align-items: center; gap: 6px; }
+  .team-tier-3-caveat { font-size: 12px; color: #ffb648; border-left: 2px solid #ffb648;
+                         padding: 4px 8px; background: #1c1c1c; }
+  .team-grounding { font-size: 12px; color: #888; }
+  .team-validation-error { font-size: 12px; color: #ff6b6b; min-height: 14px; }
   .new-project-row { display: flex; gap: 8px; padding: 4px 0 16px; }
   .new-project-row input { flex: 1; font-size: 14px; padding: 10px 12px; border-radius: 10px;
                             border: 1px solid #333; background: #1c1c1c; color: #eee; }
@@ -1859,6 +1878,16 @@ let engineChoice = {};  // project name -> engine name, picked before starting
 // principle contain quote characters, so they're never embedded directly
 // into HTML markup).
 let DEPLOY_TARGETS = {};
+// Roster & composition UI (backlog item 6e, docs/design.md) -- ROSTER is
+// global (not per-project, matching /status's own top-level "roster"
+// field), refreshed every refresh() call, re-read live off engines.d each
+// time (no client-side caching, mirroring roster()'s own no-cache
+// philosophy). TEAM_BY_NAME lets an onclick handler (which only ever gets
+// a project `name`, not the whole `team` object) look up that project's
+// current inst.team -- specifically inst.team.composition, used to seed
+// the picker's pre-selection the first time it's opened for a project.
+let ROSTER = [];
+let TEAM_BY_NAME = {};
 
 // Singleton-toggle rows (Taiga, Gitea, ...future ones) need more visual
 // states than the generic on/off rows above (see docs/design.md "How
@@ -1957,10 +1986,13 @@ async function refresh() {
   if (r.status === 401) { showOverlay(); return; }
   const s = await r.json();
   ENGINE_LABELS = s.engines || {};
+  ROSTER = s.roster || [];
   DEPLOY_TARGETS = {};
+  TEAM_BY_NAME = {};
   let html = '';
   for (const inst of s.instances) {
     if (inst.deploy) DEPLOY_TARGETS[inst.name] = inst.deploy;
+    TEAM_BY_NAME[inst.name] = inst.team;
     html += row(inst.name, inst.on, inst.url, 'inst', inst.name, inst.desc, inst.engine,
                inst.code_on, inst.code_url, undefined, undefined, inst.gitea_sync, inst.deploy, inst.team);
   }
@@ -2037,22 +2069,180 @@ function deployRow(name, deploy) {
 // textarea would otherwise be wiped every 4-second poll while the operator
 // is still typing.
 let teamTaskText = {};
-// Minimal per-project team control (backlog item 6d, part 2a --
-// docs/design.md). Rendered unconditionally per project (no "only if
-// configured" gate, unlike deployRow()) -- styled after deployRow()'s own
-// shape (a single-purpose row, not the checkbox-toggle pattern), since
-// starting a team needs a task-text input, not a boolean flip.
+// Roster & composition UI (backlog item 6e, docs/design.md) -- per-project
+// picker state, all keyed by project name, all surviving refresh()'s own
+// full-row re-render the same way teamTaskText already does above.
+let teamPickerOpen = {};        // name -> bool, closed by default
+let teamPickerInitialized = {}; // name -> bool, true once seeded from inst.team.composition
+let teamPickerLead = {};        // name -> {kind, name} | null
+let teamPickerMembers = {};     // name -> Set<string> (engine names)
+let teamGroundingCache = {};    // name -> {files, skipped} | null (fetch failed) | undefined (not fetched yet)
+
+// Client-side mirror of teams.validate_composition()'s rules (docs/spec.md
+// 6e) -- fast feedback only; the server's own check in POST .../team/start
+// remains the source of truth. Duplicate-teammate is structurally
+// impossible via checkboxes (a Set), so there's no dedicated check for it
+// here, matching docs/design.md's own note.
+function teamCompositionError(name) {
+  const lead = teamPickerLead[name];
+  if (!lead) return 'Lead is required';
+  const members = Array.from(teamPickerMembers[name] || []);
+  if (members.length === 0) return 'At least one teammate is required';
+  if (members.indexOf(lead.name) !== -1) return 'Lead cannot also be a teammate';
+  return null;
+}
+function tierLabel(tier) {
+  return tier === 1 ? 'tier 1 - native tools' : tier === 2 ? 'tier 2 - schema constrained' : 'tier 3 - prose parse';
+}
+// Fetched once per picker-open (docs/design.md "Roster and grounding are
+// fetched on picker open"), not on every 4s poll -- cached client-side
+// until the picker is closed/reopened for this project.
+async function fetchTeamGrounding(name) {
+  try {
+    const r = await fetch('/projects/' + encodeURIComponent(name) + '/team/grounding');
+    teamGroundingCache[name] = r.ok ? await r.json() : null;
+  } catch (e) {
+    teamGroundingCache[name] = null;
+  }
+  refresh();
+}
+function toggleTeamPicker(name) {
+  teamPickerOpen[name] = !teamPickerOpen[name];
+  if (teamPickerOpen[name] && !teamPickerInitialized[name]) {
+    // Pre-select from inst.team.composition (docs/spec.md: the saved
+    // composition if one exists, else default_team_composition()'s own
+    // pick, else -- unreachable here, since the "no composition at all"
+    // case never renders a Configure button to click in the first place).
+    const team = TEAM_BY_NAME[name];
+    const comp = team && team.composition;
+    teamPickerLead[name] = comp ? comp.lead : null;
+    teamPickerMembers[name] = new Set(comp ? comp.members : []);
+    teamPickerInitialized[name] = true;
+  }
+  if (teamPickerOpen[name] && teamGroundingCache[name] === undefined) {
+    fetchTeamGrounding(name);  // its own refresh() covers this render
+    return;
+  }
+  refresh();
+}
+function onTeamLeadChange(name) {
+  const sel = document.getElementById('team-lead-' + name);
+  const val = sel ? sel.value : '';
+  teamPickerLead[name] = val ? JSON.parse(val) : null;
+  refresh();
+}
+function onTeamMateToggle(name, memberName, checked) {
+  const set = teamPickerMembers[name] || (teamPickerMembers[name] = new Set());
+  if (checked) set.add(memberName); else set.delete(memberName);
+  refresh();
+}
+// docs/design.md "Grounding Files" -- always the same four canonical slots,
+// in this fixed order, so an ABSENT file (e.g. no docs/ARCHITECTURE.md) is
+// as visible as a found one, never silently omitted from the list.
+const TEAM_GROUNDING_SLOTS = [
+  {display: 'docs/ARCHITECTURE.md', labels: ['docs/ARCHITECTURE.md']},
+  {display: 'docs/BACKLOG.md', labels: ['docs/BACKLOG.md']},
+  {display: 'CLAUDE.md / AGENTS.md', labels: ['CLAUDE.md', 'AGENTS.md']},
+  {display: 'README.md', labels: ['README.md']},
+];
+function renderTeamGrounding(name) {
+  const id = 'team-grounding-' + esc(name);
+  const g = teamGroundingCache[name];
+  if (g === undefined) return '<div class="team-grounding" id="' + id + '">Loading grounding files…</div>';
+  if (g === null) return '<div class="team-grounding" id="' + id + '">Grounding unavailable</div>';
+  if (!g.files || g.files.length === 0) {
+    return '<div class="team-grounding" id="' + id + '">No grounding files discovered</div>';
+  }
+  const byLabel = {};
+  g.files.forEach(f => { byLabel[f.label] = f; });
+  const rows = TEAM_GROUNDING_SLOTS.map(slot => {
+    const found = slot.labels.map(l => byLabel[l]).find(Boolean);
+    return found ?
+      '<div>✓ ' + esc(slot.display) + ' (' + found.byte_count + ' bytes)</div>' :
+      '<div>✗ ' + esc(slot.display) + ' (not found)</div>';
+  }).join('');
+  return '<div class="team-grounding" id="' + id + '">' + rows + '</div>';
+}
+function renderTeamPicker(name) {
+  const lead = teamPickerLead[name];
+  const members = teamPickerMembers[name] || new Set();
+  const leadOptions = '<option value="">Choose a lead...</option>' + ROSTER.map(e => {
+    const val = JSON.stringify({kind: e.kind, name: e.name});
+    const selected = lead && lead.kind === e.kind && lead.name === e.name ? ' selected' : '';
+    return "<option value='" + val + "'" + selected + '>' + esc(e.name) + ' (' + tierLabel(e.tier) + ')</option>';
+  }).join('');
+  const leadPicker = '<div class="team-lead-picker"><label>Lead</label>' +
+    '<select id="team-lead-' + esc(name) + '" onchange="onTeamLeadChange(' + "'" + name + "'" + ')">' +
+    leadOptions + '</select></div>';
+  const leadEntry = lead ? ROSTER.find(e => e.kind === lead.kind && e.name === lead.name) : null;
+  const caveat = leadEntry && leadEntry.tier === 3 ?
+    '<div class="team-tier-3-caveat">⚠ This engine&#39;s reliability is lower due to prose-parsing ' +
+    'tool-calling. Use only if no tier-1 or tier-2 lead is available.</div>' : '';
+  const mateOptions = ROSTER.filter(e => e.delegate_capable && !(lead && lead.kind === e.kind && lead.name === e.name))
+    .map(e => {
+      const checked = members.has(e.name) ? ' checked' : '';
+      return '<label><input type="checkbox" id="team-mate-' + esc(name) + '-' + esc(e.name) + '"' + checked +
+        ' onchange="onTeamMateToggle(' + "'" + name + "','" + e.name + "'" + ', this.checked)"> ' +
+        esc(e.name) + ' (' + tierLabel(e.tier) + ')</label>';
+    }).join('');
+  const mates = '<div class="team-mates-picker"><label>Teammates</label>' + mateOptions + '</div>';
+  const err = teamCompositionError(name);
+  const errDiv = '<div class="team-validation-error" id="team-validation-' + esc(name) + '">' +
+    (err ? esc(err) : '') + '</div>';
+  return '<div class="team-picker">' + leadPicker + caveat + mates + renderTeamGrounding(name) + errDiv + '</div>';
+}
+// Combined disabled-state recompute for the plain task-text oninput path
+// (docs/design.md: Start is disabled if the task is empty OR, once the
+// picker is open, a composition validation error exists) -- a live DOM
+// update, not a full refresh(), matching 6d's own original oninput
+// handler's lightweight style exactly (typing must not re-fetch /status).
+function updateTeamStartButton(name) {
+  const btn = document.getElementById('start-btn-' + name);
+  if (!btn) return;
+  const taskEl = document.getElementById('task-' + name);
+  const taskOk = !!(taskEl && taskEl.value.trim());
+  const compErr = teamPickerOpen[name] ? teamCompositionError(name) : null;
+  btn.disabled = !taskOk || !!compErr;
+}
+// Minimal per-project team control (backlog item 6d, part 2a; extended with
+// a lead/teammate picker in 6e -- docs/design.md). Rendered unconditionally
+// per project (no "only if configured" gate, unlike deployRow()) -- styled
+// after deployRow()'s own shape (a single-purpose row, not the
+// checkbox-toggle pattern), since starting a team needs a task-text input,
+// not a boolean flip.
 function teamRow(name, team) {
   const msgSlot = '<div class="team-msg" id="team-msg-' + esc(name) + '"></div>';
   if (!team || team.status === 'idle') {
     const text = teamTaskText[name] || '';
-    return '<div class="team-row">' +
-      '<textarea class="team-textarea" id="task-' + esc(name) + '" placeholder="Task description..." ' +
+    const taskArea = '<textarea class="team-textarea" id="task-' + esc(name) + '" placeholder="Task description..." ' +
       'oninput="teamTaskText[' + "'" + name + "'" + '] = this.value; ' +
-      "document.getElementById('start-btn-" + esc(name) + "').disabled = !this.value.trim();" + '">' +
-      esc(text) + '</textarea>' +
+      "updateTeamStartButton('" + esc(name) + "');" + '">' +
+      esc(text) + '</textarea>';
+    // team === null is a defensive-only shape (the real /status always
+    // sends an object per project, see docs/spec.md 6d) -- the picker only
+    // applies once there IS a team object to read inst.team.composition
+    // off of, so `composition` stays `undefined` (not `null`) in that
+    // case, which renders the same plain row 6d always has.
+    const composition = team ? team.composition : undefined;
+    if (composition === null) {
+      // docs/spec.md "no usable roster member at all" -- picker area shows
+      // the refusal text, Start button omitted entirely, not a broken/
+      // empty picker.
+      return '<div class="team-row">' + taskArea +
+        '<div class="team-msg error">✕ No roster members available. Add an engine to engines.d ' +
+        'or configure TEAM_LLM_BASE_URL/TEAM_LLM_MODEL.</div>' +
+        '<div class="team-actions"><button class="team-btn" id="start-btn-' + esc(name) + '" disabled>' +
+        'Start team</button></div>' + msgSlot + '</div>';
+    }
+    const open = composition !== undefined && !!teamPickerOpen[name];
+    const configureRow = composition !== undefined ?
+      '<div class="team-configure-row"><a class="team-configure-btn" onclick="toggleTeamPicker(' +
+      "'" + name + "'" + ')">' + (open ? 'Hide configuration' : 'Configure team...') + '</a></div>' : '';
+    const picker = open ? renderTeamPicker(name) : '';
+    const startDisabled = !text.trim() || (open && !!teamCompositionError(name));
+    return '<div class="team-row">' + taskArea + configureRow + picker +
       '<div class="team-actions"><button class="team-btn" id="start-btn-' + esc(name) + '"' +
-      (text.trim() ? '' : ' disabled') +
+      (startDisabled ? ' disabled' : '') +
       ' onclick="doTeamStart(' + "'" + name + "'" + ')">Start team</button></div>' +
       msgSlot + '</div>';
   }
@@ -2116,6 +2306,19 @@ function actionBody(kind, name, on, code) {
   if (kind === 'team-start') {
     const el = document.getElementById('task-' + name);
     body.task = (el ? el.value : (teamTaskText[name] || '')).trim();
+    // Roster & composition UI (backlog item 6e, docs/design.md
+    // "Implementation notes" §7): only included once the picker has been
+    // opened AND a valid composition is selected -- omitted entirely
+    // otherwise, so a start with the picker never touched (or left
+    // invalid) stays byte-for-byte the 6d default-composition body a
+    // stale/old client would also send (docs/spec.md "backward
+    // compatible"). doTeamStart() already refuses to dispatch at all on an
+    // invalid composition, so this condition is a defense-in-depth repeat
+    // of that same check, not the only thing guarding it.
+    if (teamPickerOpen[name] && !teamCompositionError(name)) {
+      body.lead = teamPickerLead[name];
+      body.members = Array.from(teamPickerMembers[name] || []).map(n => ({kind: 'engine', name: n}));
+    }
   }
   return body;
 }
@@ -2259,12 +2462,13 @@ function doDeploy(name) {
   if (msgEl) { msgEl.textContent = 'Deploying…'; msgEl.className = 'deploy-msg'; }
   toggle('deploy', name, true, null);
 }
-// Minimal per-project team control (backlog item 6d, part 2a --
-// docs/design.md). Client-side validation only (the route's own 400 on an
-// empty task is the real, authoritative check) -- reuses toggle()'s own
-// TOTP-retry/code-overlay plumbing exactly like doDeploy() above, just with
-// actionBody()'s own kind==='team-start' branch supplying the {task: ...}
-// body every other kind's shape doesn't need.
+// Minimal per-project team control (backlog item 6d, part 2a; extended with
+// a composition picker in 6e -- docs/design.md). Client-side validation
+// only (the route's own 400 is the real, authoritative check either way)
+// -- reuses toggle()'s own TOTP-retry/code-overlay plumbing exactly like
+// doDeploy() above, just with actionBody()'s own kind==='team-start'
+// branch supplying the {task, lead, members} body every other kind's shape
+// doesn't need.
 function doTeamStart(name) {
   const el = document.getElementById('task-' + name);
   const task = (el ? el.value : '').trim();
@@ -2273,6 +2477,13 @@ function doTeamStart(name) {
   if (!task) {
     if (msgEl) { msgEl.textContent = 'Enter a task description.'; msgEl.className = 'team-msg error'; }
     return;
+  }
+  if (teamPickerOpen[name]) {
+    const err = teamCompositionError(name);
+    if (err) {
+      if (msgEl) { msgEl.textContent = err; msgEl.className = 'team-msg error'; }
+      return;
+    }
   }
   toggle('team-start', name, true, null);
 }
@@ -3202,6 +3413,19 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/status":
             _reap_dead_state()
             engines = load_engines()
+            # Roster & composition UI (backlog item 6e, docs/spec.md) --
+            # global, not per-project, computed once per poll next to the
+            # existing load_engines() call above. roster() re-reads
+            # load_engines() itself, duplicating one directory scan per
+            # poll -- the same accepted cost default_team_composition()
+            # already carries by calling roster() internally, not worth
+            # threading a pre-loaded engines dict through for.
+            roster = teams.roster()
+            # Read once per /status call, same "avoid staleness after an
+            # operator edits it" reasoning _load_deploy_map()/_load_gitea_
+            # repo_map() already establish -- used below, per project, to
+            # populate inst.team.composition.
+            compositions = teams.load_compositions()
             host_on, host_url = False, None
             if HOST_CONTROL_ENABLED:
                 out = host_run("status").splitlines()
@@ -3255,7 +3479,52 @@ class Handler(BaseHTTPRequestHandler):
                               {"running": "running", "blocked_ask_user": "blocked",
                                "escalated_max_rounds": "blocked", "finished": "finished",
                                "error": "error", "stopped": "idle"}.get(run["status"], "idle"))
-                inst["team"] = {"status": team_status, "run_id": run["run_id"] if run else None}
+                # Roster & composition UI (backlog item 6e, docs/spec.md) --
+                # what the picker pre-selects: the saved composition if one
+                # exists, else default_team_composition()'s own pick if it
+                # can produce one, else None (no roster member at all can
+                # lead). Only meaningful when status=="idle" but cheap
+                # enough to compute unconditionally, consistent with
+                # team's own existing "always present" treatment.
+                saved_comp = compositions.get(n)
+                if saved_comp is not None:
+                    composition = {"lead": saved_comp["lead"], "members": saved_comp["members"]}
+                else:
+                    default_comp = teams.default_team_composition()
+                    if default_comp["ok"]:
+                        composition = {"lead": default_comp["lead"], "members": default_comp["members"]}
+                    elif roster:
+                        # Reviewer fix (2026-08-14): default_team_composition()
+                        # refuses for three distinct reasons -- an empty
+                        # roster, a single already-picked-lead engine with
+                        # nothing left to delegate to, or (the case this
+                        # branch exists for) a roster that's real but
+                        # tier-3-only, which 6d part 2 settled must never be
+                        # auto-picked as the DEFAULT lead. Collapsing all
+                        # three into composition=None broke this sub-spec's
+                        # own headline acceptance criterion for the third
+                        # case: the frontend's `composition === null` check
+                        # can't tell "nothing to show" apart from "something
+                        # real exists, just not an automatic pick", so it
+                        # rendered a permanently-disabled Start button with
+                        # no way to ever open the picker for a tier-3-only
+                        # roster with no saved composition yet. `roster`
+                        # (this same /status call's own top-level list,
+                        # computed once above) is the authoritative "does a
+                        # real, pickable member exist at all" signal --
+                        # independent of whether the automatic default could
+                        # use one. When it's non-empty, the picker must still
+                        # be openable, so composition is a real (non-None)
+                        # object with nothing pre-selected -- `lead: None`
+                        # mirrors docs/design.md's own "Choose a lead..."
+                        # empty-select default, letting the operator pick
+                        # explicitly instead of the automatic default that
+                        # just declined to.
+                        composition = {"lead": None, "members": []}
+                    else:
+                        composition = None
+                inst["team"] = {"status": team_status, "run_id": run["run_id"] if run else None,
+                                "composition": composition}
                 sync_entry = gitea_sync_by_name.get(n)
                 if sync_entry is not None:
                     inst["gitea_sync"] = {"state": sync_entry.get("sync_state"),
@@ -3272,6 +3541,7 @@ class Handler(BaseHTTPRequestHandler):
                 instances.append(inst)
             self._json({"instances": instances,
                        "engines": {name: e.label for name, e in engines.items()},
+                       "roster": roster,
                        "host_enabled": HOST_CONTROL_ENABLED, "host_label": HOST_LABEL,
                        "host": host_on, "host_url": host_url,
                        "taiga_enabled": TAIGA_ENABLED, "taiga_label": TAIGA_LABEL,
@@ -3279,6 +3549,22 @@ class Handler(BaseHTTPRequestHandler):
                        "gitea_enabled": GITEA_ENABLED, "gitea_label": GITEA_LABEL,
                        "gitea": gitea_on, "gitea_url": gitea_url})
         else:
+            # Roster & composition UI (backlog item 6e, docs/spec.md) --
+            # GET /projects/<name>/team/grounding, read-only discovery
+            # metadata only (never content/digest/headings, which would
+            # ship a project's full doc text to the browser for what's
+            # meant to be a before-you-start summary, not a viewer). No
+            # TOTP needed, matching /status's own gating -- _authed() only,
+            # already checked above.
+            parts = [unquote(p) for p in self.path.strip("/").split("/")]
+            if len(parts) == 4 and parts[0] == "projects" and parts[2] == "team" and parts[3] == "grounding":
+                name = parts[1]
+                if name not in instance_names():
+                    return self._json({"error": "unknown project"}, 404)
+                g = teams.load_grounding(os.path.join(PROJECTS_DIR, name))
+                files = [{"label": f["label"], "relpath": f["relpath"], "byte_count": f["byte_count"]}
+                        for f in g["files"]]
+                return self._json({"files": files, "skipped": g["skipped"]})
             self.send_response(404)
             self.end_headers()
 
@@ -3386,21 +3672,47 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": status == 200, "message": msg}, status)
         elif parts[0] == "projects" and len(parts) == 4 and parts[2] == "team" and parts[3] == "start":
             # Team session lifecycle, part 2a (backlog item 6d, docs/spec.md
-            # §5) -- default composition only (no lead/member picker, 6e's
-            # job). Zero new privileged surface: launch_team()/team_run()
-            # already route every RUN_USER-crossing operation through the
-            # existing TMUX constant (part 1, unchanged).
+            # §5) plus roster & composition UI (backlog item 6e) -- body
+            # gains two OPTIONAL keys, lead/members. Zero new privileged
+            # surface: launch_team()/team_run() already route every
+            # RUN_USER-crossing operation through the existing TMUX constant
+            # (part 1, unchanged).
             name = parts[1]
             if name not in instance_names():
                 return self._json({"error": "unknown project"}, 404)
             task = (body.get("task") or "").strip()
             if not task:
                 return self._json({"error": "a task description is required"}, 400)
-            comp = teams.default_team_composition()
-            if not comp["ok"]:
-                return self._json({"error": comp["error"]}, 400)
+            if "lead" in body and "members" in body:
+                # A submitted composition -- validated, then saved as a side
+                # effect of a validated start REGARDLESS of whether
+                # launch_team() itself later succeeds (docs/spec.md: "a
+                # dirty-tree/session-collision failure below shouldn't
+                # discard the user's picker choice"). Never falls back to
+                # default_team_composition() on a validation failure -- a
+                # user who picked X should either get X or a clear reason
+                # they can't, not a different Y they didn't choose.
+                lead_in, members_in = body["lead"], body["members"]
+                err = teams.validate_composition(lead_in, members_in)
+                if err:
+                    return self._json({"error": err}, 400)
+                teams.save_composition(name, lead_in, members_in)
+                # validate_composition() already confirmed lead_in matches a
+                # real roster() entry by (kind, name) -- re-derive its tier
+                # live rather than trust a client-submitted one (roster() is
+                # the only source of truth for tier, same discipline
+                # save_composition() itself applies to persisted state).
+                roster_entry = next(e for e in teams.roster()
+                                    if e["kind"] == lead_in["kind"] and e["name"] == lead_in["name"])
+                lead = {"kind": lead_in["kind"], "name": lead_in["name"], "tier": roster_entry["tier"]}
+                members = [m["name"] for m in members_in]
+            else:
+                comp = teams.default_team_composition()
+                if not comp["ok"]:
+                    return self._json({"error": comp["error"]}, 400)
+                lead, members = comp["lead"], comp["members"]
             workdir = os.path.join(PROJECTS_DIR, name)
-            result = teams.launch_team(workdir, task, comp["lead"], comp["members"])
+            result = teams.launch_team(workdir, task, lead, members)
             if not result["ok"]:
                 return self._json({"error": result["error"]}, 400)
             cancel_event = threading.Event()
@@ -3409,7 +3721,7 @@ class Handler(BaseHTTPRequestHandler):
             _team_threads_set(name, {"run_id": result["run_id"], "thread": t, "cancel_event": cancel_event})
             t.start()
             self._json({"ok": True, "run_id": result["run_id"], "session": result["session"],
-                       "lead": comp["lead"], "members": comp["members"]})
+                       "lead": lead, "members": members})
         elif parts[0] == "projects" and len(parts) == 4 and parts[2] == "team" and parts[3] == "stop":
             # Restart-safe by construction: re-derived from run.json via
             # latest_run_for_project(), never dependent on _team_threads

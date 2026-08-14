@@ -188,15 +188,16 @@ async function tick() {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
-function statusWith(instances) {
+function statusWith(instances, roster) {
   return {
     instances,
     engines: {},
+    roster: roster || [],
     host_enabled: false, taiga_enabled: false, gitea_enabled: false,
   };
 }
 
-async function setupCase(instances) {
+async function setupCase(instances, roster) {
   const c = createCase();
   // Drain the script's own unawaited bootstrap refresh() call at load time.
   c.resolveFetch((f) => f.url === '/status', 200, statusWith([]));
@@ -204,9 +205,46 @@ async function setupCase(instances) {
   await tick();
   // Now do the real refresh() this test actually wants to assert against.
   const p = c.call('refresh');
-  c.resolveFetch((f) => f.url === '/status', 200, statusWith(instances));
+  c.resolveFetch((f) => f.url === '/status', 200, statusWith(instances, roster));
   await p;
   return c;
+}
+
+// toggleTeamPicker()/fetchTeamGrounding()/refresh() form a fire-and-forget
+// async chain (toggleTeamPicker() itself is not async, so there is no
+// single promise a caller can await through to the end) -- polls with
+// tick() until a matching fetch actually shows up in pendingFetches,
+// rather than guessing a fixed number of microtask ticks deep enough to
+// reach it.
+async function waitForFetch(c, matchFn, maxTicks) {
+  const limit = maxTicks || 20;
+  for (let i = 0; i < limit; i++) {
+    if (c.pendingFetches.some(matchFn)) return;
+    await tick();
+  }
+  throw new Error('waitForFetch: timed out. Pending URLs: [' + c.pendingFetches.map((f) => f.url).join(', ') + ']');
+}
+
+// Opens the composition picker for `name` -- drains toggleTeamPicker()'s own
+// grounding fetch + refresh() cycle (docs/design.md: "Roster and grounding
+// are fetched on picker open"), so callers land with the picker already
+// rendered and ready to assert against, exactly like setupCase() itself
+// does for the initial /status poll.
+async function openPicker(c, name, instances, roster, grounding) {
+  c.call('toggleTeamPicker', name);
+  await waitForFetch(c, (f) => f.url === '/projects/' + name + '/team/grounding');
+  c.resolveFetch((f) => f.url === '/projects/' + name + '/team/grounding', 200,
+    grounding || { files: [], skipped: [] });
+  await waitForFetch(c, (f) => f.url === '/status');
+  c.resolveFetch((f) => f.url === '/status', 200, statusWith(instances, roster));
+  await tick();
+  await tick();
+  await tick();
+}
+
+function rosterEntry(overrides) {
+  return Object.assign({ name: 'e', kind: 'engine', label: 'E', tier: 2, delegate_capable: true,
+                        schema_flag_error: null }, overrides || {});
 }
 
 const tests = [];
@@ -451,6 +489,227 @@ test('a 428 mid-stop shows the code overlay labeled for this team stop', async (
   await tick();
   const label = c.elements.get('code-overlay-label');
   assert.strictEqual(label.textContent, 'Stopping team: proj');
+});
+
+// ─── Roster & composition UI (backlog item 6e, docs/design.md) ────────────
+
+test('a composition present renders a "Configure team..." link, no picker panel yet', async () => {
+  const roster = [rosterEntry({ name: 'lead2', tier: 2 }), rosterEntry({ name: 'helper', tier: 2 })];
+  const comp = { lead: { kind: 'engine', name: 'lead2' }, members: ['helper'] };
+  const c = await setupCase([inst('proj', { status: 'idle', run_id: null, composition: comp })], roster);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('Configure team...'), 'expected the configure link, got: ' + html);
+  assert.ok(!html.includes('team-lead-proj'), 'the picker itself must not render before it is opened');
+});
+
+test('composition === null (no usable roster member) shows the refusal text, omits the configure link, disables Start', async () => {
+  const c = await setupCase([inst('proj', { status: 'idle', run_id: null, composition: null })]);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('No roster members available'), 'expected the refusal text, got: ' + html);
+  assert.ok(!html.includes('Configure team...'), 'no configure link when there is no usable composition at all');
+  const startBtnHtml = html.slice(html.indexOf('id="start-btn-proj"'), html.indexOf('</button>'));
+  assert.ok(startBtnHtml.includes('disabled'), 'expected the rendered Start button to be disabled, got: ' + startBtnHtml);
+});
+
+test('opening the picker fetches grounding and renders every roster member as a lead option', async () => {
+  const roster = [rosterEntry({ name: 'lead2', tier: 2 }), rosterEntry({ name: 'helper', tier: 2 })];
+  const comp = { lead: { kind: 'engine', name: 'lead2' }, members: ['helper'] };
+  const instances = [inst('proj', { status: 'idle', run_id: null, composition: comp })];
+  const c = await setupCase(instances, roster);
+  await openPicker(c, 'proj', instances, roster);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('id="team-lead-proj"'), 'expected the lead select, got: ' + html);
+  assert.ok(html.includes('lead2'), 'expected lead2 listed as a lead option');
+  assert.ok(html.includes('helper'), 'expected helper listed as a lead option');
+  assert.ok(html.includes('Hide configuration'), 'the configure link toggles to Hide configuration once open');
+});
+
+test('the saved composition pre-selects the lead and excludes it from the teammate checkboxes', async () => {
+  const roster = [rosterEntry({ name: 'lead2', tier: 2 }), rosterEntry({ name: 'helper', tier: 2 }),
+                  rosterEntry({ name: 'other', tier: 2 })];
+  const comp = { lead: { kind: 'engine', name: 'lead2' }, members: ['helper'] };
+  const instances = [inst('proj', { status: 'idle', run_id: null, composition: comp })];
+  const c = await setupCase(instances, roster);
+  await openPicker(c, 'proj', instances, roster);
+  const html = c.instanceRowHtml('proj');
+  const leadSelect = html.slice(html.indexOf('id="team-lead-proj"'));
+  assert.ok(/value='[^']*"lead2"[^']*'\s+selected/.test(leadSelect), 'expected lead2 pre-selected, got: ' + leadSelect);
+  assert.ok(!html.includes('team-mate-proj-lead2'), 'the current lead must be excluded from the teammate checkboxes');
+  assert.ok(html.includes('team-mate-proj-helper'));
+  assert.ok(html.includes('team-mate-proj-other'));
+});
+
+test('a tier-3 lead shows the plain-language reliability caveat, never blocked', async () => {
+  const roster = [rosterEntry({ name: 'prose3', tier: 3 }), rosterEntry({ name: 'helper', tier: 2 })];
+  const comp = { lead: { kind: 'engine', name: 'prose3' }, members: ['helper'] };
+  const instances = [inst('proj', { status: 'idle', run_id: null, composition: comp })];
+  const c = await setupCase(instances, roster);
+  await openPicker(c, 'proj', instances, roster);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('team-tier-3-caveat'), 'expected the tier-3 caveat, got: ' + html);
+  assert.ok(html.includes('reliability is lower'));
+  // Tier 3 is a real option, never blocked -- Start must not be disabled
+  // purely because of the lead's tier (empty task is a separate reason).
+  c.taskEl('proj').value = 'do it';
+  assert.strictEqual(c.call('teamCompositionError', 'proj'), null);
+});
+
+// Regression test for the reviewer-found defect (docs/implementation.md's
+// "6e fix" cycle): a roster that is real but tier-3-only, with NO saved
+// composition yet, is the one case `default_team_composition()` refuses
+// for a reason OTHER than "nothing usable at all" -- 6d part 2 settled
+// that the automatic default never auto-picks a tier-3 lead. Before the
+// fix, GET /status collapsed this into composition=null, indistinguishable
+// from a genuinely empty roster, which permanently disabled the Start
+// button with no way to ever open the picker. The fix makes /status send
+// composition={lead: null, members: []} (nothing pre-selected) whenever
+// roster() is non-empty, even when the automatic default declined to pick
+// one -- this test drives that exact shape through teamRow()/
+// renderTeamPicker(), the same technique the tier-3-caveat test above
+// uses, to prove the picker actually opens and tier-3 is selectable, not
+// disabled.
+test('a tier-3-only roster with no saved composition still shows a Configure link (not the permanent refusal), and the picker opens with tier-3 selectable', async () => {
+  const roster = [rosterEntry({ name: 'prose3', tier: 3 })];
+  // What GET /status now sends for this exact case (app/app.py's fix):
+  // a real, non-null composition object with nothing pre-selected, rather
+  // than composition=null.
+  const comp = { lead: null, members: [] };
+  const instances = [inst('proj', { status: 'idle', run_id: null, composition: comp })];
+  const c = await setupCase(instances, roster);
+  const closedHtml = c.instanceRowHtml('proj');
+  assert.ok(closedHtml.includes('Configure team...'),
+    'expected the Configure link to render (a real roster member exists), got: ' + closedHtml);
+  assert.ok(!closedHtml.includes('No roster members available'),
+    'must not render the permanent-refusal state when a real tier-3 roster member exists, got: ' + closedHtml);
+
+  await openPicker(c, 'proj', instances, roster);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('id="team-lead-proj"'), 'expected the lead select to render, got: ' + html);
+  const leadSelect = html.slice(html.indexOf('id="team-lead-proj"'), html.indexOf('</select>'));
+  assert.ok(leadSelect.includes('prose3'), 'expected the tier-3 engine listed as a selectable lead option');
+  assert.ok(!leadSelect.includes('disabled'), 'the tier-3 lead option must not be disabled -- never blocked');
+
+  // Actually selecting it succeeds -- never blocked.
+  c.taskEl('proj').value = 'do it';
+  const sel = c.sandbox.document.getElementById('team-lead-proj');
+  sel.value = JSON.stringify({ kind: 'engine', name: 'prose3' });
+  c.call('onTeamLeadChange', 'proj');
+  await tick();
+  assert.strictEqual(c.call('teamCompositionError', 'proj'), 'At least one teammate is required',
+    'lead selection itself must succeed (only the separate empty-teammates rule blocks Start here)');
+});
+
+test('the Ollama roster entry (not delegate_capable) is never offered as a teammate checkbox', async () => {
+  const roster = [rosterEntry({ name: 'qwen3:8b', kind: 'ollama', tier: 1, delegate_capable: false,
+                                schema_flag_error: undefined }),
+                  rosterEntry({ name: 'helper', tier: 2 })];
+  const comp = { lead: { kind: 'ollama', name: 'qwen3:8b' }, members: ['helper'] };
+  const instances = [inst('proj', { status: 'idle', run_id: null, composition: comp })];
+  const c = await setupCase(instances, roster);
+  await openPicker(c, 'proj', instances, roster);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(!html.includes('team-mate-proj-qwen3:8b'), 'Ollama must never appear as a teammate checkbox');
+});
+
+test('grounding files render as a fixed four-slot checklist, an absent file marked not found', async () => {
+  const roster = [rosterEntry({ name: 'lead2', tier: 2 }), rosterEntry({ name: 'helper', tier: 2 })];
+  const comp = { lead: { kind: 'engine', name: 'lead2' }, members: ['helper'] };
+  const instances = [inst('proj', { status: 'idle', run_id: null, composition: comp })];
+  const c = await setupCase(instances, roster);
+  await openPicker(c, 'proj', instances, roster, {
+    files: [{ label: 'docs/BACKLOG.md', relpath: 'docs/BACKLOG.md', byte_count: 500 }],
+    skipped: [],
+  });
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('✓ docs/BACKLOG.md'), 'expected the found file, got: ' + html);
+  assert.ok(html.includes('✗ docs/ARCHITECTURE.md') && html.includes('not found'),
+    'expected the ABSENT file to be explicitly shown, not silently omitted, got: ' + html);
+  assert.ok(html.includes('✗ README.md'));
+});
+
+test('deselecting the teammate down to zero shows the client-side validation error and disables Start', async () => {
+  const roster = [rosterEntry({ name: 'lead2', tier: 2 }), rosterEntry({ name: 'helper', tier: 2 })];
+  const comp = { lead: { kind: 'engine', name: 'lead2' }, members: ['helper'] };
+  const instances = [inst('proj', { status: 'idle', run_id: null, composition: comp })];
+  const c = await setupCase(instances, roster);
+  await openPicker(c, 'proj', instances, roster);
+  c.taskEl('proj').value = 'do it';
+
+  c.call('onTeamMateToggle', 'proj', 'helper', false);
+  await waitForFetch(c, (f) => f.url === '/status');
+  c.resolveFetch((f) => f.url === '/status', 200, statusWith(instances, roster));
+  await tick();
+  await tick();
+
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('At least one teammate is required'), 'expected the validation error, got: ' + html);
+  const startBtnHtml = html.slice(html.indexOf('id="start-btn-proj"'), html.indexOf('</button>'));
+  assert.ok(startBtnHtml.includes('disabled'), 'expected the rendered Start button to be disabled, got: ' + startBtnHtml);
+});
+
+test('clicking Start with a valid open composition dispatches POST with {task, lead, members}', async () => {
+  const roster = [rosterEntry({ name: 'lead2', tier: 2 }), rosterEntry({ name: 'helper', tier: 2 })];
+  const comp = { lead: { kind: 'engine', name: 'lead2' }, members: ['helper'] };
+  const instances = [inst('proj', { status: 'idle', run_id: null, composition: comp })];
+  const c = await setupCase(instances, roster);
+  await openPicker(c, 'proj', instances, roster);
+  c.taskEl('proj').value = 'do it';
+
+  const p = c.call('doTeamStart', 'proj');
+  await tick();
+  assert.strictEqual(c.pendingFetches.length, 1);
+  const body = JSON.parse(c.pendingFetches[0].opts.body);
+  assert.strictEqual(body.task, 'do it');
+  assert.deepStrictEqual(body.lead, { kind: 'engine', name: 'lead2' });
+  assert.deepStrictEqual(body.members, [{ kind: 'engine', name: 'helper' }]);
+  c.resolveFetch((f) => f.url === '/projects/proj/team/start', 200,
+    { ok: true, run_id: 'run-x', session: 'team-proj', lead: comp.lead, members: comp.members });
+  await p;
+});
+
+test('clicking Start with the picker closed omits lead/members entirely (unchanged 6d default-composition body)', async () => {
+  const roster = [rosterEntry({ name: 'lead2', tier: 2 }), rosterEntry({ name: 'helper', tier: 2 })];
+  const comp = { lead: { kind: 'engine', name: 'lead2' }, members: ['helper'] };
+  const instances = [inst('proj', { status: 'idle', run_id: null, composition: comp })];
+  const c = await setupCase(instances, roster);
+  c.taskEl('proj').value = 'do it';
+
+  const p = c.call('doTeamStart', 'proj');
+  await tick();
+  const body = JSON.parse(c.pendingFetches[0].opts.body);
+  assert.strictEqual(body.task, 'do it');
+  assert.strictEqual(body.lead, undefined);
+  assert.strictEqual(body.members, undefined);
+  c.resolveFetch((f) => f.url === '/projects/proj/team/start', 200,
+    { ok: true, run_id: 'run-x', session: 'team-proj', lead: comp.lead, members: comp.members });
+  await p;
+});
+
+test('clicking Start while the open picker composition is invalid sends no request and shows the reason', async () => {
+  const roster = [rosterEntry({ name: 'lead2', tier: 2 }), rosterEntry({ name: 'helper', tier: 2 })];
+  // No saved composition and no default -- picker opened with nothing
+  // pre-selected (an edge case the operator could still reach by clearing
+  // the lead select back to "Choose a lead...").
+  const instances = [inst('proj', { status: 'idle', run_id: null, composition: null })];
+  // composition is null so no Configure link would normally render -- this
+  // test instead exercises teamCompositionError()/doTeamStart() directly
+  // against a manually-opened, manually-invalidated picker state, the
+  // same "call the exported function directly, no renderer needed"
+  // technique this file's own header describes.
+  const c = await setupCase(instances, roster);
+  c.call('toggleTeamPicker', 'proj');
+  await tick();
+  c.resolveFetch((f) => f.url === '/projects/proj/team/grounding', 200, { files: [], skipped: [] });
+  await tick();
+  c.resolveFetch((f) => f.url === '/status', 200, statusWith(instances, roster));
+  await tick();
+  c.taskEl('proj').value = 'do it';
+
+  c.call('doTeamStart', 'proj');
+  await tick();
+  assert.strictEqual(c.pendingFetches.length, 0, 'no fetch should have been dispatched');
+  assert.strictEqual(c.msgEl('proj').textContent, 'Lead is required');
+  assert.ok(c.msgEl('proj').className.includes('error'));
 });
 
 // ─── run ────────────────────────────────────────────────────────────────

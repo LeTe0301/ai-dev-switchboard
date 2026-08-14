@@ -1873,6 +1873,106 @@ def default_team_composition() -> dict:
     return {"ok": True, "lead": lead, "members": members}
 
 
+def validate_composition(lead: dict, members: list) -> str:
+    """
+    None if valid, else a human-readable reason (docs/spec.md 6e "Proposed
+    approach" §1). Built on roster() (called once internally, the source of
+    truth for tier/delegate_capable/schema_flag_error), not on
+    load_engines() directly -- same reasoning default_team_composition()
+    already established.
+
+    `lead`/`members` are the raw wire-format objects a POST body carries
+    (docs/design.md "API shape for composition in JSON"): `lead` is
+    {"kind": "engine"|"ollama", "name": str}, each `members` entry is
+    {"kind": "engine", "name": str} -- only "name" is actually read off a
+    member entry (its own declared "kind" is never trusted; a member only
+    ever matches a roster entry looked up by kind=="engine" specifically,
+    which is also what keeps the Ollama entry, if any, from ever being
+    accepted as a teammate -- it is never delegate_capable).
+    """
+    if not isinstance(lead, dict) or lead.get("kind") not in ("engine", "ollama") or not lead.get("name"):
+        return "Lead is required"
+    lead_kind, lead_name = lead["kind"], lead["name"]
+
+    entries = roster()
+    by_key = {(e["kind"], e["name"]): e for e in entries}
+    lead_entry = by_key.get((lead_kind, lead_name))
+    if lead_entry is None:
+        return f"Unknown lead: {lead_name}"
+    # Same tier-2-only schema-flag protection _cli_team_start() already
+    # gives, now shared -- a tier-3 lead has no schema flag to be wrong
+    # about, so this never applies to one.
+    if lead_entry["tier"] == 2 and lead_entry.get("schema_flag_error"):
+        return (f"lead engine '{lead_name}' is misconfigured for tier-2 use: "
+                f"{lead_entry['schema_flag_error']}")
+
+    if not isinstance(members, list) or not members:
+        return "At least one teammate is required"
+    names = []
+    for m in members:
+        name = m.get("name") if isinstance(m, dict) else None
+        if not name:
+            return "At least one teammate is required"
+        names.append(name)
+    if len(set(names)) != len(names):
+        return "Teammate list contains duplicates"
+    if lead_name in names:
+        return "Lead cannot also be a teammate"
+    for name in names:
+        member_entry = by_key.get(("engine", name))
+        if member_entry is None:
+            return f"Unknown teammate: {name}"
+        if not member_entry.get("delegate_capable"):
+            return f"Teammate {name} is not delegate-capable"
+    return None
+
+
+def _compositions_path() -> str:
+    return os.path.join(TEAM_STATE_DIR, "compositions.json")
+
+
+def load_compositions() -> dict:
+    """{project_name: {"lead": {"kind", "name"}, "members": [str, ...],
+    "saved_at": iso}}. Same missing/corrupt-file tolerance as app.py's own
+    _load_desc_cache() -- never a 500, just an empty dict (docs/spec.md
+    "Edge cases": 'compositions.json missing or corrupt')."""
+    try:
+        with open(_compositions_path()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_composition(project_name: str, lead: dict, members: list) -> None:
+    """
+    Upserts one project's composition, atomic write via .tmp + os.replace()
+    (same convention app.py's own _save_desc_cache() and this module's own
+    _persist() already use). `lead`/`members` are the raw wire-format
+    objects (see validate_composition()'s own docstring) -- ONLY validated
+    values ever reach here (docs/spec.md "saved on successful validation").
+
+    Stores only kind+name for lead, never tier/schema_flag_error -- those
+    are always re-derived live from roster() at read time, so a later
+    engines.d edit can't leave a stale tier displayed or trusted. Members
+    are stored as a plain list of names, the same shape
+    default_team_composition() already returns -- the only valid `kind` a
+    member can have is "engine" (delegate_capable is Ollama-exclusionary by
+    construction), so nothing is lost by dropping it.
+    """
+    path = _compositions_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    compositions = load_compositions()
+    compositions[project_name] = {
+        "lead": {"kind": lead["kind"], "name": lead["name"]},
+        "members": [m["name"] for m in members],
+        "saved_at": _now_iso(),
+    }
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(compositions, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
 # ─── the four-tool schema (reused verbatim in shape from
 # scripts/spike-lead-toolcalling.py, docs/spec.md §4) -- the one deliberate
 # change from the spike's own throwaway harness is that delegate.agent's
