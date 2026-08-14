@@ -673,19 +673,30 @@ headings). Two non-blocking follow-ups recorded as `docs/BACKLOG.md` item
   backlog, not pulled forward — unrelated to part 2's UI, a server-side
   hardening item for a future cycle.
 
-**Part 1b — fix the stale-transcript race (item 11(a))**, its own small
-bugfix cycle sequenced between part 1 and part 2: `docs/spec.md` currently
-holds this cycle's spec. Single-function fix in
-`teams.resolve_ask_user()` (reorder `_append_history()` to after the
-`os.replace()` win/lose decision), skips ux-designer (no UI surface,
-same as part 1), reuses the deterministic hook-based repro technique
-already established in `tests/test_team_routes.py`
-(`test_loser_whose_exists_check_lands_after_winner_already_renamed_does_not_report_ok`).
-Part 2 (the Teams page itself) gets its own spec once part 1b is
-reviewer-approved -- the archaeology for it (single-page-app structure,
-exact route contracts, where in `teamRow()` the feed belongs) is already
-captured in this spec's own "Note for the next product-manager iteration"
-section, so that pass should reuse it rather than re-deriving it.
+**Part 1b status: done** (reviewer-approved, commit `68dc968`). Fixed the
+stale-transcript race (item 11(a)): `resolve_ask_user()` was calling
+`_append_history()` -- which writes `transcript.jsonl` synchronously, with
+no rollback -- BEFORE the `os.replace()` call that decides win/lose on a
+concurrent resolve, so a losing double-submit permanently left a spurious
+`ask_user_resolved` entry in the transcript. Fixed by moving that call to
+after the `os.replace()` win/lose decision, so only the winner's answer is
+ever recorded; skipped ux-designer (no UI surface, same as part 1); reused
+the deterministic hook-based repro technique already established in
+`tests/test_team_routes.py`
+(`test_loser_whose_exists_check_lands_after_winner_already_renamed_does_not_report_ok`)
+for the new regression test. No carried-forward items -- a small,
+single-function, fully-diagnosed fix with no new findings.
+
+**Part 2 (the Teams page itself)** -- spec in progress: `docs/spec.md`.
+The archaeology for it (single-page-app structure, exact route contracts,
+where in `teamRow()` the feed belongs) was captured verbatim in part 1b's
+own spec (preserved in git history at commit `e0e52c4`) and is reused
+directly rather than re-derived. This is the last sub-spec of the story --
+once part 2 is reviewer-approved and its own end-to-end pass is clean, the
+story's core build (6a-6f) is substantially complete, modulo the two
+non-blocking carried-forward items already recorded above (BACKLOG items
+10 and 11(b)) and the open questions in §7 below, none of which block
+shipping.
 
 ---
 
