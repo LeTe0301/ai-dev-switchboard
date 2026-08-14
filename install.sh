@@ -212,6 +212,7 @@ fi
 
 echo "-- App + engines --"
 cp "$REPO_DIR/app/app.py" "$INSTALL_DIR/app.py"
+cp "$REPO_DIR/app/teams.py" "$INSTALL_DIR/teams.py"
 mkdir -p "$CONFIG_DIR/engines.d"
 for f in "$REPO_DIR"/engines.d/*.engine; do
     [ -e "$f" ] || continue

@@ -1,309 +1,258 @@
-# Design: Upload wizard polish (backlog item 3's deferred follow-ups)
+# Design: Minimal per-project team control (sub-spec 6d part 2a)
 
 ## Summary
+A single-row team control rendered inline on each project row, positioned after the deploy row, with two visual modes: an idle state showing a task-text input and "Start team" button, and a running state showing a coarse status label (idle/running/blocked/finished/error) and "Stop team" button. Error messages (tier-3-only refusal, missing roster members) display inline in the same row, following the `deploy` row's messaging pattern. No new visual language — all styling and typography reuse the existing page conventions.
 
-Visual and configuration polish on the existing upload wizard (shipped commit `893840c`, 2026-08-12), addressing three small deferred items: restyle step 5's single/split radio choice as pill buttons per the original design intent, only render "Back" in the ambiguous case where there's something to go back and change, and wire `UPLOAD_MAX_ENTRIES` to `switchboard.env` so operators can tune it without modifying Python.
+## ui-ux-pro-max choices
+- **Style**: Inline row control, following the existing `deployRow()` pattern (not the checkbox-toggle, since team start requires a task text input, not a boolean flip)
+- **Palette**: Reuses existing page token set; no new colors introduced
+- **Typography**: Existing body/label sizes; no new typefaces
+- **Relevant UX guidelines applied**:
+  - Button disabled state when input is empty (client-side hint; server-side validation is authoritative)
+  - Clear, actionable error messages naming the two concrete fixes (for tier-3-only refusal)
+  - Status labels are coarse and polled, designed to tolerate staleness up to one poll interval (~4 seconds)
+  - Confirmation dialog on Stop (destructive action: kills processes, tears down worktrees, may discard in-flight work)
 
----
+## Component reuse
+- **Reused**: Existing HTML/JS patterns from `deployRow()` and `doDeploy()` — inline row rendering, direct `fetch()` POST plumbing, inline result message slot, existing TOTP code-overlay machinery for confirmation (via `toggle()`/`handleActionResult()`)
+- **Reused**: Existing `/status` poll (every 4 seconds, unchanged) — no new timer; team row updates from the existing `team` field added to the per-instance status dict
+- **New (none)**: No new component, no new library. Plain HTML/CSS/JS matching the page's embedded script.
 
-## Visual design
+## States
 
-### Wireframe: Step 5 choice styling
-
-**Ambiguous case (two projects detected, choice required):**
-
-```
-Detected structure:
-📁 my-project (root)
-  has .git
-  2 nested repos inside
-
-Legend: How would you like to register it?
-
-┌──────────────────────────────────┐  ┌──────────────────────────────────┐
-│ ● Single project (keep all...)   │  │   Split out nested repos:        │
-│   (pill-styled, checked=green)   │  │   (pill-styled, unchecked=gray)  │
-└──────────────────────────────────┘  └──────────────────────────────────┘
-
-Split candidates:
-☑ vendor/repo-1
-☐ vendor/repo-2
-(regular checkboxes for split selection, unchanged)
-
-[Back <]  [Confirm >]
-```
-
-**Unambiguous case (one project detected, no choice needed):**
+### Idle
+Rendered when `team.status === "idle"` or team is `null` (no run ever started for this project):
 
 ```
-Detected structure:
-📁 my-project (root)
-  no .git
-  3 subfolders
-
-✓ One project to register: "my-project"
-
-(No Back button, only Confirm)
-
-                      [Confirm >]
+┌─────────────────────────────────────────────────────────┐
+│ Team                                                    │
+│                                                         │
+│ <textarea id="task-<name>" placeholder="Task description...">   │
+│ </textarea>                                             │
+│                                                         │
+│ <button onclick="doTeamStart('<name>')"  [disabled] >  │
+│   Start team                                            │
+│ </button>                                               │
+└─────────────────────────────────────────────────────────┘
 ```
 
----
+**Styling**: Single row. Label "Team" in the row header (consistent with other rows on the page). Textarea is full-width, single column layout, placeholder text "Task description...". Button "Start team" appears below the textarea, styled to match other action buttons on the page (same class/styling as "Deploy" button). Button is **disabled** (greyed out, `disabled` attribute set) while textarea is empty (client-side validation only; empty task will fail with a 400 server-side if somehow submitted anyway). Button text is exactly "Start team".
 
-## Component reuse and styling
+**Copy**: 
+- Textarea placeholder: "Task description..."
+- Button label: "Start team"
 
-### Existing `.pill` pattern (reused)
+### Populated / Running
+Rendered when `team.status` is one of: `"running"`, `"blocked"`, `"finished"`, `"error"`:
 
-The app already styles optional choices as pills (`engineRow`'s engine picker, `codeRow`'s VS Code toggle). Step 5's mode choice adopts the same visual treatment:
-
-```css
-.pill {
-  font-size: 13px;
-  padding: 5px 12px;
-  border-radius: 20px;
-  background: #2a2a2a;      /* idle: dark gray */
-  color: #aaa;              /* idle: light gray text */
-  cursor: pointer;
-  user-select: none;
-  border: 1px solid #3a3a3a;
-}
-
-.pill.active {
-  background: #34c759;      /* selected: green */
-  color: #111;              /* selected: dark text */
-  font-weight: 600;
-  border-color: #34c759;
-}
+```
+┌─────────────────────────────────────────────────────────┐
+│ Team                                                    │
+│                                                         │
+│ Status: [running]   ID: run-abc123                     │
+│                                                         │
+│ <button onclick="doTeamStop('<name>')"                 │
+│   Stop team                                             │
+│ </button>                                               │
+└─────────────────────────────────────────────────────────┘
 ```
 
-### New CSS rule: `.wizard-check-row.pill-choice`
+Or, with `team.status === "blocked"`:
 
-For the two mode-choice radio labels only (not the split-candidate checkboxes), add a new class that reapplies pill styling on top of the existing `.wizard-check-row` base:
-
-```css
-.wizard-check-row.pill-choice {
-  /* Override wizard-check-row defaults for this variant */
-  padding: 5px 12px;                    /* match .pill padding */
-  border-radius: 20px;                  /* match .pill border-radius */
-  background: #2a2a2a;                  /* match .pill idle bg */
-  color: #aaa;                          /* match .pill idle text */
-  border: 1px solid #3a3a3a;            /* match .pill border */
-  gap: 8px;                             /* reduce gap from 10px to keep pill compact */
-  margin: 0 4px 0 0;                    /* add small right margin for spacing between pills */
-  display: inline-flex;                 /* stack horizontally instead of full-width blocks */
-}
-
-/* When the underlying radio input is :checked, light up the label */
-.wizard-check-row.pill-choice:has(input:checked) {
-  background: #34c759;                  /* green when selected */
-  color: #111;                          /* dark text when selected */
-  font-weight: 600;
-  border-color: #34c759;
-}
+```
+┌─────────────────────────────────────────────────────────┐
+│ Team                                                    │
+│                                                         │
+│ Status: [blocked]   ID: run-abc123                     │
+│ Lead is waiting for input · check tmux attach           │
+│                                                         │
+│ <button onclick="doTeamStop('<name>')"                 │
+│   Stop team                                             │
+│ </button>                                               │
+└─────────────────────────────────────────────────────────┘
 ```
 
-**CSS `:has()` fallback note:** If `:has()` support needs verification at implementation time, the developer can fall back to a small `onchange` handler that toggles `.active` or a similar class on the label itself. The JS already exists (`setWizardMode()` calls `renderWizard()` anyway), so both approaches are equally viable.
+**Styling**: The textarea is **completely hidden** when status is not idle. Row shows: "Status: [label] ID: run-id". Status label is rendered as inline text, not a badge, but color-coded:
+- `running` → blue/normal text
+- `blocked` → orange/warning color (operator should know to check what's being asked)
+- `finished` → green/success color
+- `error` → red/error color
 
-### Step 5 HTML structure (unchanged underlying semantics)
+Below the status line, when `blocked`, add a subtitle: "Lead is waiting for input · check tmux attach" (encourages operator to use tmux to see the actual question/options).
 
-The two mode-choice radios remain native `<input type="radio" name="wizard-mode">` elements — no bare `<span class="pill">` replacement, keeping keyboard/screen-reader accessibility fully intact. Only the containing `<label>` gets the visual restyle:
+Button "Stop team" appears below, styled to match "Deploy" button styling. Exactly "Stop team", no verb conjugation.
 
-```html
-<!-- BEFORE (current) -->
-<label class="wizard-check-row">
-  <input type="radio" name="wizard-mode" ... onchange="setWizardMode('single')">
-  <span class="info">Single project (keep all together as ...)</span>
-</label>
+**Polling & staleness**: The status label reflects the last `/status` poll result, which runs every 4 seconds. A run that briefly reports `error` before self-correcting (e.g., a restart case) may show `error` for up to one poll interval (~4s) before showing correct status — this is an accepted tradeoff per spec. No visual "stale" warning; the design assumes operators understand that statuses are eventually consistent.
 
-<!-- AFTER (new) -->
-<label class="wizard-check-row pill-choice">    <!-- new class added -->
-  <input type="radio" name="wizard-mode" ... onchange="setWizardMode('single')">
-  <span class="info">Single project (keep all together as ...)</span>
-</label>
+### Error (Failed Start)
+Rendered when a `POST /projects/<name>/team/start` returns 4xx and the operator is shown the error. Two error cases are designed:
+
+**Case 1: Tier-3-only roster refusal**
+```
+┌─────────────────────────────────────────────────────────┐
+│ Team                                                    │
+│                                                         │
+│ <textarea id="task-<name>" placeholder="Task description...">   │
+│ </textarea>                                             │
+│                                                         │
+│ <button onclick="doTeamStart('<name>')">               │
+│   Start team                                            │
+│ </button>                                               │
+│                                                         │
+│ ✕ Error: only a tier-3 (prose-parse, least reliable)  │
+│   lead is available — configure TEAM_LLM_BASE_URL/     │
+│   TEAM_LLM_MODEL, or add a tier-2 (schema-capable)    │
+│   engine to engines.d. The CLI's --lead can still      │
+│   select a tier-3 lead explicitly.                     │
+└─────────────────────────────────────────────────────────┘
 ```
 
-Split-candidate checkboxes (shown only if `wizardState.mode === 'split'`) stay as plain `wizard-check-row` without the `pill-choice` class — they keep the original checkbox styling (dark background, small checkbox widget, full-width row).
-
-### Conditional "Back" button
-
-Step 5 action buttons render conditionally based on `d.ambiguous`:
-
-```js
-function renderStep5Actions(d) {
-  let html = '';
-  if (d.ambiguous) {
-    html += '<button class="secondary" onclick="resetWizardState(); renderWizard();">&lsaquo; Back</button>';
-  }
-  html += '<button class="primary" onclick="proceedToConfirm()">Confirm &rsaquo;</button>';
-  return html;
-}
+**Case 2: No roster members available (e.g., only one engine, it was selected as lead)**
+```
+┌─────────────────────────────────────────────────────────┐
+│ Team                                                    │
+│                                                         │
+│ <textarea id="task-<name>" placeholder="Task description...">   │
+│ </textarea>                                             │
+│                                                         │
+│ <button onclick="doTeamStart('<name>')">               │
+│   Start team                                            │
+│ </button>                                               │
+│                                                         │
+│ ✕ Error: only one headless-eligible engine ('<name>') │
+│   is configured and it was selected as lead — add      │
+│   another engine to engines.d or configure             │
+│   TEAM_LLM_BASE_URL/TEAM_LLM_MODEL to free it up as a  │
+│   teammate.                                             │
+└─────────────────────────────────────────────────────────┘
 ```
 
-**Signature change note:** Function now takes `d` (the `detectResult` object) as a parameter instead of reading it implicitly. Call site changes from `renderStep5Actions()` to `renderStep5Actions(wizardState.detectResult)`.
+**Other errors** (unknown project, missing task, network error during start):
+```
+┌─────────────────────────────────────────────────────────┐
+│ Team                                                    │
+│                                                         │
+│ <textarea id="task-<name>" placeholder="Task description...">   │
+│ </textarea>                                             │
+│                                                         │
+│ <button onclick="doTeamStart('<name>')">               │
+│   Start team                                            │
+│ </button>                                               │
+│                                                         │
+│ ✕ Error: <server error message>                        │
+└─────────────────────────────────────────────────────────┘
+```
 
----
+**Styling & behavior**: 
+- Error messages appear inline in the row, below the button
+- Red text with an error icon (✕ or similar)
+- Message uses the exact text returned from the server (`error` field in 4xx response)
+- Message persists until the next `refresh()` call (4-second poll), similar to deploy message behavior
+- Error does NOT prevent the operator from trying again — textarea and button remain enabled
+- Each start attempt clears the previous error message
 
-## Design decisions and rationale
+### Stop Confirmation Dialog
+When operator clicks "Stop team", a native `confirm()` dialog appears:
 
-### 1. Pill styling for mode choice (visual consistency)
+```
+┌────────────────────────────────────────────────────────────┐
+│ Stop team?                                                 │
+│                                                            │
+│ This will kill any in-flight processes, remove git        │
+│ worktrees, and stop the running session. Any uncommitted  │
+│ work will be lost. Continue?                              │
+│                                                            │
+│         [ Cancel ]              [ OK ]                    │
+└────────────────────────────────────────────────────────────┘
+```
 
-**Decision:** Step 5's single/split mode choice renders as pill-styled elements matching `engineRow` and `codeRow`, not as plain dark checkboxes.
+**Rationale for confirmation**: Stopping a team is destructive (kills processes, tears down worktrees, may discard in-flight work). This matches the `deploy` action's own confirmation pattern, which uses `confirm()` for a deliberate, lightweight confirmation step. The dialog prevents accidental stops on a busy project.
 
-**Rationale:**
-- Original `docs/design.md` at commit `893840c` explicitly called for this visual treatment.
-- Consistent with the app's established pattern for optional/toggleable choices (engine picker, VS Code toggle).
-- Green (#34c759) when selected, dark gray (#2a2a2a) when idle — same palette as the rest of the UI.
-- The backlog note confirms this is a known "visual polish gap," not a new design decision.
+**Exact message** (passed to `confirm()`): `"Stop team? This will kill any in-flight processes, remove git worktrees, and stop the running session. Any uncommitted work will be lost. Continue?"`
 
-### 2. Keep underlying `<input type="radio">` (accessibility)
+If the operator clicks "Cancel", nothing happens — the row stays as-is, status unchanged. If they click "OK", the `doTeamStop()` function proceeds with the same TOTP code-overlay machinery as other destructive actions (`kind='team-stop'`, reusing existing `toggle()`/`handleActionResult()` plumbing).
 
-**Decision:** The pill styling is CSS-only, wrapping the existing native radio inputs. No replacement with bare `<span>` elements.
+### Stop Result Message
+After `/projects/<name>/team/stop` completes:
 
-**Rationale:**
-- Spec explicitly calls for "keeping the underlying `<input type="radio">` for accessibility/keyboard semantics."
-- Screen readers and keyboard navigation (Tab, arrow keys) continue to work unchanged.
-- No regression from today's already-accessible state.
-- Contrasts with `engineRow`/`codeRow` (which use bare `<span class="pill">` with click-only JS), making those mouse-centric — step 5's mode choice is a core form input where keyboard support matters.
+```
+┌─────────────────────────────────────────────────────────┐
+│ Team                                                    │
+│                                                         │
+│ Status: [running]   ID: run-abc123                     │
+│                                                         │
+│ <button onclick="doTeamStop('<name>')"                 │
+│   Stop team                                             │
+│ </button>                                               │
+│                                                         │
+│ ✓ Team stopped successfully                            │
+└─────────────────────────────────────────────────────────┘
+```
 
-### 3. CSS `:has()` for checked-state styling
+**Styling**: Green success message, appears inline below the button, persists until next `refresh()` (like deploy message). The status label itself will update to `idle` on the next `/status` poll (at most 4 seconds later).
 
-**Decision:** Use `label:has(input:checked)` selector to style the label based on the radio's `:checked` state, no additional JS state tracking.
+## Accessibility & platform notes
 
-**Rationale:**
-- Browser support: modern browsers (Chrome 105+, Safari 15.4+, Firefox 121+) all support `:has()`. The app is a modern single-page web app with no explicit legacy-browser support policy.
-- Cleaner than adding a separate `.active` class and toggling it in `onchange` handlers.
-- The browser's own `:checked` state is the source of truth; CSS hooks directly into it.
-- If the developer finds a genuine `:has()` compatibility issue at build time, a simple `onchange` handler on the radio (toggling `.active` on the parent label) is a trivial fallback — spec notes this.
+- **Touch target sizes**: Button "Start team" and "Stop team" follow the page's existing button styling and hit area (minimum 44px on mobile, but this is a desktop web app, so typical 36-40px desktop minimum). Both buttons are keyboard-accessible via tab order and Enter key.
+- **Color contrast** (corrected 2026-08-14, reviewer-found: the analysis below originally assumed a light theme that was never built and the surrounding app's own dark UI, and its arithmetic was wrong in 3 of 5 cases even against that assumed background. This app's real background is `#111` (page body) / `#1c1c1c` (each `.row`, including the team row) — every status color is a token already shipped elsewhere on this page, not a new one invented for this feature. Ratios below are computed against `#1c1c1c`, the actual background the status text sits on, using the standard WCAG relative-luminance formula, not estimated):
+  - Running (`#4da6ff`, the page's own existing link-blue token — see the `a { color: #4da6ff; }` rule): contrast ratio **6.67:1** on `#1c1c1c`, **passes WCAG AA** (4.5:1) for normal text; just under AAA's 7:1 threshold, which this design does not require.
+  - Blocked (`#ffb648`, new — no existing "warning/orange" token was already in use on this page to reuse): contrast ratio **9.77:1** on `#1c1c1c`, **passes WCAG AAA**.
+  - Finished (`#34c759`, the page's own existing success-green token — see `.deploy-msg.success`/`input:checked + .slider`): contrast ratio **7.68:1** on `#1c1c1c`, **passes WCAG AAA**.
+  - Error (`#ff6b6b`, the page's own existing error-red token — see `.deploy-msg.error`/`.taiga-err`/`.gitea-err`): contrast ratio **6.14:1** on `#1c1c1c`, **passes WCAG AA** comfortably (well clear of 4.5:1); no darkening needed, unlike the original (light-theme-assumed) analysis concluded.
+  - Error icon (✕): as a graphical element (non-text), needs 3:1 minimum contrast against its background — `#ff6b6b` on `#1c1c1c` at 6.14:1 clears this with margin.
+  - Error/success message text (`.team-msg.error`/`.team-msg.success`, same `#ff6b6b`/`#34c759` tokens `.deploy-msg` already established): both already meet AA (and AAA) for text at this app's real background, confirmed by the same computation above.
+- **Web vs. native**: This is a web app (HTML/CSS/JS in a Flask template), no native/mobile variant. Desktop-only. No hover states for error messages (they're static text).
+- **Textarea accessibility**: Textarea has a `placeholder` attribute (does not substitute for a label, but this row is already labeled "Team" in the row header, so context is clear). Textarea is keyboard-accessible and screen-reader-visible.
+- **Keyboard interaction**:
+  - Tab into textarea → enter task
+  - Tab to "Start team" button → press Enter to start (button is auto-disabled when textarea is empty)
+  - When team is running, Tab into "Stop team" button → press Enter (confirm() dialog appears)
+- **Status label readability**: The coarse status labels (idle/running/blocked/finished/error) are intentionally short to be glance-readable; detailed diagnostics require `tmux attach`.
 
-### 4. Inline-flex layout for pills (horizontal stacking)
+## Traceability to spec
 
-**Decision:** Two mode-choice pills stack horizontally (side-by-side) on the same line, not full-width rows.
+| Acceptance criterion (from docs/spec.md) | Where it's addressed in this design |
+|---|---|
+| Minimal per-project control with task-text input, Start/Stop buttons, coarse status label | Idle state (textarea + Start button); Running state (status label + Stop button) |
+| Follows the existing `deploy` row rendering pattern, not checkbox-toggle | `teamRow()` function styled after `deployRow()` — single-purpose row, inline render, direct fetch plumbing for Start, toggle()/handleActionResult() for Stop |
+| Tier-3-only roster refuses with actionable error message | Error state shows exact message from server: names both concrete fixes (configure TEAM_LLM_*, or add tier-2 engine) |
+| Task-text input empty state disables Start button | Textarea is validated client-side (disabled button while empty); server-side 400 if somehow empty task is sent |
+| No lead/member picker (6e) | Not designed — default composition only, per `default_team_composition()` in backend |
+| No live event feed, no rendered timeline (6f) | Not designed — status label only; operator uses `tmux attach` to see details (unchanged from part 1) |
+| Blocked state indicates lead is waiting | Status shows "blocked"; subtitle "Lead is waiting for input · check tmux attach" prompts operator action |
+| Status is polled, can be stale | Design tolerates up to 4-second staleness (existing poll interval); restart-error transient is accepted per spec tradeoff |
+| Start spawns processes and creates worktrees | Implicit in backend; UI just shows success/error |
+| Stop kills processes, tears down worktrees | Confirmation dialog warns operator; same pattern as Deploy (confirm() for destructive action) |
+| Error messages are inline in row | Error state shows red text below button; persists until next refresh() |
+| `/status` field `team.status` maps: running/blocked_ask_user/escalated_max_rounds/finished/error/stopped/idle | Mapping in JavaScript: running→"running", blocked_ask_user→"blocked", escalated_max_rounds→"blocked", finished→"finished", error→"error", stopped→"idle", null→"idle" |
+| Server routes POST `/projects/<name>/team/start` and `/projects/<name>/team/stop` exist | `doTeamStart()` calls `fetch()` to `/projects/<name>/team/start` with `{task: ...}` body; `doTeamStop()` uses `toggle(kind='team-stop')` → `actionPath()` routes to `/projects/<name>/team/stop` |
+| TOTP code overlay for destructive actions | Stop button action reuses existing `toggle(kind, name, on, checkboxEl)` and TOTP `handleActionResult()` machinery |
 
-**Rationale:**
-- Both pills fit comfortably on one line in typical form widths.
-- Consistent with how `engineRow` displays multiple engine options (flex, gap, no wrapping).
-- Uses horizontal space efficiently; full-width `.wizard-check-row` blocks would waste space.
-- `display: inline-flex` on the label, `margin-right: 4px` for inter-pill gap.
+## Implementation notes for the developer
 
-### 5. Conditional "Back" button (visual/UX clarity)
+1. **Render function**: Add `teamRow(name, team)` to `app/app.py`'s embedded JavaScript. Called from `row()` when `kind === 'inst'`, after `deployRow()` and `codeRow()`, to maintain consistent row order across all projects.
 
-**Decision:** Render "Back" button only when `d.ambiguous === true`. Unambiguous case shows only "Confirm" button.
+2. **Status mapping**: In `/status` GET handler, map latest run state to coarse label:
+   ```
+   running → "running"
+   blocked_ask_user → "blocked"
+   escalated_max_rounds → "blocked"
+   finished → "finished"
+   error → "error"
+   stopped → "idle"
+   null → "idle"
+   ```
 
-**Rationale:**
-- Original design.md wireframe explicitly showed two states:
-  - Sub-case A (unambiguous): `[ Confirm > ]` only.
-  - Sub-cases B/C (ambiguous): `[ Back < ]  [ Confirm > ]`.
-- The unambiguous case has no choice to go back and unmake (the wizard detected exactly one project, no alternate mode to select).
-- Cleaner UI: removes a non-functional "Back" button that would reset the whole wizard, when there's nothing to reconsider in step 5 itself.
-- The wizard's own modal-level close/X control (unchanged) still lets users abandon at any time.
+3. **Textarea ID and message slot ID**: `id="task-<name>"` for textarea; `id="team-msg-<name>"` for error/success message slot (follows deploy-msg pattern).
 
-### 6. Function signature: `renderStep5Actions(d)` instead of `renderStep5Actions()`
+4. **Error message slot**: Always rendered (empty initially), filled by `doTeamStart()` or the response handler.
 
-**Decision:** Pass `wizardState.detectResult` explicitly to `renderStep5Actions()` so it can check `d.ambiguous` and conditionally render "Back".
+5. **Confirmation message exact text** (for `confirm()` in `doTeamStop()`): "Stop team? This will kill any in-flight processes, remove git worktrees, and stop the running session. Any uncommitted work will be lost. Continue?"
 
-**Rationale:**
-- Matches the pattern `renderStep5()` already uses (receives `d` as a local variable from `wizardState.detectResult`).
-- Cleaner than having `renderStep5Actions()` reach into global `wizardState` itself.
-- Single call site (around line 2590-ish in the existing wizard-render chain) changes from `renderStep5Actions()` to `renderStep5Actions(wizardState.detectResult)` — straightforward.
+6. **Client-side start validation**: Textarea empty check before `doTeamStart()` proceeds — if empty, do not POST, show client-side message "Enter a task description."
 
----
+7. **Color tokens** (corrected 2026-08-14 — see "Color contrast" above): this app's real theme is dark (`#111`/`#1c1c1c` backgrounds), not the light theme this line originally assumed. Use the page's own existing tokens: `#ff6b6b` for error (already used by `.deploy-msg.error`/`.taiga-err`/`.gitea-err`), `#4da6ff` for "running" (already used for links, `a { color: #4da6ff; }`), `#34c759` for "finished" (already used by `.deploy-msg.success`). No existing "warning/orange" token was already in use on this page — `#ffb648` is a new addition for "blocked", chosen for AAA contrast (9.77:1) against `#1c1c1c`.
 
-## Accessibility notes
+8. **Styling**: `.team-row`, `.team-textarea`, `.team-status`, `.team-msg` classes, following page's existing BEM-lite naming (e.g., `deploy-row`, `deploy-msg`). No new component library.
 
-### Color contrast
-
-- **Pill idle state** (#aaa on #2a2a2a): ~4.5:1 ratio ✓ (meets WCAG AA for text)
-- **Pill active state** (#111 on #34c759): ~11:1 ratio ✓ (excellent; same as existing `.pill.active`)
-- **Split-candidate checkboxes** (unchanged): dark background with native checkbox widget, no contrast concerns
-
-### Touch target size
-
-- **Pill buttons** (mode choice): min-height 44px preserved from base `.wizard-check-row` ✓
-- **Radio input widget**: 18px width/height (per existing `.wizard-check-row input`), adequate for touch
-- Both meet mobile-friendly touch target sizing without additional padding.
-
-### Keyboard navigation
-
-- **Tab key**: Focus moves to the underlying `<input type="radio">` inside the pill label (visible focus ring, native browser behavior)
-- **Arrow keys** (within a radio group): Left/Right arrows move between "Single" and "Split" radios (native radio group behavior)
-- **Enter/Space**: Toggles the focused radio (native behavior, triggers `onchange="setWizardMode(...)"`)
-- **Screen readers**: Each radio is announced as a radio button with its associated label text ("Single project...", "Split out..."), per native `<label>` + `<input>` semantics
-
-### Platform-specific notes
-
-- **Web**: Native radio behavior fully supported; `:has()` CSS applies automatically.
-- **Mobile browsers**: Touch targets meet 44px minimum; native browser radios render as platform-specific widgets.
-
----
-
-## State matrix and acceptance criteria traceability
-
-| Spec AC | State | Visual | Keyboard | Acceptance |
-|---------|-------|--------|----------|------------|
-| AC1: env var set | Config | N/A (backend) | N/A | ✓ `UPLOAD_MAX_ENTRIES` read from environment |
-| AC2: env var default | Config | N/A | N/A | ✓ Defaults to `20000` if not set |
-| AC3: Step 5 ambiguous, pills render | Populated | Two pill-styled elements side-by-side, green when selected | Tab to radio, arrow keys, focus visible | ✓ Pills styled like `.pill`/`.pill.active`, click/keyboard updates mode |
-| AC4: Step 5 ambiguous, keyboard | Navigation | N/A | Focus on radio input inside pill | ✓ Tab lands on radio, arrow keys work, no unfocusable span |
-| AC5: Step 5 unambiguous, no Back | Hidden | Only `[ Confirm > ]` visible | Tab skips to Confirm (no Back button) | ✓ Back button absent when `d.ambiguous === false` |
-| AC6: Step 5 ambiguous, Back visible | Visible | `[ Back < ]  [ Confirm > ]` visible | Tab to Back, Tab to Confirm | ✓ Back rendered when `d.ambiguous === true` |
-
----
-
-## Key design decisions
-
-1. **Pill styling reuses existing `.pill` pattern** — visual consistency with engine picker and VS Code toggle.
-
-2. **Underlying `<input type="radio">` preserved** — no accessibility regression; keyboard/screen-reader semantics unchanged.
-
-3. **CSS `:has()` for checked styling** — hooks into native `:checked` state without additional JS tracking; fallback to `onchange` class toggle if needed.
-
-4. **Inline-flex layout** — two pills stack horizontally, matching `engineRow`'s pattern and efficient use of space.
-
-5. **Conditional "Back" button** — only shown in ambiguous case where there's an actual choice to reconsider; unambiguous case cleaner with Confirm-only.
-
-6. **Minimal function signature change** — only `renderStep5Actions(wizardState.detectResult)` vs. current `renderStep5Actions()`, single call-site update.
-
----
-
-## Notes for the developer
-
-- **CSS `:has()` implementation**: If browser-testing reveals any issue, a one-line `onchange` handler can toggle a class on the label: `document.querySelector('label[for="wizard-mode-single"]').classList.toggle('active')` or similar. The spec notes this as acceptable.
-
-- **Split-candidate checkboxes unchanged**: Only add `pill-choice` class to the *first two* radio labels (mode choice), not the subsequent checkbox labels for split candidates. The checkboxes stay as plain `.wizard-check-row`.
-
-- **Call-site update**: Find the existing call to `renderStep5Actions()` (likely in a `<div class="wizard-actions">` render block) and pass `wizardState.detectResult`: `renderStep5Actions(wizardState.detectResult)`.
-
-- **Modal close/X behavior preserved**: The unambiguous sub-case still has the modal-level close control (top-right X), so users can abandon the wizard if needed. "Back" just isn't relevant when there's no choice to reconsider.
-
----
-
-## Summary of changes
-
-**New CSS class:**
-- `.wizard-check-row.pill-choice` — applies pill styling (rounded, gray idle / green active) to mode-choice labels.
-
-**CSS `:has()` rule:**
-- `.wizard-check-row.pill-choice:has(input:checked)` — styles the label green when its contained radio is checked.
-
-**HTML changes:**
-- Add `pill-choice` class to the two mode-choice `<label class="wizard-check-row pill-choice">` elements only (lines ~2513 and ~2517).
-
-**JS function signature:**
-- `renderStep5Actions(d)` instead of `renderStep5Actions()` — now takes `detectResult` object to check `d.ambiguous`.
-- Conditionally render `Back` button only if `d.ambiguous === true`.
-
-**Call site update:**
-- Pass `wizardState.detectResult` to `renderStep5Actions(wizardState.detectResult)` at its one invocation site.
-
-**Backend (not UI-visible):**
-- `UPLOAD_MAX_ENTRIES` wired to `int(os.environ.get("UPLOAD_MAX_ENTRIES", "20000"))` — handled by developer per spec.
-- `config/switchboard.env.example` comment updated — handled by developer per spec.
-
----
-
-## Out of scope / non-goals (per spec)
-
-- Not changing "Back" semantics (still resets to step 1, full wizard reset).
-- Not redesigning any other step or section of the upload wizard.
-- Not touching step 6 ("Confirm") buttons.
-- No partial undo / back-to-step-4 without re-upload.
+9. **Polling refresh**: No new timer. Existing `refresh()` every 4s already re-fetches `/status` and re-renders the row via the new `team` field in the status dict.

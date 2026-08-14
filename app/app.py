@@ -169,6 +169,18 @@ GITEA_REPO_MAP_FILE = os.environ.get(
 # env-overridable constant, same style as UPLOAD_STAGING_TTL_SECONDS.
 GITEA_POLL_INTERVAL_SECONDS = int(os.environ.get("GITEA_POLL_INTERVAL_SECONDS", "45"))
 
+# Team session lifecycle, part 2a (backlog item 6d, docs/spec.md §5) --
+# throttles _team_reap_if_due()'s own opportunistic sweep_dead_teams() call
+# inside _reap_dead_state(), same "not a background thread/timer, throttled
+# on every already-frequent /status poll" idiom GITEA_POLL_INTERVAL_SECONDS
+# above already establishes. Deliberately independent of that constant --
+# different domain, different tuning rationale. Does NOT throttle
+# teams.latest_run_for_project()'s own per-project /status lookup -- that
+# stays unthrottled (cheap, no subprocess calls, and freshness matters
+# there); see docs/spec.md "Proposed approach" §5 for why only the sweep
+# itself needs throttling.
+TEAM_REAP_POLL_INTERVAL_SECONDS = int(os.environ.get("TEAM_REAP_POLL_INTERVAL_SECONDS", "60"))
+
 # Switchboard-side deploy dispatch (backlog item 2c, part 2b -- docs/spec.md).
 # DEPLOY_MAP_FILE is a hand-edited, operator-maintained project -> deploy-
 # target mapping (host/port/user/deploy_path/service/key) -- unlike
@@ -1275,6 +1287,152 @@ def active_engine(name: str) -> str | None:
     return next((e for e in load_engines() if tmux_has(f"{e}-{name}")), None)
 
 
+# Team session lifecycle, part 2a (backlog item 6d, docs/spec.md §1) -- the
+# reverse import direction (teams.py -> app) has existed since 6a; this is
+# the first time app.py itself imports teams. MUST sit here, after TMUX
+# (:191), load_engines() (:397), tmux_has()/active_engine() (above) are all
+# already defined -- teams.py does `from app import TMUX, tmux_has,
+# load_engines` at ITS OWN module level, so app.py must have already
+# defined all three by the time this import runs, or the circular import
+# breaks. Never move this earlier. No sys.path manipulation needed -- both
+# files live in the same directory, in a repo checkout and in a real
+# install alike (see install.sh's own new teams.py copy line below).
+import teams  # noqa: E402
+
+# Background team-run threads (backlog item 6d part 2a). Keyed by PROJECT
+# NAME -- at most one live team per project by construction (launch_team()'s
+# own session-name collision check, part 1) -- same "in-memory, lost on
+# restart, self-heals via _reap_dead_state()" tradeoff as _ttyd_procs/
+# _code_procs below (docs/ARCHITECTURE.md "In-memory state and its one
+# sharp edge").
+_team_threads: dict[str, dict] = {}   # name -> {"run_id", "thread", "cancel_event"}
+
+# Guards every access to _team_threads (docs/test-review.md must-fix: a
+# check-then-act race on this dict -- the fourth instance of this exact
+# defect class in this story's own 6d subsystem, after the ownership stamp,
+# the unstamped-session window, and the partial-creation cleanup, all in
+# part 1). _team_threads_set()/_team_threads_get()/_team_threads_pop_if_
+# owned() below are the ONLY sanctioned way to touch _team_threads anywhere
+# in this file -- every call site was audited and switched to go through
+# one of these three, not just the one with the originally-reported bug.
+_team_threads_lock = threading.Lock()
+
+
+def _team_threads_set(name: str, entry: dict) -> None:
+    with _team_threads_lock:
+        _team_threads[name] = entry
+
+
+def _team_threads_get(name: str) -> dict | None:
+    with _team_threads_lock:
+        return _team_threads.get(name)
+
+
+def _team_threads_pop_if_owned(name: str, run_id: str) -> None:
+    """
+    Atomically removes _team_threads[name] iff it is STILL the entry for
+    run_id at the moment of removal -- the read-check-pop sequence happens
+    under a single _team_threads_lock acquisition, so there is no
+    observable window between the check and the pop for a concurrent
+    /team/start (_team_threads_set()) to install a fresh entry for the same
+    project that this call could then destroy. Previously this was a bare
+    check-then-act (`entry = _team_threads.get(name)` ... later
+    `_team_threads.pop(name, None)`) -- the pop removed whatever was
+    CURRENTLY keyed there, not specifically the validated entry, so a
+    relaunch landing in that window had its own fresh entry silently
+    destroyed by the old thread's own cleanup (docs/test-review.md
+    must-fix, reproduced with an artificially widened window; see
+    TeamThreadsLockTests). Fixed structurally -- one atomic operation, not
+    a narrowed window.
+    """
+    with _team_threads_lock:
+        entry = _team_threads.get(name)
+        if entry is not None and entry.get("run_id") == run_id:
+            _team_threads.pop(name, None)
+
+
+def _run_team_in_background(name: str, run_id: str, cancel_event: threading.Event) -> None:
+    """
+    Spawned by the /team/start route, daemon thread, same "return fast, do
+    the real work off the request thread" idiom _gitea_sync_bg()/
+    _generate_description_bg() already establish. Loads a fresh state dict
+    (never trusts a stale local var) and drives it to completion via
+    team_run(state, cancel_event=cancel_event) -- see docs/spec.md
+    "Cooperative cancellation" for what that actually stops. team_run() is
+    documented "never raises", but wrapped in try/except Exception anyway
+    (this story's own repeated lesson: a "never" claim elsewhere in this
+    codebase has been wrong before) -- an unexpected exception marks the
+    run "error" via teams.mark_run_error() rather than silently vanishing
+    the thread with run.json stuck on "running" forever.
+
+    Ownership-checked removal from _team_threads on the way out (mirrors
+    part 1's own _kill_team_session_if_owned() lesson) via _team_threads_
+    pop_if_owned() -- atomic, so this genuinely guards against a subsequent
+    stop-then-relaunch having already replaced the entry with a NEWER run's
+    thread before this old thread's own cleanup runs (see that function's
+    own docstring for why the earlier, unlocked version of this comment's
+    claim did not actually hold).
+    """
+    try:
+        state = teams._load_state(run_id)
+        teams.team_run(state, cancel_event=cancel_event)
+    except Exception as e:
+        try:
+            teams.mark_run_error(run_id, f"team run failed with an unexpected error: {e}")
+        except FileNotFoundError:
+            pass
+    finally:
+        _team_threads_pop_if_owned(name, run_id)
+
+
+_team_reap_lock = threading.Lock()
+_team_reap_last_at = 0.0
+
+
+def _team_reap_if_due() -> None:
+    """
+    Called from _reap_dead_state() on every /status. Same throttling idiom
+    as _gitea_poll_if_due() (Lock + last-run timestamp, double-checked
+    after acquiring the lock) -- an unthrottled sweep_dead_teams() call on
+    every poll from every open browser tab would repeatedly re-attempt a
+    real `git worktree remove` subprocess call against any currently-dirty
+    worktree (docs/spec.md "Proposed approach" §5).
+
+    Also closes the service-restart gap: a run recorded status="running"
+    with no matching, ALIVE thread in _team_threads (this process was
+    restarted, or a run this process never launched is otherwise orphaned)
+    is marked "error" via teams.mark_run_error() -- surfaced as the `error`
+    coarse label on the next /status poll. A run genuinely still being
+    driven by a separate CLI process (`team-resume`) looks identical from
+    here and may be transiently mis-flipped for up to one interval -- an
+    accepted, disclosed, self-correcting tradeoff (docs/spec.md "Open
+    questions", settled by the user 2026-08-13): that process's own next
+    _persist() call unconditionally overwrites status with the truth.
+    """
+    global _team_reap_last_at
+    if time.time() - _team_reap_last_at < TEAM_REAP_POLL_INTERVAL_SECONDS:
+        return
+    if not _team_reap_lock.acquire(blocking=False):
+        return
+    try:
+        if time.time() - _team_reap_last_at < TEAM_REAP_POLL_INTERVAL_SECONDS:
+            return
+        _team_reap_last_at = time.time()
+        teams.sweep_dead_teams()
+        for name in instance_names():
+            run = teams.latest_run_for_project(name)
+            if run is None or run["status"] != "running":
+                continue
+            entry = _team_threads_get(name)
+            if entry is not None and entry.get("run_id") == run["run_id"] and entry["thread"].is_alive():
+                continue
+            teams.mark_run_error(run["run_id"],
+                                 "no driving thread found for this run (service restart?) -- "
+                                 "stop this team, then start a new one")
+    finally:
+        _team_reap_lock.release()
+
+
 # Hosted remote-control links (e.g. Claude Code's claude.ai/code/session_...
 # URL) captured from a session's own startup output — in-memory only, same
 # lifetime as running sessions (lost on a service restart; see
@@ -1387,6 +1545,10 @@ def _reap_dead_state():
                     shutil.rmtree(full, ignore_errors=True)
             except OSError:
                 continue
+    # Team session lifecycle, part 2a (backlog item 6d, docs/spec.md §5) --
+    # internally throttled to its own TEAM_REAP_POLL_INTERVAL_SECONDS, same
+    # precedent as _gitea_poll_if_due() below.
+    _team_reap_if_due()
 
 
 def host_run(action: str) -> str:
@@ -1506,12 +1668,37 @@ PAGE_TEMPLATE = """<!doctype html>
      green/white/pill shape verbatim; .deploy-msg reuses .new-project-err's
      shape, with .success/.error variants instead of a single fixed color. */
   .deploy-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
-  .deploy-btn { font-size: 14px; padding: 10px 16px; border-radius: 10px; border: none;
+  /* .team-btn (backlog item 6d part 2a) shares this shape byte-for-byte
+     ("same class/styling as 'Deploy' button", docs/design.md) but is its
+     OWN class, not a literal reuse of .deploy-btn -- a project with no
+     deploy-map entry must never render anything class="deploy-btn" at all
+     (tests/test_deploy_frontend.js's own existing, reviewer-approved
+     assertion), and every project unconditionally renders a team control. */
+  .deploy-btn, .team-btn { font-size: 14px; padding: 10px 16px; border-radius: 10px; border: none;
                 background: #34c759; color: #fff; font-weight: 600; cursor: pointer;
                 white-space: nowrap; }
   .deploy-msg { font-size: 12px; color: #888; margin: 4px 0 0; min-height: 14px; word-break: break-all; }
   .deploy-msg.success { color: #34c759; }
   .deploy-msg.error { color: #ff6b6b; }
+  /* Minimal per-project team control (backlog item 6d, part 2a --
+     docs/design.md). Follows .deploy-row/.deploy-btn/.deploy-msg's own
+     shape verbatim -- a single-purpose row, not the checkbox-toggle
+     pattern, since starting a team needs a task-text input, not a boolean
+     flip. */
+  .team-row { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+  .team-textarea { font-size: 13px; padding: 8px 10px; border-radius: 8px;
+                    border: 1px solid #333; background: #1c1c1c; color: #eee;
+                    resize: vertical; min-height: 44px; font-family: inherit; }
+  .team-actions { display: flex; align-items: center; gap: 8px; }
+  .team-status { font-size: 13px; }
+  .team-status.status-running { color: #4da6ff; }
+  .team-status.status-blocked { color: #ffb648; }
+  .team-status.status-finished { color: #34c759; }
+  .team-status.status-error { color: #ff6b6b; }
+  .team-sub { font-size: 12px; color: #888; }
+  .team-msg { font-size: 12px; color: #888; margin: 0; min-height: 14px; word-break: break-all; }
+  .team-msg.success { color: #34c759; }
+  .team-msg.error { color: #ff6b6b; }
   .new-project-row { display: flex; gap: 8px; padding: 4px 0 16px; }
   .new-project-row input { flex: 1; font-size: 14px; padding: 10px 12px; border-radius: 10px;
                             border: 1px solid #333; background: #1c1c1c; color: #eee; }
@@ -1775,7 +1962,7 @@ async function refresh() {
   for (const inst of s.instances) {
     if (inst.deploy) DEPLOY_TARGETS[inst.name] = inst.deploy;
     html += row(inst.name, inst.on, inst.url, 'inst', inst.name, inst.desc, inst.engine,
-               inst.code_on, inst.code_url, undefined, undefined, inst.gitea_sync, inst.deploy);
+               inst.code_on, inst.code_url, undefined, undefined, inst.gitea_sync, inst.deploy, inst.team);
   }
   if (s.instances.length === 0) html += '<div class="empty">No project folders under the configured PROJECTS_DIR yet.</div>';
   if (s.host_enabled) html += row(s.host_label, s.host, s.host_url, 'host', null, '', null, false, null);
@@ -1844,7 +2031,44 @@ function deployRow(name, deploy) {
     "'" + name + "'" + ')">Deploy</button></div>' +
     '<div class="deploy-msg" id="deploy-msg-' + esc(name) + '"></div>';
 }
-function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverride, showBadge, gitSync, deploy) {
+// Per-project client state for the in-progress task text (backlog item 6d,
+// part 2a) -- survives refresh()'s own full-row re-render the same way
+// engineChoice already does for the engine picker, since the team row's
+// textarea would otherwise be wiped every 4-second poll while the operator
+// is still typing.
+let teamTaskText = {};
+// Minimal per-project team control (backlog item 6d, part 2a --
+// docs/design.md). Rendered unconditionally per project (no "only if
+// configured" gate, unlike deployRow()) -- styled after deployRow()'s own
+// shape (a single-purpose row, not the checkbox-toggle pattern), since
+// starting a team needs a task-text input, not a boolean flip.
+function teamRow(name, team) {
+  const msgSlot = '<div class="team-msg" id="team-msg-' + esc(name) + '"></div>';
+  if (!team || team.status === 'idle') {
+    const text = teamTaskText[name] || '';
+    return '<div class="team-row">' +
+      '<textarea class="team-textarea" id="task-' + esc(name) + '" placeholder="Task description..." ' +
+      'oninput="teamTaskText[' + "'" + name + "'" + '] = this.value; ' +
+      "document.getElementById('start-btn-" + esc(name) + "').disabled = !this.value.trim();" + '">' +
+      esc(text) + '</textarea>' +
+      '<div class="team-actions"><button class="team-btn" id="start-btn-' + esc(name) + '"' +
+      (text.trim() ? '' : ' disabled') +
+      ' onclick="doTeamStart(' + "'" + name + "'" + ')">Start team</button></div>' +
+      msgSlot + '</div>';
+  }
+  const labels = {running: 'running', blocked: 'blocked', finished: 'finished', error: 'error'};
+  const label = labels[team.status] || team.status;
+  const sub = team.status === 'blocked' ?
+    '<div class="team-sub">Lead is waiting for input · check tmux attach</div>' : '';
+  return '<div class="team-row">' +
+    '<div class="team-status status-' + esc(team.status) + '">Status: [' + esc(label) + ']' +
+    (team.run_id ? '&nbsp;&nbsp;&nbsp;ID: ' + esc(team.run_id) : '') + '</div>' +
+    sub +
+    '<div class="team-actions"><button class="team-btn" onclick="doTeamStop(' +
+    "'" + name + "'" + ')">Stop team</button></div>' +
+    msgSlot + '</div>';
+}
+function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverride, showBadge, gitSync, deploy, team) {
   // subOverride lets a singleton-toggle row (Taiga/Gitea — see refresh())
   // supply its own starting/running/stopped/error text instead of this
   // generic on/off computation — every other kind (inst/host/code) omits it
@@ -1862,6 +2086,7 @@ function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverr
     '<div class="sub">' + sub + '</div>' +
     (kind === 'inst' ? codeRow(name, codeOn, codeUrl) : '') +
     (kind === 'inst' ? deployRow(name, deploy) : '') +
+    (kind === 'inst' ? teamRow(name, team) : '') +
     '</div>' +
     '<label class="switch"><input type="checkbox" ' + (on ? 'checked' : '') +
     ' onchange="toggle(' + arg + ', this.checked, this)"><span class="slider"></span></label></div>';
@@ -1874,6 +2099,8 @@ function actionPath(kind, name, on) {
   if (kind === 'code') return '/instance/' + encodeURIComponent(name) + '/code/' + (on ? 'on' : 'off');
   if (kind === 'newproject') return '/projects/new';
   if (kind === 'deploy') return '/instance/' + encodeURIComponent(name) + '/deploy';
+  if (kind === 'team-start') return '/projects/' + encodeURIComponent(name) + '/team/start';
+  if (kind === 'team-stop') return '/projects/' + encodeURIComponent(name) + '/team/stop';
   return '/instance/' + encodeURIComponent(name) + '/' + (on ? 'on' : 'off');
 }
 function actionBody(kind, name, on, code) {
@@ -1881,6 +2108,15 @@ function actionBody(kind, name, on, code) {
   if (code) body.code = code;
   if (on && kind === 'inst') body.engine = engineChoice[name] || Object.keys(ENGINE_LABELS)[0];
   if (kind === 'newproject') body.name = name;
+  // Team start's task text isn't shaped like any other kind's body field --
+  // read directly from the still-live textarea (or the client-side
+  // teamTaskText[] mirror, in case a TOTP retry's own submitActionCode()
+  // path fires after the row has already re-rendered) so a retry after a
+  // 428 sends the operator's current text, not a stale snapshot.
+  if (kind === 'team-start') {
+    const el = document.getElementById('task-' + name);
+    body.task = (el ? el.value : (teamTaskText[name] || '')).trim();
+  }
   return body;
 }
 async function performAction(kind, name, on, code) {
@@ -1910,6 +2146,8 @@ async function handleActionResult(r, ctx) {
     pendingToggle = ctx;
     document.getElementById('code-overlay-label').textContent =
       kind === 'deploy' ? 'Deploying: ' + (name || 'this') :
+      kind === 'team-start' ? 'Starting team: ' + (name || 'this') :
+      kind === 'team-stop' ? 'Stopping team: ' + (name || 'this') :
       (on ? 'Turning on: ' : 'Turning off: ') + (name || 'this');
     document.getElementById('action-code').value = '';
     document.getElementById('err-code').textContent = '';
@@ -1919,6 +2157,31 @@ async function handleActionResult(r, ctx) {
   }
   if (r.status === 403) {
     document.getElementById('err-code').textContent = 'Wrong code — try again.';
+    return;
+  }
+  if (kind === 'team-start' || kind === 'team-stop') {
+    // Its own inline result slot (docs/design.md "Error (Failed Start)"/
+    // "Stop Result Message") — handled BEFORE the generic 400 branch below,
+    // since /team/start's own validation failures (empty task, tier-3-only
+    // refusal, no roster member) surface as a 400 that belongs in THIS
+    // row's own message slot, not the new-project error field.
+    hideCodeOverlay();
+    const data = await r.json().catch(() => ({}));
+    const msgEl = document.getElementById('team-msg-' + name);
+    if (msgEl) {
+      if (kind === 'team-start') {
+        if (r.ok && data.ok) {
+          msgEl.textContent = '';
+          msgEl.className = 'team-msg';
+        } else {
+          msgEl.textContent = '✕ Error: ' + (data.error || 'could not start team');
+          msgEl.className = 'team-msg error';
+        }
+      } else {
+        msgEl.textContent = r.ok ? '✓ Team stopped successfully' : '✕ Error: ' + (data.error || 'could not stop team');
+        msgEl.className = 'team-msg ' + (r.ok ? 'success' : 'error');
+      }
+    }
     return;
   }
   if (r.status === 400) {
@@ -1995,6 +2258,34 @@ function doDeploy(name) {
   const msgEl = document.getElementById('deploy-msg-' + name);
   if (msgEl) { msgEl.textContent = 'Deploying…'; msgEl.className = 'deploy-msg'; }
   toggle('deploy', name, true, null);
+}
+// Minimal per-project team control (backlog item 6d, part 2a --
+// docs/design.md). Client-side validation only (the route's own 400 on an
+// empty task is the real, authoritative check) -- reuses toggle()'s own
+// TOTP-retry/code-overlay plumbing exactly like doDeploy() above, just with
+// actionBody()'s own kind==='team-start' branch supplying the {task: ...}
+// body every other kind's shape doesn't need.
+function doTeamStart(name) {
+  const el = document.getElementById('task-' + name);
+  const task = (el ? el.value : '').trim();
+  const msgEl = document.getElementById('team-msg-' + name);
+  if (msgEl) { msgEl.textContent = ''; msgEl.className = 'team-msg'; }
+  if (!task) {
+    if (msgEl) { msgEl.textContent = 'Enter a task description.'; msgEl.className = 'team-msg error'; }
+    return;
+  }
+  toggle('team-start', name, true, null);
+}
+// Confirmation via native confirm() (docs/design.md "Stop Confirmation
+// Dialog") -- stopping a team is destructive (kills in-flight processes,
+// removes git worktrees, may discard uncommitted work), same lightweight-
+// confirmation precedent doDeploy() already sets for a different
+// destructive action.
+function doTeamStop(name) {
+  if (!confirm('Stop team? This will kill any in-flight processes, remove git worktrees, and stop the running session. Any uncommitted work will be lost. Continue?')) {
+    return;
+  }
+  toggle('team-stop', name, true, null);
 }
 function startNewProject() {
   const name = document.getElementById('new-project-name').value.trim();
@@ -2951,6 +3242,20 @@ class Handler(BaseHTTPRequestHandler):
                        "url": url,
                        "desc": get_description(n, os.path.join(PROJECTS_DIR, n)),
                        "code_on": code_running(n), "code_url": _code_urls.get(n)}
+                # Team session lifecycle, part 2a (backlog item 6d,
+                # docs/spec.md §5) -- always present (unlike deploy/
+                # gitea_sync, which are only attached when configured), same
+                # "always-present" treatment on/engine already get. A fresh
+                # read on every poll -- deliberately unthrottled, unlike
+                # sweep_dead_teams() below (see _team_reap_if_due()) --
+                # since a team started seconds ago must not still show
+                # "idle".
+                run = teams.latest_run_for_project(n)
+                team_status = ("idle" if run is None else
+                              {"running": "running", "blocked_ask_user": "blocked",
+                               "escalated_max_rounds": "blocked", "finished": "finished",
+                               "error": "error", "stopped": "idle"}.get(run["status"], "idle"))
+                inst["team"] = {"status": team_status, "run_id": run["run_id"] if run else None}
                 sync_entry = gitea_sync_by_name.get(n)
                 if sync_entry is not None:
                     inst["gitea_sync"] = {"state": sync_entry.get("sync_state"),
@@ -3079,6 +3384,48 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "unknown instance"}, 404)
             status, msg = deploy_run(name)
             self._json({"ok": status == 200, "message": msg}, status)
+        elif parts[0] == "projects" and len(parts) == 4 and parts[2] == "team" and parts[3] == "start":
+            # Team session lifecycle, part 2a (backlog item 6d, docs/spec.md
+            # §5) -- default composition only (no lead/member picker, 6e's
+            # job). Zero new privileged surface: launch_team()/team_run()
+            # already route every RUN_USER-crossing operation through the
+            # existing TMUX constant (part 1, unchanged).
+            name = parts[1]
+            if name not in instance_names():
+                return self._json({"error": "unknown project"}, 404)
+            task = (body.get("task") or "").strip()
+            if not task:
+                return self._json({"error": "a task description is required"}, 400)
+            comp = teams.default_team_composition()
+            if not comp["ok"]:
+                return self._json({"error": comp["error"]}, 400)
+            workdir = os.path.join(PROJECTS_DIR, name)
+            result = teams.launch_team(workdir, task, comp["lead"], comp["members"])
+            if not result["ok"]:
+                return self._json({"error": result["error"]}, 400)
+            cancel_event = threading.Event()
+            t = threading.Thread(target=_run_team_in_background,
+                                 args=(name, result["run_id"], cancel_event), daemon=True)
+            _team_threads_set(name, {"run_id": result["run_id"], "thread": t, "cancel_event": cancel_event})
+            t.start()
+            self._json({"ok": True, "run_id": result["run_id"], "session": result["session"],
+                       "lead": comp["lead"], "members": comp["members"]})
+        elif parts[0] == "projects" and len(parts) == 4 and parts[2] == "team" and parts[3] == "stop":
+            # Restart-safe by construction: re-derived from run.json via
+            # latest_run_for_project(), never dependent on _team_threads
+            # surviving a service restart (docs/spec.md "Goals").
+            name = parts[1]
+            if name not in instance_names():
+                return self._json({"error": "unknown project"}, 404)
+            run = teams.latest_run_for_project(name)
+            if run is None or run["status"] not in ("running", "blocked_ask_user"):
+                return self._json({"ok": True, "message": "no team currently running for this project"})
+            entry = _team_threads_get(name)
+            if entry is not None and entry.get("run_id") == run["run_id"]:
+                entry["cancel_event"].set()
+            result = teams.stop_team(run["run_id"])
+            self._json({"ok": True, "session_removed": result["session_removed"],
+                       "worktrees": result["worktrees"]})
         else:
             self.send_response(404)
             self.end_headers()

@@ -1098,3 +1098,708 @@ git worktree list
 python3 /home/dev/projects/ai-dev-switchboard/app/teams.py team-stop <run_id>
 python3 /home/dev/projects/ai-dev-switchboard/app/teams.py team-reap
 ```
+
+---
+
+# Implementation: Team session lifecycle, part 2a -- web routes, background driving thread, cooperative cancellation (sub-spec 6d, part 2a of 2)
+
+## Summary
+
+`app/app.py` now imports `app/teams.py` for the first time (`import teams`,
+placed immediately after `active_engine()`'s definition and before
+`_session_urls`, per `docs/spec.md` §1's exact anchor point). Two new POST
+routes, `/projects/<name>/team/start` and `/projects/<name>/team/stop`, wire
+part 1's `launch_team()`/`stop_team()` into the web UI: `start` computes a
+deterministic **default** team composition (`teams.default_team_
+composition()`, new) and runs `team_run()` on a daemon `threading.Thread`,
+tracked in a new in-memory table (`_team_threads`); `stop` synchronously
+calls `stop_team()` and, if a live thread is tracked, sets a
+`threading.Event` so an in-flight round is interrupted rather than waited
+out. `agent_run()`, `_run_headless_session()`, `_call_lead()`, `team_step()`,
+and `team_run()` each gained one additive, default-`None`, keyword-only
+`cancel_event` kwarg -- the actual cooperative-cancellation mechanism.
+`_reap_dead_state()` gained a throttled call to a new `_team_reap_if_due()`,
+which runs `sweep_dead_teams()` and a new orphan check (a run recorded
+`"running"` with no matching, alive thread in `_team_threads` is marked
+`"error"` via a new `teams.mark_run_error()`). A minimal per-project
+`teamRow()` control (task textarea, Start/Stop buttons, coarse status label)
+was added to the embedded page script, styled after `deployRow()`. `install.
+sh` now also copies `teams.py` to `$INSTALL_DIR` -- previously it copied only
+`app.py`, which would have made a real install crash on startup the moment
+`app.py` gained `import teams`.
+
+Two real, previously-undisclosed findings surfaced while building this, both
+by exercising the real thing rather than trusting the spec's/an existing
+test's own stated assumption -- see "Findings" below. Neither required a
+design change; both were fixed structurally (a CSS class rename, a test
+assertion broadened to accept either of two legitimately-launch_team()-owned
+error messages) rather than patched around.
+
+## Changes by file
+
+- **`app/app.py`**:
+  - `TEAM_REAP_POLL_INTERVAL_SECONDS` (new constant, default `60`), placed
+    next to `GITEA_POLL_INTERVAL_SECONDS` per spec, same
+    declare-once-at-module-level convention.
+  - `import teams` (`app.py`'s own first import of `app.teams`), `_team_
+    threads` (new in-memory table), `_run_team_in_background()`, `_team_
+    reap_lock`/`_team_reap_last_at`/`_team_reap_if_due()` -- all placed
+    immediately after `active_engine()`, before `_session_urls`, per spec §1
+    (the exact neighborhood the spec says both the import and the new
+    in-memory state belong in).
+  - `_reap_dead_state()` gains one call to `_team_reap_if_due()`.
+  - `do_GET`'s `/status` handler: each per-instance dict gains an
+    always-present `team` field (`{"status": ..., "run_id": ...}`), built
+    from `teams.latest_run_for_project(n)`, unthrottled (per spec §5 --
+    freshness matters there, only the sweep itself is throttled).
+  - `do_POST` gains two new branches: `/projects/<name>/team/start` and
+    `/projects/<name>/team/stop`, matching the spec's own pseudocode
+    verbatim (§5).
+  - Embedded `<style>`: `.team-row`/`.team-textarea`/`.team-actions`/
+    `.team-status` (+ four `.status-*` color variants)/`.team-sub`/
+    `.team-msg` (+ `.success`/`.error` variants), plus a **new** `.team-btn`
+    class (see "Findings" #1 below for why this is NOT a literal reuse of
+    `.deploy-btn`, despite the design doc's "same class/styling as Deploy
+    button" wording).
+  - Embedded `<script>`: `teamTaskText` (new per-project client-state
+    object, survives `refresh()`'s own full-row re-render the same way
+    `engineChoice` already does), `teamRow(name, team)` (called from
+    `row()` for `kind === 'inst'`, after `deployRow()`), `doTeamStart(name)`,
+    `doTeamStop(name)`; `actionPath()` gains `team-start`/`team-stop`
+    branches; `actionBody()` gains a `team-start` branch reading the task
+    textarea's current value; `handleActionResult()` gains a combined
+    `team-start`/`team-stop` branch (placed BEFORE the generic `r.status
+    === 400` branch, since `/team/start`'s own validation failures return
+    400 and must land in the team row's own message slot, not the
+    unrelated `new-project-err` field).
+  - `git diff --stat -- app/app.py`: 311 insertions / 0 deletions (this
+    file gains no removals -- every existing line is untouched).
+
+- **`app/teams.py`**:
+  - `default_team_composition() -> dict` (new) -- built entirely on
+    `roster()`/`_lead_tier_for_engine()`/`_schema_flag_config_error()`, per
+    spec §2. Implements the user-settled priority order (Ollama if
+    configured -> first sorted tier-2-with-no-schema-error engine -> refuse
+    if only tier-3 engines exist -> refuse if no roster member at all) and
+    the "only one engine, it became lead" empty-members refusal. See "Key
+    decisions" for the one small extension beyond the spec's literal words
+    (a misconfigured-tier-2-only roster, no genuine tier-3 present, folds
+    into the generic "no roster member is available" message rather than
+    the tier-3-specific one).
+  - `latest_run_for_project(project_name) -> dict | None` (new) -- O(all
+    runs) scan per spec §4, skips unreadable/corrupt run.json and runs with
+    no `project_name`, same discipline `sweep_dead_teams()` already uses.
+  - `mark_run_error(run_id, message) -> None` (new) -- unconditional status/
+    error overwrite + persist, used by both `app.py`'s background-thread
+    wrapper and `_team_reap_if_due()`'s orphan check.
+  - `_run_headless_session(..., cancel_event=None)`, `agent_run(...,
+    cancel_event=None)`: one new `if` branch in the existing escalation
+    chain (`cancel_event.is_set()` as a second trigger for the identical
+    TERM->KILL->kill-session ladder the timeout path already drives,
+    `cancel_reason="stopped"`), passed straight through.
+  - `_call_lead(state, system, round_context, *, cancel_event=None)`:
+    threaded into the tier-2/tier-3 `agent_run()` call sites; tier 1
+    accepts but ignores it (no subprocess to signal).
+  - `team_step(state, *, cancel_event=None)`: two new checkpoints, both
+    additive -- immediately after `_call_lead()` returns (checked FIRST,
+    ahead of every existing branch) and immediately after the delegate
+    branch's own `agent_run()` call returns (before the SUCCEEDED/FAILED
+    framing).
+  - `team_run(state, *, cancel_event=None)`: one new checkpoint at the top
+    of the loop, alongside the existing `max_rounds` check.
+  - `launch_team()`: carried-forward one-line guard from part 1 (`docs/
+    spec.md` §8) -- refuses with `{"ok": False, "error": "workdir has no
+    derivable project name"}` if `os.path.basename(os.path.normpath
+    (workdir))` is empty.
+  - `git diff --stat -- app/teams.py`: 239 insertions / 16 deletions (the
+    16 deletions are entirely the widened function signatures shown below
+    -- no existing line of *logic* was removed or reordered).
+  - `git diff -- app/teams.py | grep -E "^[+-]def "` confirms: every
+    changed `def` is either a brand-new function or an existing one gaining
+    only additive, keyword-only parameters -- no positional-argument shape
+    changed for any existing function.
+
+- **`install.sh`**: one new unconditional line, `cp "$REPO_DIR/app/teams.py"
+  "$INSTALL_DIR/teams.py"`, immediately after the existing `app.py` copy in
+  the "-- App + engines --" block (§6).
+
+- **`config/switchboard.env.example`**: new "team session lifecycle -- web
+  routes + driving thread (6d pt 2a)" section, `TEAM_REAP_POLL_INTERVAL_
+  SECONDS`, same commented-out-with-explanation style as every existing
+  `TEAM_*` block.
+
+- **New test files**:
+  - `tests/test_teams_cancel.py` (15 tests) -- pure (`team_step()`'s two
+    checkpoints, `team_run()`'s loop checkpoint, `_call_lead()`'s tier-1
+    ignore-but-accept behavior, each also with an explicit default-`None`
+    byte-for-byte-unchanged case) + real tmux/subprocess (`agent_run(...,
+    cancel_event=...)` against a real slow stand-in, both the TERM-succeeds
+    and TERM-ignored-escalates-to-SIGKILL cases; `team_run()`'s own
+    checkpoints exercised end to end with `cancel_event.set()` fired from a
+    SECOND thread mid-call, for both a mid-delegate stop and a mid-lead-call
+    stop).
+  - `tests/test_team_routes.py` (18 tests) -- real `ThreadingHTTPServer` +
+    real `urllib.request.urlopen()`, mirroring `DeployEndpointTests`'
+    technique: both routes' happy paths (tier-2 default, Ollama-configured
+    default), the tier-3-only refusal (naming both fixes, no side effects),
+    unknown-project/missing-task 400s, the two-near-simultaneous-starts real
+    concurrency race, the mid-delegate-stop timing case (real, slow
+    stand-in engine, real SIGTERM), `/status`'s `team` field mapped across
+    every run status, the service-restart simulation (both the
+    still-tears-down-real-resources case and the running-then-error
+    `/status` case), the legitimate-concurrent-CLI-`team-resume`
+    self-correction case (a REAL, separate subprocess), the explicit
+    CLI-`--lead`-still-accepts-tier-3 regression guard, and `install.sh`'s
+    new `teams.py` copy line (block-extraction technique, mirrors
+    `InstallShDeployMapBlockTests`).
+  - `tests/test_team_frontend.js` (17 tests, plain Node, not part of the
+    `pytest` count) -- mirrors `tests/test_deploy_frontend.js`'s own
+    technique verbatim (real, rendered `<script>` extracted from `app.
+    render_page()`, `vm`-sandboxed DOM/fetch/confirm/timer stubs):
+    `teamRow()`'s four states, the empty-task client-side validation, the
+    real dispatch body shape, inline success/error message rendering (both
+    client- and server-side 400s), the Stop confirmation dialog's exact
+    text, the TOTP 428-retry path for both actions, and an HTML-injection
+    safety check for the in-progress task text.
+  - `tests/test_teams_lead.py`/`tests/test_teams_lifecycle.py`: the 12
+    `fake_call_lead(state, system, round_context)` test-double signatures
+    (11 in the former, 1 in the latter) each gained a trailing `**kwargs` --
+    mechanical, no assertion changed. Required because `team_step()` now
+    unconditionally passes `cancel_event=cancel_event` into `_call_lead()`
+    (identical behavior to omitting it when `cancel_event` is `None`, but a
+    literal kwarg the old, narrower fake signatures didn't accept). See
+    "Key decisions" for why this was the chosen fix over threading
+    `cancel_event` conditionally.
+
+## Key decisions / tradeoffs
+
+- **`team_step()`/`team_run()` always pass `cancel_event=cancel_event`
+  through to `_call_lead()`/`agent_run()`, even when it's `None`, rather
+  than conditionally omitting the kwarg.** This is what caused the 12
+  existing test-double signature updates above. Considered the alternative
+  (only pass the kwarg when `cancel_event is not None`, so a `None`-default
+  call site is a byte-for-byte identical call to before and touches zero
+  existing test files) but rejected it: the acceptance criterion's own
+  wording is "zero modification to their own **assertions**" (not "zero
+  modification to the file at all"), and the spec's own "Test plan" text
+  explicitly anticipates "`tests/test_teams_lead.py`/`tests/test_teams_
+  lifecycle.py` gain a small number of additive cases ... not a rewrite" --
+  a `**kwargs` addition to a test double's signature is exactly that
+  category of change, not a rewrite, and keeps the *production* code
+  (`_call_lead(state, system, round_context, cancel_event=cancel_event)`)
+  simple and uniform rather than branching on "is this parameter worth
+  passing" for cosmetic reasons.
+- **`default_team_composition()`'s handling of a roster that is
+  misconfigured-tier-2-only (no genuine tier-3 entry, but the only tier-2
+  candidate has a `schema_flag_error`)** is not explicitly named by the
+  spec's own priority-order text (which only distinguishes "genuinely tier
+  3" from "nothing at all"). Folded into the generic `"no roster member is
+  available to lead a team..."` refusal rather than the tier-3-specific
+  message, since the tier-3-specific wording ("only a tier-3 (prose-parse,
+  least reliable) lead is available") would be factually wrong for this
+  combination. `roster()`'s own `schema_flag_error` field already surfaces
+  the specific misconfiguration to a caller inspecting the roster directly.
+  Not separately unit-tested (no acceptance criterion covers this specific
+  combination) -- disclosed here as a small, reasonable gap-fill judgment
+  call, not a deviation from anything the spec explicitly specified.
+- **`ServiceRestartSimulationTests` uses the same-process technique
+  (clearing `_team_threads` directly), not a genuinely separate OS
+  process**, per the spec's own "Test plan" note leaving this "to be
+  resolved by the developer, documented either way". Reasoning: `_team_
+  threads` is the ONLY in-memory state a real process restart would
+  actually lose from the specific angle `stop_team()`'s/`latest_run_for_
+  project()`'s own restart-safety claim is about -- the tmux dashboard
+  session and git worktrees are OS/filesystem-level and survive a killed
+  `app.py` process unaffected either way, and `run.json` is durable on
+  disk. Clearing exactly that one dict is therefore functionally
+  equivalent to a real restart for everything this cycle's own acceptance
+  criteria actually assert against (real `tmux_has()`/worktree-path
+  checks, real `/status` truthfulness), without the added complexity and
+  slowness of managing a second real `ThreadingHTTPServer` process.
+- **`TeamStopEndpointTests.test_stop_mid_delegate_terminates_real_
+  subprocess_promptly` wires `_run_team_in_background()`/`_team_threads`
+  directly (with `_call_lead()` monkeypatched to force a deterministic,
+  fast `delegate` action) rather than going through the real `/team/start`
+  HTTP route for its own setup phase.** The route always resolves the
+  REAL `default_team_composition()`/real, unmocked `_call_lead()` -- there
+  is no way to inject a controllable fake lead response through the HTTP
+  layer itself without a real, slow LLM/CLI round-trip. The STOP action
+  itself (the actual subject of the test) is exercised for real, through
+  the real HTTP route, against the real cancellation mechanism, real
+  tmux, and a real (deliberately slow) subprocess. Disclosed here, not
+  silently presented as "the route was tested end to end for this case".
+
+## Findings (real, previously-undisclosed, found by exercising the real thing)
+
+1. **`teamRow()`'s two buttons literally reusing the `.deploy-btn` CSS
+   class broke an existing, reviewer-approved frontend test.** Design's own
+   wording ("styled to match other action buttons on the page (same
+   class/styling as 'Deploy' button)") reads naturally as "share the exact
+   class name", which is what was implemented first -- but `tests/test_
+   deploy_frontend.js`'s own `'project without a deploy-map entry renders
+   no Deploy button at all'` test asserts `!html.includes('deploy-btn')`
+   for ANY project with no `deploy` entry, and `teamRow()` is rendered
+   unconditionally for every project (unlike `deployRow()`, which is only
+   rendered when `deploy` is configured) -- so every project without a
+   deploy target now failed that assertion, since its own "Start team"
+   button carried `class="deploy-btn"` too. **Found by actually running
+   the existing, already-passing frontend test suite after this cycle's
+   own change**, not by reasoning about it -- the cross-feature interaction
+   (a shared CSS class name doubling as an implicit "is deploy configured"
+   signal for an unrelated test) was not something either this spec or the
+   design doc anticipated. **Fixed structurally**: a new `.team-btn` class,
+   sharing the exact same CSS declaration as `.deploy-btn` via a combined
+   selector (`.deploy-btn, .team-btn { ... }`) so the VISUAL styling really
+   is byte-for-byte identical (honoring the design's actual intent), but a
+   distinct class name so the two features' own markup never collides
+   again. `tests/test_deploy_frontend.js` (9/9), `tests/test_team_
+   frontend.js` (17/17), `tests/test_singleton_toggle_frontend.js` (15/15),
+   and `tests/test_upload_frontend.js` (8/8) all pass together after the
+   fix -- verified by running all four real frontend suites, not just the
+   new one.
+2. **Two near-simultaneous `/team/start` requests for the same project
+   don't always collide on the session-name check the spec's own "Edge
+   cases" text describes.** `docs/spec.md`: "the second's `launch_team()`
+   call hits the exact same session-name collision refusal part 1 already
+   built and tested (`tmux_has(session)` check, before any worktree is
+   touched)". Under REAL concurrency (two threads fired via a
+   `threading.Barrier`, not sequential calls), the actual collision point
+   observed was `_create_worktree()`'s own "path already exists" refusal
+   instead -- both requests can pass the `tmux_has(session)` pre-check
+   before either has actually created a session or worktree yet, so
+   whichever creates its first worktree "wins" that specific check, and
+   the loser fails there instead. **Not a defect**: both are legitimately
+   `launch_team()`'s own collision errors (matching the acceptance
+   criterion's own more general wording, "the other gets `launch_team()`'s
+   own collision error" -- it doesn't name one specific message), and the
+   property that actually matters -- exactly one request succeeds, the
+   loser's failure leaves the winner's worktrees/session/thread completely
+   untouched -- holds either way, verified directly (`state["worktrees"]`
+   and `tmux_has()` checked against the winner after the race). Fixed by
+   broadening the test's own assertion to accept either message rather
+   than by changing any production code -- the underlying safety property
+   was never violated, only the spec's own prose description of exactly
+   which check fires first was imprecise under real scheduling. Confirmed
+   stable across 5 consecutive runs of this specific test after the fix,
+   0 flakes.
+
+## Deviations from spec
+
+- **`doTeamStart()` goes through the shared `toggle()`/`performAction()`/
+  `handleActionResult()`/TOTP-retry plumbing (with `actionBody()`'s new
+  `team-start` branch supplying `{task: ...}`), not a standalone direct
+  `fetch()` call the way `docs/spec.md`'s "Proposed approach" §9 literally
+  describes ("`doTeamStart()` follows `doDeploy()`'s own direct-
+  `fetch()`-plus-inline-result-slot shape instead").** On inspection,
+  `doDeploy()` itself does NOT make a direct `fetch()` call either -- it
+  calls `toggle('deploy', name, true, null)`, going through the exact same
+  shared plumbing `doTeamStart()` now also uses. The spec's own prose
+  describing `doDeploy()`'s shape as "direct fetch" doesn't match
+  `doDeploy()`'s actual, already-shipped implementation. Given that,
+  reusing `toggle()`/`actionBody()`/`handleActionResult()` (extended with
+  one new `kind==='team-start'` body-construction branch and one new
+  combined `kind==='team-start'||kind==='team-stop'` result-handling
+  branch, mirroring the existing `kind==='deploy'` branch's own shape
+  exactly) is the smaller, more consistent diff, reuses 100% of the
+  existing TOTP-retry/code-overlay machinery instead of reimplementing it,
+  and produces byte-for-byte the same user-visible behavior the design doc
+  specifies (inline error/success messages, empty-task client validation,
+  the Stop confirmation dialog, the exact copy). `doTeamStop()` matches the
+  spec's own text for it verbatim (`toggle()`-based, matching `doDeploy()`).
+  Verified end to end via `tests/test_team_frontend.js`, including the
+  TOTP 428-retry path for `team-start` resending the current task text.
+- **`teamTaskText` (a new per-project client-state object preserving the
+  operator's in-progress, not-yet-submitted task text across `refresh()`'s
+  own full-row re-render) is not named anywhere in `docs/spec.md`.** Without
+  it, `refresh()`'s existing 4-second poll would silently wipe whatever the
+  operator was mid-typing into the task textarea on every tick (the row's
+  entire HTML, including the textarea, is regenerated from scratch each
+  poll) -- a real usability defect the spec's own "no new poll-interval
+  timer" text doesn't address, since it's about polling cadence, not about
+  DOM-replacement side effects on in-progress input. Fixed the same way
+  `engineChoice[name]` already solves the identical problem for the engine
+  picker (a plain per-project JS object, read at render time, written by
+  the textarea's own `oninput` handler) -- reusing an existing pattern in
+  this file, not inventing a new one. Verified via `tests/test_team_
+  frontend.js`'s own dedicated round-trip/HTML-injection-safety test.
+- All other line items in "Proposed approach" (§1-§9) were implemented as
+  written: the exact `import teams` anchor point, `default_team_
+  composition()`'s exact priority order and error messages, the exact route
+  pseudocode (§5), the exact `_team_reap_if_due()` shape, the exact
+  `cancel_event` checkpoints and their exact recorded outcome text (§7),
+  and the exact `install.sh` insertion point (§6).
+
+## Known limitations
+
+- **No new limitation introduced by this cycle beyond what's disclosed
+  above.** All four of part 1's own carried-forward limitations (the
+  now-closed empty-`project_name` guard; the still-real "no locking between
+  two teams for the same project directory" non-goal, mitigated but not
+  eliminated by this cycle's own real-concurrency test; 6c's own carried
+  limitations; the tier-1/qwen3 probabilistic-judgment caveat) are
+  unaffected by this diff.
+- **`default_team_composition()`'s misconfigured-tier-2-only edge case**
+  (see "Key decisions") is handled by a reasonable, disclosed judgment call
+  but has no dedicated acceptance criterion or test -- low-severity (an
+  operator with a genuinely broken `HEADLESS_SCHEMA_FLAG` gets a slightly
+  less specific error message, still actionable via `roster()`'s own
+  `schema_flag_error` field), not revisited further this cycle.
+- **The orphan check's transient false positive for a genuinely still-live
+  CLI-driven run is accepted as specified** (user-settled, `docs/spec.md`
+  "Open questions") -- verified for real in `OrphanCheckSelfCorrectsForLive
+  CliRunTests`, not just asserted from the design.
+- **`teamTaskText`/`engineChoice` are both plain, unbounded, page-lifetime
+  JS objects** -- a project removed from `PROJECTS_DIR` while its stale
+  entry lingers in `teamTaskText` is harmless (the entry is simply never
+  read again, since `instance_names()` no longer includes that project),
+  same non-issue class `engineChoice` already carries; not a new concern
+  this cycle introduces.
+
+## What was mocked vs. exercised for real
+
+Per this role's own "not testable is a claim to verify" discipline:
+
+- **Real, not mocked**: every route (`/team/start`/`/team/stop`) against a
+  real `ThreadingHTTPServer` + real `urllib.request.urlopen()`; every tmux
+  operation against a real, locally-running tmux server (TMUX patched down
+  to `["tmux"]`, same technique every prior 6d test file already
+  establishes); real git worktree creation/removal; a real background
+  `threading.Thread` actually driving `team_run()`; real SIGTERM/SIGKILL
+  escalation against real, deliberately slow/signal-ignoring Python stand-in
+  subprocesses; a real, SEPARATE `team-resume` subprocess (not a thread) for
+  the orphan-self-correction test; real `app.py` process start (both a bare
+  `import app` and a real `ThreadingHTTPServer` bound to a real socket,
+  handling a real `/status` request) for the acceptance criterion this
+  spec's own "Summary" flags as the one place a mistake would be immediately
+  visible; all four real frontend `<script>`-extraction Node test suites,
+  run together, not just the new one.
+- **Mocked**: `_call_lead()` in the pure unit tests (`tests/test_teams_
+  cancel.py`'s Tier-1 section, and `TeamStopEndpointTests`'s own
+  mid-delegate-stop test's SETUP phase) -- standard for this story's own
+  established "pure logic first, real tmux/subprocess second" split; every
+  real-tmux/real-HTTP test above does NOT mock it. No real `claude`/`codex`/
+  Ollama endpoint was exercised this cycle (this cycle touches no adapter
+  logic, per its own explicit non-goals) -- unchanged from 6c's/part 1's own
+  disclosed gaps.
+
+## Verification status
+
+| Check | Command | Result |
+|---|---|---|
+| Syntax/compile | `python3 -m py_compile app/app.py app/teams.py tests/test_teams_cancel.py tests/test_team_routes.py` | clean |
+| **`app.py` actually imports and starts, not just compiles** (the spec's own named acceptance criterion) | `python3 -c "import sys; sys.path.insert(0, 'app'); import app"`; separately, a real `ThreadingHTTPServer` bound to a real socket, real `/login` + real `/status` request/response cycle | both succeed; `/status` returns `{"instances": [], ...}` with no error |
+| `git diff --stat -- app/teams.py` shows no positional-shape change | `git diff -- app/teams.py \| grep -E "^[+-]def "` | every changed `def` is new or additive-keyword-only, confirmed by manual read |
+| No new sudoers/privileged path | `git diff -- app/app.py app/teams.py \| grep -E "^\+.*subprocess\.(run\|Popen)\|^\+.*sudo"` | no matches in either file's diff |
+| Grounding read-only guards untouched | `git diff --stat -- tests/test_teams_grounding.py` | empty |
+| `git worktree remove` never gains `--force` | `git diff -- app/teams.py \| grep -i force` | only match is the unrelated `_force_ask_user` identifier |
+| Deploy stays manual-click-only, untouched | `git diff -- app/teams.py \| grep -i deploy` | no matches |
+| Full suite, 6 consecutive clean runs (one earlier interrupted 5-run batch hit an unrelated, leftover-system-user pollution issue in `tests/test_deploy_target.py::PrivilegedEndToEndTests` from a PRIOR run's own tearDown never completing after this environment's 2-minute command timeout killed it mid-batch -- confirmed unrelated to this diff (`test_deploy_target.py` untouched), the leftover `aidswbtest` system user removed by hand, and the file re-confirmed clean (30/30) immediately after) | `/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q` | **671 passed** every clean run (638 baseline + 33 new: 15 in `test_teams_cancel.py`, 18 in `test_team_routes.py`), 0 flakes, 0 attributable failures |
+| New test files alone | `pytest tests/test_teams_cancel.py tests/test_team_routes.py -q`, 3 consecutive runs | 33 passed every run |
+| Frontend JS, all four real suites together | `node tests/test_team_frontend.js && node tests/test_deploy_frontend.js && node tests/test_singleton_toggle_frontend.js && node tests/test_upload_frontend.js` | 17/17, 9/9, 15/15, 8/8 -- all pass |
+| Two-near-simultaneous-starts race, isolated re-runs | `pytest tests/test_team_routes.py::TeamStartEndpointTests::test_two_near_simultaneous_starts_exactly_one_succeeds -q`, 5 consecutive runs | passed every run |
+| `install.sh` copies `teams.py` | `InstallShTeamsPyCopyTests` (2 tests) -- extracts the real "-- App + engines --" block and runs it against a scratch `$INSTALL_DIR` | `teams.py` lands there, byte-identical to the source |
+| Pre-existing suites (`test_teams_headless.py`/`test_teams_lead.py`/`test_teams_lifecycle.py`) pass with zero assertion changes | `git diff -- tests/test_teams_headless.py` (empty); `test_teams_lead.py`/`test_teams_lifecycle.py` diffs are 12 mechanical `**kwargs` additions to test-double signatures only, no assertion touched | all three suites pass unmodified in behavior |
+
+## How to verify locally
+
+```bash
+# Full suite (run several times)
+/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q
+
+# New test files alone
+/home/dev/.local/bin/uv run --with pytest python -m pytest tests/test_teams_cancel.py tests/test_team_routes.py -v
+
+# Frontend JS (plain Node, no dependencies)
+node tests/test_team_frontend.js
+node tests/test_deploy_frontend.js   # regression-check: shares .team-btn's CSS declaration
+node tests/test_singleton_toggle_frontend.js
+node tests/test_upload_frontend.js
+
+# app.py actually starts (not just compiles) -- the spec's own named
+# acceptance criterion, see docs/spec.md "Proposed approach" §1
+python3 -c "import sys; sys.path.insert(0, 'app'); import app; print('import OK')"
+
+# Confirm app/teams.py's diff never changes an existing function's
+# positional-argument shape
+git diff -- app/teams.py | grep -E "^[+-]def "
+
+# install.sh copies teams.py
+grep -n 'cp "\$REPO_DIR/app/teams.py"' install.sh
+
+# Real end-to-end smoke test against a real scratch git repo + real tmux
+mkdir -p /tmp/scratch-6d2a/demo && cd /tmp/scratch-6d2a/demo
+git init -q && echo hi > README.md && git add README.md && git commit -q -m init
+export TOTP_SECRET=JBSWY3DPEHPK3PXP AUTH_MODE=simple SIMPLE_USERNAME=x SIMPLE_PASSWORD=x
+export PROJECTS_DIR=/tmp/scratch-6d2a ENGINES_DIR=$(pwd)/../../engines.d
+python3 -c "
+import sys; sys.path.insert(0, 'app'); import app
+from http.server import ThreadingHTTPServer
+import threading, json, urllib.request
+server = ThreadingHTTPServer(('127.0.0.1', 0), app.Handler)
+port = server.server_address[1]
+threading.Thread(target=server.serve_forever, daemon=True).start()
+req = urllib.request.Request(f'http://127.0.0.1:{port}/login', method='POST',
+    data=json.dumps({'username':'x','password':'x'}).encode(), headers={'Content-Type':'application/json'})
+cookie = urllib.request.urlopen(req).headers.get('Set-Cookie').split(';')[0]
+req2 = urllib.request.Request(f'http://127.0.0.1:{port}/status', headers={'Cookie': cookie})
+print(json.loads(urllib.request.urlopen(req2).read()))
+"
+```
+
+---
+
+# Implementation: Team session lifecycle, part 2a -- review round 2 (must-fix + a second, more severe finding surfaced while verifying it)
+
+## Summary
+
+Round 2 responds to the reviewer's changes-requested verdict: one must-fix
+(a check-then-act race on `app.py`'s `_team_threads` dict) and one doc-only
+fix (`docs/design.md`'s contrast analysis assumed a light theme that was
+never built). Fixing and re-verifying the must-fix surfaced a **second,
+more severe, previously-undisclosed defect** in `app/teams.py`'s own
+`_create_team_session()` (part 1 code, already reviewer-approved three
+rounds ago) -- a real, reliably-reproducible race where a losing concurrent
+`/team/start` attempt's own failure-cleanup could destroy the WINNING
+attempt's real, live tmux session. This was not something the reviewer
+asked me to look for; it surfaced because re-running this cycle's own
+two-concurrent-starts test many times (chasing down why my must-fix's own
+verification loop occasionally still flaked) exposed a third loser-error
+shape the test's own assertion hadn't accounted for, and chasing THAT down
+led directly to the real bug. Fixed both, plus two of my own round-1 tests
+whose own over-narrow error-message assertions had been silently masking
+part of this.
+
+## Changes by file
+
+- **`app/app.py`**:
+  - `_team_threads_lock` (new `threading.Lock()`) + three helper functions
+    -- `_team_threads_set(name, entry)`, `_team_threads_get(name)`,
+    `_team_threads_pop_if_owned(name, run_id)` -- placed immediately after
+    `_team_threads`'s own declaration. `_team_threads_pop_if_owned()`
+    replaces `_run_team_in_background()`'s own former check-then-act
+    (`entry = _team_threads.get(name)` ... later, separately,
+    `_team_threads.pop(name, None)`) with ONE atomic read-check-pop under
+    the lock. Every other accessor of `_team_threads` in this file --
+    `_team_reap_if_due()`'s own read, and both the `/team/start`/
+    `/team/stop` route handlers -- was audited and switched onto one of
+    these three functions; confirmed by grep that no raw `_team_threads[...]`/
+    `.get()`/`.pop()` call remains anywhere outside the three helpers
+    themselves.
+  - `_run_team_in_background()`'s own docstring corrected -- it previously
+    asserted a guarantee ("guards against a subsequent stop-then-relaunch
+    having already replaced the entry") the unlocked code did not actually
+    provide; now accurate, since the guarantee is real under the lock.
+
+- **`app/teams.py`**:
+  - `_create_team_session()`'s failure-cleanup branch: `_kill_team_session_
+    if_owned(session, run_id)` replaces a raw, unconditional `kill-session`.
+    Docstring corrected -- it previously argued (incorrectly) that a
+    concurrent second caller could never reach this branch holding someone
+    else's session, and that `_kill_team_session_if_owned()` was "the wrong
+    tool" for this specific cleanup; both claims were false, and the defect
+    they produced was real, not theoretical (see "Findings" below).
+
+- **`docs/design.md`**: "Color contrast" section (and the matching "Color
+  tokens" implementation note) rewritten against the app's real dark theme
+  (`#111`/`#1c1c1c`) and the real shipped hex values, with contrast ratios
+  recomputed via the standard WCAG relative-luminance formula rather than
+  estimated. All four status colors pass AA comfortably against the real
+  background; the original analysis's own arithmetic was wrong in 3 of 5
+  cases even against the light background it incorrectly assumed.
+
+- **`tests/test_team_routes.py`**: new `TeamThreadsLockTests` (2 tests) --
+  the must-fix's own regression test, using a `_SlowGetDict` (a dict
+  subclass whose `.get()` for one key sleeps briefly) to widen the window
+  between a caller's read and its later write/pop, the same "artificially
+  widened window standing in for real scheduler preemption" technique this
+  project's own `CreateTeamSessionAtomicStampTests` (part 1) already
+  established. One test proves the real, shipped `_team_threads_pop_if_
+  owned()`/`_team_threads_set()` survive it; a second, using the identical
+  technique against a faithful reproduction of the pre-fix shape, confirms
+  the technique itself is discriminating (so the first test's clean pass
+  isn't merely because the technique is too weak to ever catch anything).
+  Independently re-verified outside the permanent test suite too: manually
+  monkeypatched the real functions back to the pre-fix, unlocked shape and
+  confirmed the exact same widened-window scenario loses the entry every
+  time (see "Verification status").
+  - `TeamStartEndpointTests.test_two_near_simultaneous_starts_exactly_one_
+    succeeds`'s own loser-error assertion was narrowed to two specific
+    message substrings in round 1; broadened to "any real, non-empty
+    error" plus an added assertion that the winner's session is correctly
+    *stamped* with its own run_id (not just alive) -- see "Findings" for
+    why the narrower assertion was itself part of what let the real defect
+    go unnoticed in round 1.
+
+- **`tests/test_teams_lifecycle.py`**: new `SessionCreationRaceRealTmuxTests`
+  (1 test, 15 real, Barrier-synchronized concurrent-`_create_team_session()`
+  trials) -- the severe finding's own regression test. Independently
+  confirmed it fails against the pre-fix code (reverted the fix in a scratch
+  copy of `app/teams.py`, ran the test, watched it fail on trial 0, restored
+  the real fix, confirmed the restored file is byte-identical to the fixed
+  version via `diff`) before trusting it.
+
+## Findings
+
+### 1. Must-fix, confirmed and fixed as directed: `_team_threads` check-then-act race
+
+Exactly as the reviewer described. Fixed with `_team_threads_lock`,
+verified both that the real fix survives an artificially widened window and
+that the same widening technique reliably catches the pre-fix shape (2
+tests, `TeamThreadsLockTests`), and independently re-confirmed by manually
+monkeypatching the real functions back to the pre-fix shape and watching
+the identical scenario lose data every time.
+
+### 2. NOT asked for, found anyway: `_create_team_session()`'s failure-cleanup could destroy a winning concurrent launch's real session
+
+**How this was found**: chasing down why the must-fix's own re-verification
+loop still occasionally showed `test_two_near_simultaneous_starts_exactly_
+one_succeeds` failing under full-suite load (not in isolation), even after
+the `_team_threads` fix. The failure was an assertion mismatch on the
+loser's own error message ("failed to create worktree for 'helper':
+Preparing worktree ... fatal: '...' already exists" and, separately, "failed
+to create team session (tmux new-session failed)") -- neither matched
+round 1's own narrower assertion (`"already running" in ... or "already
+exists" in ...`). Investigating the SECOND of those two new message shapes
+-- one this cycle's own test had never actually observed before, in dozens
+of prior runs -- led directly to a real, severe defect in `_create_team_
+session()` (part 1 code, already reviewer-approved three rounds ago, never
+touched by this cycle's own diff until now).
+
+**The defect, precisely**: `_create_team_session()`'s own upfront
+`tmux_has(session)` check can pass as `False` for TWO different concurrent
+callers launching the same project at once (neither has created a session
+yet). Exactly one of their real `tmux new-session -s <same name> ...`
+calls can actually succeed server-side; tmux itself makes the LOSER's own
+`new-session` fail outright with a real "duplicate session" error, before
+any of its own `set-option` calls run -- so the loser's own call creates
+nothing. But the loser's OLD failure-cleanup code read `tmux_has(session)`
+being `True` at that point as "my own upfront check said nothing existed
+when I started, so whatever's here now must be MY OWN partially-created
+leftover" and issued an unconditional `kill-session` -- destroying the
+WINNER's real, live, already-fully-stamped session instead.
+
+**Reproduced directly, deterministically, not by luck**: a real,
+`threading.Barrier`-synchronized pair of concurrent `_create_team_session()`
+calls for the same project, run 20 times: **20/20 trials destroyed the
+winner's session** against the pre-fix code. Same script, same trial count,
+against the fixed code: **0/30**. See "How to verify locally" for the exact
+reproduction script.
+
+**Severity**: real resource destruction of a legitimate, currently-running
+team's tmux dashboard session (all of its member windows) by a losing,
+otherwise-harmless concurrent launch attempt for the same project -- worse
+than the `_team_threads` must-fix (which the reviewer correctly rated
+should-fix precisely because nothing it affected was unrecoverable or
+un-self-correcting). This one directly falsifies an explicit acceptance
+criterion of this cycle's own spec ("the successful run's worktrees/
+session/thread are byte-for-byte unaffected by the losing attempt") under
+real, not-especially-rare timing (~10-15% of trials under light concurrent
+system load in this session's own observations, reliably 100% under a
+tight `Barrier`-synchronized race). Also worth naming plainly: my own
+round-1 test for the two-concurrent-starts acceptance criterion did NOT
+catch this the first time, because its own loser-error assertion was
+narrower than the actual set of legitimate collision shapes -- it happened
+to pass every time it observed one of the two shapes it checked for, and
+simply never ran enough trials in round 1 to hit the third, rarer shape
+that would have exposed the real problem underneath it. This is exactly
+the "over-narrow assertion masks a real defect" failure mode the story's
+own reviewer keeps finding in this exact subsystem, just self-inflicted
+this time in my own test rather than in production code.
+
+**Fix, reusing existing, already-battle-tested machinery**:
+`_kill_team_session_if_owned(session, run_id)` -- the SAME ownership-stamp
+helper `stop_team()`/`sweep_dead_teams()` already use for the analogous
+part-1 defect (Defect #1, docs/implementation.md's own part-1 section) --
+replaces the raw `kill-session`. This is correct specifically because a
+winner's session, once observable to ANY concurrent caller at all, is
+ALWAYS already fully stamped with the winner's own run_id (part 1's own
+atomic-creation guarantee, `;`-chained in one tmux client call) -- so a
+losing caller's own (different) run_id never matches it, and `_kill_team_
+session_if_owned()` correctly leaves it alone. This call's own genuine
+partial-creation leftover (new-session succeeds, the LATER stamp link
+fails) is, by the same construction, always UNSTAMPED -- which `_kill_
+team_session_if_owned()` already treats as safe to kill for any run_id,
+correctly reclaiming it. No new mechanism, no new privileged surface --
+the exact tool this codebase already built for exactly this class of
+problem, previously not applied to this one call site because the
+docstring's own prior reasoning (now corrected) argued, incorrectly, that
+it didn't apply here.
+
+**Why this doesn't touch the standing constraints**: `_kill_team_session_
+if_owned()` already goes through the existing `TMUX` constant (unchanged);
+no new subprocess call, no new sudoers surface, no new privileged path --
+confirmed by `git diff` (no new `subprocess.run`/`sudo` call in either
+file's diff this round).
+
+## Deviations from spec
+
+None. Both fixes are structural corrections to already-shipped code (part 1
+in the second case), not changes to this cycle's own spec/design surface.
+`docs/design.md`'s color-token wording is corrected, not redesigned -- the
+actual states, copy, layout, and component reuse are all unchanged.
+
+## Known limitations
+
+- Unchanged from round 1, plus: the severity calibration the reviewer
+  applied to the `_team_threads` finding (should-fix, bounded/self-
+  correcting) does NOT apply to Finding #2 above (must-fix, real
+  destruction) -- recorded here so a future reader doesn't conflate the
+  two just because they surfaced in the same review round.
+
+## Verification status
+
+| Check | Command | Result |
+|---|---|---|
+| Syntax/compile | `python3 -m py_compile app/app.py app/teams.py tests/test_team_routes.py tests/test_teams_lifecycle.py` | clean |
+| Every `_team_threads` access goes through the lock-guarded helpers | `grep -n "_team_threads\b" app/app.py` then manual read of every match | confirmed -- every raw `[name]=`/`.get()`/`.pop()` call is inside `_team_threads_set()`/`_team_threads_get()`/`_team_threads_pop_if_owned()` only |
+| Must-fix regression test, fails against pre-fix code | manually monkeypatched `_team_threads_pop_if_owned`/`_team_threads_set` back to the unlocked shape, re-ran the exact widened-window scenario | `result: None` -- confirmed data loss reproduced against the pre-fix shape; passes cleanly against the real fixed code |
+| Must-fix regression test stability | `pytest tests/test_team_routes.py::TeamThreadsLockTests -q`, 5 consecutive runs | 2 passed every run |
+| Finding #2, standalone reproduction before trusting it as a regression test | manual `threading.Barrier`-synchronized script, 20 trials pre-fix / 30 trials post-fix | 20/20 destroyed pre-fix, 0/30 post-fix |
+| Finding #2 regression test fails against pre-fix code | reverted `_create_team_session()`'s fix in a scratch copy of `app/teams.py`, ran `SessionCreationRaceRealTmuxTests`, restored the real fix (confirmed byte-identical via `diff` afterward) | failed on trial 0 pre-fix (`AssertionError: ... the WINNER's session was destroyed`); passes cleanly post-fix |
+| Finding #2 regression test stability | `pytest tests/test_teams_lifecycle.py::SessionCreationRaceRealTmuxTests -q`, 20 consecutive runs | 1 passed every run |
+| `test_two_near_simultaneous_starts_exactly_one_succeeds` stability after broadening its own assertion | isolated: 25/25 and 40/40 clean across two separate batches; also clean across 5 consecutive full-suite runs | passed every time |
+| Full suite, 5 consecutive clean runs after both fixes (plus 2 earlier runs that caught the two over-narrow test assertions above, both since fixed) | `/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q` | **674 passed** every clean run (673 prior + 1 new: `SessionCreationRaceRealTmuxTests`; `TeamThreadsLockTests`' own 2 tests were already counted at 673) |
+| Frontend JS, all four suites (unaffected by this round -- Python/test-only changes) | `node tests/test_team_frontend.js && node tests/test_deploy_frontend.js && node tests/test_singleton_toggle_frontend.js && node tests/test_upload_frontend.js` | 17/17, 9/9, 15/15, 8/8 |
+| No new sudoers/privileged path this round | `git diff -- app/app.py app/teams.py \| grep -E "^\+.*subprocess\.(run\|Popen)\|^\+.*sudo"` | no matches |
+| Grounding read-only guards untouched | `git diff --stat -- tests/test_teams_grounding.py` | empty |
+| `git worktree remove` still never gains `--force` | `git diff -- app/teams.py \| grep -iE "\-\-force"` | no matches |
+| Deploy stays manual-click-only | `git diff -- app/app.py app/teams.py \| grep -i deploy` | only pre-existing round-1 references (the shared `.deploy-btn`/`.team-btn` CSS declaration, comment cross-references) -- `deploy_run()`/the `/instance/.../deploy` route are untouched this round |
+
+## How to verify locally
+
+```bash
+# Full suite (run several times)
+/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q
+
+# Both new/updated regression tests alone
+/home/dev/.local/bin/uv run --with pytest python -m pytest \
+  tests/test_team_routes.py::TeamThreadsLockTests \
+  tests/test_teams_lifecycle.py::SessionCreationRaceRealTmuxTests -v
+
+# Finding #2's own standalone reproduction script (20 trials, real tmux,
+# no sudo needed -- TMUX patched to plain `tmux`)
+TOTP_SECRET=JBSWY3DPEHPK3PXP AUTH_MODE=simple SIMPLE_USERNAME=x SIMPLE_PASSWORD=x python3 -c "
+import sys, threading, tempfile, subprocess
+sys.path.insert(0, 'app')
+import app as appmod, teams as teamsmod
+appmod.TMUX = teamsmod.TMUX = ['tmux']
+teamsmod.TEAM_STATE_DIR = tempfile.mkdtemp()
+session = teamsmod._team_session_name('proj')
+results = {}
+lost = 0
+for i in range(20):
+    subprocess.run(['tmux', 'kill-session', '-t', session], capture_output=True)
+    results.clear()
+    barrier = threading.Barrier(2)
+    def _launch(run_id, key):
+        barrier.wait()
+        results[key] = teamsmod._create_team_session('proj', run_id, [])
+    t1 = threading.Thread(target=_launch, args=(f'run-a-{i}', 'a'))
+    t2 = threading.Thread(target=_launch, args=(f'run-b-{i}', 'b'))
+    t1.start(); t2.start(); t1.join(); t2.join()
+    if not teamsmod.tmux_has(session):
+        lost += 1
+subprocess.run(['tmux', 'kill-session', '-t', session], capture_output=True)
+print(f'{lost}/20 trials: winner session destroyed (expect 0 against the fixed code)')
+"
+```

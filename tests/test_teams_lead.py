@@ -900,7 +900,7 @@ class MalformedRetryEscalationTests(_StateTestCase):
     def test_malformed_lead_output_retried_then_escalates_with_raw_text_included(self):
         state = teamsmod._new_state("run-malformed", self.projdir, self._lead(), [], "task")
 
-        def fake_call_lead(state, system, round_context):
+        def fake_call_lead(state, system, round_context, **kwargs):
             return None, None, "not json at all, garbage output"
 
         orig = teamsmod._call_lead
@@ -924,7 +924,7 @@ class MaxRoundsEscalationTests(_StateTestCase):
         state = teamsmod._new_state("run-maxrounds", self.projdir, self._lead(), [], "task")
         call_count = {"n": 0}
 
-        def fake_call_lead(state, system, round_context):
+        def fake_call_lead(state, system, round_context, **kwargs):
             call_count["n"] += 1
             return {"tool": "fact_check", "args": {"claim": "todo"}}, None, "..."
 
@@ -947,7 +947,7 @@ class BusinessRuleRejectionTests(_StateTestCase):
     def test_agent_not_on_team_ordinary_round_not_malformed(self):
         state = teamsmod._new_state("run-notonteam", self.projdir, self._lead(), ["claude"], "task")
 
-        def fake_call_lead(state, system, round_context):
+        def fake_call_lead(state, system, round_context, **kwargs):
             return {"tool": "delegate", "args": {"agent": "gemini", "task": "x"}}, None, "..."
 
         orig = teamsmod._call_lead
@@ -964,7 +964,7 @@ class BusinessRuleRejectionTests(_StateTestCase):
     def test_premature_finish_ordinary_round_not_malformed(self):
         state = teamsmod._new_state("run-premature", self.projdir, self._lead(), [], "task")
 
-        def fake_call_lead(state, system, round_context):
+        def fake_call_lead(state, system, round_context, **kwargs):
             return {"tool": "finish", "args": {"summary": "too soon"}}, None, "..."
 
         orig = teamsmod._call_lead
@@ -988,7 +988,7 @@ class BusinessRuleRejectionTests(_StateTestCase):
         state["round"] = 1
         state["action_count"] = 0
 
-        def fake_call_lead(state, system, round_context):
+        def fake_call_lead(state, system, round_context, **kwargs):
             return {"tool": "finish", "args": {"summary": "done"}}, None, "..."
 
         orig = teamsmod._call_lead
@@ -1007,7 +1007,7 @@ class DelegateBookkeepingTests(_StateTestCase):
     def test_successful_delegate_updates_bookkeeping_and_session(self):
         state = teamsmod._new_state("run-delegate", self.projdir, self._lead(), ["claude"], "task")
 
-        def fake_call_lead(state, system, round_context):
+        def fake_call_lead(state, system, round_context, **kwargs):
             return {"tool": "delegate", "args": {"agent": "claude", "task": "do x"}}, None, "..."
 
         seen = {}
@@ -1038,7 +1038,7 @@ class DelegateBookkeepingTests(_StateTestCase):
         state = teamsmod._new_state("run-delegate2", self.projdir, self._lead(), ["claude"], "task")
         state["teammate_sessions"]["claude"] = "sess-prev"
 
-        def fake_call_lead(state, system, round_context):
+        def fake_call_lead(state, system, round_context, **kwargs):
             return {"tool": "delegate", "args": {"agent": "claude", "task": "do y"}}, None, "..."
 
         seen = {}
@@ -1059,7 +1059,7 @@ class DelegateBookkeepingTests(_StateTestCase):
     def test_delegate_failure_still_records_history_and_does_not_raise(self):
         state = teamsmod._new_state("run-delegate-fail", self.projdir, self._lead(), ["claude"], "task")
 
-        def fake_call_lead(state, system, round_context):
+        def fake_call_lead(state, system, round_context, **kwargs):
             return {"tool": "delegate", "args": {"agent": "claude", "task": "do z"}}, None, "..."
 
         def fake_agent_run(engine, workdir, prompt, *, session_id=None, **kw):
@@ -1112,7 +1112,7 @@ class FactCheckAskUserFinishBranchTests(_StateTestCase):
     def test_fact_check_branch_records_result_and_bumps_action_count(self):
         state = teamsmod._new_state("run-fc", self.projdir, self._lead(), [], "task")
 
-        def fake_call_lead(state, system, round_context):
+        def fake_call_lead(state, system, round_context, **kwargs):
             return {"tool": "fact_check", "args": {"claim": "unprivileged system account"}}, None, "..."
 
         orig = teamsmod._call_lead
@@ -1127,7 +1127,7 @@ class FactCheckAskUserFinishBranchTests(_StateTestCase):
     def test_ask_user_branch_writes_inbox_and_blocks(self):
         state = teamsmod._new_state("run-au", self.projdir, self._lead(), [], "task")
 
-        def fake_call_lead(state, system, round_context):
+        def fake_call_lead(state, system, round_context, **kwargs):
             return {"tool": "ask_user", "args": {"question": "Continue?", "header": "Cont",
                                                   "options": [{"label": "Yes", "description": "y"},
                                                              {"label": "No", "description": "n"}]}}, None, "..."
@@ -1145,7 +1145,7 @@ class FactCheckAskUserFinishBranchTests(_StateTestCase):
         state = teamsmod._new_state("run-fin", self.projdir, self._lead(), [], "task")
         state["action_count"] = 1  # simulate prior work already done
 
-        def fake_call_lead(state, system, round_context):
+        def fake_call_lead(state, system, round_context, **kwargs):
             return {"tool": "finish", "args": {"summary": "all done"}}, None, "..."
 
         orig = teamsmod._call_lead

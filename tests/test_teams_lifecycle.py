@@ -863,6 +863,90 @@ class CreateTeamSessionFailingLinkCleanupTests(_RealTmuxTeamLifecycleTestCase):
         self.assertTrue(teamsmod.tmux_has(second["session"]))
 
 
+class SessionCreationRaceRealTmuxTests(_RealTmuxTeamLifecycleTestCase):
+    """
+    Regression test for a real, severe defect found while verifying backlog
+    item 6d part 2a's own two-concurrent-starts acceptance criterion (not
+    hypothetical, not in any spec's own enumerated cases -- found by running
+    that criterion's own real-concurrency test many times in a row and
+    noticing a rare, third failure shape): _create_team_session()'s own
+    failure-cleanup branch used to kill whatever session it found at
+    `session` unconditionally (a RAW `kill-session`, not ownership-checked).
+
+    Two real, Barrier-synchronized callers can both pass their own upfront
+    `tmux_has(session)` check as False (neither has created anything yet),
+    then race to `new-session -s <same name>`. tmux itself only lets ONE
+    such call actually create the session server-side -- the LOSER's own
+    `new-session` genuinely fails (a real "duplicate session" error, tmux
+    never rolls back or half-creates anything for the loser). But the
+    loser's OLD cleanup code read this as "a session exists at this name,
+    and my own upfront check said nothing existed when I started, so
+    whatever's there now must be MY OWN leftover" -- an unconditional
+    kill-session then destroyed the WINNER's real, live, already-stamped
+    session. Reproduced directly, standalone, before trusting this as a
+    regression test: 20/20 trials destroyed the winner's session against
+    the old (raw-kill) code, 0/30 against the fix (see docs/implementation.md
+    for the full reproduction script). Fixed by routing the same cleanup
+    through _kill_team_session_if_owned(session, run_id) instead of a raw
+    kill-session -- see _create_team_session()'s own docstring for the full
+    ownership reasoning (ONLY correct because a winner's session, once
+    observable at all, is ALWAYS already fully stamped with its own run_id,
+    per this same file's own atomic-creation guarantee).
+    """
+
+    def test_barrier_synchronized_concurrent_create_never_kills_the_winners_session(self):
+        project_name = "sessionrace"
+        session = teamsmod._team_session_name(project_name)
+        TRIALS = 15
+        for i in range(TRIALS):
+            subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
+            results = {}
+            barrier = threading.Barrier(2)
+
+            def _create(run_id, key):
+                barrier.wait()
+                results[key] = teamsmod._create_team_session(project_name, run_id, [])
+
+            run_id_a, run_id_b = f"run-a-{i}", f"run-b-{i}"
+            t1 = threading.Thread(target=_create, args=(run_id_a, "a"))
+            t2 = threading.Thread(target=_create, args=(run_id_b, "b"))
+            t1.start()
+            t2.start()
+            t1.join(timeout=10)
+            t2.join(timeout=10)
+
+            oks = {k: v for k, v in results.items() if v["ok"]}
+            fails = {k: v for k, v in results.items() if not v["ok"]}
+            self.assertEqual(len(oks), 1, f"trial {i}: expected exactly one winner, got {results!r}")
+            self.assertEqual(len(fails), 1, f"trial {i}: expected exactly one loser, got {results!r}")
+            winner_key = next(iter(oks))
+            winner_run_id = run_id_a if winner_key == "a" else run_id_b
+
+            self.assertTrue(teamsmod.tmux_has(session),
+                            f"trial {i}: the WINNER's session was destroyed by the loser's own cleanup")
+            self.assertEqual(teamsmod._team_session_run_id(session), winner_run_id,
+                             f"trial {i}: session survived but is stamped with the wrong run_id")
+            # Two legitimate shapes for the loser's own error, depending on
+            # exactly how the two threads interleave: it either loses at
+            # its own upfront tmux_has() pre-check (if the winner's session
+            # already exists by the time the loser's check runs) or loses
+            # at the real tmux "duplicate session" new-session race (if
+            # both threads pass the pre-check before either has created
+            # anything) -- both are real, both are covered by this same
+            # fix, and under real system load (e.g. this file's own full
+            # suite run) either can fire; asserting only one specific
+            # shape is exactly the kind of over-narrow assertion that let
+            # the original defect this test guards go unnoticed elsewhere
+            # in this cycle (see tests/test_team_routes.py's own
+            # near-identical lesson for the launch_team()-level version of
+            # this).
+            loser_error = next(iter(fails.values()))["error"]
+            self.assertTrue(
+                "failed to create team session" in loser_error or "already running" in loser_error,
+                loser_error)
+        subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
+
+
 class LaunchTeamWorldReadableUnderStrictUmaskTests(_RealTmuxTeamLifecycleTestCase):
     def test_every_dashboard_input_file_world_readable_under_strict_umask(self):
         # docs/spec.md acceptance criteria: reuses 6a's own precedent test
@@ -939,7 +1023,7 @@ class TeamRunDelegateWorktreeAndDashboardTests(_RealTmuxTeamLifecycleTestCase):
 
         calls = {"n": 0}
 
-        def fake_call_lead(state, system, round_context):
+        def fake_call_lead(state, system, round_context, **kwargs):
             calls["n"] += 1
             if calls["n"] <= 2:
                 return ({"tool": "delegate", "args": {"agent": "faketm", "task": f"task {calls['n']}"}},

@@ -834,13 +834,20 @@ def _sweep_stale_runs() -> None:
 
 def _run_headless_session(*, session: str, out_path: str, err_path: str, pid_path: str,
                           rc_path: str, log_path: str, headless_format: str, timeout: float,
-                          agent_name: str) -> dict:
+                          agent_name: str, cancel_event: threading.Event = None) -> dict:
     """
     Startup confirmation, tailing loop, completion-ordering, and
     cancellation escalation (docs/spec.md §4). Assumes the tmux session has
     already been created by the caller; does not create or tear it down
     itself (agent_run() owns that, so cleanup happens in one place
     regardless of which branch below returns).
+
+    `cancel_event` (backlog item 6d part 2a, docs/spec.md §7): optional,
+    keyword-only, default None -- every existing caller unaffected. Checked
+    on the loop's own existing polling cadence as a SECOND trigger for the
+    identical TERM->KILL->kill-session escalation ladder the timeout
+    already drives (reason "stopped" instead of "timeout"/"external") --
+    not a new ladder, not a new code path.
     """
     deadline = time.time() + 5.0
     pid = None
@@ -908,7 +915,11 @@ def _run_headless_session(*, session: str, out_path: str, err_path: str, pid_pat
                 # clean (docs/spec.md §4 "Completion detection").
                 return _finish(None, True, cancel_reason)
             now = time.time()
-            if escalation is None and (now - start) >= timeout:
+            if escalation is None and cancel_event is not None and cancel_event.is_set():
+                cancel_reason = "stopped"
+                _send_signal(session, pid, "TERM")
+                escalation, stage_sent_at = "term", now
+            elif escalation is None and (now - start) >= timeout:
                 cancel_reason = "timeout"
                 _send_signal(session, pid, "TERM")
                 escalation, stage_sent_at = "term", now
@@ -938,7 +949,8 @@ def agent_run(engine: str, workdir: str, prompt: str, *,
              session_id: str = None,
              timeout: float = TEAM_HEADLESS_TIMEOUT_SECONDS,
              log_path: str = None,
-             schema: dict = None) -> dict:
+             schema: dict = None,
+             cancel_event: threading.Event = None) -> dict:
     """
     Runs exactly one bounded, non-interactive turn of `engine` against
     `workdir`, resumed by `session_id` if given. Never raises for anything
@@ -965,6 +977,11 @@ def agent_run(engine: str, workdir: str, prompt: str, *,
     `_build_headless_argv()`/`_resolve_schema_fragment()` as either that
     path or the schema's own inline JSON text, depending on which
     placeholder the engine declared.
+
+    `cancel_event` (backlog item 6d part 2a, docs/spec.md §7): optional,
+    keyword-only, default None -- every existing caller (the `run` CLI
+    subcommand, every 6a/6c/6d-part-1 test) is byte-for-byte unaffected.
+    Passed straight through to `_run_headless_session()`.
     """
     _sweep_stale_runs()
 
@@ -1056,7 +1073,7 @@ def agent_run(engine: str, workdir: str, prompt: str, *,
         return _run_headless_session(
             session=session, out_path=out_path, err_path=err_path, pid_path=pid_path,
             rc_path=rc_path, log_path=log_path, headless_format=eng.headless_format,
-            timeout=timeout, agent_name=engine)
+            timeout=timeout, agent_name=engine, cancel_event=cancel_event)
     finally:
         # Durable artifact is log_path; the raw out/err/pid/rc/prompt
         # plumbing under RUNDIR is thrown away regardless of outcome
@@ -1789,6 +1806,73 @@ def roster() -> list:
     return entries
 
 
+def default_team_composition() -> dict:
+    """
+    {"ok": True, "lead": {...}, "members": [...]} or
+    {"ok": False, "error": "..."}. Backlog item 6d part 2a -- the actual
+    lead/member PICKER is 6e's job; this is the deterministic default the
+    web route uses until then. Built entirely on roster()/_lead_tier_for_
+    engine()/_schema_flag_config_error() -- no new engine-iteration logic.
+
+    Lead, in priority order:
+      1. The configured Ollama tier-1 model, if TEAM_LLM_BASE_URL and
+         TEAM_LLM_MODEL are both set (docs/story.md §3, "Ollama-backed
+         local model is the default").
+      2. Else the first (sorted by name) headless-eligible engines.d entry
+         that is tier 2 (schema-constrained) with no schema_flag_error.
+      3. A tier-3 (prose-parse) engine is NEVER selected as the default
+         lead -- SETTLED BY THE USER 2026-08-13, against this spec's own
+         original recommendation to allow it. If the only headless-eligible
+         engines are tier 3, refuse, naming both concrete fixes. Note this
+         makes the DEFAULT stricter, not the system: 6c's CLI --lead still
+         accepts a tier-3 lead as an explicit opt-in, and that path is
+         unchanged (see CliTeamStartTierThreeLeadStillAllowedTests).
+      4. Else refuse -- no roster member at all is available to lead.
+
+    Members: every OTHER headless-eligible engines.d entry (an Ollama lead
+    isn't itself an engines.d entry, so nothing is excluded from members
+    when the lead is Ollama). If that list is empty, refuse, naming the
+    lead that was selected and the two ways to free up a teammate.
+    """
+    entries = roster()
+    engine_entries = [e for e in entries if e["kind"] == "engine"]
+    excluded_name = None
+
+    if TEAM_LLM_BASE_URL and TEAM_LLM_MODEL:
+        lead = {"kind": "ollama", "name": TEAM_LLM_MODEL, "tier": 1}
+    else:
+        tier2 = [e for e in engine_entries if e["tier"] == 2 and not e.get("schema_flag_error")]
+        if tier2:
+            picked = tier2[0]
+            lead = {"kind": "engine", "name": picked["name"], "tier": 2}
+            excluded_name = picked["name"]
+        elif any(e["tier"] == 3 for e in engine_entries):
+            return {"ok": False, "error": (
+                "only a tier-3 (prose-parse, least reliable) lead is available -- "
+                "configure TEAM_LLM_BASE_URL/TEAM_LLM_MODEL, or add a tier-2 "
+                "(schema-capable) engine to engines.d. The CLI's --lead can still "
+                "select a tier-3 lead explicitly.")}
+        else:
+            # Either no headless-eligible engine at all, or every one that
+            # exists is a misconfigured tier-2 (schema_flag_error set) --
+            # neither is a genuine tier-3-only situation, so the more
+            # specific message above doesn't apply; fold into the generic
+            # "nothing usable" refusal (roster()'s own schema_flag_error
+            # field already surfaces the specific misconfiguration).
+            return {"ok": False, "error": (
+                "no roster member is available to lead a team -- configure "
+                "TEAM_LLM_BASE_URL/TEAM_LLM_MODEL or add a headless-eligible "
+                "engine to engines.d")}
+
+    members = [e["name"] for e in engine_entries if e["name"] != excluded_name]
+    if not members:
+        return {"ok": False, "error": (
+            f"only one headless-eligible engine ('{lead['name']}') is configured "
+            "and it was selected as lead -- add another engine to engines.d or "
+            "configure TEAM_LLM_BASE_URL/TEAM_LLM_MODEL to free it up as a teammate")}
+    return {"ok": True, "lead": lead, "members": members}
+
+
 # ─── the four-tool schema (reused verbatim in shape from
 # scripts/spike-lead-toolcalling.py, docs/spec.md §4) -- the one deliberate
 # change from the spike's own throwaway harness is that delegate.agent's
@@ -2394,7 +2478,8 @@ def _force_ask_user(state: dict, *, question: str, header: str, status: str = "b
 
 
 # ─── tier 2 wrapper (schema-constrained, via agent_run(..., schema=...)) ──
-def _call_lead(state: dict, system: str, round_context: str):
+def _call_lead(state: dict, system: str, round_context: str, *,
+               cancel_event: threading.Event = None):
     """
     Dispatches to the right adapter for state["lead"]["tier"]. Returns
     (raw_or_None, transport_error_or_None, raw_text) -- raw_text is the
@@ -2408,6 +2493,13 @@ def _call_lead(state: dict, system: str, round_context: str):
     the ordinary shared malformed-retry path -- there is no separate
     "transport retry" concept for an engines.d-hosted lead the way there is
     for the tier-1 HTTP endpoint.
+
+    `cancel_event` (backlog item 6d part 2a, docs/spec.md §7): optional,
+    keyword-only, default None -- threaded into the tier-2/tier-3 lead's own
+    `agent_run()` call (it has a real subprocess to SIGTERM). Tier 1 (the
+    Ollama HTTP call) has no subprocess to signal -- accepted but unused
+    there; team_step()'s own checkpoint (right after this function returns)
+    is what actually bounds a stop request arriving mid-tier-1-call.
     """
     tier = state["lead"]["tier"]
     if tier == 1:
@@ -2428,9 +2520,10 @@ def _call_lead(state: dict, system: str, round_context: str):
 
     prompt = _assemble_prompt(system, round_context)
     if tier == 2:
-        result = agent_run(state["lead"]["name"], state["workdir"], prompt, schema=_TIER2_LEAD_SCHEMA)
+        result = agent_run(state["lead"]["name"], state["workdir"], prompt,
+                           schema=_TIER2_LEAD_SCHEMA, cancel_event=cancel_event)
     else:
-        result = agent_run(state["lead"]["name"], state["workdir"], prompt)
+        result = agent_run(state["lead"]["name"], state["workdir"], prompt, cancel_event=cancel_event)
     text = result.get("text") or ""
     if not text and not result.get("ok"):
         text = result.get("error") or ""
@@ -2446,12 +2539,20 @@ def _call_lead(state: dict, system: str, round_context: str):
 
 
 # ─── the lead loop (docs/spec.md §10) ─────────────────────────────────────
-def team_step(state: dict) -> dict:
+def team_step(state: dict, *, cancel_event: threading.Event = None) -> dict:
     """
     One round. Takes/returns the run's own state dict (§11's persisted
     shape); the only I/O is one lead-adapter call, zero or one
     agent_run()/fact_check() call, and the state write at the end. Never
     raises for anything shaped wrong -- see _validate_lead_action().
+
+    `cancel_event` (backlog item 6d part 2a, docs/spec.md §7): optional,
+    keyword-only, default None -- byte-for-byte unchanged behavior when
+    omitted. Two checkpoints, both additive: immediately after _call_lead()
+    returns (checked FIRST, ahead of every existing branch, so a stop always
+    wins over a malformed/failed lead call); immediately after the delegate
+    branch's own agent_run() call returns (before the existing SUCCEEDED/
+    FAILED history framing).
     """
     round_n = len(state["history"]) + 1
     tier = state["lead"]["tier"]
@@ -2460,7 +2561,15 @@ def team_step(state: dict) -> dict:
     round_context = _round_context(state["task"], state["history"], last_entry,
                                    round_n, state["max_rounds"])
 
-    raw, transport_error, raw_text = _call_lead(state, system, round_context)
+    raw, transport_error, raw_text = _call_lead(state, system, round_context,
+                                               cancel_event=cancel_event)
+    if cancel_event is not None and cancel_event.is_set():
+        state["status"] = "stopped"
+        _append_history(state, round_n, tool=None, args_summary="(stopped)",
+                        outcome_summary="stopped by request before this round's action executed",
+                        full_result_text="", log_path=None, transcript_entries=[])
+        _persist(state)
+        return state
     if transport_error is not None:
         # Ollama unreachable/timed out/5xx after exhausting the transport
         # retry budget -- a clear, actionable, non-traceback operational
@@ -2523,11 +2632,30 @@ def team_step(state: dict) -> dict:
         worktree = state.get("worktrees", {}).get(agent)
         result = agent_run(agent, worktree or state["workdir"], task,
                           session_id=state["teammate_sessions"].get(agent),
-                          log_path=_agent_log_path(state["run_id"], agent))
+                          log_path=_agent_log_path(state["run_id"], agent),
+                          cancel_event=cancel_event)
         state["in_progress_delegate"] = None
         state["teammate_sessions"][agent] = result.get("session_id")
         state["action_count"] += 1
         text = result.get("text") or ""
+        task_preview = task if len(task) <= 100 else task[:97] + "..."
+        # backlog item 6d part 2a, docs/spec.md §7: checked BEFORE the
+        # existing SUCCEEDED/FAILED framing below, so an in-flight
+        # delegation interrupted by a stop request is recorded as a clean
+        # "stopped" outcome, not misread as an ordinary failure.
+        if cancel_event is not None and cancel_event.is_set():
+            state["status"] = "stopped"
+            _append_history(state, round_n, tool="delegate",
+                            args_summary=f'delegate(agent={agent}, task="{task_preview}")',
+                            outcome_summary="stopped by request (delegation interrupted)",
+                            full_result_text=text, log_path=result.get("log_path"),
+                            transcript_entries=[
+                                ("handoff", task, {"agent": agent}),
+                                ("tool_result", text, {"agent": agent, "ok": result["ok"],
+                                                       "log_path": result.get("log_path")}),
+                            ])
+            _persist(state)
+            return state
         # docs/spec.md "Correction: repeated delegation of an
         # already-completed task" -- the round-history summary must state
         # prior delegations' agent/task/success EXPLICITLY and SALIENTLY,
@@ -2536,7 +2664,6 @@ def team_step(state: dict) -> dict:
         # recur. SUCCEEDED/FAILED in capitals on purpose -- distinct at a
         # glance from fact_check's own lowercase found=True/False summaries
         # a few lines above/below it in the same round history.
-        task_preview = task if len(task) <= 100 else task[:97] + "..."
         if result["ok"]:
             outcome_summary = f'SUCCEEDED, {len(text)} chars (see log)'
         else:
@@ -2605,21 +2732,31 @@ def _recover_in_progress(state: dict) -> None:
     _persist(state)
 
 
-def team_run(state: dict) -> dict:
+def team_run(state: dict, *, cancel_event: threading.Event = None) -> dict:
     """
     Drives team_step() in a loop until finish / ask_user / TEAM_MAX_ROUNDS.
     This is the function the CLI's team-start/team-resume/team-resolve
     subcommands call; nothing here assumes a foreground TTY, so a later
     sub-spec can run it off a background thread with zero change.
+
+    `cancel_event` (backlog item 6d part 2a, docs/spec.md §7): optional,
+    keyword-only, default None -- every existing CLI caller unaffected
+    (cancel_event is never supplied there). Checked at the top of the loop,
+    alongside the existing max_rounds check -- the cheapest possible
+    checkpoint, avoids even starting a new round.
     """
     _recover_in_progress(state)
     while state["status"] == "running":
+        if cancel_event is not None and cancel_event.is_set():
+            state["status"] = "stopped"
+            _persist(state)
+            break
         if len(state["history"]) >= state["max_rounds"]:
             _force_ask_user(state, question=f"Team did not converge after {state['max_rounds']} rounds.",
                             header="MaxRnds", status="escalated_max_rounds")
             _persist(state)
             break
-        team_step(state)
+        team_step(state, cancel_event=cancel_event)
     return state
 
 
@@ -2989,11 +3126,12 @@ def _create_team_session(project_name: str, run_id: str, members: list) -> dict:
     only the first was closed by making creation+stamping one call.**
     Confirmed live: if `new-session` itself fails (e.g. a genuine
     duplicate-session race between this call's own upfront `tmux_has()`
-    check and its actual `new-session` -- see below for why that specific
-    race can't happen here anyway), tmux aborts the WHOLE chain before any
-    `set-option` runs, so a losing racer's chain can never touch a winning
-    racer's already-stamped session. But if `new-session` SUCCEEDS and a
-    LATER link fails (in practice only the run_id `set-option` could --
+    check and its actual `new-session` -- see below, this race very much
+    CAN happen and does, reliably, under real concurrent launches for the
+    SAME project), tmux aborts the WHOLE chain before any `set-option`
+    runs, so a losing racer's chain can never MODIFY a winning racer's
+    already-stamped session. But if `new-session` SUCCEEDS and a LATER
+    link fails (in practice only the run_id `set-option` could --
     `remain-on-exit`'s value is a hardcoded literal, and `@`-prefixed user
     options accept any string, so neither is expected to fail under normal
     operation), tmux does NOT roll back the already-successful
@@ -3006,22 +3144,38 @@ def _create_team_session(project_name: str, run_id: str, members: list) -> dict:
     outside its own cleanup, leaking a resource" shape as 6a's own first
     defect (there, a rundir; here, a tmux session).
 
-    On this failure path, the session (if one now exists at all) is killed
-    directly -- NOT via _kill_team_session_if_owned(), which is the wrong
-    tool here: it identifies ownership from the STAMP, and the stamp is
-    precisely what may not have landed. Ownership is instead established
-    structurally, from the calling context itself: this function's own
-    upfront `tmux_has(session)` check already confirmed no session with
-    this exact name existed the moment this call started, and tmux's own
-    `new-session` refuses a duplicate name outright (confirmed above --
+    **On this failure path, the session (if one now exists at all) is
+    killed via `_kill_team_session_if_owned(session, run_id)` -- not a raw,
+    unconditional `kill-session`.** An earlier version of this function
+    used a raw kill (reasoning: "this call's own upfront `tmux_has()`
+    check already confirmed no session existed when THIS call started, and
     a failing `new-session` aborts before any `set-option`, so a
-    concurrent second caller for the SAME project can never reach this
-    kill-on-failure branch with someone ELSE's session sitting at this
-    name). So if `new-session` for THIS call succeeded (this branch is
-    only reached when it did -- see the code below), any session found
-    existing at `session` right now can only be the one THIS call just
-    created, stamped or not, and killing it is safe without consulting a
-    stamp that may not exist.
+    concurrent second caller can never reach this branch holding someone
+    ELSE's session at this name"). **That reasoning was false, and the
+    defect it produced was real, not theoretical**: it only accounts for
+    ordering AFTER this call's own `new-session` attempt, not for a
+    DIFFERENT concurrent caller's `new-session` succeeding in the window
+    between THIS call's own upfront check and its own `new-session`
+    attempt (both callers can observe `tmux_has(session)` as False at
+    their own upfront check, since neither has created anything yet) --
+    when that happens, THIS call's own `new-session` fails with tmux's
+    real "duplicate session" error (nothing of this call's own creation),
+    but `tmux_has(session)` is now True because the OTHER caller's session
+    exists. The old, raw `kill-session` could not tell the difference and
+    killed the OTHER (winning) caller's real, live session. Reproduced
+    directly with two real, barrier-synchronized concurrent `_create_team_
+    session()` calls for the same project: 20/20 trials destroyed the
+    winner's session under the old code (see `SessionCreationRaceRealTmux
+    Tests`). `_kill_team_session_if_owned()` closes this correctly, reusing
+    the SAME ownership-stamp mechanism that already makes `stop_team()`'s/
+    `sweep_dead_teams()`'s own analogous races safe: the winner's session,
+    once observable at all, is ALWAYS already fully stamped (atomicity, see
+    above) with the WINNER's own run_id -- a losing racer's own run_id
+    never matches it, so `_kill_team_session_if_owned()` correctly leaves
+    it alone. THIS call's own genuine partial-creation leftover (new-
+    session succeeded, the later stamp link failed) is, by construction,
+    UNSTAMPED -- which `_kill_team_session_if_owned()` already treats as
+    safe to kill for any run_id, correctly reclaiming it.
     """
     session = _team_session_name(project_name)
     if tmux_has(session):
@@ -3038,18 +3192,23 @@ def _create_team_session(project_name: str, run_id: str, members: list) -> dict:
     except OSError as e:
         return {"ok": False, "error": f"failed to create team session: {e}"}
     if r.returncode != 0 or not tmux_has(session):
-        # `new-session` itself may have failed (nothing to clean up -- the
-        # whole chain aborted before creating anything), OR `new-session`
-        # succeeded and a LATER link failed (the session exists, half-
-        # configured, unstamped -- clean it up here so this failure path
-        # leaves nothing behind, matching the guarantee launch_team()'s own
-        # worktree rollback already gives). Either way, `tmux_has(session)`
-        # right now can only be true for a session THIS call itself just
-        # created (see this function's own docstring for why) -- direct
-        # kill-session, not _kill_team_session_if_owned() (the stamp this
-        # call may never have reached is exactly what that helper needs).
-        if tmux_has(session):
-            subprocess.run(TMUX + ["kill-session", "-t", session], capture_output=True)
+        # `new-session` itself may have failed -- either nothing was ever
+        # created (this call's own chain aborted before creating anything),
+        # OR a DIFFERENT, concurrently-racing caller's `new-session` won
+        # for this exact session name (this call's own upfront tmux_has()
+        # check passed when nothing existed yet, but the OTHER caller
+        # created+stamped its session before THIS call's own new-session
+        # attempt reached the server -- tmux's real "duplicate session"
+        # error, not a shape this code created). OR `new-session` succeeded
+        # for THIS call and a LATER link failed (the session exists,
+        # half-configured, unstamped -- a genuine leftover of THIS call).
+        # `tmux_has(session)` being true here does NOT by itself
+        # distinguish "my own leftover" from "someone else's live, winning
+        # session" -- ownership-checked cleanup via _kill_team_session_if_
+        # owned(), not a raw kill-session (see this function's own
+        # docstring for the real, reproduced defect the raw-kill version
+        # of this line used to cause).
+        _kill_team_session_if_owned(session, run_id)
         return {"ok": False, "error": "failed to create team session (tmux new-session failed)"}
     for agent in members:
         log_path = _agent_log_path(run_id, agent)
@@ -3082,6 +3241,15 @@ def launch_team(workdir: str, task: str, lead: dict, members: list,
         return {"ok": False, "error": err}
 
     project_name = os.path.basename(os.path.normpath(workdir))
+    if not project_name:
+        # backlog item 6d part 2a, docs/spec.md §8: a filesystem-root
+        # workdir would otherwise yield a degenerate "team-" session name.
+        # Carried forward from part 1's own disclosed, deliberately-left-
+        # open item, closed now that part 2's HTTP route is the first real
+        # caller that could plausibly reach this with an operator-adjacent
+        # path (though in practice it still can't -- workdir is always
+        # PROJECTS_DIR/<name> with an already-NAME_RE-validated <name>).
+        return {"ok": False, "error": "workdir has no derivable project name"}
     session = _team_session_name(project_name)
     if tmux_has(session):
         return {"ok": False, "error": f"a team is already running for '{project_name}' "
@@ -3196,6 +3364,73 @@ def stop_team(run_id: str) -> dict:
     _persist(state)
 
     return {"session_removed": session_removed, "worktrees": worktrees_result}
+
+
+def mark_run_error(run_id: str, message: str) -> None:
+    """
+    Backlog item 6d part 2a. Loads the run's own persisted state fresh
+    (never trusts a caller-held copy -- same discipline every other
+    run.json-touching function here already follows), sets
+    status="error"/error=message, and persists. Raises FileNotFoundError
+    for an unknown run_id, same as _load_state() itself -- callers (the
+    background driving thread's own try/except, _team_reap_if_due()'s
+    orphan check) handle that the same way every other run.json reader
+    already does.
+
+    Unconditional, like stop_team()'s own status-setting line -- an
+    unexpected exception mid-run (app.py's _run_team_in_background()) or a
+    detected orphaned driving thread (_team_reap_if_due()) both mean "this
+    run's own on-disk status can no longer be trusted to self-correct", so
+    this always overwrites it. No lock on run.json -- same accepted
+    "whichever writer's _persist() call lands last wins" tradeoff docs/
+    spec.md §7 already documents for the cancel_event/stop_team() race; a
+    genuinely still-live writer (e.g. a concurrent CLI team-resume) simply
+    overwrites this on its own next round, exactly as docs/spec.md's own
+    disclosed, accepted "Open questions" tradeoff describes.
+    """
+    state = _load_state(run_id)
+    state["status"] = "error"
+    state["error"] = message
+    _persist(state)
+
+
+def latest_run_for_project(project_name: str) -> dict | None:
+    """
+    The persisted state dict of the most-recently-updated run recorded for
+    this project_name, or None if no run has ever been launched for it
+    (backlog item 6d part 2a). At most one run can be non-terminal (status
+    in running/blocked_ask_user) at a time -- launch_team()'s own
+    session-name collision check (part 1) -- so when a live run exists it
+    is always also the most recent; callers that only care about a LIVE run
+    check `.get("status") in ("running", "blocked_ask_user")` on the
+    result rather than needing a separate function. Same O(all runs under
+    _leads_root()) scan idiom sweep_dead_teams() already uses (docs/spec.md
+    "Non-goals" -- accepted at this project's scale). An unreadable/corrupt
+    run.json for one run_id is skipped, not fatal, matching sweep_dead_
+    teams()'s own discipline; a run with no project_name (a bare team-start
+    that skipped team-launch, 6c-only) is skipped too -- it was never
+    launched for any project by this function's own definition.
+    """
+    root = _leads_root()
+    if not os.path.isdir(root):
+        return None
+    latest = None
+    latest_epoch = -1.0
+    for run_id in os.listdir(root):
+        try:
+            state = _load_state(run_id)
+        except (OSError, ValueError):
+            continue
+        if state.get("project_name") != project_name:
+            continue
+        try:
+            epoch = _iso_to_epoch(state.get("updated_at", ""))
+        except ValueError:
+            continue
+        if epoch > latest_epoch:
+            latest_epoch = epoch
+            latest = state
+    return latest
 
 
 def _iso_to_epoch(s: str) -> float:
