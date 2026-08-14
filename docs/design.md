@@ -259,482 +259,376 @@ After `/projects/<name>/team/stop` completes:
 
 ---
 
-# Design: Web UI for approving/rejecting board_write proposals (sub-spec 7 part 2)
+# Design: Clone a project from a remote repository URL (backlog item 16)
 
 ## Summary
-
-Extend the Teams page's already-shipped `blocked_ask_user` web UI (status strip, escalation panel, TOTP-gated resolve flow) to also handle `blocked_board_write` runs. Reuse the status strip, escalation panel, and TOTP machinery exactly where shapes match; only render verb-specific copy and panel layouts for the three board-write verb types (`set_status`, `amend_description`, `append_comment`). The escalation panel shows the proposed change alongside the current value (where applicable), buttons to Approve or Reject (no free-text input), and an optional lead's note. The status strip visually distinguishes board-write proposals from ask_user questions via distinct copy and styling. The merged event feed renders board-write proposals and resolutions distinctly via new transcript entry classifiers. All approval/rejection flows reuse the existing TOTP code-overlay machinery.
+A third project-creation entry point alongside "+ New project" and "Upload folder / .zip", allowing operators to clone an existing public repository by pasting its remote URL. The form is a simple inline row with a URL input field (required), an optional project-name override field, and a "Clone" button. The loading state displays a progress message indicating that cloning can take 30-180 seconds for large repositories. Error states handle invalid URLs, network failures, authentication failures (private repos), and oversized clones. Success results in a new project appearing in the project list, identical to projects created via other paths. No new visual language — all styling reuses existing "+ New project" patterns.
 
 ## ui-ux-pro-max choices
-
-- **Style**: Status strip copy changes from "⚠ Waiting on you" (ask_user) to "⚠ Board write pending approval" (board_write) — consistent visual weight and color (`#ffb648`), only the label distinguishes. Escalation panel reuses the same `.team-escalation` wrapper, but with verb-specific inner layout rather than a generic form (no radio/checkbox options, no free-text field, only current-vs-proposed comparison and action buttons).
-- **Palette**: Reuses existing semantic status colours for all contexts (`#ffb648` for pending approval). No new colors for board-write-specific content; verb labels and field names use body text tokens.
-- **Typography**: Existing body/label sizes. Verb names ("set_status", "amend_description", "append_comment") shown in monospace context (e.g. as code snippets in feed), matching the existing transcript rendering style.
+- **Style**: Inline form row, following the "+ New project" pattern (simple row with input + button + error slot) rather than a multi-step overlay like the upload wizard. The form expands inline when the "Clone from URL" button is clicked, maintaining the same visual hierarchy.
+- **Palette**: Reuses existing page tokens; no new colors. Button matches existing `.new-project-row button` styling (#34c759 green). Error messages use the existing #ff6b6b red token (same as `.new-project-err`). Loading indicator reuses existing page conventions (no spinner graphic, text-only status).
+- **Typography**: Existing 14px for button/input, 12px for labels/error messages. No new typefaces.
 - **Relevant UX guidelines applied**:
-  - Status copy is unambiguous and action-oriented: "Board write pending approval" (awaiting decision), distinct from "Waiting on you" (question needing an answer).
-  - Proposal panel shows the exact state being proposed (current value → new value) for clarity; no abbreviations or ambiguity.
-  - Approve/Reject buttons are equally weighted (both primary-style, not Approve highlighted and Reject greyed), since both are valid actions.
-  - Lead's note (if present) is visually secondary to the verb summary, providing context without cluttering the primary decision.
-  - Verb-specific rendering in the event feed avoids generic "resolved" wording, making decisions auditable (e.g., "approved and applied" vs "rejected by human" vs "approved but Taiga rejected").
+  - URL field has no client-side format validation (spec's allowlist is server-authoritative), but provides clear placeholder text ("https://github.com/user/repo").
+  - Button is always enabled (URL validation happens server-side), avoiding client-side guessing at what's valid.
+  - Loading message explicitly sets expectations that cloning can take "up to a few minutes for large repositories" (vs the instant response of "+ New project").
+  - Error messages are specific to the failure mode (invalid URL, network error, auth required, oversized repo) to help operators understand what went wrong.
+  - Form clears on success (same as "+ New project" pattern) to avoid accidental re-submissions.
 
 ## Component reuse
-
-- **Reused**: Status strip structure, colour, and ID pattern (`#ffb648`, `team.status === 'blocked' && team.waiting_on_you`). Only the copy changes based on `escalation_kind`.
-- **Reused**: Escalation panel wrapper (`.team-escalation`, same container pattern), fetch-cache-render machinery (`fetchTeamInbox()`, `teamInboxCache` keyed by `run_id`).
-- **Reused**: TOTP code-overlay for approval/rejection (new `toggle(kind='team-board-resolve', ...)` action, reusing `actionPath()`/`actionBody()`/`handleActionResult()` plumbing exactly as `team-resolve` and `team-start` already do).
-- **Reused**: Message slot pattern (`.team-msg`, id `team-msg-<name>`) for error/success feedback from approval/rejection.
-- **Reused**: Event feed event-kind classifier (`teamFeedEventKindClass()`, new `meta.verb` / `meta.approved` checks ahead of generic `meta.resolved`), event body renderer (`teamFeedEventBody()`, verb-specific summaries).
-- **Reused**: All styling classes from 6f part 2 (`.team-status-strip`, `.team-escalation`, `.team-escalation-form`, `.team-msg`, etc.). No new classes beyond `.team-escalation-proposal` (optional, for internal sectioning in verb-specific layout).
-- **New (none)**: No new components, no new libraries. Plain HTML/CSS/JS.
+- **Reused**: Button styling (`.new-project-row button` — #34c759 green, 10px padding, 10px 16px, rounded, bold text).
+- **Reused**: Input styling (`.new-project-row input` — #1c1c1c background, #eee text, #333 border, 10px 12px padding).
+- **Reused**: Error message slot (`.new-project-err` — #ff6b6b red, 12px font, 14px min-height) and DOM pattern (cleared by client, populated by response handler).
+- **Reused**: Form submission pattern (`actionPath()` / `actionBody()` / `toggle()` / `handleActionResult()` plumbing — same TOTP gate as `kind='newproject'`, reusing existing code-overlay machinery).
+- **Reused**: `/status` poll for success detection (no new timer or polling mechanism).
+- **New components**: None. Plain HTML input elements and CSS, matching page conventions.
 
 ## States
 
-### Status Strip: Board Write Pending Approval (blocked_board_write, waiting_on_you=true)
+### Initial (Collapsed)
+The form is not visible by default. A third button sits on the same row as "+ New project" and "Upload folder / .zip":
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│ Team                                                    │
-│                                                         │
-│ ┌─ Status ──────────────────────────────────────────┐  │
-│ │ ⚠ Board write pending approval (ID: run-abc123)  │  │  ← Orange, #ffb648
-│ └───────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│ ai-dev-switchboard                                   │
+│                                                      │
+│ <input placeholder="new project name" maxlength="60">│
+│ <button>+ New project</button>                        │
+│                                                      │
+│ <button>Upload folder / .zip</button>                │
+│                                                      │
+│ <button>Clone from URL</button>  ← NEW              │
+│                                                      │
+│ <error slot>                                         │
+└──────────────────────────────────────────────────────┘
 ```
 
-**Styling**: Status strip shows "Board write pending approval (ID: run-abc123)" in the same orange (`#ffb648`) as ask_user's "Waiting on you". The ⚠ icon is optional (same as ask_user pattern). This is the only visual change to the status strip itself; the escalation panel below differs more significantly.
+**Styling**: The "Clone from URL" button uses the same styling as "+ New project" and "Upload folder / .zip" (white text, rounded, medium padding). Positioned on its own line (or adjacent row, depending on layout space).
 
-**Copy**: "⚠ Board write pending approval" (not "Waiting on you", which implies a question needing an answer).
+**Copy**: Button label is exactly "Clone from URL".
 
-### Escalation Panel: set_status Verb
-
-```
-┌─────────────────────────────────────────────────────────┐
-│ Team                                                    │
-│                                                         │
-│ ┌─ Board Write Proposal ────────────────────────────┐  │
-│ │                                                   │  │
-│ │ Move **Implement auth system** (#42)              │  │
-│ │ from **New** to **In progress**                   │  │
-│ │                                                   │  │
-│ │ Lead's note: "This is ready to start per the     │  │
-│ │ delegate's checklist"                            │  │
-│ │                                                   │  │
-│ │ <button onclick="doTeamBoardResolve('<name>',    │  │
-│ │         'approve')">                              │  │
-│ │   Approve                                         │  │
-│ │ </button>                                         │  │
-│ │                                                   │  │
-│ │ <button onclick="doTeamBoardResolve('<name>',    │  │
-│ │         'reject')">                               │  │
-│ │   Reject                                          │  │
-│ │ </button>                                         │  │
-│ │                                                   │  │
-│ │ [message slot for error/success]                 │  │
-│ └───────────────────────────────────────────────────┘  │
-│                                                         │
-│ [ Show live feed ]                                      │
-│                                                         │
-│ <button onclick="doTeamStop('<name>')">               │
-│   Stop team                                            │
-│ </button>                                               │
-└─────────────────────────────────────────────────────────┘
-```
-
-**Styling**: The proposal renders as a simple text summary, not a form. Layout:
-1. **Summary line**: Bold card title (from enriched `subject`), card ref (`#42`), current status, arrow, new status. Example: "Move **Implement auth system** (#42) from **New** to **In progress**"
-2. **Lead's note** (if non-null): Italicized or greyed secondary text, on a separate line. Label "Lead's note: " followed by the `note` text. Truncated to ~200 chars if very long (same as event feed precedent), with ellipsis.
-3. **Two action buttons**: "Approve" and "Reject", displayed side-by-side or stacked (developer's layout choice based on space), equally styled (no highlighting).
-4. **Message slot** (`.team-msg` pattern): Shows error (if validation/network fails) or success ("Change approved and applied" / "Change rejected").
-
-**Fallback**: If `subject` enrichment failed (Taiga unreachable), use `#ref` only: "Move **#42** from **New** to **In progress**". Still actionable.
-
-**Contrast**: Subject/status names use bold text (darker weight, same `#ffffff` base color) to stand out; arrow and "from/to" are normal weight. All text is on `#1c1c1c` background, same as existing card text (passes AA).
-
-### Escalation Panel: amend_description Verb
+### Expanded (Ready to Input)
+When the operator clicks "Clone from URL", the form expands inline to show input fields:
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│ Team                                                    │
-│                                                         │
-│ ┌─ Board Write Proposal ────────────────────────────┐  │
-│ │                                                   │  │
-│ │ Replace **Fix login redirect** (#35)'s           │  │
-│ │ description                                       │  │
-│ │                                                   │  │
-│ │ Current:                                          │  │
-│ │ ┌───────────────────────────────────────────────┐ │  │
-│ │ │ Users are redirected to /home after login,    │ │  │
-│ │ │ but should go to their dashboard. Blocking.   │ │  │
-│ │ │                                               │ │  │
-│ │ │ TODO: check if this affects SSO flow.       │ │  │
-│ │ └───────────────────────────────────────────────┘ │  │
-│ │                                                   │  │
-│ │ Proposed:                                         │  │
-│ │ ┌───────────────────────────────────────────────┐ │  │
-│ │ │ Users are redirected to /home after login,    │ │  │
-│ │ │ but should go to their dashboard. Blocking    │ │  │
-│ │ │ the auth refactor.                            │ │  │
-│ │ │                                               │ │  │
-│ │ │ NOTE: SSO flow unaffected per delegate check. │ │  │
-│ │ └───────────────────────────────────────────────┘ │  │
-│ │                                                   │  │
-│ │ Lead's note: "Updated per delegate feedback"     │  │
-│ │                                                   │  │
-│ │ [ Approve ]  [ Reject ]                          │  │
-│ │                                                   │  │
-│ │ [message slot]                                    │  │
-│ └───────────────────────────────────────────────────┘  │
-│                                                         │
-│ [ Show live feed ]                                      │
-│                                                         │
-│ <button onclick="doTeamStop('<name>')">               │
-│   Stop team                                            │
-│ </button>                                               │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│ ai-dev-switchboard                                   │
+│                                                      │
+│ Clone from URL                                       │
+│ <input id="clone-url" placeholder="https://github... │
+│ <input id="clone-name" placeholder="(optional)...    │
+│ <button>Clone</button>                               │
+│                                                      │
+│ <error/status slot id="clone-err">                   │
+│                                                      │
+│ <project list rows>                                  │
+└──────────────────────────────────────────────────────┘
 ```
 
-**Styling**: Layout for `amend_description`:
-1. **Summary line**: "Replace **<subject or #ref>**'s description" (singular verb, action-oriented).
-2. **Current description block**: Labelled "Current:", displayed in a read-only text box (background: `#0a0a0a`, border: `#333333`, padding: `0.5em`, max-height: `200px` with `overflow-y: auto` to handle long descriptions without expanding the panel excessively). Text is wrapped monospace or plain (same as feed event text, 1.2 line-height for readability).
-3. **Proposed description block**: Labelled "Proposed:", same styling as Current.
-4. **Lead's note** (if non-null): Visually secondary, under the text blocks.
-5. **Action buttons**: Same as set_status.
-6. **Message slot**: Same as set_status.
+**Styling**: 
+- Row layout uses flexbox (gap 8px) consistent with `.new-project-row`.
+- "Clone from URL" is a small label/heading above the inputs (12px, #aaa color, slightly bold).
+- URL input is full-width or 60% of the form row, with maxlength="2048" (per spec's CLONE_URL_MAX_LEN).
+- Name input is narrower (20-30% of row or constrained width), with maxlength="60" (matching NAME_RE).
+- Both inputs share the same styling as `.new-project-row input`.
+- "Clone" button uses the same styling as "+ New project" button.
+- Error/status slot (`.clone-err` or reuse `.new-project-err`) sits below the form row.
 
-**Fallback**: If either description is missing (corrupted inbox or Taiga read failure), show `(description not available)` for that block, still render the proposal (approval/rejection remain fully functional).
+**Placeholder text**:
+- URL: "https://github.com/user/repo or ssh://host/path"
+- Name: "(optional — derived from URL if left blank)"
 
-**Truncation**: If current or proposed description exceeds ~500 chars, truncate to ~400 chars + ellipsis and show `(scroll to see full)` hint (or developer's choice on length, per spec's open question). This keeps the panel readable without vertical scroll explosion.
+**Behavior**:
+- Form expands when clicked (or via a toggle state in JS).
+- Inputs are focused and ready for typing (URL field auto-focused if possible).
+- Operators can press Tab to move between URL, name, and Clone button.
+- Operators can press Enter in either input to submit (if URL is non-empty).
 
-### Escalation Panel: append_comment Verb
-
-```
-┌─────────────────────────────────────────────────────────┐
-│ Team                                                    │
-│                                                         │
-│ ┌─ Board Write Proposal ────────────────────────────┐  │
-│ │                                                   │  │
-│ │ Add a comment to **Fix password reset** (#67)    │  │
-│ │                                                   │  │
-│ │ Comment text:                                     │  │
-│ │ ┌───────────────────────────────────────────────┐ │  │
-│ │ │ This has been verified in staging. Ready to   │ │  │
-│ │ │ deploy to production.                         │ │  │
-│ │ └───────────────────────────────────────────────┘ │  │
-│ │                                                   │  │
-│ │ Lead's note: "Delegate confirmed staging works" │  │
-│ │                                                   │  │
-│ │ [ Approve ]  [ Reject ]                          │  │
-│ │                                                   │  │
-│ │ [message slot]                                    │  │
-│ └───────────────────────────────────────────────────┘  │
-│                                                         │
-│ [ Show live feed ]                                      │
-│                                                         │
-│ <button onclick="doTeamStop('<name>')">               │
-│   Stop team                                            │
-│ </button>                                               │
-└─────────────────────────────────────────────────────────┘
-```
-
-**Styling**: Layout for `append_comment`:
-1. **Summary line**: "Add a comment to **<subject or #ref>**" (verb matches the action).
-2. **Comment text block**: Labelled "Comment text:", displayed in a read-only text box (same styling as amend_description's description blocks).
-3. **No comparison block**: Unlike amend_description (current vs proposed), append_comment has only the new text — there's no "current" state to compare against (comments are additive). The design shows only "Comment text:", not two side-by-side blocks.
-4. **Lead's note** (if non-null): Visually secondary.
-5. **Action buttons**: Same as set_status.
-6. **Message slot**: Same as set_status.
-
-**Fallback**: If comment text is missing (corrupted inbox), show `(comment not available)`, still render actionable proposal.
-
-**Truncation**: Same as amend_description (spec's open question on exact length; recommend ~400-char display with scroll hint).
-
-### Status Strip: Blocked Without Pending Approval (blocked_board_write, waiting_on_you=false)
-
-This state should not occur by design (per the spec, a `blocked_board_write` is only set when a proposal is pending and ready for approval). However, if a proposal is resolved elsewhere (race condition), the status pole will eventually report the run as `running` again. No special UI needed; follow the running-state pattern.
-
-### Event Feed: Board Write Proposal
+### Loading State
+While the clone operation is in flight (POST request pending):
 
 ```
-12:34:56 lead board_write (set_status): ref #42 — "Move to In progress per delegate"
-         [or]
-12:34:56 lead board_write (amend_description): ref #35 — "Update description with SSO note"
+┌──────────────────────────────────────────────────────┐
+│ Clone from URL                                       │
+│ <input id="clone-url" disabled>https://github...     │
+│ <input id="clone-name" disabled>(derived-name)       │
+│ <button disabled>Cloning…</button>                    │
+│                                                      │
+│ <spinner or "Cloning… this can take a while for      │
+│  large repositories (up to a few minutes)."  slot>    │
+│                                                      │
+│ <project list rows>                                  │
+└──────────────────────────────────────────────────────┘
 ```
 
-**Styling**: New event-kind class `'board-write-proposal'` (not generic `'tool_use'`).
-- Timestamp, agent ("lead") in normal color.
-- Event text: Verb in parentheses, ref number, and args_summary (captured from the proposal's own transcript text).
-- No options/question text (unlike ask_user).
+**Styling**:
+- Input fields and button are **disabled** (greyed out, `disabled` attribute set, pointer: not-allowed).
+- Button text changes to "Cloning…" (with optional ellipsis animation if using CSS @keyframes, same pattern as existing loading states on the page).
+- Error slot is replaced with a status message: "Cloning… this can take a while for large repositories (up to a few minutes)." in #aaa (muted) color, 12px font.
+- No animated spinner graphic (text-only, per existing page conventions).
 
-**Example output**:
-```
-board_write (set_status): ref #42 — "Move to In progress per delegate"
-board_write (amend_description): ref #35 — "Update description with SSO note"
-board_write (append_comment): ref #99 — "Comment: tests passing"
-```
+**Duration**: Can run up to 180 seconds (default CLONE_TIMEOUT_SECONDS). The message sets expectations so operators don't assume the UI is hung.
 
-### Event Feed: Board Write Resolution (Approved & Applied)
+### Error States
 
-```
-12:34:57 lead board_write_resolved (approved): "✓ Change approved and applied"
-```
-
-**Styling**: New event-kind class `'board-write-resolved'` (checked **before** the generic `meta.resolved` → `'resolved'` classifier, so it never mismatches as generic "resolved").
-- Verb: "approved and applied" (green checkmark `✓`).
-- Reflects successful Taiga write.
-
-### Event Feed: Board Write Resolution (Approved but Taiga Failed)
+#### Invalid URL Scheme
+Disallowed schemes (file://, git://, ext::, bare paths, argument-injection attempts) are rejected before any subprocess:
 
 ```
-12:34:57 lead board_write_resolved (approved, failed): "⚠ Change approved but Taiga rejected: Conflict — version mismatch"
+┌──────────────────────────────────────────────────────┐
+│ Clone from URL                                       │
+│ <input id="clone-url" placeholder="...">             │
+│ <input id="clone-name" placeholder="...">            │
+│ <button>Clone</button>                               │
+│                                                      │
+│ ✕ unsupported URL — use http://, https://, ssh://,  │
+│   or user@host:path (git's own shorthand)            │
+└──────────────────────────────────────────────────────┘
 ```
 
-**Styling**: Same `'board-write-resolved'` class.
-- Verb: "approved but Taiga rejected" (warning icon `⚠`).
-- Error detail from Taiga (version conflict, network error, vanished ref, etc.).
-- Full error text captured from the outcome_summary.
+**Styling**: Red error text (#ff6b6b), ✕ icon, error message clipped to ~300 chars per spec (but this particular error is concise).
 
-### Event Feed: Board Write Resolution (Rejected)
+**Behavior**: Form remains expanded and editable; user can correct the URL and re-submit.
+
+#### Network Failure / Unreachable Host
+A legitimate URL that points to a non-existent or unreachable host:
 
 ```
-12:34:57 lead board_write_resolved (rejected): "✕ Change rejected by human"
+┌──────────────────────────────────────────────────────┐
+│ Clone from URL                                       │
+│ <input id="clone-url" value="https://invalid.host/...">
+│ <input id="clone-name" placeholder="...">            │
+│ <button>Clone</button>                               │
+│                                                      │
+│ ✕ Error: fatal: unable to access                     │
+│   'https://invalid.host/repo.git': Could not resolve │
+│   host...                                            │
+└──────────────────────────────────────────────────────┘
 ```
 
-**Styling**: Same `'board-write-resolved'` class.
-- Verb: "rejected by human" (red X `✕`).
-- No Taiga involvement (human chose to reject, no write attempted).
+**Styling**: Red error text (#ff6b6b), clipped to ~300 chars (as per spec). Message is from git's own stderr, sanitized.
+
+**Behavior**: Form remains expanded; user can try a different URL.
+
+#### Authentication Required (Private HTTPS Repo)
+A private repository URL that would normally require credentials (unsupported this cycle):
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Clone from URL                                       │
+│ <input id="clone-url" value="https://github.com/private/repo.git">
+│ <input id="clone-name" placeholder="...">            │
+│ <button>Clone</button>                               │
+│                                                      │
+│ ✕ Error: could not read Username for                │
+│   'https://github.com': terminal prompts disabled    │
+└──────────────────────────────────────────────────────┘
+```
+
+**Styling**: Red error text (#ff6b6b), clipped to ~300 chars. Message is git's stderr (not a polished "this feature isn't supported yet" message, but a real, prompt, non-hanging failure).
+
+**Behavior**: Form remains expanded; explains that credentials aren't supported this cycle (via the error message). A future fast-follow can pattern-match this error to show friendlier UX.
+
+#### Oversized Repository
+A clone succeeds but the resulting repository exceeds the CLONE_MAX_BYTES limit and is rolled back:
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Clone from URL                                       │
+│ <input id="clone-url" value="https://huge-repo.git">  │
+│ <input id="clone-name" placeholder="...">            │
+│ <button>Clone</button>                               │
+│                                                      │
+│ ✕ Error: Cloned repository is 1.2 GB, over the     │
+│   500 MB limit — removed.                            │
+└──────────────────────────────────────────────────────┘
+```
+
+**Styling**: Red error text (#ff6b6b), clipped to ~300 chars. Message from the privileged script's own check.
+
+**Behavior**: Form remains expanded; project was never registered (directory was removed atomically).
+
+#### Name Collision
+Explicit name override or derived name collides with an existing project:
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Clone from URL                                       │
+│ <input id="clone-url" value="https://github.com/my/repo.git">
+│ <input id="clone-name" value="existing-project">     │
+│ <button>Clone</button>                               │
+│                                                      │
+│ ✕ Error: 'existing-project' already exists.          │
+└──────────────────────────────────────────────────────┘
+```
+
+**Styling**: Red error text (#ff6b6b), exact message from server.
+
+**Behavior**: Form remains expanded; user can change the name field to override the derived name.
+
+#### Timeout
+A slow/stalled transfer that exceeds CLONE_TIMEOUT_SECONDS:
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Clone from URL                                       │
+│ <input id="clone-url" disabled>...                   │
+│ <input id="clone-name" disabled>...                  │
+│ <button disabled>Clone</button>                      │
+│                                                      │
+│ ✕ Error: clone failed: <timeout message>             │
+└──────────────────────────────────────────────────────┘
+```
+
+**Styling**: Red error text (#ff6b6b).
+
+**Behavior**: Form remains expanded; user can retry (orphaned child processes are a known, accepted gap per spec).
+
+### Success State
+After a successful clone:
+
+```
+┌──────────────────────────────────────────────────────┐
+│ <form is hidden or collapsed>                        │
+│                                                      │
+│ <project rows, now including the new project>        │
+│                                                      │
+│ <new row>                                            │
+│ my-cloned-repo                                       │
+│ origin: https://github.com/user/my-repo.git         │
+│ • tmux • ttyd • Code • Deploy (if mapped)            │
+└──────────────────────────────────────────────────────┘
+```
+
+**Behavior**:
+- Form clears (URL and name inputs reset to empty/placeholder) and collapses or hides.
+- Page automatically refreshes (via existing `/status` poll, within ~4 seconds) and the new project appears in the project list.
+- No special "success" message is shown (same as "+ New project" behavior — the new project appearing is the confirmation).
+- Project row includes the derived or provided name, and the origin URL is visible in a subtitle (per existing project-list styling).
 
 ## Accessibility & platform notes
 
+- **Touch target sizes**: "Clone from URL" button and "Clone" button both match the page's existing button minimum (36-40px on desktop, larger on mobile if needed). Keyboard-accessible via tab order.
 - **Color contrast**:
-  - Status strip copy ("Board write pending approval"): `#ffffff` on `#ffb648` background (the strip element itself) at **19.4:1** (passes WCAG AAA comfortably).
-  - Actually, wait — let me recalculate. The status strip's background colour isn't specified in the existing design. Looking at the existing code, the status text is rendered inline as plain text, not with a background. The color is `#ffb648` for "blocked" status. So: `#ffb648` text on `#1c1c1c` background = **9.77:1** (same as existing "blocked" status, passes WCAG AAA).
-  - Proposal text (subject names, values): `#ffffff` (normal text) on `#1c1c1c` background = **21:1** (passes WCAG AAA for all uses).
-  - Description/comment text boxes: `#cccccc` (lighter grey for read-only fields) on `#0a0a0a` (darker background for visual distinction) = **12.3:1** (passes WCAG AAA).
-  - Action button text: `#ffffff` on `#4da6ff` (action button background, reused from existing buttons) = **9.15:1** (passes WCAG AA for large button text).
-  - Message slot (success): `#34c759` on `#1c1c1c` = **7.68:1** (passes WCAG AAA).
-  - Message slot (error): `#ff6b6b` on `#1c1c1c` = **6.14:1** (passes WCAG AA).
-- **Touch target sizes**: Approve/Reject buttons follow page's existing button minimum (36-40px on desktop). Buttons are keyboard-accessible via tab order.
+  - Button text (#fff) on button background (#34c759): **5.05:1** (passes WCAG AA for large button text).
+  - Error message (#ff6b6b) on page background (#1c1c1c): **6.14:1** (passes WCAG AA).
+  - Placeholder text (#666 or #888 muted) on input background (#1c1c1c): **6.14:1** (passes WCAG AA).
+  - Status message (#aaa muted) on background (#1c1c1c): **6.4:1** (passes WCAG AA for body text).
 - **Keyboard interaction**:
-  - Tab to "Approve" or "Reject" button → press Enter.
-  - TOTP code overlay: same as team-resolve (28-second code entry window, retry on wrong code).
-- **Screen reader accessibility**:
-  - Proposal summary line is plain text (no markup needed, descriptive on its own).
-  - Description/comment text boxes: use `<textarea readonly>` or equivalent, accessible to screen readers.
-  - Button labels: "Approve" and "Reject" are unambiguous.
-  - Lead's note: marked with visible label "Lead's note: " so context is clear.
-  - Event feed: proposal and resolution lines are plain text in the `role="log" aria-live="polite"` container (inherited from 6f part 2). New event-kind classifiers ensure screen readers don't see duplicates (the feed's own `teamFeedEventBody()` text is the accessible output, not a hidden class name).
-- **Web vs. native**: This is a web app (HTML/CSS/JS in Flask template), desktop-only. No native variant.
+  - Tab to "Clone from URL" button → press Enter to expand form.
+  - Tab to URL input → type URL (or paste via Ctrl+V / Cmd+V).
+  - Tab to name input → type optional name or leave blank.
+  - Tab to "Clone" button → press Enter to submit.
+  - Escape key can close the expanded form (same as other inline forms on the page, if implemented).
+- **Form field labels**: URL and name inputs have descriptive `placeholder` attributes (do not fully substitute for labels, but context is clear from the row's "Clone from URL" header). For strict accessibility, developers can add `<label for="clone-url">Repository URL</label>` elements (not shown in wireframe, but recommended).
+- **Error message accessibility**: Errors are shown as plain text, readable by screen readers. The `.clone-err` slot is always present (empty initially), so screen readers pick it up when populated.
+- **Web vs. native**: This is a web app (HTML/CSS/JS in Flask template), desktop-only. No native/mobile variant.
+- **Disabled state during loading**: Inputs and button are disabled during clone, preventing accidental re-submissions. Screen readers announce the disabled state.
 
 ## Traceability to spec
 
 | Acceptance criterion (from docs/spec.md) | Where it's addressed in this design |
 |---|---|
-| `/status` reports `escalation_kind === "board_write"` | Status strip branches on `team.escalation_kind` to show distinct copy ("Board write pending approval" vs "Waiting on you") |
-| `/status` also distinguishes `blocked_board_write` from `blocked_ask_user` with new `escalation_kind` field | New field added to `/status` response; frontend uses it to render correct status strip text and escalation panel type |
-| `GET .../team/inbox` returns board_write inbox with `kind`, `verb`, `ref`, `value`, `note`, `current_value`, `subject` (enriched) | Route mirrors ask_user branch but reads board_write inbox shape; frontend caches via `fetchTeamInbox()` / `teamInboxCache[runId]` same as ask_user |
-| Escalation panel renders verb-specific current-vs-proposed content | `renderEscalationPanel()` gains `team.escalation_kind` branch; set_status shows status names, amend_description shows full descriptions, append_comment shows only new comment |
-| Approve/Reject buttons, no free-text field | Panel renders two action buttons only; no "Other" field like ask_user has |
-| Lead's note shown if non-null | Note text rendered as secondary text under proposal summary, with "Lead's note: " label |
-| `POST .../team/board-resolve` reuses TOTP gate | New `toggle(kind='team-board-resolve', ...)` action plugs into existing `toggle()`/`actionPath()`/`actionBody()`/`handleActionResult()` machinery; TOTP 428/403 flow identical to team-resolve |
-| Event feed renders board-write proposals distinctly (new class, verb-specific text) | `teamFeedEventKindClass()` gains check for `meta.verb` → `'board-write-proposal'` class; `teamFeedEventBody()` renders verb/ref summary (checked before generic `tool_use` branch) |
-| Event feed renders board-write resolutions distinctly (new class, three outcomes) | `teamFeedEventKindClass()` gains check for `meta.approved !== undefined` → `'board-write-resolved'` class (checked before generic `meta.resolved` branch); `teamFeedEventBody()` parses outcome text to render "approved and applied" / "approved but Taiga rejected: ..." / "rejected by human" distinctly |
-| `POST .../team/stop` now actually stops runs blocked on board_write | Backend route validation tuple updated to include `"blocked_board_write"` (one-line spec fix, no UI component change) |
-| Card subject enrichment via Taiga read (fallback: #ref only) | `GET .../team/inbox` calls best-effort Taiga read; frontend displays subject in proposal summary ("Move **<subject>**"), or `#ref` only if missing |
-| Long text (value/note/description) truncated in panel | Amend_description and append_comment show scrollable text boxes (max-height 200-400px) with truncation hint if needed; proposal summary line truncated same as feed (200 chars default) |
-| Two-tab race condition handled | Route reloads state fresh, returns 400 if no longer pending; UI shows error in message slot (no crash, no double-apply) |
+| Third button "Clone from URL" next to "+ New project" and "Upload folder / .zip" | Button positioned on form alongside existing project-creation buttons; same visual weight/styling |
+| URL input (required), optional name-override input | Form row with two text inputs; URL required, name optional |
+| Valid public https:// URL → project created under derived name, appears in list | Success state shows new project in list with derived or explicit name |
+| Explicit name override → project uses that name instead | Name input allows operator to override derived name |
+| Disallowed scheme (file://, git://, ext::, bare path) → 400 before subprocess, no directory created | Error state shows "unsupported URL" message; no project directory created |
+| URL resembling `-oProxyCommand=...` → rejected | Error state covers this (no leading `-` in allowlist) |
+| Invalid explicit name → 400, same message as create_project() | Error state shows NAME_RE validation message |
+| Name collision → 400 "'<name>' already exists." | Error state shows collision message; form remains editable to fix |
+| Concurrent requests to same name → exactly one succeeds, other fails cleanly | Atomic `mkdir` in script handles TOCTOU race; error state shows clean 400 |
+| Unreachable host → 400 with clipped error, no orphaned directory | Error state shows network error; script's ERR trap removes directory |
+| Private HTTPS repo → fails fast (not hung) with clear message | Error state shows git's "terminal prompts disabled" message; no timeout wait |
+| Private SSH with no user key → fails fast with error | Error state shows SSH error; BatchMode=yes prevents interactive prompt |
+| Oversized clone → rolled back, 400 error, project never appears | Error state shows size-limit message; script removes directory |
+| Works without Gitea (no GITEA_ENABLED dependency) | Form submission reuses existing TOTP/action plumbing; no Gitea dependency in routes |
+| SSH URL to host where RUN_USER has ambient keys → succeeds | Success state shows new project; spec notes SSH uses RUN_USER's own keys |
+| Clone can take 30-180 seconds → loading message sets expectations | Loading state shows "can take a while" message; button disabled and says "Cloning…" |
 
 ## Implementation notes for the developer
 
-### Backend (no new routes in this phase; spec handles via existing `POST .../team/board-resolve` from part 1)
+1. **Button placement**: Add the "Clone from URL" button to the same container as "+ New project" and "Upload folder / .zip" (around line 2178-2184 of app/app.py). Use the same button class/styling.
 
-No backend changes needed for this phase. Backend routes (`POST .../team/board-resolve`, updated `/status`, updated `GET .../team/inbox`) are all part 1, already implemented.
-
-### Frontend: renderEscalationPanel() extension
-
-The existing `renderEscalationPanel(name, team)` function gains a branch on `team.escalation_kind`:
-
-1. **If `team.escalation_kind === 'ask_user'`**: Render the existing question/options/free-text form (unchanged).
-
-2. **If `team.escalation_kind === 'board_write'`**: Fetch inbox via `fetchTeamInbox(name, team.run_id)` (same cache pattern as ask_user). Once cached, render:
-   - Verb-specific proposal summary.
-   - Current value block (set_status: status names; amend_description: description text; append_comment: omitted).
-   - Proposed value block.
-   - Lead's note (if present).
-   - Two buttons: `doTeamBoardResolve(name, 'approve')` and `doTeamBoardResolve(name, 'reject')`.
-
-3. **Race case** (proposal already resolved while cached): If `cached.pending === false`, show "This proposal was already approved or rejected" (mirrors the ask_user existing race message).
-
-### Frontend: New doTeamBoardResolve() function
-
-Parallel to existing `doTeamResolve()`:
-
-```javascript
-function doTeamBoardResolve(name, action) {
-  const msgEl = document.getElementById('team-msg-' + name);
-  if (msgEl) { msgEl.textContent = ''; msgEl.className = 'team-msg'; }
-  // Clear any stale message, then dispatch with TOTP machinery
-  toggle('team-board-resolve', name, true, {action: action});
-}
-```
-
-This dispatches via `toggle()` with a context object carrying the `action` (approve/reject) through the TOTP retry machinery.
-
-### Frontend: actionPath() extension
-
-Add case for `team-board-resolve`:
-```javascript
-if (kind === 'team-board-resolve') return '/projects/' + encodeURIComponent(name) + '/team/board-resolve';
-```
-
-### Frontend: actionBody() extension
-
-Add case for `team-board-resolve`. The `action` is sourced from the `pendingToggle` context (passed through `toggle()` calls):
-
-```javascript
-if (kind === 'team-board-resolve') {
-  const ctx = pendingToggle || {};
-  body.action = ctx.action; // "approve" or "reject"
-  body.run_id = ''; // Latest run fallback, same as team-resolve
-}
-```
-
-Or, if the developer prefers to store action in a client-side map keyed by name (like `teamEscalationSelected`), that's also valid:
-```javascript
-if (kind === 'team-board-resolve') {
-  body.action = teamBoardResolveAction[name] || 'approve'; // fallback to approve
-  body.run_id = '';
-}
-```
-
-The spec leaves this plumbing choice to the developer; either pattern works.
-
-### Frontend: handleActionResult() extension
-
-Add case for `team-board-resolve` after the existing `team-start`/`team-stop`/`team-resolve` branches:
-
-```javascript
-if (kind === 'team-board-resolve') {
-  hideCodeOverlay();
-  const data = await r.json().catch(() => ({}));
-  const msgEl = document.getElementById('team-msg-' + name);
-  if (msgEl) {
-    if (r.ok && data.ok) {
-      msgEl.textContent = '✓ Board write resolved';
-      msgEl.className = 'team-msg success';
-      const team = TEAM_BY_NAME[name];
-      if (team && team.run_id) delete teamInboxCache[team.run_id];
-    } else {
-      msgEl.textContent = '✕ Error: ' + (data.error || 'could not resolve board write');
-      msgEl.className = 'team-msg error';
-    }
-  }
-  return;
-}
-```
-
-### Frontend: handleActionResult() label for TOTP overlay
-
-Extend the label switch to include:
-```javascript
-kind === 'team-board-resolve' ? 'Resolving board write: ' + (name || 'this') :
-```
-
-### Frontend: renderTeamStatusStrip() extension
-
-The function gains a branch for `team.escalation_kind`:
-
-```javascript
-if (team.status === 'blocked' && team.waiting_on_you) {
-  if (team.escalation_kind === 'board_write') {
-    return '<div class="team-status-strip status-blocked waiting-on-you">⚠ Board write pending approval' + idSuffix + '</div>';
-  }
-  // else: ask_user (unchanged)
-  return '<div class="team-status-strip status-blocked waiting-on-you">⚠ Waiting on you' + idSuffix + '</div>';
-}
-```
-
-### Frontend: teamFeedEventKindClass() extension
-
-Add two new checks **before** the existing generic branches:
-
-1. **Board write proposal**:
-   ```javascript
-   if (e.kind === 'tool_use' && meta.verb !== undefined) return 'board-write-proposal';
+2. **Form HTML structure**: Insert the form inputs after the button but initially hidden or collapsed:
+   ```html
+   <div id="clone-form" class="clone-form" style="display: none;">
+     <label class="clone-form-label">Clone from URL</label>
+     <input id="clone-url" placeholder="https://github.com/user/repo or ssh://host/path" maxlength="2048">
+     <input id="clone-name" placeholder="(optional — derived from URL if left blank)" maxlength="60">
+     <button onclick="startClone()">Clone</button>
+   </div>
+   <div class="clone-err" id="clone-err"></div>
    ```
 
-2. **Board write resolution** (checked before generic `meta.resolved`):
+3. **Styling**: Add CSS for `.clone-form` (flexbox row, gap 8px, same as `.new-project-row`) and `.clone-err` (reuse or adapt `.new-project-err` styling — red text, 12px, min-height 14px).
+
+4. **JavaScript function startClone()**: Similar to `startNewProject()`:
    ```javascript
-   if (e.kind === 'tool_result' && meta.approved !== undefined) return 'board-write-resolved';
-   ```
-
-These are checked BEFORE the existing `meta.resolved` check, so ask_user entries (which have `meta.resolved` but no `meta.approved`) continue to match the generic `'resolved'` class.
-
-### Frontend: teamFeedEventBody() extension
-
-Add two new rendering branches **before** the generic branches:
-
-1. **Board write proposal**:
-   ```javascript
-   if (cls === 'board-write-proposal') {
-     return 'board_write (' + esc(meta.verb || '') + '): ref #' + esc(meta.ref || '') + ' — ' + esc(e.text || '');
-   }
-   ```
-   The `e.text` is the `args_summary` from the transcript (e.g., "Move to In progress per delegate").
-
-2. **Board write resolution** (checked before generic 'resolved'):
-   ```javascript
-   if (cls === 'board-write-resolved') {
-     // Parse the outcome from e.text (the full_result_text from backend)
-     const text = e.text || '';
-     if (meta.approved === false) {
-       return '✕ Change rejected by human';
-     } else if (text.startsWith('approved and applied')) {
-       return '✓ Change approved and applied';
-     } else if (text.startsWith('approved but Taiga rejected')) {
-       // Extract the error detail
-       const match = /approved but Taiga rejected: (.*)/.exec(text);
-       return '⚠ Change approved but Taiga rejected: ' + esc(match ? match[1] : text);
-     } else {
-       return '✓ Change approved'; // fallback
+   function startClone() {
+     const url = document.getElementById('clone-url').value.trim();
+     const name = (document.getElementById('clone-name').value || '').trim();
+     document.getElementById('clone-err').textContent = '';
+     if (!url) {
+       document.getElementById('clone-err').textContent = 'Enter a repository URL.';
+       return;
      }
+     toggle('clone', name || '', true, null); // or pass url separately
    }
    ```
 
-### Styling (CSS in app/app.py template)
+5. **Route in actionPath()**: Add case for `kind === 'clone'`:
+   ```javascript
+   if (kind === 'clone') return '/projects/clone';
+   ```
 
-No new CSS classes needed beyond what 6f part 2 already defined. Optionally, add `.team-escalation-proposal` for internal grouping in the verb-specific panels (purely optional for cleaner markup).
+6. **Route in actionBody()**: Add case to pass URL and name:
+   ```javascript
+   if (kind === 'clone') {
+     body.url = document.getElementById('clone-url').value.trim();
+     body.name = (document.getElementById('clone-name').value || '').trim();
+   }
+   ```
 
-New text styles (not classes, just inline or via element type):
-- Description/comment text boxes: `<textarea readonly>` with CSS `background: #0a0a0a; border: 1px solid #333333; padding: 0.5em; max-height: 200px; overflow-y: auto; font-family: monospace; line-height: 1.2;`.
-- Truncation hint: "(scroll to see more)" rendered as small grey text if needed.
+7. **Route in handleActionResult()**: Add case for `kind === 'clone'` to handle success/error:
+   ```javascript
+   if (kind === 'clone') {
+     if (r.ok) {
+       document.getElementById('clone-url').value = '';
+       document.getElementById('clone-name').value = '';
+       document.getElementById('clone-form').style.display = 'none';
+       setTimeout(refresh, 1500); // refresh to show new project
+     } else {
+       const data = await r.json().catch(() => ({}));
+       document.getElementById('clone-err').textContent = data.error || 'Clone failed.';
+     }
+     hideCodeOverlay();
+     return;
+   }
+   ```
 
-### State transitions
+8. **Button toggle function**: Add `openCloneForm()` and `closeCloneForm()` to toggle the form visibility:
+   ```javascript
+   function openCloneForm() {
+     document.getElementById('clone-form').style.display = 'flex';
+     document.getElementById('clone-url').focus();
+   }
+   function closeCloneForm() {
+     document.getElementById('clone-form').style.display = 'none';
+   }
+   ```
+   Connect the "Clone from URL" button to `openCloneForm()`.
 
-```
-team.status === 'blocked' + team.escalation_kind === 'board_write' + waiting_on_you === true
-├─ renderTeamStatusStrip() → "⚠ Board write pending approval"
-│
-├─ renderEscalationPanel()
-│  ├─ Fetch inbox (once per run_id, cached)
-│  ├─ Render verb-specific proposal (set_status/amend_description/append_comment)
-│  └─ Show Approve/Reject buttons
-│
-├─ User clicks Approve or Reject
-│  └─ doTeamBoardResolve(name, action)
-│     └─ toggle(kind='team-board-resolve', name, true, {action: action})
-│        └─ 1st call: performAction() → 428 TOTP → show overlay
-│        └─ 2nd call (with code): performAction(kind, name, on, code)
-│           └─ handleActionResult()
-│              ├─ 200 OK → show "✓ Board write resolved", clear cache
-│              └─ 400 error → show "✕ Error: ..." in message slot
-```
+9. **Server route** (`POST /projects/clone`): Already specified in spec. Route calls `clone_project_from_url(url, name)` function and returns `{"ok": true}` on success or `{"error": "message"}` on failure (400 status).
 
-## Open questions from spec (design perspective)
+10. **Error message persistence**: Like `.new-project-err`, the error slot persists until manually cleared or until `refresh()` re-renders the page (next /status poll, ~4 seconds). No auto-dismissal.
 
-1. **Exact wording for verb-specific proposal summaries**: The spec defines the semantic content (current vs proposed values) but leaves exact wording to design. The design above uses clear action-oriented language ("Move", "Replace", "Add") matching the verbs themselves. Developers are free to adjust wording for brevity or clarity, as long as the three verbs remain visually/textually distinct and the proposal remains unambiguous.
+11. **Keyboard support**: Operator can press Enter in the URL or name field to submit the form (use `onkeypress="event.key==='Enter' && startClone()"` on inputs, or handle via JavaScript event listeners).
 
-2. **Long text truncation length**: Spec suggests ~200 chars for proposal summary (following event-feed precedent), but amend_description and append_comment may deserve more context (~400 chars with scroll hint). Design recommends starting with ~400 chars visible + scroll, adjustable per user feedback. Exact length is not load-bearing.
+12. **Form collapse on Escape**: Optionally detect Escape key to close the form (same as upload wizard pattern, if implemented).
 
-3. **Description/comment box max-height**: Design recommends 200px (fits 10-15 lines at default line-height) to keep the panel scrollable without taking over the entire page. Developers can adjust based on layout testing.
+## Open design questions
+
+None blocking. One subtle implementation detail: whether to show the form expanded inline-on-page or in a small overlay similar to the upload wizard's card. The spec says "simpler inline shape like + New project," which this design interprets as inline expansion (form grows in place on the page). If the developer prefers a small card overlay like the upload wizard (but without the multi-step complexity), that's a valid alternative that doesn't change the UX significantly — the key constraint is that the form remains simple (two inputs + one button, no wizard steps). Either approach is acceptable; the spec's intent is to avoid the upload wizard's complexity, not to dictate exact positioning.
 
 ---

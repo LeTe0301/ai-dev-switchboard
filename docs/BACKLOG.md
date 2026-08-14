@@ -785,6 +785,44 @@ project list."
   it's scoped, following this project's existing `switchboard.env`-style
   credential-storage convention.
 
+**Status: shipped (2026-08-14).** `POST /projects/clone` + a new
+privileged `scripts/new-project-from-url.sh`, following item 2b's
+established clone-privilege-separation pattern. Private-repo auth
+settled, not left open: SSH-based private clones work at zero new cost
+(ride `RUN_USER`'s own pre-existing SSH access); HTTPS+token auth is
+explicitly deferred to a fast-follow, since a `switchboard.env`-style
+single-secret convention doesn't map cleanly onto "arbitrary host,
+project doesn't exist yet."
+
+Reviewer-approved after **three** review rounds on the same must-fix — an
+argument-injection vector via a crafted URL (e.g.
+`ssh://-oProxyCommand=...`) reaching the `RUN_USER`-privileged clone
+subprocess. Round 1 found the gap (regex allowlist alone didn't close it,
+only the installed git's own CVE-2017-1000117 hardening did). Round 2's
+fix (regex negative-lookaheads anchored right after the scheme/`@`) was
+itself proven bypassable via `user@-oProxyCommand=...` and scp-shorthand
+`user@host:-oProxyCommand=...`, both of which hide the malicious host
+behind an optional grammar segment the lookahead didn't cover. Round 3
+replaced lookahead-anchoring entirely with real host-component isolation
+(`urllib.parse.urlsplit().hostname` for `scheme://` URLs; explicit
+last-`@`/first-`:` parsing for scp-shorthand, empirically verified against
+git's/OpenSSH's actual double-`@` splitting behavior, not assumed) plus a
+dedicated `_clone_url_host_is_safe()` charset/IPv6 check, mirrored in
+`scripts/new-project-from-url.sh`. Approved after independent adversarial
+testing (double-`@`, bracketed IPv6, empty host/port, trailing colon) via
+real `sudo` runs against the privileged script.
+
+**Should-fix follow-up, not yet fixed:** neither validation layer checks
+that a `scheme://host:port` URL's port component is actually numeric
+(e.g. `ssh://127.0.0.1:-oProxyCommand=...` is currently accepted).
+Verified not currently exploitable — git doesn't split a non-numeric port
+into its own argv token, so this doesn't reach the actual
+leading-`-`-as-argv-token mechanism the must-fix targeted, and OpenSSH
+itself rejects the malformed combined hostname before any connection
+attempt — but it's the same "relying on downstream hardening" pattern
+this fix arc was meant to eliminate. Shape of the fix: validate the port
+substring (if present) is `^[0-9]+$` at both layers.
+
 ---
 
 ## 17. Track and remotely interact with a project's real (non-Gitea) origin

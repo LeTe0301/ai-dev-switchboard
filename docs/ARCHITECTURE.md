@@ -6,7 +6,9 @@
   unprivileged system account with no login shell of its own. Via narrow
   `/etc/sudoers.d` rules it can run `tmux`/`ttyd`/`code-server` as
   `RUN_USER`, and run the folder-upload wizard's privileged hand-off script
-  (`ai-dev-switchboard-new-project-from-upload.sh` — see below) — plus,
+  (`ai-dev-switchboard-new-project-from-upload.sh` — see below) and the
+  clone-from-URL privileged hand-off script
+  (`ai-dev-switchboard-new-project-from-url.sh` — see below) — plus,
   only when `--with-git-hosting` is installed, the Gitea toggle wrapper
   triplet and the "+ New project" registration script (see below).
   Nothing else. A bug in this stdlib-only app is not an instant path to
@@ -33,6 +35,19 @@
   `PROJECTS_DIR/<name>` crosses into root via a narrowly-scoped sudoers
   entry, same "do the minimum mechanical work as root, nothing else"
   discipline as the upload wizard's own hand-off.
+- **Clone-from-URL's own privileged hand-off** (`scripts/new-project-from-url.sh`,
+  installed unconditionally, no `--with-git-hosting` dependency — see
+  `docs/spec.md` backlog item 16) follows the same mechanical shape again:
+  `clone_project_from_url()` validates the URL/name and checks for a
+  collision entirely unprivileged, as `SVC_USER` — only the final
+  `mkdir`/`chown`/`git clone -- <url> <dest>` crosses into root, cloning as
+  `RUN_USER` (so an `ssh://`/scp-like clone of a private repo already
+  works if `RUN_USER` has its own working SSH access to that host, with no
+  switchboard-managed credential involved). Unlike the two hand-offs above,
+  a failed or oversized clone always removes the destination directory
+  (rather than leaving a partial clone for manual cleanup) — an arbitrary
+  external clone is the one creation path genuinely likely to fail
+  partway through a large transfer.
 - **`RUN_USER`** (default `dev`) is where the actual work happens: project
   files, engine credentials (e.g. `claude`'s own login), and the tmux
   sessions the engines run in all live here. This account needs whatever

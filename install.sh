@@ -420,6 +420,16 @@ set_env "$ENV_FILE" DEPLOY_KEYS_DIR "$CONFIG_DIR/deploy-keys"
 chown "$SVC_USER:$SVC_USER" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
+echo "-- Clone project from URL (backlog item 16, works standalone, no --with-git-hosting needed) --"
+install -m 755 "$REPO_DIR/scripts/new-project-from-url.sh" \
+    /usr/local/bin/ai-dev-switchboard-new-project-from-url.sh
+set_env "$ENV_FILE" NEW_PROJECT_FROM_URL_SCRIPT \
+    "/usr/local/bin/ai-dev-switchboard-new-project-from-url.sh"
+# CLONE_TIMEOUT_SECONDS/CLONE_MAX_BYTES stay commented-out optional
+# overrides in config/switchboard.env.example (app.py's/the script's own
+# defaults already cover them) -- same "not force-set by install.sh"
+# treatment UPLOAD_MAX_BYTES/UPLOAD_MAX_ENTRIES already get.
+
 echo "-- sudoers (scoped: $SVC_USER can only run tmux/ttyd/code-server AS $RUN_USER) --"
 SUDOERS=/etc/sudoers.d/ai-dev-switchboard
 {
@@ -438,6 +448,10 @@ SUDOERS=/etc/sudoers.d/ai-dev-switchboard
     # wizard is explicitly the project-registration path for people WITHOUT
     # git hosting installed.
     echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-new-project-from-upload.sh *"
+    # Also unconditional (backlog item 16, docs/spec.md) — cloning an
+    # arbitrary external repo URL never depends on --with-git-hosting
+    # either, same reasoning as the upload wizard's own rule above.
+    echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-new-project-from-url.sh *"
     if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
         # Gitea's own toggle wrapper triplet (docs/spec.md "Crossing the
         # privilege boundary") — zero-argument narrowing, same as Taiga's

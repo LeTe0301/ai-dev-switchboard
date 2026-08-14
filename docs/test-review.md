@@ -956,3 +956,707 @@ failures, both investigated and confirmed pre-existing/environmental
 (real-host deploy-wrapper provisioning, a wholly separate subsystem with
 zero references to this diff's code) rather than caused by this change.
 Two nits noted for awareness, neither blocking.
+
+# Test & Review: Backlog item 16 — clone a project by `git clone <url>` directly
+
+## Scope
+Testing + review pass against `docs/spec.md`'s 12 acceptance criteria for
+clone-from-URL: `app/app.py`'s `_validate_clone_url()`,
+`_last_path_segment_from_clone_url()`, `_derive_project_name()`'s new
+`fallback_prefix` param, `clone_project_from_url()`, the new
+`POST /projects/clone` route, the new privileged script
+`scripts/new-project-from-url.sh`, unconditional `install.sh` wiring, and
+the frontend inline "Clone from URL" form — plus the assigning prompt's
+four specific hands-on asks: (1) constructing a real adversarial URL and
+confirming rejection at both the app-level allowlist and the script's own
+defense-in-depth layer, (2) verifying the `trap cleanup ERR` → `EXIT` bash
+semantics claim with a minimal repro, (3) verifying the `install.sh`
+placement-constraint claim against `tests/test_deploy_dispatch.py`, (4)
+tracing the oversized-clone rollback end-to-end, and (5) independently
+re-confirming the "4 pre-existing `test_deploy_frontend.js` failures" claim
+via `git stash`.
+
+## Test cases
+
+| # | Criterion / case | Method | Result | Evidence |
+|---|---|---|---|---|
+| 1 | Valid public `https://` URL, no `name` override → project appears under derived name, working `.git`, owned by `RUN_USER`, no restart needed | Automated, real `git http-backend`-backed server + real `sudo` | pass | `tests/test_new_project_from_url.py::PrivilegedCloneTests::test_clones_real_public_repo_owned_by_run_user` |
+| 2 | Explicit `name` override → registers under that exact name | Automated (app-level mocked + script-level real, incl. spaces/hyphens) | pass | `tests/test_clone.py::CloneProjectFromUrlTests::test_explicit_name_override_used_instead_of_derived`; `tests/test_new_project_from_url.py::PrivilegedCloneTests::test_name_with_space_and_hyphen_accepted` |
+| 3 | Disallowed scheme (`file://`, `ext::`, `fd::`, `git://`, bare/relative local path) → 400 before any subprocess, no directory created | Automated, both layers | pass | `tests/test_clone.py::ValidateCloneUrlTests` (11 cases); `tests/test_new_project_from_url.py::ArgumentValidationTests` |
+| 4 | Schemeless `-oProxyCommand=...`-shaped URL → rejected, never reaches `git clone` as an argv token | Automated + manual adversarial construction (see Hands-on verification) | **pass for the literal schemeless case; gap found in the broader injection-defense goal for the `ssh://`-scheme variant — see Finding 1** | `tests/test_clone.py::ValidateCloneUrlTests::test_argument_injection_shape_rejected`; my own repro below |
+| 5 | Explicit `name` failing `NAME_RE` → 400, same message as `create_project()` | Automated | pass | `tests/test_clone.py::CloneProjectFromUrlTests::test_explicit_name_failing_name_re_rejected_before_subprocess`; message text confirmed byte-identical via `grep` (both call sites at `app/app.py:1277`/`1366`) |
+| 6 | Name collision (explicit or derived) → 400 `"'<name>' already exists."`, existing project untouched | Automated | pass | `tests/test_clone.py::CloneProjectFromUrlTests::test_name_collision_rejected_before_subprocess`, `test_derived_name_collision_rejected_before_subprocess` |
+| 7 | Two concurrent same-name clones → exactly one succeeds, other fails cleanly | Automated, atomic-`mkdir`-no-`-p` proof (same technique as sibling items 2b/3 — neither has a literal-threads test either, confirmed by inspection) | pass | `tests/test_new_project_from_url.py::PrivilegedCloneTests::test_already_existing_target_fails_atomically_no_dash_p` |
+| 8 | Unreachable/nonexistent host → 400 clipped error, well under timeout, no orphaned directory | Automated, real HTTP server returning a 404-shaped bad path | pass | `tests/test_new_project_from_url.py::PrivilegedCloneTests::test_clone_failure_removes_dest_deviation_from_gitea_sibling` |
+| 9 | Private HTTPS repo (auth required) → fails fast, not hung | Automated, real HTTP server always demanding Basic auth | pass | `tests/test_new_project_from_url.py::PrivilegedAuthRequiredTests::test_auth_required_repo_fails_fast_not_hangs` (bounded 30s `PRIVILEGED_TEST_TIMEOUT` is itself part of the assertion) |
+| 10 | Oversized clone → `DEST` removed, 400, never appears in project list | Automated, real clone + `CLONE_MAX_BYTES=1` forcing rollback (see Hands-on verification) | pass | `tests/test_new_project_from_url.py::PrivilegedCloneTests::test_oversized_clone_rolled_back_and_removed` |
+| 11 | No `--with-git-hosting` dependency (`GITEA_ENABLED=0`, no token) → still succeeds | Automated, monkeypatched `GITEA_ENABLED`/`GITEA_API_TOKEN` | pass | `tests/test_clone.py::CloneProjectFromUrlTests::test_no_gitea_dependency_reads` |
+| 12 | `ssh://`/scp-like URL to a host `RUN_USER` already has SSH access to → succeeds with no switchboard-side credential | Validation-regex-only (no live SSH server in this sandbox) — disclosed known limitation, matches item 2b's own precedent exactly (confirmed by reading `tests/test_new_project_from_gitea.py`, which also only exercises the HTTP path end-to-end) | pass (regex level); not live-SSH-tested (accepted, precedented gap) | `tests/test_clone.py::ValidateCloneUrlTests::test_ssh_scheme_accepted`/`test_scp_like_shorthand_accepted` |
+| 13 | `scripts/new-project-from-url.sh` run directly with wrong arg count / invalid name/URL → exits 1, touches no filesystem state | Automated, unprivileged | pass | `tests/test_new_project_from_url.py::ArgumentValidationTests` (8 cases) |
+| — | Frontend: open/close toggle, empty-URL guard, loading/"Cloning…" state, success clears+hides form, 400 shows server error, 428 TOTP retry, cancel re-enables form | Automated, real rendered `<script>` extracted from `render_page()` in a Node `vm` sandbox (same proven technique as `test_deploy_frontend.js`) | pass | `node tests/test_clone_frontend.js` → 8/8 |
+
+## Hands-on verification (per the assigning prompt's specific asks)
+
+**1. Adversarial URL construction — app-level allowlist.** Ran a battery of
+crafted URLs directly against `_validate_clone_url()`:
+```
+'-oProxyCommand=touch /tmp/pwned-app'      -> REJECTED
+'ext::sh -c touch /tmp/pwned2'             -> REJECTED
+'fd::5:'                                   -> REJECTED
+'file:///etc/passwd'                       -> REJECTED
+'--upload-pack=touch /tmp/y'               -> REJECTED
+'git://example.com/repo.git'               -> REJECTED
+'/etc/passwd', '../../etc/passwd'          -> REJECTED
+'user@-oProxyCommand=id:path'              -> REJECTED (the `=` isn't in
+                                               the scp-like host char class)
+'ssh://-oProxyCommand=touch${IFS}/tmp/x'   -> ACCEPTED  <-- see Finding 1
+'ssh://-oProxyCommand=id'                  -> ACCEPTED  <-- see Finding 1
+```
+Most of the spec's own enumerated shapes are correctly rejected. Two
+`ssh://`-scheme variants are **not** — `_CLONE_URL_SCHEME_RE = r"^(https?|ssh)://\S+$"`
+places no constraint on the character immediately after `://`, so a
+scheme-prefixed CVE-2017-1000117-shaped host (`-oProxyCommand=...`) passes.
+See Finding 1 below for the full analysis (including proof that the same
+gap exists in the script's own bash-regex mirror, and that the only actual
+protection in this repo's git — 2.47.3 — is git's own upstream 2017 patch,
+not this codebase's validation).
+
+**2. Adversarial URL — script-level defense-in-depth, end to end.** Ran
+`scripts/new-project-from-url.sh` for real, via `sudo`, exactly as
+`clone_project_from_url()` would invoke it:
+```
+$ sudo env RUN_USER=$(id -un) PROJECTS_DIR=/tmp/npfu-manual-test/projects \
+    bash scripts/new-project-from-url.sh \
+    'ssh://-oProxyCommand=touch${IFS}/tmp/pwned-via-script2' 'advtest2'
+git clone failed:
+Cloning into '/tmp/npfu-manual-test/projects/advtest2'...
+fatal: strange hostname '-oProxyCommand=touch${IFS}' blocked
+exit: 1
+```
+Confirmed: (a) the URL is never shell-interpolated — it reaches `git
+clone` as a genuine argv token via `su ... -c '...git clone -- "$1" "$2"' _
+"$URL" "$DEST"`, exactly as `docs/spec.md` §5 "DEVIATION 2" describes,
+proven by the fact that `${IFS}` in the payload is never expanded (it
+appears literally in git's own error message, not executed); (b) no file
+was created at `/tmp/pwned-via-script2`; (c) `DEST` was correctly removed
+(the `EXIT`-trap cleanup ran); (d) the thing that actually stopped the
+clone was git's own "strange hostname blocked" guard (added upstream for
+CVE-2017-1000117, present since git 2.14.1, Aug 2017), not this script's
+own bash-regex re-validation (`^(https?|ssh)://[^[:space:]]+$`, which has
+the identical gap as the Python regex it mirrors). Net effect on this
+sandbox (git 2.47.3): safe. See Finding 1 for why this is still worth
+fixing.
+
+**3. `trap cleanup ERR` → `EXIT` bash-semantics claim.** Verified directly
+with a minimal repro before trusting the developer's claim:
+```
+$ cat trap_test.sh   # trap cleanup ERR; echo before; exit 1
+$ ./trap_test.sh
+before                    # cleanup never printed — ERR trap did not fire
+$ cat trap_test2.sh  # trap cleanup EXIT; echo before; exit 1
+$ ./trap_test2.sh
+before
+CLEANUP RAN               # EXIT trap fired correctly on explicit exit 1
+$ cat trap_test3.sh  # trap cleanup EXIT; echo before; trap - EXIT; echo success
+$ ./trap_test3.sh
+before
+success                   # cleanup did NOT run once cleared before success
+```
+Confirms the developer's bash-semantics claim exactly (`ERR` doesn't fire
+on an explicit `exit` builtin; `EXIT` does; clearing it with `trap - EXIT`
+right before the final success echo correctly avoids removing `DEST` on
+the success path) — also independently confirmed by the real privileged
+test suite (`test_clones_real_public_repo_owned_by_run_user` passes with
+`DEST` present after a successful clone; `test_oversized_clone_rolled_back_and_removed`
+passes with `DEST` absent after a triggered failure).
+
+**4. `install.sh` placement-constraint claim.** Read
+`tests/test_deploy_dispatch.py:557-559`: `InstallShDeployMapBlockTests`
+extracts the deploy-map config block via the exact-substring marker
+`'set_env "$ENV_FILE" UPLOAD_STAGING_TTL_SECONDS "1800"\n\n# Switchboard-side deploy dispatch'`.
+Confirmed this substring is real, present verbatim in `install.sh`
+(`grep -n` around lines 196-198, 407-409), and that the developer's new
+block is placed after the deploy-dispatch block's own closing
+`chown`/`chmod` pair (line ~420-423), not between the two halves of that
+marker — preserving the exact adjacency the test regex depends on. Ran
+`python3 -m unittest tests.test_deploy_dispatch -v`: 42/42 pass, confirming
+the constraint is real and the fix doesn't reintroduce it.
+
+**5. Oversized-clone rollback, traced concretely.** The real privileged
+test (`test_oversized_clone_rolled_back_and_removed`) clones a genuine
+one-commit repo over real `git http-backend`, forces `CLONE_MAX_BYTES=1`
+via env, and asserts (a) the script exits nonzero, (b) stderr contains
+"byte limit", (c) `PROJECTS_DIR/toobig` does not exist afterward. Ran it
+directly: passes. Traced the code path: `du -sb "$DEST"` runs after the
+clone succeeds, compares against `CLONE_MAX_BYTES` (default 524288000 =
+500 MiB), and on breach falls through to the `EXIT` trap's `rm -rf "$DEST"`
+(verified in point 3 above) rather than a separate explicit cleanup call —
+correct and consistent with the rest of the script's failure handling.
+
+**6. Pre-existing `test_deploy_frontend.js` failures.** Ran
+`node tests/test_deploy_frontend.js` on the working tree: 4/9 fail (the
+same 4 named in `docs/implementation.md`: cancel-dialog-sends-no-request,
+quote-containing-host-renders-safely, confirmed-deploy-success-message,
+428-mid-dispatch-retry). Then `git stash -u` (removing every change in
+this cycle's diff, including all new files) and re-ran the identical
+command: **same 4 tests fail, identical failure messages**, confirming
+they are unrelated to this diff. `git stash pop` restored the working
+tree. Independently confirmed, not taken on trust.
+
+## Regression check
+Full existing suite run: `python3 -m unittest discover -s tests` (988
+tests, 142.8s) — **0 failures, all pass**. Also ran the new test files
+individually: `tests.test_clone` (41/41), `tests.test_new_project_from_url`
+(15/15, all run for real against `sudo` — passwordless sudo is available
+on this sandbox, none skipped), `node tests/test_clone_frontend.js` (8/8),
+and `tests.test_deploy_dispatch` (42/42, confirming the `install.sh`
+placement change doesn't break the marker-extraction tests). The 4
+pre-existing `test_deploy_frontend.js` failures are unrelated (see Hands-on
+verification #6) and not counted against this diff.
+
+## Spec coverage
+12 of 12 acceptance criteria implemented and tested — see the Test cases
+table above. Criterion 4 (argument-injection rejection) is satisfied for
+its own literal wording (a schemeless `-oProxyCommand=...` string) but the
+broader injection-defense **goal** it exists to serve ("closing off the
+known git argument-injection ... RCE shapes", per spec's own "Goals"
+section) has a real gap for the `ssh://`-scheme case — see Finding 1.
+Criterion 12 (live SSH clone) is validation-level-only, an accepted,
+precedented gap matching item 2b's own test suite. No other gaps.
+
+## Findings (most severe first)
+
+### 1. `ssh://`-scheme URLs with a leading-`-` host bypass this codebase's own injection-defense allowlist; only git's own upstream 2017 hardening prevents exploitation — must-fix
+- File: `app/app.py:715` (`_CLONE_URL_SCHEME_RE = re.compile(r"^(https?|ssh)://\S+$", re.IGNORECASE)`), mirrored in `scripts/new-project-from-url.sh:29` (`^(https?|ssh)://[^[:space:]]+$`)
+- Issue: neither regex constrains the character immediately following
+  `://`, so a URL like `ssh://-oProxyCommand=id` (or any other single-token
+  `-o...`-shaped SSH flag with no embedded whitespace) matches both the
+  app-level allowlist and the script's own bash re-validation, and is
+  handed to `git clone` as a real argv token. This is exactly the
+  CVE-2017-1000117 shape the spec's own text explicitly claims this
+  allowlist defends against ("`_validate_clone_url()` ... blocks git's own
+  known argument-injection shape ... every accepted pattern above requires
+  a fixed non-'-' prefix ... so a leading '-' can never match either
+  regex"). That claim is true of the *whole string* (thanks to the literal
+  `ssh://` prefix) but false of the *host component* that actually reaches
+  `ssh` — which is the part CVE-2017-1000117 is about. I verified this
+  gap for real, end to end, via `sudo`: the crafted URL passes both
+  validation layers and reaches `git clone` as an argv token; the clone
+  then fails only because installed git (2.47.3) itself refuses with
+  `fatal: strange hostname '-oProxyCommand=...' blocked` — an upstream git
+  hardening patch shipped in git ≥2.14.1 (Aug 2017), not anything this
+  codebase's own allowlist did. `docs/spec.md`'s "Open questions" section
+  explicitly (and, per this finding, incorrectly) states: "if a target's
+  git predates `--` support for `clone` specifically, the allowlist regex
+  alone still fully closes the argument-injection shape described above" —
+  demonstrably false for this URL shape on any git older than 2.14.1.
+- Failure scenario: an operator's switchboard host runs a git build
+  predating August 2017 (realistic on a long-lived enterprise/LTS
+  distribution image — the same "unverified minimum git version" risk
+  class the spec itself already flags elsewhere, but this specific
+  instance is a full argument-injection RCE via the `RUN_USER`-privileged
+  `ssh` subprocess spawned by the script, not merely a `--`-flag
+  compatibility question). Submits `ssh://-oProxyCommand=<attacker
+  command>` through the web form. On such a host, both validation layers
+  accept it and `ssh` executes the injected `ProxyCommand` as `RUN_USER`.
+- Suggested fix (not applied by me — reviewer doesn't fix): tighten both
+  regexes to reject a `-` immediately after `://` (e.g.
+  `r"^(https?|ssh)://(?!-)\S+$"` in Python, `^(https?|ssh)://[^-[:space:]]` in
+  bash, or equivalently parse out and check the actual host component)
+  — closing the gap at this codebase's own validation layer rather than
+  depending on git's own upstream patch, consistent with this project's
+  stated "never trust a single layer" defense-in-depth discipline
+  elsewhere in this very diff (the script's own header comments make
+  exactly this argument for re-validating in bash at all).
+
+### 2. `docs/design.md`'s stated WCAG contrast ratios don't match the actual hex values — should-fix (design doc, not this diff's code)
+- File: `docs/design.md` "Accessibility & platform notes" (~line 512-516)
+- Issue: recomputed all four stated pairs from the literal hex values used
+  in `app/app.py`'s CSS (WCAG relative-luminance formula):
+  - Button text `#fff` on button bg `#34c759`: design.md claims **5.05:1**;
+    actual is **2.22:1** — fails WCAG AA for normal text (4.5:1) and even
+    the large-text threshold (3:1); the button text is 14px/600-weight,
+    below the ~18.7px-bold "large text" cutoff, so 4.5:1 is the applicable
+    bar.
+  - Placeholder `#666`/`#888` on input bg `#1c1c1c`: design.md claims
+    **6.14:1** for both (identical to its separately-stated error-text
+    ratio, suggesting a copy/paste error); actual is **2.97:1** for `#666`
+    (fails even the 3:1 non-text threshold) and **4.81:1** for `#888`
+    (passes AA, barely). Moot in practice: `app/app.py`'s CSS diff adds no
+    `::placeholder` rule at all (grepped the whole file — none exists
+    anywhere in this codebase), so the actual placeholder color is
+    whatever the browser applies by default, not `#666`/`#888` — this part
+    of design.md's accessibility analysis was never grounded in real CSS.
+  - Error text `#ff6b6b` / status text `#aaa` on `#1c1c1c`: design.md's
+    claims (6.14:1 / 6.4:1) are close to my recomputed values (6.14:1 /
+    7.34:1) — the error-text figure is exactly right; the status-text
+    figure is off but still comfortably passes AA either way.
+- Failure scenario: none for this cycle specifically — the button styling
+  is reused verbatim from the pre-existing "+ New project"/"Upload folder /
+  .zip" buttons (not new to this diff; the same contrast gap already ships
+  in production today), and the placeholder-color claim was never backed
+  by real CSS in the first place. Not blocking backlog item 16 — flagged
+  as a design-doc accuracy issue and a pre-existing, out-of-scope
+  accessibility gap worth its own follow-up, not something this
+  developer's diff introduced or is expected to fix here.
+
+## Follow-ups (non-blocking)
+- Investigate/fix the button-text-on-green-background contrast gap
+  (`#fff` on `#34c759`, 2.22:1) as its own accessibility item — affects
+  "+ New project" and "Upload folder / .zip" too, pre-existing and outside
+  this backlog item's scope.
+- Once Finding 1 is fixed, consider adding an explicit
+  `tests/test_clone.py` case for `ssh://-oProxyCommand=...`-shaped URLs
+  (and the bash-level equivalent in `tests/test_new_project_from_url.py`)
+  so a future regression in either regex is caught without relying on
+  installed git's own version-dependent hardening.
+
+## Overall verdict: **Changes requested**
+
+The testing pass is clean: all 13 acceptance-criteria-derived test cases
+pass (12 from `docs/spec.md`'s literal acceptance-criteria list plus the
+frontend suite), the full 988-test regression suite is green, and all five
+of the assigning prompt's specific hands-on verification asks (adversarial
+URL at both layers, `trap` bash-semantics repro, `install.sh` placement
+constraint, oversized-clone rollback trace, independent re-confirmation of
+the pre-existing frontend-test failures) check out — most of them exactly
+as the developer described. However, the same hands-on adversarial-URL
+exercise the assigning prompt specifically called for surfaced a real gap
+(Finding 1): `_validate_clone_url()`'s own allowlist, and its bash mirror
+in `scripts/new-project-from-url.sh`, do not actually close the
+`ssh://`-scheme argument-injection shape they explicitly claim to close in
+both `docs/spec.md`'s own text and the code's own comments — only
+installed git's own 2017 upstream patch currently prevents exploitation on
+this sandbox, which is not something this codebase's validation logic
+accounts for, tests against, or can rely on for an environment running an
+older git. Given this is the single most safety-critical property of the
+entire feature (the reason a narrowly-scoped root-privileged script exists
+at all) and the fix is small and precise, this is a must-fix, not a nit —
+route back to the developer to tighten both regexes (or otherwise reject a
+leading `-` in the URL's actual host component, not just at the very start
+of the whole string) before re-review. Finding 2 (design.md's inaccurate
+WCAG contrast claims) is a should-fix, non-blocking on its own, but is
+included for the same cycle's fix-and-reapprove pass since it's cheap to
+correct alongside Finding 1.
+
+---
+
+## Re-review: Backlog item 16 — Finding 1 fix-and-reapprove round
+
+### Scope
+Covers the developer's disclosed "Post-review fix" in `docs/implementation.md`:
+the tightened `_CLONE_URL_SCHEME_RE`/`_CLONE_URL_SCP_RE` in `app/app.py`
+(now `r"^(https?|ssh)://(?!-)\S+$"` / `r"^[A-Za-z0-9_.-]+@(?!-)[A-Za-z0-9_.-]+:\S.*$"`,
+`app/app.py:722-723`), the matching bash re-validation in
+`scripts/new-project-from-url.sh:34-35`
+(`^(https?|ssh)://[^-[:space:]][^[:space:]]*$` /
+`^[A-Za-z0-9_.-]+@[^-[:space:]][A-Za-z0-9_.-]*:[^[:space:]].*$`), and the
+new adversarial test cases in `tests/test_clone.py` and
+`tests/test_new_project_from_url.py`. Re-verified independently — I did not
+re-run or re-trust the developer's own repro/revert-and-fail claims, I
+constructed my own adversarial inputs from scratch per the assigning
+prompt's explicit instruction.
+
+### What I checked
+1. **Read the actual diff.** Confirmed the regex change is exactly as
+   `docs/implementation.md` describes, and confirmed via `git diff --stat`
+   that this round's diff is scoped to `app/app.py`, the script, and the
+   two test files (plus the docs pair every cycle updates) — no unrelated
+   changes.
+2. **Constructed independent adversarial URLs** (not reusing the
+   developer's own `ssh://-oProxyCommand=id` / `user@-oProxyCommand=id:path`
+   test cases) and ran them against both the live Python regexes and a real
+   `sudo` invocation of the actual privileged script, mirroring the exact
+   harness the developer's own privileged tests use.
+3. **Ran `tests/test_clone.py` and `tests/test_new_project_from_url.py` in
+   full** to confirm every legitimate URL shape still passes.
+4. **Ran the full suite twice** (`python3 -m unittest discover -s tests`)
+   and `node tests/test_clone_frontend.js`, and traced down an initial
+   spurious failure to my own accidental concurrent invocation rather than
+   a real regression (see "Regression check" below).
+5. **Confirmed the WCAG should-fix was correctly left untouched.**
+6. **Checked `docs/spec.md`'s "Open questions" text** for the
+   already-flagged incorrect claim.
+
+### Finding 1 (carried over from the prior round): **NOT resolved** — the tightened regex still lets a crafted URL reach a real `git clone` subprocess before this codebase's own validation rejects it
+
+The developer's fix correctly closes the *literal* case flagged in the
+prior round (`ssh://-oProxyCommand=id`, no `user@` prefix — confirmed
+rejected at both layers, `Unsupported URL: ...` printed before any
+`Cloning into...` line). But my own independently-constructed adversarial
+URLs show the same underlying vulnerability class (CVE-2017-1000117-shaped
+argument injection) is still open via two variants neither regex — nor any
+new test — covers:
+
+**Repro 1 — `ssh://` scheme, malicious host hidden behind a `user@` prefix.**
+The negative lookahead in `_CLONE_URL_SCHEME_RE` (`(?!-)`) only checks the
+character immediately after `://`; it never re-checks after an optional
+`user@` segment, so a URL whose first character after `://` is an
+innocuous username still matches even though the actual *host* component
+(after `@`) starts with `-`:
+```
+$ python3 -c "
+import re
+r = re.compile(r'^(https?|ssh)://(?!-)\S+\$', re.IGNORECASE)
+print(bool(r.match('ssh://user@-oProxyCommand=id/repo')))"
+True   # ACCEPTED -- should be rejected
+```
+Confirmed the bash mirror in the script has the identical gap:
+```
+$ bash -c '
+URL="ssh://user@-oProxyCommand=id/repo"
+[[ "$URL" =~ ^(https?|ssh)://[^-[:space:]][^[:space:]]*$ ]] && echo "ACCEPTED by bash regex"'
+ACCEPTED by bash regex
+```
+Ran the real, `sudo`-privileged script end to end, exactly as the
+developer's own `test_ssh_argument_injection_shape_rejected_before_any_subprocess`
+does, with a `${IFS}`-encoded `touch` marker:
+```
+$ mkdir -p /tmp/npfu-bypass-test/projects
+$ sudo env RUN_USER=$(id -un) PROJECTS_DIR=/tmp/npfu-bypass-test/projects \
+    bash scripts/new-project-from-url.sh \
+    'ssh://user@-oProxyCommand=touch${IFS}/tmp/npfu-bypass-marker' 'bypasstest'
+git clone failed:
+Cloning into '/tmp/npfu-bypass-test/projects/bypasstest'...
+hostname contains invalid characters
+fatal: Could not read from remote repository.
+```
+Observed: the script's own `Unsupported URL: ...` rejection message never
+appeared — the URL passed the script's own bash re-validation and `git
+clone` was genuinely invoked (`Cloning into ...` printed) with the crafted
+URL as a real argv token. The marker file (`/tmp/npfu-bypass-marker`) was
+**not** created and the attempt failed, but only because installed git
+(2.47.3) independently rejects this hostname shape ("hostname contains
+invalid characters") — the exact same "protected by git's own upstream
+hardening, not by this codebase's allowlist" gap the prior round's Finding
+1 already flagged, just reachable through a slightly different string
+shape the fix didn't anticipate.
+
+**Repro 2 — scp-like shorthand, leading `-` after the `:` path separator**
+(the specific variant the assigning prompt suggested trying).
+`_CLONE_URL_SCP_RE`'s negative lookahead only guards the character right
+after `@` (the host); nothing constrains the character right after `:`
+(the path/command component git hands to the remote transport):
+```
+$ python3 -c "
+import re
+r = re.compile(r'^[A-Za-z0-9_.-]+@(?!-)[A-Za-z0-9_.-]+:\S.*\$')
+print(bool(r.match('user@127.0.0.1:-oProxyCommand=id')))"
+True   # ACCEPTED -- should be rejected
+```
+Real `sudo` run of the script:
+```
+$ sudo env RUN_USER=$(id -un) PROJECTS_DIR=/tmp/npfu-bypass-test/projects \
+    bash scripts/new-project-from-url.sh \
+    'user@127.0.0.1:-oProxyCommand=touch${IFS}/tmp/npfu-bypass-marker3' 'scptest'
+git clone failed:
+Cloning into '/tmp/npfu-bypass-test/projects/scptest'...
+fatal: strange pathname '-oProxyCommand=touch${IFS}/tmp/npfu-bypass-marker3' blocked
+```
+Same shape: the script's own bash re-validation never fires (`Unsupported
+URL:` never printed), `git clone` is genuinely invoked, and only git's own
+separate "strange pathname blocked" hardening (a different check than the
+hostname one) stops it. Marker file not created — safe on this sandbox's
+git, not safe by construction.
+
+**Neither repro is covered by any test.** Grepped both test files: the
+developer's new adversarial cases are `ssh://-oProxyCommand=id` (no `user@`
+prefix) and `user@-oProxyCommand=id:path` (leading `-` right after `@`,
+not after `:`) — the exact two shapes above (`user@` hiding the malicious
+host after `://`, and a malicious path immediately after `:`) are absent
+from both `tests/test_clone.py::ValidateCloneUrlTests` and
+`tests/test_new_project_from_url.py::ArgumentValidationTests`.
+
+This means acceptance criterion 4 ("a URL shaped like an argument-injection
+attempt is rejected — never reaches `git clone` as an argv token") is still
+not fully met: both repros above **do** reach `git clone` as a real argv
+token via a genuine subprocess call, contradicting the criterion's own
+"never reaches `git clone` as an argv token" wording, exactly as the prior
+round's Finding 1 already established for the un-prefixed case. The fix is
+a real, partial improvement (the literal case it targeted is closed) but
+does not close the vulnerability class it was dispatched to close, on an
+older/differently-hardened git this remains exploitable exactly as before.
+
+### Regression check (the parts of the fix that do work)
+- Every legitimate URL shape still accepted: `tests/test_clone.py` (44
+  tests) + `tests/test_new_project_from_url.py` (18 tests) = 62/62 pass,
+  rerun directly: `python3 -m unittest tests.test_clone
+  tests.test_new_project_from_url -v` → `Ran 62 tests` / `OK`.
+- Full suite: `python3 -m unittest discover -s tests` → `Ran 994 tests` /
+  `OK`, 0 failures, run cleanly and in isolation. (An earlier run of mine
+  showed one failure in `test_teams_headless.RealTmuxHeadlessTests.
+  test_run_sh_and_prompt_file_are_world_readable_under_a_strict_umask`
+  — traced this down before treating it as a regression: it was caused by
+  my own accidental overlap of two full-suite invocations racing on the
+  same PID-derived tmux session name (`team-sessionrace-p<pid>` collisions
+  visible in the log). A clean, single, non-concurrent rerun passed
+  994/994 with no failures. Not a regression in this diff, self-inflicted
+  test-harness noise on my part, confirmed and ruled out before writing
+  this up.)
+- Node: `node tests/test_clone_frontend.js` → 8/8 pass, unaffected (this
+  fix touches no frontend code).
+- WCAG should-fix confirmed correctly left untouched, per the explicit
+  instruction not to touch it this round: `docs/design.md` lines 512-516
+  (the button/error/placeholder/status contrast claims) are byte-identical
+  to the prior round.
+
+### Doc accuracy note (not a blocker on its own, folding into this write-up per the assigning prompt's ask)
+`docs/spec.md`'s "Open questions" section (lines ~636-643) still states:
+"...the allowlist regex alone still fully closes the argument-injection
+shape described above" — already disproven by the first review round, and
+now doubly so given the two additional bypasses found this round. Since
+this cycle is already going back to the developer for Finding 1's
+re-fix, recommend correcting this sentence in the same pass rather than
+leaving a durable spec doc with a demonstrably false safety claim — not a
+separate blocking item, just worth folding into the same commit that fixes
+Finding 1 properly.
+
+### Verdict on the must-fix: **NOT resolved — still a must-fix**
+The developer's regex tightening is a genuine, real improvement (the
+literal `ssh://-oProxyCommand=...`/`user@-oProxyCommand=...:path` shapes
+from the prior round's own repro are now correctly rejected before any
+subprocess), but it is not a complete fix for the vulnerability class the
+prior round's Finding 1 identified. A `user@` prefix in front of a
+malicious `ssh://` host, and a malicious path immediately after the `:` in
+the scp-like shorthand, both still reach a real `git clone` subprocess
+invocation with the crafted string as an argv token, protected only by
+installed git's own (version-dependent) downstream hardening — exactly the
+residual-risk shape the prior round asked to be closed at this codebase's
+own validation layer instead. Recommended fix direction for the next
+round: parse out the actual host component (split on the last unescaped
+`@` for `ssh://`, and require the path segment after `:` in the scp-like
+form to also reject a leading `-`) rather than only guarding the character
+immediately following the scheme/`@`, since both accepted grammars allow
+an optional `user@`/`:path` segment between the checked character and the
+component that actually matters to `ssh`/`git`.
+
+## Overall verdict (re-review): **Blocked**
+
+---
+
+## Re-review: Backlog item 16 — third round, component-isolation fix-and-reapprove
+
+### Scope
+Covers the developer's disclosed "Second post-review fix" in
+`docs/implementation.md`: abandonment of lookahead-anchored regexes entirely
+in favor of real component isolation — `urllib.parse.urlsplit(url).hostname`
+for `scheme://` URLs, manual "split on `@`, then `:`" for scp-like
+shorthand, both validated through a new `_clone_url_host_is_safe()` helper
+(`app/app.py:702-810`), mirrored in bash via parameter expansion in
+`scripts/new-project-from-url.sh:22-106`. Per the assigning prompt's
+explicit instruction, this review does **not** re-run or re-trust the
+developer's own repro/revert-and-fail claims or either of my own prior two
+rounds' adversarial lists — every URL below is independently constructed for
+this round, and every accept/reject claim is backed by either a real `sudo`
+invocation of the actual privileged script or a direct call into the live
+`app._validate_clone_url()` in this session (not simulated).
+
+### 1. Both prior rounds' bypass URLs — now genuinely blocked, verified live
+Ran the exact round-1 (`ssh://-oProxyCommand=id`, `user@-oProxyCommand=id:path`)
+and round-2 (`ssh://user@-oProxyCommand=touch${IFS}/tmp/x`,
+`user@127.0.0.1:-oProxyCommand=touch${IFS}/tmp/x`) URLs against both the live
+Python validator and a real `sudo` invocation of
+`scripts/new-project-from-url.sh`. All four are rejected at both layers
+(`_validate_clone_url()` returns the error string; the script prints
+`Unsupported URL: ...` and exits 1 before any `git clone` invocation, `rc=1`,
+no marker file, no `PROJECTS_DIR/<name>` directory left).
+
+### 2. Double-`@` semantics — verified against git's *actual* behavior, not assumed
+Before trusting the "split on first/last `@`" reasoning in either the code
+comments or `docs/implementation.md`, I determined git's own real semantics
+empirically (not from the man page, which is silent on double-`@`): using
+`GIT_SSH_COMMAND` pointed at a logging stub, I confirmed `git` hands the
+**entire** `[user@]host[:port]` (or scp-form `[user@]host`) string to `ssh`
+as one unsplit argv token, and separately confirmed via `ssh -G` that
+OpenSSH 10.0 itself resolves username/hostname by splitting on the **last**
+unescaped `@` (`real@decoy@127.0.0.1` → `user=real@decoy`,
+`hostname=127.0.0.1`) — i.e. an earlier `@` is swallowed into the username,
+not the host boundary.
+- **Scheme form (`ssh://`)**: `urllib.parse.urlsplit(url).hostname` also
+  resolves on the *last* `@` (`ssh://real@decoy@-oProxyCommand=pwn/repo` →
+  `hostname='-oproxycommand=pwn'`, correctly flagged unsafe) — this matches
+  git/ssh's real behavior exactly, confirmed both via direct Python call and
+  a real `sudo` run (`ssh://real@decoy@-oProxyCommand=pwn/repo` → rejected,
+  `Unsupported URL`, no clone attempt) and a real-`sudo` run of the
+  legitimate counterpart (`ssh://real@decoy@127.0.0.1/doesnotexist` →
+  correctly *accepted*, real `Cloning into...` attempted, fails only on
+  "repository not found", exactly as a genuine double-`@` username should
+  behave).
+- **Scp-like form**: the code splits on the *first* `@`, not the last —
+  I verified this is still safe, not a bypass, but for a subtler reason than
+  "correctly matches git": the app's `host` extraction is
+  "everything between the first `@` and the following `:`", which
+  necessarily *includes* any additional `@` characters when more than one is
+  present, and `@` is not in `_SAFE_HOST_RE`'s allowed charset — so a
+  malicious real-host-after-the-last-`@` is always caught (by the `@`
+  appearing where it shouldn't, not because the split boundary was correct).
+  Real `sudo` run confirms: `real@decoy@-oProxyCommand=pwn:repo` → rejected,
+  `Unsupported URL`, no clone attempt. One side effect, confirmed
+  intentional and non-security: this also **over-rejects** a *legitimate*
+  double-`@` scp-form username (`real@decoy@127.0.0.1:doesnotexist`, where
+  ssh would resolve `user=real@decoy`, `host=127.0.0.1`) — verified via real
+  `sudo` run: rejected, even though this exact shape is accepted in scheme
+  form. A false negative on an unusual-but-legitimate URL, not a security
+  gap — not blocking.
+
+### 3. IPv6 bracketed forms, with and without a leading `-` inside the brackets
+- `ssh://[::1]/repo`, `ssh://[::1]:22/repo`, `ssh://user@[::1]:22/repo` — all
+  correctly **accepted** (`ipaddress.ip_address("::1")` succeeds); verified
+  the accepted case doesn't collaterally break anything by real `sudo` run
+  of `ssh://user@[::1]:22/repo` — proceeds to a genuine SSH connection
+  attempt (`Permission denied (publickey,password)` from real localhost
+  sshd), never `Unsupported URL`.
+- `ssh://[-oProxyCommand=pwn]/repo` (leading `-` inside the brackets) —
+  correctly **rejected** at both layers (`ipaddress.ip_address()` raises
+  `ValueError` on a non-IPv6 bracket payload); confirmed via a real `sudo`
+  run: `Unsupported URL`, no clone attempt.
+
+### 4. Trailing `:` / empty-component edge cases
+| Case | `_validate_clone_url()` | Real `sudo` script | Assessment |
+|---|---|---|---|
+| `user@host:` (scp, no path) | reject | reject (`Unsupported URL`) | correct — `path` empty fails the check |
+| `@host:path` (scp, empty user) | reject | reject | correct — doesn't match `_CLONE_URL_SCP_RE`'s `[A-Za-z0-9_.-]+` (needs ≥1 char) |
+| `user@:path` (scp, empty host) | reject | (not separately re-run — same code path as `@host:path`, already exercised) | correct — `_clone_url_host_is_safe("")` is `False` |
+| `ssh://@host/repo` (scheme, empty user) | **accept** | accepted, real connection attempted, `Permission denied` | benign — empty userinfo is not attacker-advantageous, `hostname='host'` is genuinely safe |
+| `ssh://user@:22/repo` (scheme, empty host) | reject | reject | correct — `urlsplit().hostname` is `None`/empty, `_clone_url_host_is_safe(None)` is `False` |
+| `ssh://host:/repo` (scheme, trailing `:`, empty port) | **accept** | (not separately re-run; `urlsplit().port` is simply `None`, never checked or misused) | benign — no injection surface, port is simply absent |
+
+### 5. Git-vs-validator "what counts as scp-remote-syntax at all" mismatch — checked, confirmed safe
+Per `git-clone(1)`'s own GIT URLS section, scp-like syntax is "only
+recognized if there are no slashes before the first colon" — a URL like
+`user@evil/proxy:something` is *not* treated as a remote by git at all, it
+falls back to being parsed as a **local filesystem path** (verified
+directly: no `SSH_ARGS` were ever logged by a `GIT_SSH_COMMAND` spy for this
+exact string, confirming ssh was never invoked). This is exactly the
+generic risk class the assigning prompt named ("our validator's idea of the
+host differs from git's own idea of the host") — but `_CLONE_URL_SCP_RE`
+has no equivalent "no slash before the colon" carve-out, so I checked
+whether this divergence is exploitable. It is not: any `/` occurring in what
+the app extracts as `host` (the substring between the first `@` and the
+first `:`) is rejected outright, because `/` is not in `_SAFE_HOST_RE`'s
+allowed charset — so any string shaped this way is rejected by the app's
+own host-safety check regardless of git's differing scp-vs-local
+classification. Confirmed via a real `sudo` run:
+`user@evil/proxy:something` → rejected, `Unsupported URL`, no clone
+attempt (and, separately, no local-path clone was possible even had it
+passed, since nothing here is exploitable either way).
+
+### 6. New finding — should-fix, not a must-fix: the `scheme://` port component is silently unvalidated at both layers
+Neither `_validate_clone_url()` nor `_host_is_safe()`/the bash port-strip
+(`${hostport%:*}`) ever inspects what follows a `:` after the host in
+`scheme://host:port/path` form when that content isn't a clean numeric port.
+`urllib.parse.urlsplit(url).hostname` is accessed but `.port` never is, so
+an invalid port string never even raises; the bash mirror discards
+everything after the last `:` via `${hostport%:*}` with no check on what was
+discarded.
+- Constructed `ssh://127.0.0.1:-oProxyCommand=touch${IFS}/tmp/marker/repo`
+  and `ssh://real@127.0.0.1:-oProxyCommand=touch${IFS}/tmp/marker2/repo`.
+  Both are **accepted** by `_validate_clone_url()` (host resolves to
+  `127.0.0.1`, which is safe; the malformed port is never examined) and by
+  the bash script's own validation (same reasoning). Ran both for real via
+  `sudo`: in both cases the script proceeds past validation and genuinely
+  invokes `git clone` — `Cloning into ...` is printed, no `Unsupported URL`.
+  **However**, in this sandbox (git 2.47.3, OpenSSH 10.0), git does *not*
+  split a non-numeric "port" into a separate argv token the way it does for
+  a real numeric port (confirmed by comparing the `GIT_SSH_COMMAND` spy log
+  for a numeric-port URL, which shows a separate `-p <port>` argument, vs.
+  the non-numeric case, which shows the whole `host:garbage` string passed
+  as one combined token) — and real OpenSSH itself then rejects that
+  combined string outright with `hostname contains invalid characters`
+  before attempting any connection (confirmed directly:
+  `ssh -o BatchMode=yes '127.0.0.1:-oProxyCommand=touch /tmp/x' echo hi` →
+  same error, same non-creation of the marker). No marker file was created
+  in either real `sudo` run; no directory was left behind.
+- I assessed this is a **materially different (and safer) case than the two
+  must-fix rounds already closed**, not a re-opening of the same
+  vulnerability class: in both prior rounds, the malicious payload became
+  the *first character* of the exact argv token handed to `ssh`, which is
+  the literal CVE-2017-1000117 mechanism (`getopt`-style parsing treats a
+  leading `-` on a positional argument as a flag). Here, the malicious
+  content is *embedded mid-token* (`host:payload`), never the leading
+  character of the combined destination string handed to `ssh` — so even on
+  an ssh/git combination *without* OpenSSH's "hostname contains invalid
+  characters" sanity check, there is no mechanism by which this string would
+  be re-split into a discrete flag argument; `getopt`-style option detection
+  only ever inspects the first character of a token. I could not construct
+  a plausible exploitation path for this specific case, unlike the two prior
+  rounds where the mechanism was concrete and version-dependent only on
+  *whether* the CVE-2017-1000117 patch was present, not on a difference in
+  mechanism.
+- Recommend closing it anyway on defense-in-depth grounds consistent with
+  this whole must-fix arc's own stated discipline (validate the real
+  component, don't lean on git/ssh's own hardening) — e.g. also access
+  `urlsplit(url).port` inside a `try/except ValueError` and reject on
+  failure, and have the bash mirror validate the port substring
+  (`^[0-9]+$`) rather than discarding it unchecked. Not blocking this round.
+
+### Regression check
+- `python3 -m unittest tests.test_clone tests.test_new_project_from_url -v`
+  → **`Ran 80 tests` / `OK`** (62 legitimate/adversarial-regression cases +
+  18 this-round adversarial cases, exactly matching
+  `docs/implementation.md`'s own count), run directly in this session, not
+  taken on trust.
+- `python3 -m unittest discover -s tests` → **`Ran 1012 tests` / `OK`**, 0
+  failures, run to completion in this session (145.6s). (Noisy interleaved
+  stdout from real-tmux/team-lifecycle tests — JSON transcript dumps,
+  `duplicate session: team-sessionrace-p<pid>` lines — is expected
+  pre-existing test-harness chatter from those suites, not a failure
+  indicator; confirmed the actual summary line reads `Ran 1012 tests` /
+  `OK` with no `FAILED`/`ERROR:` lines anywhere in the log.)
+- `node tests/test_clone_frontend.js` → **8/8 PASS**, run directly, unrelated
+  to this round's Python/bash-only diff.
+- `git diff --stat` / `git diff app/app.py | grep '^@@'` confirms this
+  round's diff is scoped to `app/app.py` (imports, the clone-URL validation
+  block, `_clone_url_host_is_safe()`), `scripts/new-project-from-url.sh`,
+  and the docs pair every cycle updates — no unrelated changes, no scope
+  creep.
+
+### Spec / criterion coverage
+Acceptance criterion 4 ("a URL shaped like an argument-injection attempt is
+rejected — never reaches `git clone` as an argv token") is now genuinely
+met for every adversarial shape I could construct that maps to the actual
+CVE-2017-1000117 mechanism (a crafted string becoming the *first character*
+of an argv token handed to `ssh`), across both grammars, including double-`@`
+variants verified against git's own real (not assumed) host-resolution
+semantics, and IPv6 bracketed forms. The one residual gap found (§6 above)
+does not reach that mechanism and is assessed should-fix, not must-fix — see
+reasoning above.
+
+### Verdict on the must-fix: **RESOLVED**
+Unlike the previous two rounds, I was not able to construct an adversarial
+URL, in either accepted grammar, that reaches `git clone` as an argv token
+whose leading character is attacker-controlled and equal to `-`. Every prior
+bypass shape (this round's own repro attempts included) is now rejected
+before any subprocess is spawned, confirmed via real `sudo` runs against the
+actual privileged script, not simulation. The bash mirror in
+`scripts/new-project-from-url.sh` reaches the same accept/reject decision as
+the Python validator for every case I tried (including the one case where
+both are more conservative than strictly necessary — double-`@` scp-form —
+which is a shared, not divergent, false negative).
+
+## Overall verdict (third re-review): **Approve**
+
+This closes the fix-and-reapprove cycle for backlog item 16. The one new
+should-fix (§6, unvalidated `scheme://` port component) and the two
+carried-forward non-blocking items from the first round (WCAG button
+contrast; the informational `docs/spec.md` accuracy note, already corrected
+per the developer's second post-review fix) are recorded as follow-ups, not
+blockers — none of them reopen the argument-injection vulnerability class
+this must-fix arc was dispatched to close.
+
+The testing pass fails on the same must-fix acceptance criterion (#4,
+argument-injection rejection "before any subprocess") the prior round
+flagged: my own independently-constructed adversarial URLs — one `ssh://`
+variant and one scp-like variant, neither identical to the developer's own
+test list, per the assigning prompt's explicit instruction — both pass the
+tightened regex at both the Python and bash layers and reach a genuine
+`git clone` subprocess invocation via a real `sudo` run of the privileged
+script, stopped only by installed git's own downstream hardening. Per this
+role's process, a failed testing pass routes straight back to the
+developer without a review pass — the should-fix (WCAG contrast, correctly
+left untouched this round) and the docs/spec.md doc-accuracy note above
+remain open follow-ups for whenever this item is eventually approved, not
+addressed in this blocked round. Full regression suite (994 Python + 8
+clone-frontend Node tests) is otherwise green, and every legitimate URL
+shape this feature needs to accept still works correctly — only the
+injection-rejection criterion itself remains unmet.

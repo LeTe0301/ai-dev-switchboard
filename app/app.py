@@ -36,6 +36,7 @@ import base64
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import os
 import re
@@ -147,6 +148,19 @@ GITEA_API_TOKEN = os.environ.get("GITEA_API_TOKEN", "")
 NEW_PROJECT_FROM_GITEA_SCRIPT = os.environ.get(
     "NEW_PROJECT_FROM_GITEA_SCRIPT",
     "/usr/local/bin/ai-dev-switchboard-new-project-from-gitea.sh")
+
+# Clone-from-URL (backlog item 16, docs/spec.md) -- unlike NEW_PROJECT_FROM_
+# GITEA_SCRIPT above, installed UNCONDITIONALLY (base install.sh block, like
+# NEW_PROJECT_FROM_UPLOAD_SCRIPT) -- cloning an arbitrary external repo URL
+# never depends on --with-git-hosting.
+NEW_PROJECT_FROM_URL_SCRIPT = os.environ.get(
+    "NEW_PROJECT_FROM_URL_SCRIPT",
+    "/usr/local/bin/ai-dev-switchboard-new-project-from-url.sh")
+# Generous relative to the 30s/60s timeouts create_project()/confirm_upload()
+# use for their own privileged scripts -- an arbitrary external repo's
+# history can legitimately take a while to transfer, unlike a Gitea repo
+# this switchboard just created itself (2b) or a local cp -a (3).
+CLONE_TIMEOUT_SECONDS = int(os.environ.get("CLONE_TIMEOUT_SECONDS", "180"))
 
 # Poll-based sync-on-push (backlog item 2c, part 1 -- docs/spec.md) -- keeps
 # PROJECTS_DIR/<name> in sync when a push lands on its Gitea repo from
@@ -686,6 +700,114 @@ def _code_stop(name: str):
 
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]{0,59}$")
+
+# Clone-from-URL allowlist (backlog item 16, docs/spec.md "URL validation --
+# allowlist, not denylist"). Only http(s)://, ssh://, or git's own scp-like
+# user@host:path shorthand are accepted -- file://, git://, ext::/fd::
+# transport helpers (a known git RCE shape when an attacker controls the
+# clone URL), a bare/relative local filesystem path, and a string with no
+# recognizable scheme at all are all rejected before any subprocess is ever
+# spawned.
+#
+# This allowlist is also what has to block git's own known argument-injection
+# shape (a "URL" whose host or scp-path component is actually a
+# `-oProxyCommand=...`-style flag, CVE-2017-1000117). A first pass at that
+# used negative lookaheads pinned right after the scheme/`@` (`(?!-)`); a
+# review found that insufficient -- those lookaheads only ever check the
+# character *immediately* following a fixed anchor, but both accepted
+# grammars allow an optional `user@` (for `scheme://`) or `:path` (for the
+# scp-like shorthand) segment between that anchor and the component that
+# actually matters to ssh/git, so a URL like `ssh://user@-oProxyCommand=.../x`
+# or `user@host:-oProxyCommand=...` slipped straight past the lookahead and
+# reached a real `git clone` subprocess, protected only by installed git's
+# own (version-dependent) downstream hardening -- not by this codebase.
+#
+# The regexes below are now only a coarse "does this look like the right
+# grammar at all" pre-filter. The actual security-relevant check parses out
+# the real host (and, for scp-like shorthand, the real path) component and
+# validates THAT specific substring via _clone_url_host_is_safe() /
+# `path[0] != "-"` below -- see clone_project_from_url()'s docs/spec.md
+# history and docs/test-review.md's item 16 re-review for the two concrete
+# bypasses (`ssh://user@-oProxyCommand=...` and
+# `user@host:-oProxyCommand=...`) this replaced the lookahead approach to
+# close.
+CLONE_URL_MAX_LEN = 2048
+_CLONE_URL_SCHEME_RE = re.compile(r"^(https?|ssh)://\S+$", re.IGNORECASE)
+_CLONE_URL_SCP_RE = re.compile(r"^[A-Za-z0-9_.-]+@\S+:\S.*$")
+
+# Host-validation charset for the non-IPv6 case: must start AND end with an
+# alphanumeric character (never '-', the shape ssh/git can mistake for the
+# start of an option flag) and contain only characters a real hostname or
+# IPv4 literal can use in between.
+_SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$")
+
+
+def _clone_url_host_is_safe(host) -> bool:
+    """True only for a syntactically legitimate hostname, IPv4 literal, or
+    IPv6 literal -- never for an empty/None host, never for anything
+    starting with '-', and never for a stray '@'/':' smuggled in from a
+    malformed or adversarial URL. See the module comment above
+    _CLONE_URL_SCHEME_RE for why this replaced the prior
+    per-character-after-a-fixed-anchor lookahead approach."""
+    if not host:
+        return False
+    if ":" in host:
+        # Only ever legitimate for an IPv6 literal (a bracketed
+        # ssh://user@[::1]:22/path host, urlsplit() already strips the
+        # brackets into plain "::1"). ipaddress.ip_address() is a strict,
+        # well-tested parser for that shape (including a %<scope-id>
+        # suffix) -- anything that isn't genuinely a valid IPv6 literal is
+        # rejected outright rather than falling through to the plain
+        # hostname charset below, which would wrongly accept a ':'-laden
+        # injection attempt.
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            return False
+        return True
+    return bool(_SAFE_HOST_RE.match(host))
+
+
+def _validate_clone_url(url: str) -> str:
+    """Returns an error message if url is rejected, None if it passes. See
+    module-level comment above _CLONE_URL_SCHEME_RE for the reasoning."""
+    err = ("unsupported URL — use http://, https://, ssh://, or "
+           "user@host:path (git's own shorthand)")
+    if not url or not isinstance(url, str):
+        return "a URL is required"
+    if len(url) > CLONE_URL_MAX_LEN:
+        return f"URL is too long (max {CLONE_URL_MAX_LEN} characters)"
+    if any(ord(c) < 0x20 or c == "\x7f" for c in url):
+        return "URL contains control characters"
+
+    if _CLONE_URL_SCHEME_RE.match(url):
+        # urlsplit() (not hand-rolled slicing) isolates the real host --
+        # correctly ignoring an optional user@ prefix, a bracketed IPv6
+        # literal, and a :port suffix -- exactly the component ssh/git
+        # itself treats as a connection target.
+        try:
+            host = urllib.parse.urlsplit(url).hostname
+        except ValueError:
+            return err
+        return None if _clone_url_host_is_safe(host) else err
+
+    if _CLONE_URL_SCP_RE.match(url):
+        # git's scp-like shorthand has no scheme for urlsplit() to parse --
+        # isolate host/path ourselves: split on the first '@' (the regex
+        # above already anchored the user to a safe charset with no '@' or
+        # ':' in it, so the first '@' is unambiguous), then the first ':'
+        # after that splits the real host from the real path. Both
+        # components matter here (unlike the scheme case): host is ssh's
+        # connection target, and path is what git hands to the remote
+        # git-upload-pack invocation -- a leading '-' on either is the
+        # injection shape.
+        _user, _, rest = url.partition("@")
+        host, _, path = rest.partition(":")
+        if _clone_url_host_is_safe(host) and path and path[0] != "-":
+            return None
+        return err
+
+    return err
 
 
 def _gitea_slug(name: str) -> str:
@@ -1289,6 +1411,62 @@ def create_project(name: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _last_path_segment_from_clone_url(url: str) -> str:
+    """Naming-only heuristic ("what's the repo's own name") for
+    clone_project_from_url()'s default-name derivation (backlog item 16,
+    docs/spec.md "Name derivation and collision handling") -- this never
+    itself needs to reject anything, since _validate_clone_url() has already
+    run by the time this is called."""
+    m = _CLONE_URL_SCP_RE.match(url)
+    path = url.split(":", 1)[1] if m else urllib.parse.urlsplit(url).path
+    last = path.rstrip("/").rsplit("/", 1)[-1]
+    if last.endswith(".git"):
+        last = last[:-4]
+    return last
+
+
+def clone_project_from_url(url: str, name_override: str) -> tuple[bool, str]:
+    """Clones an arbitrary existing remote git repo URL into
+    PROJECTS_DIR/<name> (backlog item 16, docs/spec.md). No Gitea
+    involvement at all -- reads neither GITEA_ENABLED nor GITEA_API_TOKEN,
+    same "general-purpose entry point, no dependency" positioning as the
+    upload wizard. Validation/naming/collision checks run entirely
+    unprivileged here; only the final mkdir/chown/git-clone crosses into
+    root via NEW_PROJECT_FROM_URL_SCRIPT, same privilege-separation shape as
+    create_project()'s own NEW_PROJECT_FROM_GITEA_SCRIPT hand-off above."""
+    url = (url or "").strip()
+    err = _validate_clone_url(url)
+    if err:
+        return False, err
+
+    name = (name_override or "").strip()
+    if name:
+        if not NAME_RE.match(name):
+            return False, "Use letters, numbers, spaces, - or _ (must start with a letter/number)."
+    else:
+        name = _derive_project_name(_last_path_segment_from_clone_url(url), fallback_prefix="clone")
+
+    if name in instance_names():
+        return False, f"'{name}' already exists."
+
+    # deploy_run() (app/app.py) is this codebase's own precedent for
+    # wrapping a synchronous, request-thread subprocess.run(..., timeout=...)
+    # call in try/except (subprocess.SubprocessError, OSError) -- catches
+    # subprocess.TimeoutExpired too (a SubprocessError subclass), unlike
+    # create_project()'s/confirm_upload()'s own privileged-script calls,
+    # which don't guard against a timeout exception at all (a pre-existing
+    # gap in both, out of scope to fix here, but not one this new code
+    # should repeat).
+    try:
+        r = subprocess.run(["sudo", NEW_PROJECT_FROM_URL_SCRIPT, url, name],
+                           capture_output=True, text=True, timeout=CLONE_TIMEOUT_SECONDS)
+    except (subprocess.SubprocessError, OSError) as e:
+        return False, f"clone failed: {e}"
+    if r.returncode != 0:
+        return False, (r.stderr or r.stdout or "clone script failed").strip()[:300]
+    return True, ""
+
+
 # ─── folder upload → auto-detect repo(s), phase 1 (detect only) ───────────
 # See docs/spec.md "Zip-slip protection" / "Detection and the two-phase
 # protocol". Everything in this phase-1 section only ever reads/writes
@@ -1419,20 +1597,22 @@ def detect_structure(effective_root: str) -> dict:
 # collision-checking here still runs entirely unprivileged; only the final
 # per-project registration step crosses into RUN_USER's territory, via
 # NEW_PROJECT_FROM_UPLOAD_SCRIPT (see "Crossing the privilege boundary").
-def _derive_project_name(raw: str) -> str:
+def _derive_project_name(raw: str, fallback_prefix: str = "upload") -> str:
     """
-    Sanitizes a raw folder name (from the uploaded zip's own contents —
-    fully attacker-controlled) into a NAME_RE-valid project name
-    (docs/spec.md step 5): strip disallowed characters, strip any leading
-    non-alnum run (NAME_RE requires starting with a letter/number), cap at
-    60 chars. Falls back to "upload-<8 hex chars>" if nothing usable
-    survives.
+    Sanitizes a raw name (from the uploaded zip's own contents, or —
+    backlog item 16 — a clone URL's last path segment; either way, fully
+    attacker-controlled) into a NAME_RE-valid project name (docs/spec.md
+    step 5): strip disallowed characters, strip any leading non-alnum run
+    (NAME_RE requires starting with a letter/number), cap at 60 chars. Falls
+    back to "<fallback_prefix>-<8 hex chars>" if nothing usable survives --
+    fallback_prefix defaults to "upload" (the upload wizard's own original,
+    unchanged behavior); clone_project_from_url() passes "clone" instead.
     """
     cleaned = re.sub(r"[^A-Za-z0-9 _-]+", "", raw or "")
     cleaned = re.sub(r"^[^A-Za-z0-9]+", "", cleaned)[:60]
     if NAME_RE.match(cleaned):
         return cleaned
-    return f"upload-{secrets.token_hex(4)}"
+    return f"{fallback_prefix}-{secrets.token_hex(4)}"
 
 
 def _register_via_privileged_script(source: str, name: str) -> subprocess.CompletedProcess:
@@ -2101,6 +2281,16 @@ PAGE_TEMPLATE = """<!doctype html>
   .new-project-row button { font-size: 14px; padding: 10px 16px; border-radius: 10px; border: none;
                              background: #34c759; color: #111; font-weight: 600; cursor: pointer; white-space: nowrap; }
   .new-project-err { color: #ff6b6b; font-size: 12px; margin: -10px 0 12px; min-height: 14px; }
+  .clone-form { display: flex; flex-wrap: wrap; gap: 8px; padding: 4px 0 8px; align-items: center; }
+  .clone-form-label { flex-basis: 100%; font-size: 12px; color: #aaa; font-weight: 600; }
+  .clone-form input { flex: 1; min-width: 160px; font-size: 14px; padding: 10px 12px; border-radius: 10px;
+                       border: 1px solid #333; background: #1c1c1c; color: #eee; }
+  .clone-form input#clone-name { flex: 0 1 200px; }
+  .clone-form button { font-size: 14px; padding: 10px 16px; border-radius: 10px; border: none;
+                        background: #34c759; color: #111; font-weight: 600; cursor: pointer; white-space: nowrap; }
+  .clone-form input:disabled, .clone-form button:disabled { opacity: 0.6; cursor: not-allowed; }
+  .clone-err { color: #ff6b6b; font-size: 12px; margin: -4px 0 12px; min-height: 14px; }
+  .clone-status { color: #aaa; font-size: 12px; margin: -4px 0 12px; min-height: 14px; }
   .switch { position: relative; width: 51px; height: 31px; flex-shrink: 0; }
   .switch input { opacity: 0; width: 0; height: 0; }
   .slider { position: absolute; inset: 0; background: #444; border-radius: 31px;
@@ -2182,6 +2372,16 @@ PAGE_TEMPLATE = """<!doctype html>
 </div>
 <div class="new-project-err" id="new-project-err"></div>
 <button class="upload-wizard-btn" onclick="openUploadWizard()">Upload folder / .zip</button>
+<button class="upload-wizard-btn" id="clone-toggle-btn" onclick="openCloneForm()">Clone from URL</button>
+<div class="clone-form" id="clone-form" style="display: none;">
+  <div class="clone-form-label">Clone from URL</div>
+  <input id="clone-url" placeholder="https://github.com/user/repo or ssh://host/path" maxlength="2048"
+         onkeypress="event.key==='Enter' && startClone()">
+  <input id="clone-name" placeholder="(optional — derived from URL)" maxlength="60"
+         onkeypress="event.key==='Enter' && startClone()">
+  <button onclick="startClone()">Clone</button>
+</div>
+<div class="clone-err" id="clone-err"></div>
 <div id="rows"></div>
 
 <div id="upload-overlay" class="overlay">
@@ -3246,6 +3446,7 @@ function actionPath(kind, name, on) {
   if (kind in singletonToggleState) return '/' + kind + '/' + (on ? 'on' : 'off');
   if (kind === 'code') return '/instance/' + encodeURIComponent(name) + '/code/' + (on ? 'on' : 'off');
   if (kind === 'newproject') return '/projects/new';
+  if (kind === 'clone') return '/projects/clone';
   if (kind === 'deploy') return '/instance/' + encodeURIComponent(name) + '/deploy';
   if (kind === 'team-start') return '/projects/' + encodeURIComponent(name) + '/team/start';
   if (kind === 'team-stop') return '/projects/' + encodeURIComponent(name) + '/team/stop';
@@ -3258,6 +3459,16 @@ function actionBody(kind, name, on, code) {
   if (code) body.code = code;
   if (on && kind === 'inst') body.engine = engineChoice[name] || Object.keys(ENGINE_LABELS)[0];
   if (kind === 'newproject') body.name = name;
+  // Clone-from-URL (backlog item 16, docs/spec.md/docs/design.md) -- reads
+  // straight from the still-live inputs, same "survives a TOTP retry"
+  // discipline team-start's own task/lead/members fields already rely on
+  // above, rather than threading url/name through toggle()'s own
+  // name/on/checkboxEl parameters (which don't have a slot for a second
+  // string like this).
+  if (kind === 'clone') {
+    body.url = document.getElementById('clone-url').value.trim();
+    body.name = (document.getElementById('clone-name').value || '').trim();
+  }
   // Team start's task text isn't shaped like any other kind's body field --
   // read directly from the still-live textarea (or the client-side
   // teamTaskText[] mirror, in case a TOTP retry's own submitActionCode()
@@ -3324,6 +3535,7 @@ async function handleActionResult(r, ctx) {
       kind === 'team-stop' ? 'Stopping team: ' + (name || 'this') :
       kind === 'team-resolve' ? 'Submitting answer: ' + (name || 'this') :
       kind === 'team-board-resolve' ? 'Resolving board write: ' + (name || 'this') :
+      kind === 'clone' ? 'Cloning from URL' :
       (on ? 'Turning on: ' : 'Turning off: ') + (name || 'this');
     document.getElementById('action-code').value = '';
     document.getElementById('err-code').textContent = '';
@@ -3404,6 +3616,29 @@ async function handleActionResult(r, ctx) {
         msgEl.textContent = '✕ Error: ' + (data.error || 'could not resolve board write');
         msgEl.className = 'team-msg error';
       }
+    }
+    return;
+  }
+  if (kind === 'clone') {
+    // Its own inline result slot (docs/design.md "Error States" /
+    // "Success State"), same pattern as team-start/deploy above -- handled
+    // before the generic 400 branch below for the same reason (a
+    // clone-specific 400 belongs in THIS row's own clone-err slot, not the
+    // new-project error field).
+    hideCodeOverlay();
+    setCloneFormBusy(false);
+    const data = await r.json().catch(() => ({}));
+    const errEl = document.getElementById('clone-err');
+    if (r.ok && data.ok) {
+      errEl.textContent = '';
+      errEl.className = 'clone-err';
+      document.getElementById('clone-url').value = '';
+      document.getElementById('clone-name').value = '';
+      closeCloneForm();
+      setTimeout(refresh, 1500);
+    } else {
+      errEl.className = 'clone-err';
+      errEl.textContent = data.error || 'Clone failed.';
     }
     return;
   }
@@ -3527,6 +3762,41 @@ function startNewProject() {
   }
   toggle('newproject', name, true, null);
 }
+// Clone from URL (backlog item 16, docs/design.md "Component reuse") --
+// same inline-form/actionPath()/actionBody()/toggle() plumbing as
+// startNewProject() above, extended with a disabled/"Cloning…" loading
+// state (docs/design.md "Loading State") since a clone can legitimately
+// take up to CLONE_TIMEOUT_SECONDS (180s default), unlike + New project's
+// near-instant response.
+function openCloneForm() {
+  document.getElementById('clone-form').style.display = 'flex';
+  document.getElementById('clone-err').textContent = '';
+  document.getElementById('clone-url').focus();
+}
+function closeCloneForm() {
+  document.getElementById('clone-form').style.display = 'none';
+}
+function setCloneFormBusy(busy) {
+  document.getElementById('clone-url').disabled = busy;
+  document.getElementById('clone-name').disabled = busy;
+  document.querySelectorAll('#clone-form button').forEach(b => { b.disabled = busy; });
+  const btn = document.querySelector('#clone-form button');
+  if (btn) btn.textContent = busy ? 'Cloning…' : 'Clone';
+}
+function startClone() {
+  const url = document.getElementById('clone-url').value.trim();
+  const errEl = document.getElementById('clone-err');
+  errEl.textContent = '';
+  errEl.className = 'clone-err';
+  if (!url) {
+    errEl.textContent = 'Enter a repository URL.';
+    return;
+  }
+  setCloneFormBusy(true);
+  errEl.textContent = 'Cloning… this can take a while for large repositories (up to a few minutes).';
+  errEl.className = 'clone-status';
+  toggle('clone', url, true, null);
+}
 function hideCodeOverlay() {
   document.getElementById('code-overlay').classList.remove('show');
   pendingToggle = null;
@@ -3552,6 +3822,14 @@ function cancelActionCode() {
     // toggle() set before the code overlay ever showed up.
     singletonToggleState[pendingToggle.kind].pending = null;
     singletonToggleState[pendingToggle.kind].wasRunning = false;
+  }
+  if (pendingToggle && pendingToggle.kind === 'clone') {
+    // Nothing actually started server-side either (same reasoning as
+    // above) -- re-enable the form so the operator can retry.
+    setCloneFormBusy(false);
+    const errEl = document.getElementById('clone-err');
+    errEl.textContent = '';
+    errEl.className = 'clone-err';
   }
   hideCodeOverlay();
 }
@@ -4853,6 +5131,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True})
         elif parts[0] == "projects" and len(parts) == 2 and parts[1] == "new":
             ok, err = create_project((body.get("name") or "").strip())
+            if not ok:
+                return self._json({"error": err}, 400)
+            self._json({"ok": True})
+        elif parts[0] == "projects" and len(parts) == 2 and parts[1] == "clone":
+            # Backlog item 16, docs/spec.md "New route -- POST /projects/
+            # clone" -- an ordinary JSON-body POST (no special early-branch
+            # the way /projects/upload needs for its raw-bytes body), so it
+            # goes through the shared TOTP gate exactly like /projects/new.
+            ok, err = clone_project_from_url(body.get("url") or "", (body.get("name") or "").strip())
             if not ok:
                 return self._json({"error": err}, 400)
             self._json({"ok": True})
