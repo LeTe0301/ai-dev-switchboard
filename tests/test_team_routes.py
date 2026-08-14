@@ -1262,6 +1262,53 @@ class TeamResolveEndpointTests(_RealHTTPTeamTestCase):
         self.assertEqual(len(answered), 1)
         self.assertEqual(answered[0]["full_result_text"], "winner answer")  # winner's entry survives
 
+    def test_loser_leaves_no_stale_transcript_entry(self):
+        # docs/spec.md (6f part 1b): resolve_ask_user() used to call
+        # _append_history() -- which writes transcript.jsonl synchronously,
+        # unconditionally, with no rollback -- BEFORE the os.replace() win/
+        # lose decision point. A losing caller's in-memory state["history"]
+        # mutation was correctly discarded (it never reaches _persist()),
+        # but its transcript.jsonl write had already hit disk with no way to
+        # undo it, leaving a permanent, spurious tool_result entry for an
+        # answer nobody actually accepted. Fixed by moving the
+        # _append_history() call to after os.replace() has already
+        # succeeded, so only the winner ever writes to the transcript.
+        #
+        # Reused verbatim: the same deterministic one-shot hook on
+        # _load_state() that
+        # test_loser_whose_exists_check_lands_after_winner_already_renamed_
+        # does_not_report_ok uses above, just asserting transcript.jsonl
+        # content instead of state["history"] content.
+        run_id = self._make_run()
+        orig_load_state = teamsmod._load_state
+        hook_fired = []
+
+        def _patched_load_state(rid):
+            snapshot = orig_load_state(rid)
+            if rid == run_id and not hook_fired:
+                hook_fired.append(True)
+                teamsmod._load_state = orig_load_state  # avoid re-entering this hook
+                winner_result = teamsmod.resolve_ask_user(run_id, "winner answer")
+                self.assertTrue(winner_result["ok"], winner_result)
+                teamsmod._load_state = _patched_load_state
+            return snapshot
+
+        teamsmod._load_state = _patched_load_state
+        self.addCleanup(setattr, teamsmod, "_load_state", orig_load_state)
+
+        loser_result = teamsmod.resolve_ask_user(run_id, "loser answer")
+        self.assertFalse(loser_result["ok"], loser_result)
+
+        with open(teamsmod._transcript_path(run_id)) as f:
+            transcript_lines = [json.loads(line) for line in f if line.strip()]
+        resolved_entries = [e for e in transcript_lines if e["kind"] == "tool_result"
+                            and e.get("meta", {}).get("resolved")]
+        # Exactly one ask_user_resolved entry -- the winner's -- and never
+        # the loser's, no matter how the loser's own call is timed relative
+        # to the winner's.
+        self.assertEqual(len(resolved_entries), 1)
+        self.assertEqual(resolved_entries[0]["text"], "winner answer")
+
     def test_cli_and_route_produce_identical_persisted_state_for_same_input(self):
         # docs/spec.md's own acceptance criterion: the CLI's team-resolve
         # and this route both funnel through the same shared

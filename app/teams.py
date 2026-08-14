@@ -3806,6 +3806,21 @@ def resolve_ask_user(run_id: str, answer: str) -> dict:
     two independent ones layered on top of each other. state["status"] is
     only flipped and persisted after os.replace() has already succeeded, so
     a loser never touches state at all.
+
+    A third instance of the same "act before the win/lose decision" mistake
+    (docs/spec.md 6f part 1b): this function used to call _append_history()
+    -- which writes transcript.jsonl synchronously, unconditionally, with
+    no rollback path -- BEFORE the os.replace() call above ever ran. A
+    losing caller's own state["history"] mutation was correctly discarded
+    (it's in-memory only until _persist(), which only ever runs on the
+    winning path), but its _append_history() call had already appended a
+    spurious ask_user_resolved entry to transcript.jsonl on disk, for an
+    answer nobody actually accepted -- exactly the kind of misleading entry
+    the team/events feed (6f part 1) would otherwise render. Fixed by moving
+    the round_n/_append_history() call to after os.replace() has already
+    succeeded: a loser now returns from the except OSError: branch above
+    without ever calling _append_history(), so it leaves zero trace in
+    transcript.jsonl, same as it already left zero trace in state["history"].
     """
     try:
         state = _load_state(run_id)
@@ -3814,11 +3829,6 @@ def resolve_ask_user(run_id: str, answer: str) -> dict:
     if state.get("status") != "blocked_ask_user":
         return {"ok": False,
                 "error": f"run {run_id} is not blocked on ask_user (status={state.get('status')})"}
-    round_n = len(state["history"]) + 1
-    _append_history(state, round_n, tool="ask_user_resolved",
-                    args_summary="ask_user_resolved(...)",
-                    outcome_summary=f"answered: {answer[:80]}", full_result_text=answer, log_path=None,
-                    transcript_entries=[("tool_result", answer, {"resolved": True})])
     inbox_path = _inbox_path(run_id)
     try:
         os.replace(inbox_path, _inbox_resolved_path(run_id))
@@ -3829,6 +3839,11 @@ def resolve_ask_user(run_id: str, answer: str) -> dict:
             status_now = "unknown"
         return {"ok": False,
                 "error": f"run {run_id} is not blocked on ask_user (status={status_now})"}
+    round_n = len(state["history"]) + 1
+    _append_history(state, round_n, tool="ask_user_resolved",
+                    args_summary="ask_user_resolved(...)",
+                    outcome_summary=f"answered: {answer[:80]}", full_result_text=answer, log_path=None,
+                    transcript_entries=[("tool_result", answer, {"resolved": True})])
     state["status"] = "running"
     _persist(state)
     return {"ok": True, "state": state}

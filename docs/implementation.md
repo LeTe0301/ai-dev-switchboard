@@ -3345,3 +3345,135 @@ done
 # Full suite
 /home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q
 ```
+
+---
+
+# Implementation: 6f part 1b -- losing concurrent `/team/resolve` call must not leave a stale transcript entry
+
+## Summary
+
+Fixes `docs/BACKLOG.md` item 11's first bullet, diagnosed by the 6f part 1
+reviewer and deferred as non-blocking at the time: `resolve_ask_user()`
+called `_append_history()` -- which writes `transcript.jsonl` synchronously,
+unconditionally, with no rollback path -- BEFORE the `os.replace()` call
+that is the sole win/lose arbiter for a concurrent resolve. A losing
+caller's own in-memory `state["history"]` mutation was already correctly
+discarded (it only reaches `_persist()` on the winning path), but its
+`_append_history()` call had already appended a spurious
+`ask_user_resolved` (`tool_result`) transcript entry to disk for an answer
+nobody actually accepted, with no way to undo it. Closed now, before 6f
+part 2 (the Teams page UI, deferred -- see `docs/spec.md`'s closing note)
+starts building against the merged event feed (`GET .../team/events`,
+6f part 1) that renders `transcript.jsonl` verbatim -- so that feed never
+has to special-case a known-buggy artifact.
+
+## Changes by file
+
+- **`app/teams.py`** (`resolve_ask_user()`, ~line 3752): moved the
+  `round_n = len(state["history"]) + 1` computation and the
+  `_append_history(...)` call from immediately after the upfront
+  `status != "blocked_ask_user"` check to immediately after the
+  `try: os.replace(...) except OSError: ...` block has already succeeded
+  (i.e. after the `try/except`, before `state["status"] = "running"`). The
+  loss path (`except OSError:`) is completely unchanged -- it still returns
+  `{"ok": False, "error": "..."}` without ever calling `_append_history()`,
+  same as before this fix, except now that's also true for the write that
+  used to happen unconditionally before the `try` block. The win path now
+  runs `_append_history()` then `state["status"] = "running"` then
+  `_persist(state)`, in that order, strictly after `os.replace()` has
+  already returned without raising. No change to `_append_history()`'s or
+  `_append_transcript()`'s own signature or behavior -- a pure call-site
+  reorder. Docstring extended with a third paragraph documenting this fix,
+  appended after the two existing paragraphs documenting the prior two
+  races in this same function (the crash-on-collision fix and the
+  `os.path.exists()` check-then-act fix), matching their style.
+- **`tests/test_team_routes.py`** (`TeamResolveEndpointTests`, new test
+  `test_loser_leaves_no_stale_transcript_entry`, added directly after
+  `test_loser_whose_exists_check_lands_after_winner_already_renamed_does_not_report_ok`):
+  reuses that same test's deterministic one-shot hook on `_load_state()`
+  verbatim in mechanism -- the hook lets a real winning `resolve_ask_user()`
+  call run to completion (real `os.replace()`, real `_append_history()`,
+  real `_persist()`) between the loser's own state read and its subsequent
+  `os.replace()` attempt, so the loser deterministically hits the `except
+  OSError:` branch with no thread-timing flakiness. The new test then reads
+  `transcript.jsonl` directly (via `teamsmod._transcript_path(run_id)`)
+  instead of `state["history"]`, and asserts there is exactly one
+  `tool_result` entry with `meta.resolved == True` (i.e. exactly one
+  `ask_user_resolved` transcript entry) and that its `text` is
+  `"winner answer"`, not `"loser answer"` and not two entries. Written
+  first against the pre-fix code (confirmed red: `2 != 1`, i.e. both the
+  winner's and the loser's entries were present) per TDD, then confirmed
+  green after the `app/teams.py` reorder above.
+
+## Key decisions / tradeoffs
+
+- **Reordered the call site only, touched nothing else.** Per spec's
+  explicit non-goal, no lock/mutex was added and `os.replace()` remains the
+  sole win/lose arbiter (already true after the 6f part 1 reviewer fix
+  round above) -- this fix only moves an existing side effect (the
+  `_append_history()` call) from before that arbiter's decision to after
+  it. `_append_history()` and `_append_transcript()` themselves are
+  unmodified.
+- **New test reads `transcript.jsonl` directly rather than going through
+  a route-level `GET .../team/events` call.** `resolve_ask_user()` is
+  exercised directly (as the existing sibling test in this class already
+  does), so asserting on the file `resolve_ask_user()` itself writes is
+  the most direct proof of this fix, without pulling in the unrelated
+  `team/events` polling/cursor machinery this fix doesn't touch.
+- **Winning path's own output left unverified by a dedicated new
+  assertion beyond the existing sibling tests.** The spec's "Edge cases"
+  section calls for confirming the winner's transcript entry and
+  `state["history"]` entry are byte-for-byte unchanged from before this
+  fix. `test_genuinely_blocked_valid_answer_resolves_and_returns_immediately`
+  (single, non-racing caller) and the new test's own assertion that the
+  surviving entry's `full_result_text`/`text` is exactly `"winner answer"`
+  already cover this: both passed unmodified/as-added before and after the
+  reorder, and the reorder does not touch any of `_append_history()`'s
+  arguments or `_append_transcript()`'s envelope shape, only when the call
+  happens.
+
+## Deviations from spec
+
+None. The reorder matches "Proposed approach" exactly (steps 1-3), and the
+docstring addition (step 4) appends a third paragraph rather than rewriting
+the existing two, as specified.
+
+## Known limitations
+
+Same as the 6f part 1 / 1b-preceding cycles above -- no new limitations
+introduced by this fix. The exact reason string a losing concurrent `POST
+/team/resolve` call receives remains timing-dependent (the same three
+legitimate strings the route/CLI already handle); this fix does not change
+any of those strings or which one a given timing produces, only whether a
+losing call leaves a transcript trace (now: never).
+
+## Verification status
+
+| Check | Command | Result |
+|---|---|---|
+| New test, written first against pre-fix code (TDD red) | `/home/dev/.local/bin/uv run --with pytest python -m pytest tests/test_team_routes.py -k test_loser_leaves_no_stale_transcript_entry -v` | 1 failed -- `AssertionError: 2 != 1` (both winner's and loser's entries present in `transcript.jsonl`), confirming the bug as diagnosed |
+| New test, after the `app/teams.py` reorder (TDD green) | same command | 1 passed |
+| Fixed function's own test class | `/home/dev/.local/bin/uv run --with pytest python -m pytest tests/test_team_routes.py::TeamResolveEndpointTests -v` | **11 passed** (10 pre-existing + 1 new), including both pre-existing races (`test_two_concurrent_resolves_exactly_one_succeeds`, `test_loser_whose_exists_check_lands_after_winner_already_renamed_does_not_report_ok`) |
+| Concurrent-resolve tests, repeated for stability | `/home/dev/.local/bin/uv run --with pytest python -m pytest tests/test_team_routes.py::TeamResolveEndpointTests::test_two_concurrent_resolves_exactly_one_succeeds tests/test_team_routes.py::TeamResolveEndpointTests::test_loser_leaves_no_stale_transcript_entry tests/test_team_routes.py::TeamResolveEndpointTests::test_loser_whose_exists_check_lands_after_winner_already_renamed_does_not_report_ok -q`, 3 consecutive runs | **3 passed** every run |
+| CLI's own non-concurrent regression test | `/home/dev/.local/bin/uv run --with pytest python -m pytest tests/test_teams_lead.py -k ResolveInSeparateProcessTests -v` | **2 passed**, byte-for-byte unaffected (never exercises the loss path) |
+| Full Python suite, before this fix | (implied by the prior cycle's own recorded baseline) | 764 passed |
+| Full Python suite, after this fix | `/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q` | **765 passed**, 0 failures/errors (764 baseline + 1 new test), 14 pre-existing `DeprecationWarning`s from `tests/test_install_ollama.py` (unrelated to this fix, untouched by this diff) |
+
+## How to verify locally
+
+```bash
+# This cycle's own new test, in isolation
+/home/dev/.local/bin/uv run --with pytest python -m pytest \
+  tests/test_team_routes.py -k test_loser_leaves_no_stale_transcript_entry -v
+
+# The fixed function's own test class
+/home/dev/.local/bin/uv run --with pytest python -m pytest \
+  tests/test_team_routes.py::TeamResolveEndpointTests -v
+
+# The CLI's own non-concurrent regression test (must stay unaffected)
+/home/dev/.local/bin/uv run --with pytest python -m pytest \
+  tests/test_teams_lead.py -k ResolveInSeparateProcessTests -v
+
+# Full suite
+/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q
+```

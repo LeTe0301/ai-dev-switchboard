@@ -2887,3 +2887,126 @@ are cheap, well-scoped fixes for a future follow-up rather than reasons to
 send this cycle back to the developer. No must-fix findings. Correctness,
 security (beyond Finding 2), and simplicity all check out on direct
 reading of the complete diff.
+
+---
+
+# Test & Review: 6f part 1b — losing concurrent `/team/resolve` call must not leave a stale transcript entry
+
+## Scope
+Verifies `docs/spec.md`'s 6f part 1b acceptance criteria: the single
+call-site reorder in `app/teams.py`'s `resolve_ask_user()` that moves the
+`_append_history()` call (which writes `transcript.jsonl` synchronously,
+unconditionally, with no rollback) from before the `os.replace()` win/lose
+decision to after it, closing `docs/BACKLOG.md` item 11(a). Small,
+single-function, no-new-locking fix — this is a lighter-weight pass than a
+full new-feature review, per the dispatch instructions, but every claim
+below was independently re-run, not re-trusted from
+`docs/implementation.md`.
+
+## Test cases
+
+| # | Criterion / case | Method (automated/manual) | Result | Evidence |
+|---|---|---|---|---|
+| 1 | Two genuinely concurrent `POST /team/resolve` calls (real-thread race) → exactly one winner, loser gets a clean shaped 400 | automated | pass | `test_two_concurrent_resolves_exactly_one_succeeds` — re-ran, PASSED; read the test body directly (not just the pass count) and confirmed it still spins up two real un-synchronized threads against the live HTTP handler and asserts `[200, 400]` plus one of the three legitimate loser-error strings, unmodified by this diff |
+| 2 | Deterministic hook repro: loser's `_load_state()` lands after a real winner has already completed → loser returns `{"ok": False, ...}`, `transcript.jsonl` has exactly one `ask_user_resolved` entry, and it's the winner's text | automated | pass | `test_loser_leaves_no_stale_transcript_entry` — re-ran in isolation, PASSED; independently reverted `app/teams.py` to pre-fix (via `git stash`) and re-ran the same test — it failed with `AssertionError: 2 != 1`, the exact defect claimed, proving the test is real and not vacuously passing; restored the fix via `git stash pop` and confirmed the diff came back byte-identical |
+| 3 | Single, non-racing `POST /team/resolve` call → persisted `state["history"]`/`transcript.jsonl` unchanged in shape/content from before the fix | automated | pass | `test_genuinely_blocked_valid_answer_resolves_and_returns_immediately` — re-ran, PASSED; direct code read of the winning path (see Review below) confirms `_append_history()`'s own arguments/call are byte-for-byte unmodified, only its position moved |
+| 4 | Full suite passes, including both pre-existing `TeamResolveEndpointTests` races and `ResolveInSeparateProcessTests` | automated | pass | `pytest tests/ -q` → **765 passed**, 0 failures (matches developer's claim exactly); `pytest tests/test_team_routes.py::TeamResolveEndpointTests -v` → 11/11 passed; `pytest tests/test_teams_lead.py -k ResolveInSeparateProcessTests -v` → 2/2 passed |
+
+## Regression check
+Full existing suite run: `/home/dev/.local/bin/uv run --with pytest python -m pytest tests/ -q` — **765 passed, 14 warnings (pre-existing, unrelated `DeprecationWarning`s from `tests/test_install_ollama.py`), 0 failures**, ~136s. Matches the developer's reported baseline (764) + 1 new test.
+
+## Defects found
+None. Testing pass is fully clean — proceeding to review.
+
+---
+
+## Spec coverage
+All four acceptance criteria in `docs/spec.md` (6f part 1b) have real
+implementation and real test coverage:
+- Bullet 1 (real two-thread race, exactly one transcript entry): the code
+  structurally guarantees this — `_append_history()` is now reachable only
+  after a successful `os.replace()`, and `os.replace()`'s own OS-level
+  atomicity means only one of two racing threads can ever reach that
+  point — but note this specific invariant (transcript *count*) is not
+  independently asserted by `test_two_concurrent_resolves_exactly_one_
+  succeeds` itself; `docs/spec.md`'s own "Edge cases" section explicitly
+  and deliberately defers that assertion to the deterministic hook test
+  (bullet 2) "since only that one pins down which caller is genuinely the
+  loser." This is the spec's own documented reasoning, not a gap the
+  developer introduced — verified consistent with the spec text, not just
+  taken on faith.
+- Bullet 2 (deterministic hook repro): directly covered and independently
+  re-verified failing pre-fix / passing post-fix (see test case 2 above).
+- Bullet 3 (non-racing happy path unchanged): directly covered, and I
+  additionally confirmed by direct diff read that `_append_history()`'s
+  call arguments are untouched (only the call site moved).
+- Bullet 4 (full suite including the two named pre-existing races and the
+  CLI's own regression test): directly covered, all re-run independently
+  this session.
+
+No acceptance criterion is unimplemented or untested.
+
+## Findings (most severe first)
+
+None. Read the full diff (`app/teams.py`, `tests/test_team_routes.py`)
+directly:
+
+- **Winner's path is still correct, and correctly ordered.** `state` is
+  loaded once at the top of the function (line 3826) and held as a local
+  variable; the winning branch computes `round_n = len(state["history"]) +
+  1` (line 3842) from that same already-loaded snapshot, calls
+  `_append_history()` (unchanged arguments), then flips
+  `state["status"] = "running"` and `_persist(state)` — all strictly after
+  `os.replace()` (lines 3833-3834) has already returned without raising.
+  This matches `docs/spec.md`'s "Proposed approach" exactly. The bug was
+  not moved from "loser writes" to "nobody writes" — the winner still
+  writes, in the same shape as before, just later in the function body.
+- **Nothing else was silently dropped or duplicated in the reorder.** The
+  diff moves exactly one contiguous block (the `round_n` computation +
+  `_append_history()` call, 6 lines) past exactly one other block (the
+  `try: os.replace() except OSError:` block, already present, unmodified)
+  — confirmed by direct diff read (`git diff -- app/teams.py`), no other
+  line in the function changed. The loss branch (`except OSError:`, lines
+  3835-3841) is byte-for-byte unchanged from before this fix.
+- **`_append_transcript()`'s envelope shape is untouched**
+  (`app/teams.py:2520-2530`, not part of this diff) — confirmed the new
+  test's assertion (`e["kind"] == "tool_result"` and
+  `e["meta"]["resolved"]`) matches that shape directly by reading the
+  function, not by inference from the test passing.
+- **New test's mechanism is a faithful reuse of an already-proven
+  technique**, not just an assertion swap — same one-shot `_load_state()`
+  hook, same `addCleanup` restore, same real-winner-runs-to-completion
+  interleaving as `test_loser_whose_exists_check_lands_after_winner_
+  already_renamed_does_not_report_ok`; read both tests side by side and
+  confirmed the only substantive difference is what's asserted at the end
+  (transcript content vs. `state["history"]` content), as the spec's own
+  "Affected areas" section called for.
+- **No scope creep.** The diff touches exactly what `docs/spec.md`
+  scoped: one function's call-site reorder, one docstring paragraph, one
+  new test. No change to `_append_history()`, `_append_transcript()`,
+  `app/app.py`'s route handler, or any locking — matching the spec's
+  explicit non-goals.
+- No security-relevant surface in this diff (no new input handling, no
+  new external-facing behavior — this is an internal ordering fix within
+  an already-authenticated, already-scoped function).
+
+## Follow-ups (non-blocking)
+None beyond what's already tracked in `docs/BACKLOG.md` item 11(b)
+(`run_id` path traversal — explicitly out of scope for this cycle per
+`docs/spec.md`'s own non-goals, unaffected by this diff).
+
+## Overall verdict
+
+**Approved.**
+
+Both the testing pass and the review pass are clean. All four acceptance
+criteria have real, independently-verified implementation and test
+coverage — including a genuine revert-and-watch-it-fail check on the new
+test (not just a re-run of the developer's reported result), which
+reproduced the exact `2 != 1` defect the fix claims to close. The full
+suite is green (765/765), the two pre-existing concurrency regression
+tests still genuinely exercise their original scenarios unmodified, and
+direct reading of the reordered code confirms the winner's path is intact
+and no other side effect was dropped, duplicated, or reordered incorrectly
+in the move. No must-fix, should-fix, or nit findings. Ready to hand back
+to the product-manager for 6f part 2.
