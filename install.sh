@@ -41,10 +41,22 @@
 #                         actually reachable/present, writes TEAM_LLM_BASE_URL/
 #                         TEAM_LLM_MODEL. Refuses to write config it can't
 #                         verify — see docs/spec.md (6d part 2b)
+#   --update, --upgrade   update an already-installed box: fast-forwards
+#                         this checkout to origin/$REPO_BRANCH (never a
+#                         destructive reset — refuses on local changes, a
+#                         branch mismatch, or real divergence from origin),
+#                         re-runs the steps below against that fresh
+#                         checkout, then restarts ai-dev-switchboard — but
+#                         ONLY if RUN_USER has no live tmux session; if one
+#                         is live, the restart is deferred (code is still
+#                         updated) and the script prints how to finish by
+#                         hand once it's safe. Exact synonyms, same flag.
 #
 # Safe to re-run: every step here either checks for existing state first or
 # overwrites deterministically-generated files (units, sudoers), never
-# clobbers switchboard.env values that are already set.
+# clobbers switchboard.env values that are already set. --update
+# additionally pulls $REPO_DIR first and may defer its own service restart
+# around live sessions (see above) — nothing else changes when it's absent.
 set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/LeTe0301/ai-dev-switchboard.git}"
@@ -75,6 +87,7 @@ WITH_HOST_CONTROL=0
 WITH_DEPLOY_TARGET=0
 WITH_TAIGA=0
 WITH_OLLAMA=0
+UPDATE=0
 for arg in "$@"; do
     case "$arg" in
         --yes) YES=1 ;;
@@ -84,6 +97,7 @@ for arg in "$@"; do
         --with-deploy-target) WITH_DEPLOY_TARGET=1 ;;
         --with-taiga) WITH_TAIGA=1 ;;
         --with-ollama) WITH_OLLAMA=1 ;;
+        --update|--upgrade) UPDATE=1 ;;
         *) echo "Unknown flag: $arg (see the top of install.sh for the list)" >&2; exit 1 ;;
     esac
 done
@@ -97,6 +111,41 @@ CONFIG_DIR=/etc/ai-dev-switchboard
 INSTALL_DIR=/opt/ai-dev-switchboard
 STATE_DIR=/var/lib/ai-dev-switchboard
 mkdir -p "$CONFIG_DIR" "$INSTALL_DIR" "$STATE_DIR"
+# Hoisted up from the "-- Config --" step below (still assigned there too,
+# idempotently) so the RUN_USER/SVC_USER prompts further down can read an
+# already-configured value via get_env, same as PVE_HOST/SIMPLE_USERNAME/
+# PUBLISH_MODE already do (docs/BACKLOG.md item 14).
+ENV_FILE="$CONFIG_DIR/switchboard.env"
+
+# ── Update (--update/--upgrade): pull latest $REPO_BRANCH into $REPO_DIR,
+# before anything else in this script reads from it (docs/BACKLOG.md item
+# 14). Never a destructive `git reset --hard` -- fetch, then a
+# `merge --ff-only`, mirroring scripts/gitea-sync-project.sh's own
+# fetch-then-ff-only-merge shape (dirty check, ancestor check, never reset
+# --hard).
+if [ "$UPDATE" -eq 1 ]; then
+    echo "-- Update (--update/--upgrade): pulling $REPO_BRANCH into $REPO_DIR --"
+    if [ ! -d "$REPO_DIR/.git" ]; then
+        echo "ERROR: $REPO_DIR is not a git checkout, so --update has nothing to pull. Re-run via the curl-pipe installer (which clones \$SRC_DIR itself), or 'git clone $REPO_URL' and run install.sh --update from inside that clone." >&2
+        exit 1
+    fi
+    if [ -n "$(git -C "$REPO_DIR" status --porcelain)" ]; then
+        echo "ERROR: $REPO_DIR has uncommitted local changes -- refusing to pull over them. Commit, stash, or discard them, then re-run --update." >&2
+        exit 1
+    fi
+    CURRENT_BRANCH="$(git -C "$REPO_DIR" symbolic-ref --short -q HEAD || true)"
+    if [ "$CURRENT_BRANCH" != "$REPO_BRANCH" ]; then
+        echo "ERROR: $REPO_DIR is checked out on '${CURRENT_BRANCH:-<detached HEAD>}', not \$REPO_BRANCH ('$REPO_BRANCH') -- switch to $REPO_BRANCH yourself (or set REPO_BRANCH to match what's checked out) before re-running --update." >&2
+        exit 1
+    fi
+    git -C "$REPO_DIR" fetch origin "$REPO_BRANCH"
+    if ! git -C "$REPO_DIR" merge-base --is-ancestor HEAD "origin/$REPO_BRANCH"; then
+        echo "ERROR: $REPO_DIR's local $REPO_BRANCH has diverged from origin/$REPO_BRANCH -- refusing to merge. Resolve by hand, then re-run --update." >&2
+        exit 1
+    fi
+    git -C "$REPO_DIR" merge --ff-only "origin/$REPO_BRANCH"
+    echo "Pulled $(git -C "$REPO_DIR" rev-parse --short HEAD) ($REPO_BRANCH)."
+fi
 
 interactive() { [ "$YES" -eq 0 ] && [ -t 0 ]; }
 prompt() {  # prompt <message> <default> -> echoes the answer
@@ -185,8 +234,10 @@ if [ "$WITH_CODE_SERVER" -eq 1 ] && [ ! -x /usr/local/bin/code-server ]; then
 fi
 
 echo "-- Users --"
-RUN_USER=$(prompt "Unprivileged user to run coding sessions as" "dev")
-SVC_USER=$(prompt "Unprivileged user to run the web UI process as" "switchboard-svc")
+RUN_USER_DEFAULT="$(get_env "$ENV_FILE" RUN_USER)"; RUN_USER_DEFAULT="${RUN_USER_DEFAULT:-dev}"
+SVC_USER_DEFAULT="$(get_env "$ENV_FILE" SVC_USER)"; SVC_USER_DEFAULT="${SVC_USER_DEFAULT:-switchboard-svc}"
+RUN_USER=$(prompt "Unprivileged user to run coding sessions as" "$RUN_USER_DEFAULT")
+SVC_USER=$(prompt "Unprivileged user to run the web UI process as" "$SVC_USER_DEFAULT")
 
 id "$RUN_USER" &>/dev/null || { useradd -m -s /bin/bash "$RUN_USER"; echo "Created $RUN_USER"; }
 id "$SVC_USER" &>/dev/null || { useradd -r -m -d "/home/$SVC_USER" -s /usr/sbin/nologin "$SVC_USER"; echo "Created $SVC_USER"; }
@@ -240,7 +291,8 @@ for f in "$REPO_DIR"/engines.d/*.engine; do
 done
 
 echo "-- Config --"
-ENV_FILE="$CONFIG_DIR/switchboard.env"
+# ENV_FILE itself is already assigned above (hoisted so the RUN_USER/
+# SVC_USER prompts could read it too -- see that comment).
 [ -f "$ENV_FILE" ] || cp "$REPO_DIR/config/switchboard.env.example" "$ENV_FILE"
 
 set_env "$ENV_FILE" RUN_USER "$RUN_USER"
@@ -497,6 +549,32 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable --now ai-dev-switchboard
+
+# ── Update (--update/--upgrade): guarded restart -- refuses to restart the
+# service (not just warns) whenever RUN_USER has ANY live tmux session,
+# full stop, no --force override (mirrors _remove_worktree()'s own
+# no-`--force` `git worktree remove` precedent, item 13). New code was
+# already copied to $INSTALL_DIR above regardless -- this only gates the
+# restart that makes it take effect. The generated systemd unit above sets
+# no KillMode, so systemd's default (KillMode=control-group) applies: a
+# `systemctl restart` sends SIGTERM/SIGKILL to every process still in this
+# unit's cgroup, not just app.py itself -- every per-project engine/team
+# tmux session spawned via `sudo -u $RUN_USER tmux new-session -d` is a
+# descendant of this service's own process and nothing moves it to a
+# different cgroup first, so restarting while sessions are live can very
+# likely take down the entire RUN_USER tmux server (docs/ARCHITECTURE.md,
+# docs/BACKLOG.md item 14 "Background").
+if [ "$UPDATE" -eq 1 ]; then
+    LIVE_SESSIONS="$(sudo -u "$RUN_USER" tmux list-sessions -F '#{session_name}' 2>/dev/null || true)"
+    if [ -n "$LIVE_SESSIONS" ]; then
+        echo "WARNING: $RUN_USER has live tmux session(s):" >&2
+        echo "$LIVE_SESSIONS" | sed 's/^/  - /' >&2
+        echo "New code was copied to $INSTALL_DIR, but ai-dev-switchboard was NOT restarted -- restarting now would very likely interrupt these (see docs/ARCHITECTURE.md). Stop them (or wait for them to finish), then re-run 'install.sh --update' -- it will be a fast no-op pull, just the restart. Or, if you're sure it's safe: sudo systemctl restart ai-dev-switchboard." >&2
+    else
+        echo "-- Update: no live $RUN_USER sessions -- restarting ai-dev-switchboard to pick up the update --"
+        systemctl restart ai-dev-switchboard
+    fi
+fi
 
 if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
     # ── Self-hosted Gitea (part of --with-git-hosting). Backlog item 2b

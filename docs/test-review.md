@@ -508,3 +508,150 @@ file re-run, full-suite re-run) and traced to a known, already-documented,
 pre-existing real-tmux session-race flake unrelated to this diff, not a
 regression -- filed as a non-blocking follow-up rather than a blocker. No
 must-fix or should-fix issues found in the diff itself.
+
+# Test & Review: Backlog item 14 -- `install.sh --update`/`--upgrade`, an update path for an already-installed box
+
+## Scope
+Covers all ten acceptance criteria in `docs/spec.md`: flag parsing/synonyms,
+the guarded fetch+ff-only-merge update-pull (dirty/branch-mismatch/
+divergence/not-a-repo refusals), the guarded restart (defers while any
+`RUN_USER` tmux session is live, never destructive, no `--force`), the
+`RUN_USER`/`SVC_USER` default-value bug fix, and non-interference with
+plain (non-`--update`) invocations and `--with-*` combinations. Branch:
+`backlog/install-update-14`. Changes: `install.sh`, `README.md`,
+`docs/ARCHITECTURE.md`, `docs/BACKLOG.md`, new `tests/test_install_update.py`
+(20 tests). Nothing committed by the developer; nothing committed by this
+review.
+
+The developer disclosed running `git checkout -- install.sh` mid-session
+(reverting a sabotage-test edit but taking the whole file with it) and
+redoing all `install.sh` edits from scratch. Per the dispatch instructions,
+this was independently re-verified rather than trusted: the current
+`install.sh` was read end-to-end for every changed section (flag parsing,
+the hoisted `ENV_FILE`/update-pull block, the `RUN_USER`/`SVC_USER` default
+fix, the guarded-restart block) and matches `docs/spec.md`'s "Proposed
+approach" essentially verbatim. No leftover sabotage markers, `TODO`s, or
+stray diff artifacts found (`grep` for `sabotage|SABOTAGE|XXX|TODO|FIXME`
+in `install.sh`/the new test file: no hits). `bash -n install.sh`: OK.
+
+## Test cases
+
+| # | Criterion / case | Method | Result | Evidence |
+|---|---|---|---|---|
+| 1 | Clean checkout behind origin, no live sessions -> fast-forward + restart | automated (`UpdatePullBlockTests.test_clean_behind_origin_fast_forwards`, `GuardedRestartBlockTests.test_no_live_sessions_restarts_service`, both against the real extracted block) | pass | `python3 -m unittest tests.test_install_update -v` -- both tests ok; app.py/teams.py re-copy itself is pre-existing, unconditional `cp` (unchanged by this diff, confirmed present at install.sh:284-285 and separately asserted by `tests/test_team_routes.py:2601`) -- not independently re-tested end-to-end this cycle (see Spec coverage) |
+| 2 | Live session present -> pull still happens, restart never invoked, stderr names session(s) + retry/override instructions | automated (`GuardedRestartBlockTests.test_live_session_defers_restart_names_it_in_stderr`, `test_multiple_live_sessions_all_named`) | pass | asserts `systemctl.invoked` log file never created; stderr contains session name(s), `$INSTALL_DIR`, and `sudo systemctl restart ai-dev-switchboard`; `$REPO_DIR` update itself covered separately by case 1's pull tests (independent code path, runs unconditionally before `RUN_USER` is even resolved) |
+| 3 | Dirty `$REPO_DIR` -> exits non-zero before fetching/touching state, names dirty state | automated (`test_dirty_working_copy_refused_before_fetch`) **and independently re-run by hand** against the real (non-extracted) current `install.sh` source in a fresh scratch git repo | pass | test asserts `refs/remotes/origin/main`... no fetch occurred and HEAD unchanged; manual repro: `git status --porcelain` dirty file, ran the literal block extracted fresh from today's `install.sh` -- `ERROR: ... has uncommitted local changes`, exit 1, `git log` on repo unchanged (`4f1d7b7 one`), working tree still shows the uncommitted edit (`M f.txt`) |
+| 4 | Branch mismatch / detached HEAD -> exits non-zero before fetching, names mismatch | automated (`test_wrong_branch_checked_out_refused_before_fetch`, `test_detached_head_refused_before_fetch`) | pass | stderr contains `REPO_BRANCH` and branch name / `detached HEAD` |
+| 5 | Real divergence -> exits non-zero after fetch, before merge, names divergence | automated (`test_diverged_local_branch_refused_after_fetch_before_merge`) | pass | asserts fetch DID happen (`refs/remotes/origin/main` == origin's real HEAD) but HEAD/working tree still only has the local-only commit, not origin's new file |
+| 6 | Not a git repo -> exits non-zero immediately, actionable message | automated (`test_not_a_git_repo_refused_immediately`) | pass | stderr: "not a git checkout" |
+| 7 | `--update`/`--upgrade` exact synonyms | automated (`FlagAndDocTests.test_flag_defaults_to_off_and_both_spellings_wired_up`, source-level: single `case` arm `--update\|--upgrade) UPDATE=1 ;;`) | pass | unambiguous bash case-pattern match, sufficient given both spellings set literally the same flag with no branching difference anywhere else in the script |
+| 8 | `RUN_USER`/`SVC_USER` preserved (not reset to `dev`/`switchboard-svc`) on non-interactive re-run with existing config | automated (`RunUserSvcUserDefaultTests.test_non_interactive_rerun_preserves_already_configured_run_user`) **and independently re-verified as non-tautological**: reverted the fix (`RUN_USER_DEFAULT="dev"`), re-ran the test -- failed exactly as expected (`'RUN_USER=someuser' not found in ...RUN_USER=dev...`); restored via a pre-saved file copy (deliberately not `git checkout --`, to avoid repeating the developer's own disclosed mistake), confirmed byte-identical restore and all 20 tests green again | pass | see command transcript below |
+| 9 | Plain invocation (no `--update`/`--upgrade`) unaffected | automated (`UpdatePullBlockTests.test_update_flag_off_is_a_noop`) plus direct source read (guarded-restart block is a single `if [ "$UPDATE" -eq 1 ]` gate, no other code path changed) | pass | update-pull block emits nothing and exits 0 when `UPDATE=0`; guarded-restart block's gating condition read directly from install.sh:567 -- not independently exercised via `GuardedRestartBlockTests` with `UPDATE=0` (minor gap, see Findings) |
+| 10 | `--update` + `--with-taiga` (or any `--with-*`) uses the freshly-pulled checkout, no stale artifacts | manual code read only, no combined automated test (developer-disclosed limitation) | pass (by construction, independently confirmed) | read install.sh top to bottom: update-pull block (lines 120-148) runs before `-- App + engines --` (line 283) and every `--with-*` block (all >= line 579), all of which read from `$REPO_DIR` -- the freshly-pulled checkout is what every later step sees, with no special-casing needed |
+| 11 (safety-critical, not a spec AC by number but the spec's core justification) | Does `systemctl restart` on this unit shape (no `KillMode` set) actually take down the entire `RUN_USER` tmux server, not just the switchboard's own process? | **real empirical test** -- built a throwaway systemd unit matching `install.sh`'s generated shape verbatim (`Type=simple`, no `KillMode`), spawned a tmux session as a second throwaway user via `sudo -u <user> tmux new-session -d` from inside the service's own process (mirroring `app.py`'s `TMUX = ["sudo", "-u", RUN_USER, "/usr/bin/tmux"]`), confirmed via `systemctl status` that the tmux server + its child landed in the service's own cgroup, then `systemctl restart`ed and checked | **confirmed true** | before restart: `sudo -u runtestlm tmux list-sessions` -> session present, created at a fixed timestamp. After `systemctl restart killmode-test`: `sudo -u runtestlm tmux list-sessions` -> **"no server running on /tmp/tmux-1003/default"** -- the entire tmux server for that user was killed, not just the one session's client. Journal confirms: `Stopping...`/`Deactivated successfully`/`Started...` bracket the restart, and the post-restart service's own idempotent `tmux has-session` check reports no server at all. Test environment (users, sudoers rule, unit file, `/opt` fakeapp) fully torn down afterward -- confirmed via `id svctestlm`/`id runtestlm` (no such user) and `systemctl list-units \| grep killmode` (none) |
+
+## Regression check
+- `python3 -m unittest tests.test_install_update -v` -- 20/20 pass.
+- `python3 -m unittest discover -s tests` (full suite) -- **1054 tests, OK**
+  (took ~150s; no failures, no errors, no skips beyond the project's own
+  existing privileged-test gating).
+- `python3 -m unittest tests.test_install_ollama tests.test_install_set_env tests.test_deploy_target.WrapperBranchingTests tests.test_deploy_target.RestartValidationTests tests.test_deploy_target.InstallShTemplateTests -v`
+  (the adjacent install.sh-touching suites the developer flagged) -- 40/40
+  pass, independently re-run this session (not just re-reading the
+  developer's own claimed output).
+- `bash -n install.sh` -- syntax OK.
+
+## Spec coverage
+| Acceptance criterion (docs/spec.md) | Implemented? | Tested? | Gap? |
+|---|---|---|---|
+| 1. Clean+no-sessions -> ff + re-copy + restart | Yes | Yes, at block level (pull + restart tested separately); the re-copy step itself is pre-existing/unconditional code, unmodified by this diff | No full single-run E2E (explicitly disclosed by developer) -- acceptable given the re-copy line's unconditional nature and pre-existing coverage via `test_team_routes.py` |
+| 2. Live session -> update but no restart, stderr names it | Yes | Yes, at block level | Same "no combined E2E" gap as #1, same reasoning |
+| 3. Dirty repo -> refuse before fetch | Yes | Yes, automated + independently hand-verified against the real current file this session | None |
+| 4. Branch mismatch/detached -> refuse before fetch | Yes | Yes | None |
+| 5. Divergence -> refuse after fetch, before merge | Yes | Yes, including proof the fetch happened | None |
+| 6. Not a git repo -> refuse immediately | Yes | Yes | None |
+| 7. `--update`/`--upgrade` synonyms | Yes | Yes | None |
+| 8. `RUN_USER`/`SVC_USER` default fix | Yes | Yes, automated + independently re-verified as non-tautological this session | None |
+| 9. Plain invocation unaffected | Yes | Yes for the update-pull block; guarded-restart block's `UPDATE=0` no-op path is correct by direct source read (single `if` gate) but has no dedicated automated test | Minor test-coverage gap, not a functional gap (see Findings #1) |
+| 10. `--update` + `--with-*` combined | Yes | No automated combined test; verified correct by construction via direct source read this session | Disclosed limitation, independently confirmed low-risk |
+
+All ten acceptance criteria are implemented; nine are directly tested
+(automated and/or independently hand-verified this session), one (#10) is
+verified correct by direct code reading rather than an executable test.
+Both disclosed gaps (#1/#2's missing full E2E, #10's missing combined test)
+were independently re-derived from the actual current source rather than
+taken on the developer's word, and hold up.
+
+## Findings (most severe first)
+
+### 1. `GuardedRestartBlockTests` has no explicit `UPDATE=0` case -- nit
+- File: `tests/test_install_update.py` (`GuardedRestartBlockTests`, all four
+  test methods hardcode `UPDATE=1` inside `_build_restart_block_harness`'s
+  generated script)
+- Issue: nothing in this test class exercises the restart-guard block with
+  `UPDATE=0` to prove it's a true no-op on a plain invocation. The guarantee
+  currently rests on a direct read of `install.sh:567` (`if [ "$UPDATE" -eq
+  1 ]; then`) plus `UpdatePullBlockTests.test_update_flag_off_is_a_noop`
+  covering the *other* half (the pull block) of the same flag.
+- Failure scenario: none realistic today -- the gating condition is a single
+  `if` with no other logic outside it, so there's no plausible code change
+  that would break this without also breaking the already-tested `UPDATE=1`
+  paths. Flagging only because the acceptance criterion ("no behavior
+  change to any existing flag") deserves a same-shape explicit test to
+  match this file's own stated rigor elsewhere, not because of any observed
+  or suspected defect.
+
+### 2. `docs/implementation.md`'s "Known limitations" claim about update-pull ordering is inaccurate -- nit
+- File: `docs/implementation.md` line ~2040 ("the update-pull section runs
+  before `CONFIG_DIR` is even set, let alone any `--with-*` block")
+- Issue: reading the actual current `install.sh`, `CONFIG_DIR`/`INSTALL_DIR`/
+  `STATE_DIR` are set and `mkdir -p`'d at line 110-113, *before* the
+  update-pull block (line 120-148) runs -- not after, as this sentence
+  claims. The developer's own diff summary made the same claim for the
+  spec's "before CONFIG_DIR=..." placement, but the actual placement (driven
+  by needing `CONFIG_DIR` already set so `ENV_FILE` could be hoisted for the
+  `RUN_USER`/`SVC_USER` fix) put the mkdir line first.
+- Failure scenario: none -- `mkdir -p` on plain, constant paths is
+  idempotent and doesn't read from `$REPO_DIR`, so the property the sentence
+  is actually trying to establish ("update-pull runs before anything reads
+  from `$REPO_DIR`") still holds and was independently re-confirmed by
+  direct source read this session. This is a doc-accuracy nit, not a
+  functional issue.
+
+## Follow-ups (non-blocking)
+- `docs/ARCHITECTURE.md`'s new section states the `KillMode=control-group`
+  blast-radius claim is "inferred... not re-confirmed against a live box in
+  this repo's own test suite." That's no longer true as of this review --
+  see test case #11 above, which empirically confirmed it against a real
+  systemd unit matching this project's generated shape. Worth a follow-up
+  doc edit (in `docs/ARCHITECTURE.md` and/or `docs/implementation.md`'s
+  "Known limitations") to change "inferred, not yet confirmed" to
+  "confirmed" and point at this review, so the next reader doesn't have to
+  redo the empirical check.
+- Consider the real underlying fix (`systemd-run --scope`/`Delegate=yes` +
+  explicit cgroup move for spawned tmux sessions) as a separate, larger
+  backlog item now that the blast radius is empirically confirmed rather
+  than just suspected -- explicitly out of scope for this spec, not a
+  blocker here.
+
+## Overall verdict
+**Approve.** All ten acceptance criteria in `docs/spec.md` are implemented;
+the current `install.sh` was read end-to-end and independently confirmed to
+match the spec's proposed approach (ruling out the disclosed
+`git checkout --`-during-redo mistake having left the file in a bad state).
+`tests/test_install_update.py`'s 20 tests all pass, the full existing suite
+(1054 tests) has no regressions, and this session independently re-derived
+(not just re-read) three of the developer's own strongest claims: the
+dirty-working-copy refusal (hand repro against a fresh scratch git repo and
+the real current source), the RUN_USER-default regression test's
+non-tautology (reverted the fix, watched it fail, restored via file copy
+rather than `git checkout --`), and — the one item both the product-manager
+and developer explicitly flagged as unverified — the spec's core safety
+claim, empirically confirmed via a real systemd unit + real tmux server on
+this sandbox's genuine systemd (PID 1): a restart with no `KillMode` set
+does kill the entire `RUN_USER` tmux server, not just the switchboard's own
+process, validating the whole guarded-restart design this feature is built
+around. Two nit-level findings (a missing `UPDATE=0` test case in
+`GuardedRestartBlockTests`, and a doc-accuracy slip about mkdir/update-pull
+ordering in `docs/implementation.md`) -- neither blocks approval, both
+optional to pick up in a future cycle.

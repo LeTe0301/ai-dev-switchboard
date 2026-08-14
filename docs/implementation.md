@@ -1868,3 +1868,210 @@ python3 -m py_compile app/app.py   # syntax check -- OK
 Manual visual check: open the Teams page, confirm every green button
 (Start/Stop/Resolve/Board-resolve/Send/Deploy) now renders dark (#111)
 text on the green background instead of white.
+
+---
+
+# Implementation: Backlog item 14 -- `install.sh --update`/`--upgrade`, an update path for an already-installed box
+
+## Summary
+Added `--update` (and its exact synonym `--upgrade`) as a new flag to
+`install.sh`, parallel to the existing `--with-*` optional-feature flags.
+It:
+1. Fast-forwards the local `$REPO_DIR` git checkout to `origin/$REPO_BRANCH`
+   -- fetch, then `merge --ff-only` (never a destructive `git reset
+   --hard`), refusing on uncommitted local changes, a checked-out branch
+   other than `$REPO_BRANCH` (including detached HEAD), or a real
+   divergence from origin -- before anything else in the script reads from
+   `$REPO_DIR`.
+2. Lets the script's existing (already idempotent) copy/config steps re-run
+   against that now-fresh checkout -- no new copy logic needed, the
+   unconditional `cp "$REPO_DIR/app/app.py" "$INSTALL_DIR/app.py"` (etc.)
+   already does this on every run.
+3. Restarts `ai-dev-switchboard.service` to pick up the new code -- but
+   only if `RUN_USER` has no live tmux session right now (checked via
+   `sudo -u "$RUN_USER" tmux list-sessions`). If one is live, the restart is
+   refused outright (no `--force` override), with the live session names
+   and next-step instructions printed to stderr; the code update itself
+   still happened.
+
+Also folded in the one real correctness bug the spec identified as
+load-bearing for this flag's own safety story: `RUN_USER`/`SVC_USER`
+prompts previously defaulted to the literal strings `"dev"`/
+`"switchboard-svc"` instead of reading the already-configured value from
+`switchboard.env` (unlike `PVE_HOST`/`SIMPLE_USERNAME`/`PUBLISH_MODE`,
+which already did this correctly) -- fixed the same way those other
+prompts already do it.
+
+## Root cause
+Not applicable (new capability, not a bugfix) for the `--update` flag
+itself. The folded-in `RUN_USER`/`SVC_USER` default fix *is* a real
+pre-existing bug: on a non-interactive re-run (`--yes`, which makes
+`prompt()` just echo its default with no `/dev/tty` read), `RUN_USER`/
+`SVC_USER`/derived `PROJECTS_DIR` would silently reset to `"dev"`/
+`"switchboard-svc"` regardless of what was actually configured, and
+`switchboard.env` would be overwritten with those wrong values via the
+`set_env` calls right after. Latent until now because a first-time
+interactive install always sets these correctly and most operators'
+non-interactive re-runs happened to already use `RUN_USER=dev`; `--update`
+is specifically meant to be re-run non-interactively on an
+already-configured, already-running box, which is exactly the case this
+bug bites.
+
+## Changes by file
+- `install.sh`:
+  - Flag parsing: `UPDATE=0` declared alongside the other `WITH_*` flags;
+    `--update|--upgrade) UPDATE=1 ;;` added to the `case` statement -- both
+    spellings set the same internal flag, no behavior difference.
+  - `RUN_USER`/`SVC_USER` default fix (`-- Users --` section): now read
+    `RUN_USER_DEFAULT="$(get_env "$ENV_FILE" RUN_USER)"; RUN_USER_DEFAULT="${RUN_USER_DEFAULT:-dev}"`
+    (and the `SVC_USER` equivalent) before prompting, same idiom
+    `PVE_HOST`/`SIMPLE_USERNAME`/`PUBLISH_MODE` already use. Required
+    hoisting `ENV_FILE="$CONFIG_DIR/switchboard.env"` up from the `--
+    Config --` step (where it's still referenced, now via a comment
+    pointing at the hoisted assignment) to right after `CONFIG_DIR` is set
+    (`get_env` against a not-yet-existing file already returns empty
+    cleanly via its own `2>/dev/null`, so a genuine first install still
+    falls back to `"dev"`/`"switchboard-svc"` exactly as before).
+  - New update-pull section, placed right after the root check and the
+    `ENV_FILE` hoist, before any helper function or the rest of the script
+    reads from `$REPO_DIR`: the dirty/branch/divergence-checked
+    fetch-then-`merge --ff-only`, exactly as specced (mirrors
+    `scripts/gitea-sync-project.sh`'s own shape).
+  - New guarded-restart section, placed right after the existing
+    `systemctl daemon-reload; systemctl enable --now ai-dev-switchboard`
+    (after `RUN_USER` is resolved and `app.py`/`teams.py` are already
+    re-copied to `$INSTALL_DIR`): checks `sudo -u "$RUN_USER" tmux
+    list-sessions`, restarts only if empty, otherwise warns to stderr and
+    leaves the service running the old code in memory (new code already on
+    disk).
+  - Top-of-file flag documentation: added a `--update, --upgrade` bullet
+    matching the existing entries' style/verbosity, and extended the
+    "Safe to re-run" comment to mention `--update`'s extra pull step and
+    possible deferred restart.
+- `README.md`: new "Updating" section (between "Configuration" and "Repo
+  layout") documenting `sudo ./install.sh --update`/`--upgrade` and the
+  deferred-restart-around-live-sessions behavior, pointing at
+  `docs/ARCHITECTURE.md` for why.
+- `docs/ARCHITECTURE.md`: new section ("A restart can very likely take down
+  every RUN_USER tmux session, not just the switchboard's own process")
+  documenting the `KillMode=control-group` inference from the spec's
+  "Background" (the generated systemd unit sets no `KillMode`, so
+  systemd's default applies -- a restart signals every process in the
+  unit's cgroup, and nothing moves spawned `tmux` sessions to a different
+  cgroup first) plus the independent in-process driving-thread risk
+  (`app/teams.py`'s `_tail_loop`/lead loop), and notes `--update`'s guard
+  is built around this finding.
+- `tests/test_install_update.py` (new): see "How to verify locally" below.
+
+## Key decisions / tradeoffs
+- **Extracted the real `install.sh` blocks verbatim for testing, never
+  reimplemented them** -- same `_extract_between`-on-literal-markers
+  technique `tests/test_deploy_target.py`/`tests/test_install_ollama.py`
+  already use, so a future edit to `install.sh`'s real source that drifts
+  from what these tests assume would fail the test, not silently pass
+  against a stale reimplementation. Four separate harnesses, one per
+  independently-testable piece (flag/doc greps, the `-- Users --` section,
+  the update-pull block, the guarded-restart block) -- deliberately not one
+  harness driving a full top-to-bottom `install.sh` run, since a full run
+  needs real `apt-get`/`useradd`/Docker/`systemctl` machinery this repo's
+  own test precedent (`test_deploy_target.py`'s `InstallScriptDeployTargetBlockTests`)
+  already reserves for a `HAVE_PASSWORDLESS_SUDO`-gated privileged class,
+  which this cycle didn't need since none of the four pieces here require
+  root to exercise meaningfully.
+- **Update-pull block tested against real throwaway git repos** (a real
+  local clone with a real `origin` remote, both on-disk under a per-test
+  temp dir), not fakes -- git's own dirty/branch/divergence/ff-only
+  semantics are exactly the thing under test, and none of it needs root.
+  Confirmed the divergence test actually proves what it claims (fetch
+  happened, merge didn't) by asserting `refs/remotes/origin/main` matches
+  origin's real HEAD post-run, not just checking which files landed.
+- **Guarded-restart block tested with fake `sudo`/`tmux`/`systemctl` on a
+  fake `PATH`** (same fake-PATH-stub-binaries technique
+  `test_deploy_target.py`'s `WrapperBranchingTests` already uses) --
+  proving exactly which command gets invoked (or doesn't) without a real
+  tmux server or real root-owned systemd unit, which this repo's own
+  `HAVE_PASSWORDLESS_SUDO` gating precedent reserves for genuinely
+  privileged end-to-end coverage this cycle doesn't need.
+- **Deliberately did not build a full end-to-end test that runs the entire
+  `install.sh --update` script top to bottom** (acceptance criterion 1/2's
+  literal wording -- "when `sudo ./install.sh --update` runs..."). Doing so
+  for real would mean provisioning a real `ai-dev-switchboard.service`,
+  real `RUN_USER`, and a real `$INSTALL_DIR` on the test machine -- the kind
+  of privileged, slow, higher-blast-radius setup this repo's own
+  `PrivilegedEndToEndTests`/`InstallScriptDeployTargetBlockTests` classes
+  reserve specifically for things that "genuinely can't be faked" (per
+  `docs/spec.md`'s own "Affected areas" guidance for this item). Each piece
+  of the acceptance criteria that a full run would exercise (fetch/merge
+  correctness, the `RUN_USER`/`SVC_USER` default fix, the live-session
+  restart guard, `--update`/`--with-*` running before any `--with-*` block
+  reads `$REPO_DIR` -- true by construction, since the update-pull section
+  is now the very first thing in the script that reads from it) is instead
+  covered at the block level above. Flagging this explicitly rather than
+  claiming full literal coverage of criteria 1/2/10's wording.
+- **Verified the tests actually catch a regression**, not just that they
+  pass against the real code: temporarily reverted the `RUN_USER_DEFAULT`
+  fallback to the old hardcoded `"dev"` and re-ran
+  `RunUserSvcUserDefaultTests` -- `test_non_interactive_rerun_preserves_already_configured_run_user`
+  failed exactly as expected, confirming the test isn't a tautology.
+  Restored the real fix afterward (see "How to verify locally" for the
+  exact command).
+
+## Deviations from spec / design
+None from `docs/spec.md`'s "Proposed approach" -- the flag parsing,
+`RUN_USER`/`SVC_USER` default fix, update-pull section, and guarded-restart
+section all match the spec's proposed code essentially verbatim (comments
+expanded slightly for context, matching this file's own prose density
+elsewhere). No design doc for this cycle, per spec's own "ux-designer: Skip
+this cycle" note (no web-UI-visible surface).
+
+## Known limitations
+- **No full end-to-end test of `install.sh --update` running top to
+  bottom** -- see "Key decisions" above for why, and what's covered instead
+  at the block level.
+- **The `KillMode=control-group`-takes-down-the-whole-tmux-server
+  inference this guard is built around has since been empirically
+  confirmed** by the reviewer's testing pass (real throwaway systemd
+  unit + tmux session, `systemctl restart` took down the entire tmux
+  server) -- see `docs/ARCHITECTURE.md`'s "A restart can very likely take
+  down every RUN_USER tmux session" section, updated accordingly. The
+  guard was already correct either way per the spec's own reasoning (the
+  in-process driving thread is unconditionally ended by any restart
+  regardless of the cgroup question).
+- **`--update` combined with a `--with-*` flag in the same invocation is
+  correct by construction** (the update-pull section runs before any
+  `--with-*` block; `CONFIG_DIR`/`INSTALL_DIR`/`STATE_DIR` are already
+  `mkdir -p`'d by that point, which the update-pull block doesn't touch
+  either way) but not exercised by a combined test run for the reasons
+  above.
+
+## How to verify locally
+```
+bash -n install.sh                              # syntax check -- OK
+
+python3 -m unittest tests.test_install_update -v
+# Ran 20 tests in ~2.6s ... OK
+
+# Confirms the RUN_USER-default test isn't a tautology (regression-catch
+# check performed during this cycle, not part of the committed test run):
+#   sed -i 's/RUN_USER_DEFAULT="\${RUN_USER_DEFAULT:-dev}"/RUN_USER_DEFAULT="dev"/' install.sh
+#   python3 -m unittest tests.test_install_update.RunUserSvcUserDefaultTests -v
+#   -> test_non_interactive_rerun_preserves_already_configured_run_user FAILS as expected
+#   git checkout -- install.sh   # restore
+
+# No regressions in adjacent install.sh-touching suites (unaffected by
+# this cycle's changes, run to confirm):
+python3 -m unittest tests.test_install_ollama tests.test_install_set_env -v
+# Ran 24 tests ... OK
+
+python3 -m unittest tests.test_deploy_target.WrapperBranchingTests \
+    tests.test_deploy_target.RestartValidationTests \
+    tests.test_deploy_target.InstallShTemplateTests -v
+# Ran 16 tests ... OK
+```
+
+Manual verification on a real box (not performed in this session -- needs
+a real systemd/tmux environment): `sudo ./install.sh --update --yes` on an
+already-installed box with `RUN_USER` set to something other than `"dev"`,
+confirm `switchboard.env`'s `RUN_USER` is unchanged; start a tmux session
+as `RUN_USER`, re-run `--update`, confirm the restart is deferred and the
+session survives; stop it, re-run again, confirm the service restarts.

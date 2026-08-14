@@ -114,6 +114,45 @@ they're either cheap to regenerate or genuinely tied to a live process:
   directory that outlived its originating request should read this as the
   intended retry-then-TTL-cleanup story, not a leak.
 
+## A restart can very likely take down every RUN_USER tmux session, not just the switchboard's own process
+
+The generated systemd unit (`install.sh`, mirrored in
+`systemd/ai-dev-switchboard.service`) sets no `KillMode` at all, so
+systemd's default (`KillMode=control-group`) applies: on `systemctl
+restart`, systemd sends `SIGTERM`/`SIGKILL` to **every process still in
+that unit's cgroup**, not just the unit's own direct child. Every
+per-project engine session and every team session is started via `sudo -u
+$RUN_USER tmux new-session -d ...` (`app.py`, and `run_startup_watch`) as a
+descendant of the service process, and nothing in this codebase moves that
+spawned `tmux` server out of the service's own cgroup first (no
+`systemd-run --scope`, no explicit cgroup move, no `Delegate=yes`). The
+practical implication: **restarting `ai-dev-switchboard.service` while any
+session is running very likely takes down the entire `RUN_USER` tmux
+server, not just the switchboard's own web process** — every open project
+session, not only team runs. **Empirically confirmed** (backlog item 14's
+review, 2026-08-14): a throwaway systemd unit matching this project's
+generated shape exactly (`Type=simple`, no `KillMode`), with a tmux
+session spawned as a second user from inside the service process
+(mirroring `app.py`'s own spawn pattern), lost its entire tmux server on
+`systemctl restart` — not just the service's own process. This was
+previously only inferred from documented `systemd.kill(5)` default
+behavior; it is now verified against a real unit/cgroup.
+
+This is also worse than it first looks because a team run's own driving
+loop (`app/teams.py`'s `_tail_loop`/lead loop) is a `threading.Thread`
+living *inside* the service's own Python process — restarting that process
+ends that thread outright, mid-run, with no resume, independent of the
+cgroup question above.
+
+`install.sh --update`/`--upgrade` (docs/BACKLOG.md item 14) is built around
+this finding: it refuses to restart the service (not just warn) whenever
+`RUN_USER` has any live tmux session, full stop, no override flag — see
+that item and `install.sh`'s own "guarded restart" comment. This doesn't
+fix the underlying process-isolation gap (a real fix would look like
+`systemd-run --scope`-launching each spawned tmux server, or `Delegate=yes`
+plus an explicit cgroup move) — that's a separate, larger change this spec
+deliberately didn't take on.
+
 ## Why engines are config, not code
 
 The original build had Claude Code and aider handling hardcoded directly
