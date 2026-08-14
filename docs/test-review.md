@@ -1,41 +1,44 @@
-# Test & Review: 6f part 2 follow-ups (BACKLOG item 12)
+# Test & Review: Backlog item 7 part 1 — board_read/board_write on the lead loop (backend)
 
 ## Scope
-Covers all three items in `docs/spec.md` (BACKLOG item 12): **A** — permanent
-regression test for the escalation-panel "already answered" race branch,
-**B** — the ARIA attributes `docs/design.md`'s existing 6f part 2
-"Accessibility & platform notes" section specifies (`role="log"`/
-`aria-live="polite"`, `aria-pressed`, `<fieldset>`/`<legend>`), **C** — a
-transient "pending classification" rendering state for the fact_check-vs-
-finish poll-boundary edge case. Frontend-only (`app/app.py`'s `PAGE_TEMPLATE`
-JS/CSS, `tests/test_team_frontend.js`); no Python file touched, confirmed by
-`git diff --name-only` against the working tree.
+Covers `docs/spec.md` (committed `63c97b1`) against the uncommitted working
+tree: `app/taiga_board.py` (new), `app/teams.py` (tool contract, inbox
+generalization, `resolve_board_write()`, CLI subcommand, status audit),
+`tests/test_teams_board.py` (new, 61 tests), `tests/test_teams_lead.py`
+(updated for the rename/new tool count), `docs/implementation.md` (rewritten).
+Confirmed via `git diff --stat`/`git status` that `app/app.py` and
+`scripts/taiga_push_spec.py` are untouched, matching the spec's explicit
+part-1 scope.
 
 ## Test cases
 
 | # | Criterion / case | Method | Result | Evidence |
 |---|---|---|---|---|
-| 1 | Permanent test proves the "already answered" branch (`waiting_on_you: true` cached + fresh `/team/inbox` `{"pending": false}`) renders distinct copy, no submit form | Automated, `tests/test_team_frontend.js` | pass | `node tests/test_team_frontend.js` → `PASS - waiting_on_you true but a fresh /team/inbox already reports pending:false renders "already answered", no form` |
-| 2 | "Already answered" is distinct from the normal question-form state | Automated, reviewer-written adversarial test (same run_id family, `cached.pending: true`) | pass | scratch harness run, `PASS - [ADVERSARIAL] "already answered" is distinct from the normal question-form state` |
-| 3 | "Already answered" is distinct from a genuine `/team/inbox` fetch failure | Automated, reviewer-written adversarial test (500 response → `cached === null`) | pass | scratch harness run, `PASS - [ADVERSARIAL] "already answered" is distinct from a genuine /team/inbox fetch failure (500)` |
-| 4 | `.team-feed-list` carries `role="log"` and `aria-live="polite"` in real rendered markup | Automated + manual extraction, real `<script>` from `app.render_page()` | pass | `node tests/test_team_frontend.js` → `PASS - the event feed list container carries role="log" and aria-live="polite"`; manual `grep` on `render_page()` output confirms `role="log" aria-live="polite"` on the template string |
-| 5 | Filter pills carry `aria-pressed`, value toggles on selection change | Automated (2-pill toggle) + reviewer adversarial (3-pill, exactly-one-true invariant) | pass | `PASS - per-agent filter pills carry aria-pressed, toggling true/false as the selected pill changes`; `PASS - [ADVERSARIAL] filter pills with 3 agents: only the actually-selected pill is aria-pressed=true, all others false` |
-| 6 | Escalation option group wrapped in `<fieldset>`/`<legend>`, legend text is the question, options inside the fieldset | Automated, regex + slice-between-tags assertion on real markup | pass | `PASS - the escalation option group is wrapped in <fieldset>/<legend>, legend text is the question` |
-| 7 | Trailing empty-meta `tool_use` (last lead event) while `status === 'running'` renders transient state, not finish/fact_check | Automated | pass | `PASS - a trailing tool_use with empty meta renders a transient pending state while team.status is still "running"` |
-| 8 | Transient state resolves to fact_check once paired `tool_result` arrives on a later poll | Automated | pass | `PASS - the transient pending state resolves to fact_check once the paired tool_result arrives on a later poll` |
-| 9 | Transient state resolves to finish once a terminal status arrives on a later poll | Automated | pass | `PASS - the transient pending state resolves to finish once a terminal status arrives on a later poll` |
-| 10 | Renamed test (`status: 'running'` → `'finished'`) is a legitimate adaptation, not weakened coverage | Reviewer trace: called `teamFeedEventKindClass`/`teamFeedEventBody` directly against the real extracted script with the OLD test's exact input (`status: 'running'`) | pass | `status=running -> kindClass=pending-classification, body="⋯ pending…"` (old assertion `[Finish summary]` now provably false under the old scenario — genuinely intercepted, not cosmetic); `status=finished -> kindClass=finish, body="[Finish summary] All done: summary text"` (renamed scenario genuinely hits finish) |
-| 11 | Adversarial: trailing empty-meta `tool_use` (last lead event) while `status === 'blocked'` (not running, not terminal) | Reviewer-written adversarial test | pass (see Findings #1 for the resulting observation) | `PASS - [ADVERSARIAL] trailing empty-meta tool_use with team.status "blocked" ... falls to finish, per the literal status==="running" gate` |
-| 12 | `aria-checked` resolution ("applies nowhere") matches `docs/design.md`'s literal text | Manual re-read of `docs/design.md` lines 991-994 | pass | Quoted below in Review pass |
-| 13 | `<fieldset>`/`<legend>` placement choice is reasonable and documented | Manual re-read of `docs/design.md` line 994 + `docs/implementation.md` "Key decisions" | pass | See Review pass |
+| 1 | `board_read(ref=42)` returns same round, `action_count` +1, status stays `running` | Automated, `TeamStepBoardReadTests.test_board_read_by_ref_returns_result_same_round_no_block` | pass | `python3 -m unittest tests.test_teams_board -v` → OK; traced test body directly against `team_step()`, real assertions on `state["status"]`/`action_count`/`full_result_text` |
+| 2 | `board_read()` no-args lists recent; Taiga error and "not configured" both fold into an ordinary outcome, never crash | Automated, `test_board_read_no_args_lists_recent`/`test_board_read_taiga_error_is_ordinary_outcome_not_crash`/`test_board_read_not_configured_is_ordinary_outcome` | pass | Same run |
+| 3 | `board_write(verb="set_status", ref=42, value="In progress")` sets `blocked_board_write`, `inbox.json` has exact `{"kind": "board_write", "verb", "ref", "value", ...}` shape, zero Taiga PATCH calls at proposal time | Automated, `TeamStepBoardWriteTests.test_board_write_blocks_and_writes_inbox_no_taiga_write_call` | pass | Same run; asserted `patch_calls == []` and inbox contents directly |
+| 4 | `board_write` snapshot failure (bad ref/unreachable) never queues a proposal, status stays `running`, ordinary outcome | Automated, `test_board_write_snapshot_failure_never_queues_proposal` | pass | Same run |
+| 5 | `resolve_board_write(run_id, "approve")` makes exactly one Taiga PATCH with a **freshly-fetched** version (not the proposal-time snapshot), inbox moved to `inbox.resolved.json`, status → `running`, history entry recorded | Automated, `ResolveBoardWriteTests.test_approve_set_status_makes_exactly_one_patch_with_fresh_version` (also amend_description/append_comment variants) | pass | Test deliberately makes proposal-time snapshot carry no version and asserts the applied PATCH used `version=99` from a fresh `get_userstory()` stub, not any stale value |
+| 6 | `resolve_board_write(run_id, "reject")` makes zero Taiga calls, inbox still resolves, status → `running` | Automated, `test_reject_makes_zero_taiga_calls_and_resumes` | pass | Asserted `calls == []` on the `resolve_session` stub |
+| 7 | Taiga PATCH fails at approve time (`TaigaHTTPError`/`TaigaPushError`): inbox still resolves, status still → `running`, failure detail present in `outcome_summary` | Automated, `test_approve_taiga_failure_still_resolves_and_resumes`, `test_approve_unknown_status_name_is_recorded_as_taiga_rejected_not_stuck` | pass | Both branches (generic Taiga failure and "no such status name") verified never leave the run stuck |
+| 8 | Two genuinely simultaneous `resolve_board_write()` calls: exactly one succeeds, loser gets `{"ok": False}`, no unhandled exception, no transcript entry for the loser | Automated, real-thread test, `test_two_concurrent_resolves_exactly_one_succeeds_no_taiga_call_for_loser` | pass | Ran 5x in a row for stability — consistently `[False, True]`, `len(call_log) == 1` (loser never reached the Taiga call), exactly one `board_write_resolved` history entry |
+| 9 | `board_write` while a proposal (or `ask_user`) is already pending: rejected as business-rule outcome, does not consume malformed-retry budget | Automated, `test_board_write_while_already_blocked_is_business_rule_not_malformed`, `test_board_write_while_blocked_ask_user_also_rejected` | pass | Asserted `state["malformed_retries"] == 0` and outcome text |
+| 10 | `GroundingStaticASTScanTests` passes unmodified; no board function added to `_GROUNDING_FUNCS`; no grounding-section function calls into `taiga_board` | Automated + independent reviewer AST script | pass | `python3 -m unittest tests.test_teams_grounding.GroundingStaticASTScanTests -v` → OK (3/3); independent `ast.walk()` script (not reusing the test's own code) over the 12 named grounding functions found zero `Attribute`/`Name` references to any board function or `taiga_board` |
+| 11 | `team-board-resolve --action approve\|reject` works end-to-end via the CLI, zero `app.py` involvement | Automated, `CliTeamBoardResolveTests.test_approve_end_to_end_drives_to_finished`/`test_reject_end_to_end_drives_to_finished`/`test_unresolvable_run_id_exits_nonzero` | pass | Drove `teamsmod.main([...])` directly, confirmed `rc == 0` and final `status == "finished"` |
+| 12 | `sweep_dead_teams()`/`_team_exit_code()` correctly treat `blocked_board_write` like `blocked_ask_user` (crash-detected only if session actually gone, never TTL-swept, exit code 0) | Automated, `BlockedBoardWriteStatusAuditTests` | pass | `test_sweep_marks_crashed_session_error_when_blocked_on_board_write` genuinely exercises the crash-detection branch (no live tmux session in test env) and confirms `action == "marked_error"` — proves no orphaning risk from the disclosed `app.py` gap |
+| 13 | Full existing suite green, no regression | Automated | pass | `python3 -m unittest discover -s tests` → `Ran 855 tests ... OK` (794 baseline + 61 new, matches `docs/implementation.md`'s own count) |
+| 14 | Node suite unaffected | Automated | pass | `test_singleton_toggle_frontend.js` 15/15, `test_upload_frontend.js` 8/8, `test_team_frontend.js` 59/59, `test_deploy_frontend.js` 9/9 → **91/91** |
+| 15 | Every remaining `"blocked_ask_user"` literal in `app/teams.py` correctly audited (either left alone because it's ask_user-specific, or extended to also cover `blocked_board_write`) | Manual grep + read of each of the 12 hit sites | pass | See "Correctness review" below — `_force_ask_user`/`resolve_ask_user` sites correctly left alone; `sweep_dead_teams()`/`_team_exit_code()`/`latest_run_for_project()` docstring correctly extended |
+| 16 | The two extra `taiga_board.py` functions (`resolve_session()`, `list_userstory_statuses()`) are glue/lookup necessities, not lead-facing verb-set expansion | Manual: diffed `_LEAD_TOOL_NAMES`/`_lead_tools()`/`_tool_prose()`, confirmed only `board_read`/`board_write` are lead-visible; confirmed both extra functions are called only from `team_step()`/`resolve_board_write()` internals, never exposed as a tool | pass | See "Non-goal compliance" below |
+| 17 | Approval gate cannot be bypassed; a rejected/never-approved proposal can never reach Taiga | Manual: grepped every call site of `taiga_board.set_status`/`amend_description`/`append_comment` | pass | All three calls exist in exactly one place — inside `resolve_board_write()`'s `action == "approve"` branch, gated by an explicit `action in ("approve", "reject")` check with no other code path in the diff calling them |
 
 ## Regression check
-- `tests/test_team_frontend.js`: `node tests/test_team_frontend.js` → `ALL PASS (59/59)` (52 baseline + 7 new, matches `docs/implementation.md`'s own count).
-- Full Node suite: `test_deploy_frontend.js` 9/9, `test_singleton_toggle_frontend.js` 15/15, `test_team_frontend.js` 59/59, `test_upload_frontend.js` 8/8 → **91/91**, no regressions in the three unchanged files.
-- Full Python suite: `python3 -m unittest discover -s tests` → **`Ran 792 tests ... OK`**, unchanged (no Python file touched; re-ran anyway per this cycle's own convention). The "duplicate session: team-sessionrace-p4079817" lines in the output are pre-existing log noise from an unrelated test, not new failures.
-- Working-tree diff confirmed scoped to exactly `app/app.py`, `docs/implementation.md`, `tests/test_team_frontend.js` (`git status --porcelain`) — no other file touched, satisfying `docs/spec.md`'s Non-goals ("No new UI surface, no new route, no backend change").
+- Full Python suite: `python3 -m unittest discover -s tests` → `Ran 855 tests in 136.599s` / `OK`. Ran the new file in isolation too: `python3 -m unittest tests.test_teams_board -v` → `Ran 61 tests` / `OK`, and `tests.test_teams_lead` → `Ran 114 tests` / `OK`.
+- Full Node suite (4 files, all run for real): 91/91, all green — none of these files were touched by this diff, confirming zero collateral breakage.
+- Re-ran the concurrency race test 5x back-to-back for stability (no flake observed).
+- Confirmed via `git status`/`git diff --stat` that only the files claimed in the task description changed; `app/app.py` and `scripts/taiga_push_spec.py` are untouched.
 
-No defects found in the testing pass — proceeding to the review pass.
+No test failures — proceeding to the review pass.
 
 ---
 
@@ -43,153 +46,188 @@ No defects found in the testing pass — proceeding to the review pass.
 
 | Acceptance criterion (`docs/spec.md`) | Implemented | Tested | Notes |
 |---|---|---|---|
-| Permanent test for "already answered" race branch | Yes (test only; production code pre-existing) | Yes (#1 above, plus reviewer's #2/#3 for the three-way distinctness) | Full coverage |
-| `role="log"`/`aria-live="polite"` on feed list, verified via real rendered markup | Yes | Yes (#4) | Attributes on `.team-feed-list` specifically, not the outer wrapper — matches design.md's intent (the element that actually gains new rows) |
-| Filter pills carry the ARIA state attribute(s) design.md specifies, with a toggle test | Yes (`aria-pressed` only — see `aria-checked` resolution below) | Yes (#5, incl. reviewer's 3-pill invariant test) | |
-| Escalation option group wrapped in `<fieldset>`/`<legend>` | Yes | Yes (#6) | |
-| Transient state for trailing empty-meta `tool_use` while `status === 'running'` | Yes | Yes (#7) | |
-| Transient state resolves correctly once resolved by a later poll | Yes | Yes (#8, #9) | Both resolution paths (fact_check and finish) independently tested |
-| Full existing suite passes, no regression | Yes | Yes | Python 792/792, Node 91/91 |
+| `board_read(ref=42)` returns same round, `action_count`+1, status unchanged | Yes | Yes (#1) | |
+| `board_write(...)` blocks, writes exact inbox shape, zero Taiga writes | Yes | Yes (#3) | |
+| `resolve_board_write(..., "approve")`: one PATCH, fresh version, inbox moved, status resumes, history recorded | Yes | Yes (#5) | Fresh-version discipline specifically verified (version deliberately differs from the proposal-time snapshot) |
+| `resolve_board_write(..., "reject")`: zero Taiga calls, inbox resolves, status resumes | Yes | Yes (#6) | |
+| Taiga PATCH failure at approve time never leaves the run stuck | Yes | Yes (#7) | |
+| Two genuinely simultaneous resolves: exactly one wins, no crash, no spurious transcript entry | Yes | Yes (#8) | Reused the same real-thread technique `TeamResolveEndpointTests` already validated for `ask_user` — confirmed this file's test genuinely exercises the equivalent race windows (see below) |
+| `board_write` while already pending: business-rule rejection, not malformed | Yes | Yes (#9) | Both `blocked_board_write` and `blocked_ask_user` pending cases covered |
+| `GroundingStaticASTScanTests` passes unmodified | Yes (no change) | Yes (#10) | Independently re-verified with a separate AST script, not just re-running the existing test |
+| `team-board-resolve` CLI works end-to-end, zero `app.py` involvement | Yes | Yes (#11) | |
+| Full existing suite green | Yes | Yes (#13, #14) | |
 
-All seven acceptance criteria are implemented and independently verified by tests I ran myself this session (developer's tests plus my own adversarial constructions). No gaps.
+All nine acceptance criteria in `docs/spec.md` are implemented and independently verified by tests I ran myself this session.
 
 ## Review pass
 
-### `aria-checked` resolution vs. `docs/design.md`'s literal text
-`docs/design.md` line 993: *"Filter pills should be `<button>` or
-`<input type="radio">` with `aria-pressed="true"` / `aria-checked="true"` for
-selected pill."* This is one sentence pairing `aria-pressed`/`aria-checked`
-with the two *alternative* implementations of the same element (filter
-pills as `<button>` vs. as `<input type="radio">`), not two different UI
-elements. `app/app.py`'s `renderTeamFeed()` renders pills as
-`<button class="team-feed-pill">` — confirmed directly in the diff and in
-the extracted rendered markup — so `aria-pressed` is the attribute that
-applies, and `aria-checked` correctly does not appear anywhere. Separately,
-design.md's escalation-specific line 994 ("`<fieldset>` for radio/checkbox
-groups with `<legend>` for the question") never mentions `aria-checked` for
-the escalation inputs either. The developer's reading in
-`docs/implementation.md` "Key decisions" is accurate to design.md's literal
-wording, not a favorable paraphrase — confirmed by reading the design doc
-directly rather than trusting the summary.
+### Race-safety shape vs. `resolve_ask_user()` (the specific ask from the dispatch prompt)
+`resolve_board_write()` reuses `resolve_ask_user()`'s exact shape with one
+necessary structural difference: because the proposal's `verb`/`ref`/`value`
+live *inside* `inbox.json` (unlike `ask_user`'s `answer`, which arrives as a
+caller argument), `resolve_board_write()` must read `inbox.json`'s content
+*before* calling `os.replace()`, to know what to apply. I traced this
+carefully against both of `resolve_ask_user()`'s two previously-fixed races:
 
-### `<fieldset>`/`<legend>` placement
-`docs/spec.md` explicitly left this to the developer's judgment. The chosen
-approach — the `<legend class="team-escalation-question">` *replaces* the
-previously-separate `.team-escalation-question` div (same class, same text,
-CSS-reset to look identical) rather than duplicating the question text —
-avoids a visually duplicated line while still giving the fieldset its
-required screen-reader association. Verified in the diff
-(`app/app.py`: the old `<div class="team-escalation-question">` line is
-deleted, its class/content moved onto the new `<legend>`) and confirmed
-structurally correct by test #6's slice-between-`</legend>`-and-`</fieldset>`
-assertion (radios are genuinely inside the fieldset, after the legend, not
-just present somewhere in the row).
+- **The crash/`FileNotFoundError` race** (loser's own `os.replace()` call
+  collides with the winner's): still closed. `os.replace()` is called
+  unconditionally, wrapped in `try/except OSError`, exactly as
+  `resolve_ask_user()` does.
+- **The `exists()`-check race** (a separate check-then-act window): not
+  reintroduced. There is no `os.path.exists()` guard anywhere in
+  `resolve_board_write()` — `os.replace()` is the sole atomic arbiter, same
+  as the fixed `resolve_ask_user()`.
+- **The "act before win/lose is known" race** (history/Taiga call before the
+  replace succeeds): not reintroduced, and correctly extended to a stricter
+  new requirement this function has that `ask_user` doesn't. I confirmed by
+  reading line order: `verb, ref, value = inbox.get(...)` and every use of
+  those values (the Taiga calls, `_append_history()`) appear strictly
+  *after* the `try: os.replace(...) except OSError: return ...` block. The
+  pre-replace `open()`/`json.load()` read is wrapped in its own
+  `except (OSError, ValueError): inbox = {}` and its result is never acted
+  on by a loser, since a loser always returns from the `except OSError`
+  branch before reaching the `verb, ref, value = ...` line. A loser can read
+  stale-but-harmless content and still never call Taiga or write history.
 
-### Correctness
-- The `status === 'running'` gate for the transient state is applied
-  literally as `docs/spec.md`'s Background/Proposed-approach text specifies.
-  Test #11 (reviewer-constructed) confirms that a `status: 'blocked'` value
-  with the same trailing empty-meta event does **not** get the transient
-  treatment — it falls straight to `'finish'`, same as pre-cycle behavior.
-  This is not a bug against this cycle's spec (which explicitly scopes the
-  fix to `status === 'running'` and to a race the reviewer already
-  documented as practically unreachable), but it's worth flagging as a
-  should-fix-in-a-later-cycle observation — see Findings below — since the
-  underlying rendering ambiguity (a trailing empty-meta `tool_use` with no
-  paired `tool_result` yet) is equally present, in principle, whenever the
-  run hasn't reached a truly terminal status, not just while `running`.
-- `e.agent === 'lead'` guard in the transient-state condition: confirmed
-  necessary and correctly scoped — without it, a non-lead agent's own
-  (hypothetical) empty-meta `tool_use` would also match `!next` (since
-  `findNextLeadEvent` only searches `leadEvents`, `indexOf` returns `-1` for
-  non-lead events, always yielding `next === null`), which would have
-  incorrectly extended new behavior beyond the spec's literal "last
-  lead-agent event" wording. The guard prevents that.
-- Renamed test is a genuine adaptation, not weakened coverage — confirmed
-  via direct function-level trace (#10 above): the old scenario's inputs,
-  re-run against the real post-diff script, now produce
-  `pending-classification`, provably falsifying the old test's original
-  assertion under the old inputs. The rename is not cosmetic.
+This is correctly reasoned, not just superficially "mirrored" — confirmed by
+tracing the actual line order, not by trusting the docstring's own claim.
 
-### Security
-No new user input handling introduced. `esc(cached.question)` is correctly
-applied to the new `<legend>` content (same escaping already used
-throughout this file for LLM-authored / operator-authored text). No new
-routes, no new fetch targets, no new SQL/shell/command surfaces. Nothing in
-this diff touches authn/authz or secrets.
+### Non-goal compliance: two extra client functions
+- `resolve_session()` — pure three-step wiring (`load_config` →
+  `authenticate` → `lookup_project`), never lead-exposed. Confirmed
+  `_LEAD_TOOL_NAMES`/`_lead_tools()`/`_tool_prose()` only add `board_read`/
+  `board_write` — no new tool name reaches the lead's own contract.
+- `list_userstory_statuses()` — a read-only lookup used exclusively inside
+  `resolve_board_write()`'s `approve` branch to translate `set_status`'s
+  human-readable `value` to the numeric id `taiga_board.set_status()`
+  requires, exactly as the spec's own "status_id for set_status" section
+  demands ("the apply step uses the id"). Not callable by the lead.
 
-### Simplicity / scope
-The diff is minimal and proportionate to the three-item spec: no new
-abstractions, no speculative generality. Threading a third `status`
-parameter through `teamFeedEventKindClass`/`teamFeedEventBody`/
-`renderTeamFeedEvent` is the smallest change that satisfies part C without
-introducing global state. The CSS resets for `<fieldset>`/`<legend>` are
-scoped narrowly (only the two new selectors) and exist specifically to keep
-the visual layout unchanged, which is a reasonable, minimal tradeoff for
-adding required a11y structure without a visual regression — appropriately
-flagged in `docs/implementation.md`'s "Known limitations" as not
-manually/visually verified, consistent with this file's existing
-markup-presence-only testing convention.
+Both are genuinely necessary plumbing the spec's own text requires but its
+literal 8-function code block didn't happen to enumerate — not scope creep,
+and the "exactly three write verbs, no passthrough" Non-goal is intact
+(verified directly: only three functions ever appear in a PATCH call site,
+all three gated behind the single `action == "approve"` branch).
 
-## Findings (most severe first)
+### Security: approval gate cannot be bypassed
+Grepped every call site of `taiga_board.set_status`/`amend_description`/
+`append_comment` in `app/teams.py` — all three appear exactly once each,
+all three inside `resolve_board_write()`'s `else:` (approve) branch, gated
+by `action in ("approve", "reject")` checked before anything is touched on
+disk. `board_write` itself (`team_step()`) never calls a write verb, only
+`get_userstory()` (a GET) for the display-only snapshot. There is currently
+no web route at all (part 2), so the only way to reach `resolve_board_write`
+is the CLI or a direct Python call — matches the spec's explicit "approval
+is the only path" and "CLI-testable, no web UI yet" scope. `ref`/`verb` are
+JSON-type-checked (`int`/enum-checked string) before ever reaching a URL
+f-string, and `slug` is the only value URL-quoted via
+`urllib.parse.quote()` — no injection surface identified.
 
-### 1. Transient "pending classification" gate is scoped to `status === 'running'` only, not to "run hasn't reached a terminal status" — should-fix (follow-up, not blocking)
-- File: `app/app.py`, `teamFeedEventKindClass()`, the
-  `if (!next && e.agent === 'lead' && status === 'running') return 'pending-classification';`
-  line.
-- Issue: the condition matches `docs/spec.md`'s literal wording exactly, but
-  the wording itself only anticipated the `running` case. A trailing
-  empty-meta `tool_use` from the lead with no paired `tool_result` yet, and
-  `team.status === 'blocked'` (e.g. the lead is mid-way through emitting a
-  fact_check tool_use/tool_result pair right as an `ask_user` escalation
-  from a **different**, in-flight round gets appended and flips status to
-  `blocked` before the pair completes — a narrower but structurally similar
-  poll-boundary race to the one this cycle already fixed for `running`)
-  still falls through to `'finish'`, i.e. the exact assumed-finish bug this
-  cycle was written to eliminate, just gated to a status this cycle didn't
-  cover.
-- Failure scenario: `team.status: 'blocked'`, last lead event is an
-  empty-meta `tool_use` with no next lead event yet — renders
-  `[Finish summary] ...` instead of the transient state, even though the
-  run has not actually finished (confirmed empirically, test case #11
-  above).
-- This does not block approval: `docs/spec.md`'s own Non-goals disclaim
-  "attempting to make the poll-boundary race... provably unreachable," and
-  the implementation matches the spec's literal, deliberately-narrow scope
-  exactly — this is a spec-scoping observation for a future cycle, not an
-  implementation defect against this cycle's spec.
+### Disclosed gap: does `blocked_board_write` risk orphaning under `app/app.py`'s blindness to it?
+Traced this directly, the single highest-value check per the dispatch
+prompt:
+- `sweep_dead_teams()` (in `app/teams.py`, not `app/app.py`) **was** updated
+  to include `blocked_board_write` in both its crash-detection tuple and its
+  never-TTL-swept tuple — independently confirmed by reading the diff and by
+  `BlockedBoardWriteStatusAuditTests.test_sweep_marks_crashed_session_error_when_blocked_on_board_write`,
+  which genuinely exercises the crash-detection branch (no live tmux
+  session) and gets the expected `marked_error` outcome, same as
+  `blocked_ask_user` would.
+- The only things `app/app.py` gets wrong for this status are purely
+  cosmetic/informational: the status pill falls through `.get(status,
+  "idle")` to `"idle"` (line ~3990-3993), and `GET .../team/inbox` doesn't
+  report it as pending (checks `status == "blocked_ask_user"` only,
+  line 4177) — both exactly as disclosed in `docs/implementation.md`'s
+  "Known limitations."
+- **One additional gap, not disclosed in `docs/implementation.md`**: the
+  pre-existing `/team/stop` route (`app/app.py` line 4364,
+  `run["status"] not in ("running", "blocked_ask_user")`) also silently
+  no-ops for a `blocked_board_write` run — the web UI's Stop button won't
+  actually stop it. This is **not a new regression**: this exact guard
+  already had the identical blind spot for `escalated_max_rounds` before
+  this diff, so it's a pre-existing pattern this diff's new status simply
+  also falls into, not something this diff broke. The CLI's `team-stop`
+  (`stop_team()`) is unconditional and works regardless of status, so the
+  run is not actually unstoppable — just not stoppable from the web UI
+  until part 2. Because it causes no data loss, no orphaning, and is
+  consistent with the spec's own "app.py untouched" scope, this is a
+  **should-fix** documentation gap (add it to `docs/implementation.md`'s
+  "Known limitations" alongside the other two), not a blocker.
 
-### 2. No visual/manual accessibility smoke test performed — nit
-- File: `docs/implementation.md` "Known limitations" (already
-  self-disclosed).
-- Issue: no real screen reader or browser was used to confirm the
-  `aria-live="polite"` region announces correctly, or that the
-  `<fieldset>`/`<legend>` CSS reset actually renders pixel-identical to the
-  pre-cycle layout in a real browser (only markup-presence assertions and a
-  `grep` on the rendered template were used).
-- Not blocking: this matches the same level of rigor every other test in
-  `tests/test_team_frontend.js` already uses (this codebase has no browser/
-  screen-reader test harness), and `docs/spec.md`'s Non-goals explicitly
-  scope this cycle to implementing already-specified attributes, not a full
-  accessibility audit.
+**Conclusion: no orphaning/stuck-run risk.** The one gap found is
+UI-cosmetic and has a working CLI workaround.
 
-## Follow-ups (non-blocking)
-- Consider widening the transient-classification gate from
-  `status === 'running'` to `status !== 'finished' && status !== 'error'`
-  (or equivalent "non-terminal" check) in a future cycle, per Finding #1.
-- A manual screen-reader/browser smoke test of the new `role="log"`/
-  `aria-live`/`fieldset`/`legend` markup would be a reasonable low-cost
-  addition whenever this codebase's first browser-based test harness (if
-  ever added) lands — not warranted as a one-off for this cycle.
+### Correctness: `"blocked_ask_user"` literal audit
+Independently grepped all 12 hits of `"blocked_ask_user"` in `app/teams.py`
+(not just re-reading the two functions named in the dispatch prompt):
+- `_force_ask_user()`'s default param and internal `if status ==
+  "blocked_ask_user":` branch, and its one `blocked_ask_user`-specific call
+  site — correctly left alone; this function is ask_user-specific by
+  design (its `status` kwarg is also used for `escalated_max_rounds`).
+- `team_step()`'s own `ask_user` branch — correctly left alone (unrelated
+  to board_write).
+- `resolve_ask_user()`'s own status check and docstring references —
+  correctly left alone (this function only ever resolves `ask_user`;
+  `resolve_board_write()` is its own new, parallel function with its own
+  `blocked_board_write` check).
+- `latest_run_for_project()`'s docstring, `sweep_dead_teams()`'s docstring
+  and both status tuples, `_team_exit_code()` — all correctly extended to
+  include `blocked_board_write`.
+- One comment (`TEAM_SESSION_STALE_TTL_SECONDS`'s own comment, line ~152)
+  mentions only `blocked_ask_user` but explicitly defers to
+  `sweep_dead_teams()`'s own (correctly updated) docstring for the current
+  behavior — a **nit**, not a defect (no functional impact, purely a stale
+  cross-reference in a comment).
 
-## Overall verdict
-**Approve.** All seven acceptance criteria are implemented and verified by
-tests I ran myself this session (the developer's new tests plus my own
-adversarial constructions covering the three-way "already answered"
-distinctness, the 3-pill `aria-pressed` invariant, the `blocked`-status
-edge case, and a direct function-level trace proving the renamed test is a
-genuine adaptation). Full regression suite is clean: Python 792/792, Node
-91/91. The `aria-checked` and `<fieldset>`/`<legend>`-placement developer
-calls both check out against `docs/design.md`'s literal text. One
-should-fix-later observation (Finding #1) and one pre-existing, self-
-disclosed nit (Finding #2) — neither blocks this cycle.
+The audit was complete. No status-shape-specific site was missed.
+
+### Simplicity
+No unnecessary abstraction found. `taiga_board.py`'s single-layer error
+translation (vs. `taiga_push_spec.py`'s three-layer pattern) is a reasonable,
+disclosed simplification given this module has exactly one caller category.
+The `board_write` "already pending" defensive check duplicates
+`_append_history()`/`_persist()` call shape inline rather than routing
+through the shared `agent_not_on_team`/`premature_finish` block earlier in
+`team_step()` — mildly duplicative but the shared block is keyed off
+`_validate_lead_action()`'s return value and doesn't have access to
+`state["status"]`, so factoring it in would cost more than it saves for one
+call site. Not worth a follow-up.
+
+## Findings (ranked)
+
+1. **Should-fix** — `docs/implementation.md`'s "Known limitations" section
+   should also disclose that `POST .../team/stop` (`app/app.py` line 4364)
+   silently no-ops for a `blocked_board_write` run (web UI Stop button does
+   nothing; `team-stop` CLI still works). No code change needed, no data
+   loss, not a regression — just an omission in the disclosed-gaps writeup
+   that a future part-2 author should know about alongside the two gaps
+   already listed there.
+2. **Nit** — `app/teams.py`'s `TEAM_SESSION_STALE_TTL_SECONDS` comment
+   (line ~152) still says "Never applies to `status=="blocked_ask_user"`"
+   without mentioning `blocked_board_write`, even though the code it
+   defers to (`sweep_dead_teams()`) was correctly updated. Optional
+   one-line touch-up.
+3. **Nit** — `tests/test_teams_board.py`'s `TaigaRequestSeamTests` has no
+   dedicated test for the malformed-`base_url`/`ValueError`-at-`Request()`-
+   construction path that `scripts/taiga_push_spec.py`'s own test suite
+   covers (referenced in this module's own docstring as "Defect 1's fix,
+   carried forward"). The code correctly carries the fix forward (verified
+   by reading `_taiga_request()`'s `except (urllib.error.URLError, OSError,
+   ValueError)` clause) — this is a coverage-parity nit, not a functional
+   gap.
+
+No must-fix findings.
+
+## Overall verdict: **Approve** (with the one should-fix noted above as a
+non-blocking follow-up)
+
+All nine acceptance criteria are implemented and independently verified.
+The race-safety shape correctly reuses `resolve_ask_user()`'s hardening
+(traced line-by-line, not just trusted). The approval gate cannot be
+bypassed. The two extra client functions are genuine plumbing, not scope
+creep. `sweep_dead_teams()` correctly prevents any orphaning risk from the
+disclosed `app.py` blindness to the new status. Full regression suite
+(855 Python + 91 Node) is green. The one should-fix (undisclosed `/team/stop`
+no-op) and two nits do not block this cycle — they're worth a quick
+follow-up note in `docs/implementation.md` but not worth bouncing back to
+the developer for.

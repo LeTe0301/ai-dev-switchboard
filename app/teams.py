@@ -52,6 +52,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
 from app import TMUX, tmux_has, load_engines  # noqa: E402  app/app.py:191,:1187,:315
+import taiga_board  # noqa: E402  backlog item 7 part 1 -- Taiga board_read/board_write client
 
 # ─── config (see config/switchboard.env.example for the full reference) ──
 TEAM_STATE_DIR = os.environ.get("TEAM_STATE_DIR", "/var/lib/ai-dev-switchboard/teams")
@@ -175,6 +176,16 @@ TEAM_EVENTS_MAX_BYTES_PER_FILE_PER_POLL = int(
 # paste (an entire file, a whole prompt) before it's appended to the run's
 # history and folded into the lead's next-round context.
 TEAM_ASK_USER_ANSWER_MAX_CHARS = int(os.environ.get("TEAM_ASK_USER_ANSWER_MAX_CHARS", "2000"))
+
+# Max length of board_write's own `value` argument (backlog item 7 part 1,
+# docs/spec.md "Edge cases") -- a proposed status name/description/comment
+# text the LEAD itself supplies, a materially different case from
+# TEAM_ASK_USER_ANSWER_MAX_CHARS's own human free-text answer. 8000
+# (matching TEAM_GROUNDING_MAX_BYTES's own precedent, not the narrower
+# 2000-char ask_user default per docs/spec.md's own "Open questions" --
+# "a real userstory description could reasonably be longer") than a short
+# human answer/explanation would need.
+TEAM_BOARD_WRITE_VALUE_MAX_CHARS = int(os.environ.get("TEAM_BOARD_WRITE_VALUE_MAX_CHARS", "8000"))
 
 # Bash's own `$?` convention for a foreground child killed by signal N is
 # 128+N (POSIX, confirmed live for SIGTERM against `claude -p` during this
@@ -1787,7 +1798,12 @@ def fact_check(claim: str, grounding: dict, *,
 # fact_check()/load_grounding() (6b/6b.1) into an actual team. CLI-only --
 # no web route, no UI (that's 6d/6e/6f).
 
-_LEAD_TOOL_NAMES = ("delegate", "fact_check", "ask_user", "finish")
+_LEAD_TOOL_NAMES = ("delegate", "fact_check", "ask_user", "board_read", "board_write", "finish")
+
+# The exactly-three board_write verbs (docs/spec.md "Verb set naming" --
+# set_status covers what the backlog calls "move card", since in Taiga's
+# own data model a Kanban column IS a userstory's status).
+_BOARD_WRITE_VERBS = {"set_status", "amend_description", "append_comment"}
 
 
 def _lead_tier_for_engine(e) -> int:
@@ -2037,6 +2053,25 @@ def _lead_tools(team_members: list) -> list:
                 "multi_select": {"type": "boolean"}},
                 "required": ["question", "options"]}}},
         {"type": "function", "function": {
+            "name": "board_read",
+            "description": "Look up userstories on this project's Taiga kanban board -- one "
+                           "card by ref, a bounded substring-matched list by query, or the "
+                           "most recently modified cards if neither is given.",
+            "parameters": {"type": "object", "properties": {
+                "ref": {"type": "integer", "description": "Look up one specific card by its ref number."},
+                "query": {"type": "string", "description": "Substring to match against card subjects."}},
+                "required": []}}},
+        {"type": "function", "function": {
+            "name": "board_write",
+            "description": "Propose one narrow change to one existing Taiga card. Does NOT "
+                           "apply the change -- queues it for human approval.",
+            "parameters": {"type": "object", "properties": {
+                "verb": {"type": "string", "enum": sorted(_BOARD_WRITE_VERBS)},
+                "ref": {"type": "integer"},
+                "value": {"type": "string"},
+                "note": {"type": "string"}},
+                "required": ["verb", "ref", "value"]}}},
+        {"type": "function", "function": {
             "name": "finish",
             "description": "Conclude the task with a summary.",
             "parameters": {"type": "object", "properties": {
@@ -2102,6 +2137,23 @@ _DELEGATION_HISTORY_MITIGATION = (
     "result was clearly incomplete."
 )
 
+# Required verbatim (or materially equivalent) in _system_framing(), every
+# tier (backlog item 7 part 1, docs/spec.md §3) -- states explicitly what
+# board_write's tool_result does NOT mean, the same "make it explicit and
+# salient, don't leave it to be inferred" discipline the two mitigation
+# clauses above already established.
+_BOARD_WRITE_MITIGATION = (
+    "You also have read/write access to this project's Taiga kanban board via "
+    "board_read and board_write. board_write does NOT apply your change -- "
+    "every board_write call is queued as a pending proposal and takes effect "
+    "ONLY after a human explicitly approves it. Its tool_result tells you the "
+    "proposal was queued, never that the board was actually changed -- do not "
+    "assume a board_write call has succeeded, and do not repeat an identical "
+    "board_write call while a prior one is still pending (a run can only have "
+    "one board write pending approval at a time; a second board_write call "
+    "while one is already pending will be rejected)."
+)
+
 
 def _tool_prose(team_members: list) -> str:
     """Prose tool descriptions for tier 2/3 (tier 1 gets these for free from
@@ -2109,7 +2161,7 @@ def _tool_prose(team_members: list) -> str:
     §5)."""
     agents = ", ".join(team_members) if team_members else "(no teammates configured)"
     return (
-        "You have exactly four tools:\n"
+        "You have exactly six tools:\n"
         f"- delegate(agent, task): give one self-contained task to a named "
         f"teammate agent. agent must be exactly one of: {agents}.\n"
         "- fact_check(claim): verify a claim against the project's own "
@@ -2118,6 +2170,15 @@ def _tool_prose(team_members: list) -> str:
         "a question when something is genuinely unresolved. options is a "
         "list of 2-4 objects each shaped {label, description}; header is a "
         "short label (12 characters or fewer); multi_select is a boolean.\n"
+        "- board_read(ref, query): look up userstories on this project's "
+        "Taiga kanban board -- one card by ref, a bounded substring-matched "
+        "list by query, or the most recently modified cards if neither is "
+        "given. Both arguments optional.\n"
+        "- board_write(verb, ref, value, note): propose one narrow change "
+        "to one existing card. verb must be exactly one of set_status, "
+        "amend_description, append_comment (set_status moves the card "
+        "between Kanban columns by changing its status). Does NOT apply "
+        "the change -- queues it for human approval; note is optional.\n"
         "- finish(summary): conclude the task with a summary.\n"
     )
 
@@ -2159,6 +2220,7 @@ def _system_framing(workdir: str, team_members: list, tier: int) -> str:
             "outside the fence.")
     parts.append(_FACT_CHECK_MITIGATION)
     parts.append(_DELEGATION_HISTORY_MITIGATION)
+    parts.append(_BOARD_WRITE_MITIGATION)
     return "\n\n".join(parts)
 
 
@@ -2388,6 +2450,8 @@ _LEAD_TOOL_REQUIRED_ARGS = {
     "delegate": (("agent", str), ("task", str)),
     "fact_check": (("claim", str),),
     "ask_user": (("question", str), ("options", list)),
+    "board_read": (),  # every arg optional -- special-cased below, same as ask_user's own optional args
+    "board_write": (("verb", str), ("ref", int), ("value", str)),
     "finish": (("summary", str),),
 }
 
@@ -2404,10 +2468,17 @@ def _validate_lead_action(raw, team_members: list, action_count: int) -> dict:
     separate early-exit path needed by callers.
 
     Categories (docs/spec.md "Shape robustness"):
-      unknown_tool        -- raw["tool"] not one of the four names
+      unknown_tool        -- raw["tool"] not one of the six names
       missing_args         -- a tool-required key absent from raw["args"]
       wrong_type            -- an arg present but the wrong JSON type
       not_a_dict            -- raw itself, or raw["args"], isn't an object
+      unknown_verb          -- board_write.verb not one of the three known
+                              verbs (backlog item 7 part 1, docs/spec.md
+                              "Edge cases" -- malformed-shape, same as
+                              unknown_tool, not a business rule)
+      value_too_long        -- board_write.value exceeds
+                              TEAM_BOARD_WRITE_VALUE_MAX_CHARS (malformed
+                              shape, same family as the above)
       agent_not_on_team    -- delegate.agent not in team_members (valid
                               shape, invalid *value* -- NOT malformed)
       premature_finish     -- finish with action_count == 0 (valid shape,
@@ -2425,7 +2496,8 @@ def _validate_lead_action(raw, team_members: list, action_count: int) -> dict:
     tool = raw.get("tool")
     if tool not in _LEAD_TOOL_REQUIRED_ARGS:
         return {"ok": False, "reason": "unknown_tool",
-                "detail": f"unknown tool {tool!r}; valid tools are delegate, fact_check, ask_user, finish"}
+                "detail": f"unknown tool {tool!r}; valid tools are delegate, fact_check, ask_user, "
+                         "board_read, board_write, finish"}
     args = raw.get("args")
     if not isinstance(args, dict):
         return {"ok": False, "reason": "not_a_dict", "detail": f"{tool}'s args is not a JSON object"}
@@ -2444,6 +2516,23 @@ def _validate_lead_action(raw, team_members: list, action_count: int) -> dict:
             return {"ok": False, "reason": "wrong_type", "detail": "ask_user.multi_select must be a boolean"}
         if "header" in args and not isinstance(args["header"], str):
             return {"ok": False, "reason": "wrong_type", "detail": "ask_user.header must be a string"}
+    if tool == "board_read":
+        if "ref" in args and args["ref"] is not None and not isinstance(args["ref"], int):
+            return {"ok": False, "reason": "wrong_type", "detail": "board_read.ref must be an int"}
+        if "query" in args and args["query"] is not None and not isinstance(args["query"], str):
+            return {"ok": False, "reason": "wrong_type", "detail": "board_read.query must be a string"}
+    if tool == "board_write":
+        if args["verb"] not in _BOARD_WRITE_VERBS:
+            valid = ", ".join(sorted(_BOARD_WRITE_VERBS))
+            return {"ok": False, "reason": "unknown_verb",
+                    "detail": f"unknown verb {args['verb']!r}; valid verbs are {valid}"}
+        if args["ref"] <= 0:
+            return {"ok": False, "reason": "wrong_type", "detail": "board_write.ref must be a positive int"}
+        if len(args["value"]) > TEAM_BOARD_WRITE_VALUE_MAX_CHARS:
+            return {"ok": False, "reason": "value_too_long",
+                    "detail": f"board_write.value exceeds {TEAM_BOARD_WRITE_VALUE_MAX_CHARS} chars"}
+        if "note" in args and args["note"] is not None and not isinstance(args["note"], str):
+            return {"ok": False, "reason": "wrong_type", "detail": "board_write.note must be a string"}
     if tool == "delegate" and args["agent"] not in team_members:
         members_str = ", ".join(team_members) if team_members else "(none)"
         return {"ok": False, "reason": "agent_not_on_team",
@@ -2567,15 +2656,46 @@ def _append_history(state: dict, round_n: int, *, tool, args_summary: str, outco
         _append_transcript(state["run_id"], kind, text, meta)
 
 
-def _write_inbox(state: dict, args: dict) -> None:
-    """Exact §4.5 shape: question, header (<=12 chars, silently truncated --
-    cosmetic, never worth spending retry budget on), 2-4 options each
-    {label, description}, multi_select."""
+def _write_ask_user_inbox(state: dict, args: dict) -> None:
+    """Exact §4.5 shape (renamed from _write_inbox, backlog item 7 part 1,
+    docs/spec.md §4: inbox.json is now generalized with a "kind"
+    discriminator, "ask_user" for this shape): question, header (<=12
+    chars, silently truncated -- cosmetic, never worth spending retry
+    budget on), 2-4 options each {label, description}, multi_select. Every
+    field but the new "kind" is byte-for-byte unchanged from before this
+    rename."""
     inbox = {
+        "kind": "ask_user",
         "question": args.get("question", ""),
         "header": (args.get("header") or "")[:12],
         "options": args.get("options") or [],
         "multi_select": bool(args.get("multi_select", False)),
+    }
+    d = _run_dir(state["run_id"])
+    os.makedirs(d, exist_ok=True)
+    path = _inbox_path(state["run_id"])
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(inbox, f, indent=2)
+    os.replace(tmp, path)
+
+
+def _write_board_inbox(state: dict, verb: str, ref: int, value: str, note, current_value: dict) -> None:
+    """Sibling of _write_ask_user_inbox() -- kind="board_write" shape
+    (backlog item 7 part 1, docs/spec.md §4). Same tmp-file + os.replace()
+    atomic-write pattern, same _inbox_path(). `current_value` is a
+    display-only snapshot (read via one get_userstory() call at proposal
+    time) -- never reused as the `version` passed to the actual write,
+    which resolve_board_write() always fetches fresh immediately before
+    applying (docs/spec.md's own optimistic-concurrency requirement)."""
+    inbox = {
+        "kind": "board_write",
+        "verb": verb,
+        "ref": ref,
+        "value": value,
+        "note": note,
+        "current_value": current_value,
+        "proposed_at": _now_iso(),
     }
     d = _run_dir(state["run_id"])
     os.makedirs(d, exist_ok=True)
@@ -2614,7 +2734,7 @@ def _force_ask_user(state: dict, *, question: str, header: str, status: str = "b
             ],
             "multi_select": False,
         }
-        _write_inbox(state, args)
+        _write_ask_user_inbox(state, args)
         _append_history(state, round_n, tool="ask_user", args_summary=f'ask_user("{question[:60]}")',
                         outcome_summary="forced escalation, awaiting human",
                         full_result_text=question, log_path=None,
@@ -2840,12 +2960,96 @@ def team_step(state: dict, *, cancel_event: threading.Event = None) -> dict:
                             ("tool_result", result_text, {"found": result["found"]}),
                         ])
     elif tool == "ask_user":
-        _write_inbox(state, args)
+        _write_ask_user_inbox(state, args)
         state["status"] = "blocked_ask_user"
         _append_history(state, round_n, tool="ask_user", args_summary=f'ask_user("{args["question"][:60]}")',
                         outcome_summary="blocked, awaiting human",
                         full_result_text=json.dumps(args), log_path=None,
                         transcript_entries=[("tool_use", args["question"], {"header": args.get("header")})])
+    elif tool == "board_read":
+        # backlog item 7 part 1, docs/spec.md §3: executes and persists in
+        # the SAME round, exactly like fact_check -- never blocks. Any
+        # TaigaPushError (not configured, unreachable, no such ref) is
+        # caught and turned into an ordinary round outcome, never raised.
+        ref = args.get("ref")
+        query = args.get("query")
+        args_summary = f"board_read(ref={ref}, query={query!r})"
+        try:
+            base_url, token, project_id = taiga_board.resolve_session()
+            if ref is not None:
+                result = taiga_board.get_userstory(base_url, token, project_id, ref)
+            else:
+                result = taiga_board.list_userstories(base_url, token, project_id, query=query)
+        except taiga_board.TaigaPushError as e:
+            state["action_count"] += 1
+            detail = f"Taiga error: {e}"
+            _append_history(state, round_n, tool="board_read", args_summary=args_summary,
+                            outcome_summary=detail, full_result_text=detail, log_path=None,
+                            transcript_entries=[("tool_use", args_summary, {}),
+                                                ("tool_result", detail, {"ok": False})])
+            _persist(state)
+            return state
+        state["action_count"] += 1
+        result_text = json.dumps(result)
+        _append_history(state, round_n, tool="board_read", args_summary=args_summary,
+                        outcome_summary="ok", full_result_text=result_text, log_path=None,
+                        transcript_entries=[("tool_use", args_summary, {}),
+                                            ("tool_result", result_text, {"ok": True})])
+    elif tool == "board_write":
+        # backlog item 7 part 1, docs/spec.md §3: never calls Taiga's write
+        # API itself -- queues a proposal in inbox.json (kind="board_write")
+        # and blocks the run, mirroring the ask_user branch immediately
+        # above. `current_value` is read via one get_userstory() call made
+        # HERE, at proposal time, for DISPLAY only -- resolve_board_write()
+        # always re-fetches a fresh `version` immediately before the actual
+        # write, never this snapshot.
+        verb, ref, value = args["verb"], args["ref"], args["value"]
+        note = args.get("note")
+        args_summary = f"board_write({verb}, ref={ref})"
+        if state["status"] != "running":
+            # Should be unreachable -- team_run()'s own loop only calls
+            # team_step() while status == "running" -- but cheap to assert
+            # defensively, same posture as app.py's own "already running"
+            # check on POST /team/resolve. Business-rule outcome, NOT
+            # malformed -- matches agent_not_on_team's own precedent.
+            state["malformed_retries"] = 0
+            detail = (f"a board_write or ask_user is already pending for this run "
+                     f"(status={state['status']})")
+            _append_history(state, round_n, tool="board_write", args_summary=args_summary,
+                            outcome_summary=f"rejected: {detail}", full_result_text=detail, log_path=None,
+                            transcript_entries=[("status", detail, {"reason": "board_write_already_pending"})])
+            _persist(state)
+            return state
+        try:
+            base_url, token, project_id = taiga_board.resolve_session()
+            current = taiga_board.get_userstory(base_url, token, project_id, ref)
+        except taiga_board.TaigaPushError as e:
+            # Never queues a proposal on a snapshot failure (bad ref,
+            # unreachable Taiga) -- fed back as an ordinary round outcome so
+            # the lead can retry or ask_user instead (docs/spec.md
+            # "Proposed approach" §3).
+            state["action_count"] += 1
+            detail = f"Taiga error: {e}"
+            _append_history(state, round_n, tool="board_write", args_summary=args_summary,
+                            outcome_summary=detail, full_result_text=detail, log_path=None,
+                            transcript_entries=[("tool_use", args_summary, {}),
+                                                ("tool_result", detail, {"ok": False})])
+            _persist(state)
+            return state
+        if verb == "set_status":
+            current_value = {"status_id": current["status_id"], "status_name": current["status_name"]}
+        elif verb == "amend_description":
+            current_value = {"description": current["description"]}
+        else:  # append_comment -- no single "current value" to snapshot
+            current_value = {}
+        _write_board_inbox(state, verb, ref, value, note, current_value)
+        state["status"] = "blocked_board_write"
+        _append_history(state, round_n, tool="board_write", args_summary=args_summary,
+                        outcome_summary="blocked, awaiting board-write approval",
+                        full_result_text=json.dumps({"verb": verb, "ref": ref, "value": value,
+                                                     "note": note, "current_value": current_value}),
+                        log_path=None,
+                        transcript_entries=[("tool_use", args_summary, {"verb": verb, "ref": ref})])
     else:  # finish
         state["status"] = "finished"
         state["summary"] = args["summary"]
@@ -3548,11 +3752,12 @@ def latest_run_for_project(project_name: str) -> dict | None:
     The persisted state dict of the most-recently-updated run recorded for
     this project_name, or None if no run has ever been launched for it
     (backlog item 6d part 2a). At most one run can be non-terminal (status
-    in running/blocked_ask_user) at a time -- launch_team()'s own
-    session-name collision check (part 1) -- so when a live run exists it
-    is always also the most recent; callers that only care about a LIVE run
-    check `.get("status") in ("running", "blocked_ask_user")` on the
-    result rather than needing a separate function. Same O(all runs under
+    in running/blocked_ask_user/blocked_board_write, the last added by
+    backlog item 7 part 1) at a time -- launch_team()'s own session-name
+    collision check (part 1) -- so when a live run exists it is always also
+    the most recent; callers that only care about a LIVE run check
+    `.get("status") in ("running", "blocked_ask_user", "blocked_board_write")`
+    on the result rather than needing a separate function. Same O(all runs under
     _leads_root()) scan idiom sweep_dead_teams() already uses (docs/spec.md
     "Non-goals" -- accepted at this project's scale). An unreadable/corrupt
     run.json for one run_id is skipped, not fatal, matching sweep_dead_
@@ -3595,14 +3800,17 @@ def sweep_dead_teams() -> list:
     _leads_root() with a project_name (a bare team-start that skipped
     team-launch has no team session/worktrees to sweep -- skipped entirely):
 
-      1. status in (running, blocked_ask_user) but the team-<project>
-         session is gone (tmux_has() false) -- crash/reboot: mark
-         status="error", error naming what was observed, persist, and STOP
-         for this run_id this pass (does not fall through to step 2 in the
-         SAME call -- "now terminal" means eligible starting the NEXT sweep
-         pass, matching the acceptance criterion's own two-pass sequence:
-         crash-detection first, worktree/session sweep only on a
-         subsequent call).
+      1. status in (running, blocked_ask_user, blocked_board_write) but the
+         team-<project> session is gone (tmux_has() false) -- crash/reboot:
+         mark status="error", error naming what was observed, persist, and
+         STOP for this run_id this pass (does not fall through to step 2 in
+         the SAME call -- "now terminal" means eligible starting the NEXT
+         sweep pass, matching the acceptance criterion's own two-pass
+         sequence: crash-detection first, worktree/session sweep only on a
+         subsequent call). blocked_board_write (backlog item 7 part 1,
+         docs/spec.md §4) joins blocked_ask_user here for the identical
+         reason: it's also a normal, expected stopping point where nothing
+         is "in progress", not a live-processing status.
       2. status in (finished, escalated_max_rounds, error, stopped) AND age
          since updated_at > TEAM_SESSION_STALE_TTL_SECONDS -- sweep: kill
          the session if still present, attempt _remove_worktree() for every
@@ -3610,12 +3818,12 @@ def sweep_dead_teams() -> list:
          run.json/transcript.jsonl in place (matches TEAM_HEADLESS_STALE_
          RUN_TTL_SECONDS's own precedent -- the state RECORD persists, only
          the live session/worktrees are reclaimed).
-      3. status == "blocked_ask_user" is NEVER swept by TTL, at any age
-         (docs/spec.md "Open questions" -- settled by the user: no backstop
-         TTL this cycle) -- its session/worktrees stay alive so a human can
-         `tmux attach` for context before answering, same reasoning
-         docs/spec.md "Resolved from docs/story.md §5's own open notes"
-         already gives.
+      3. status in ("blocked_ask_user", "blocked_board_write") is NEVER
+         swept by TTL, at any age (docs/spec.md "Open questions" -- settled
+         by the user: no backstop TTL this cycle) -- its session/worktrees
+         stay alive so a human can `tmux attach` for context before
+         answering/resolving, same reasoning docs/spec.md "Resolved from
+         docs/story.md §5's own open notes" already gives.
 
     Returns a list of {run_id, action, detail} for team-reap's own printed
     report. Never raises -- a corrupt/missing run.json for one run_id is
@@ -3641,7 +3849,7 @@ def sweep_dead_teams() -> list:
         status = state.get("status")
         session = _team_session_name(project_name)
 
-        if status in ("running", "blocked_ask_user"):
+        if status in ("running", "blocked_ask_user", "blocked_board_write"):
             if not tmux_has(session):
                 state["status"] = "error"
                 state["error"] = f"team session '{session}' is gone (crash or reboot)"
@@ -3874,6 +4082,122 @@ def resolve_ask_user(run_id: str, answer: str) -> dict:
     return {"ok": True, "state": state}
 
 
+def resolve_board_write(run_id: str, action: str) -> dict:
+    """
+    Resume half of board_write's blocking shape (backlog item 7 part 1,
+    docs/spec.md §4), living right next to resolve_ask_user() and reusing
+    its exact race-safety shape byte-for-byte -- see that function's own
+    docstring (immediately above) for the full history of why each of
+    these three properties matters (found live, across three separate
+    races, during 6f part 1/1b): (1) state is always reloaded fresh from
+    disk, never a caller-supplied dict, so two concurrent resolves for the
+    same run race safely; (2) `os.replace(inbox_path, inbox_resolved_path)`
+    is the SOLE atomic arbiter of "who won" -- inbox.json's own content
+    (verb/ref/value) is read BEFORE the os.replace() call (needed to know
+    what to apply), but nothing derived from it is ACTED on -- no Taiga
+    call, no history entry -- until AFTER os.replace() has already
+    succeeded, so a losing concurrent caller can never trigger a real Taiga
+    write and leaves zero trace in transcript.jsonl; (3) the history/
+    transcript entry is appended only after that same successful replace.
+
+    `action` is "approve" or "reject" -- unlike resolve_ask_user(), there is
+    no free-text argument here (the proposed change is already fully
+    specified by the pending inbox.json itself; the human's only input is
+    the accept/reject decision).
+
+    - status != "blocked_board_write" -> {"ok": False, "error": ...}, same
+      shape/wording convention as resolve_ask_user()'s own two error
+      messages.
+    - action not in ("approve", "reject") -> {"ok": False, "error": ...}
+      before anything is touched on disk.
+    - action == "reject": no Taiga call at all. History entry:
+      tool="board_write_resolved", outcome_summary="rejected by human".
+    - action == "approve": calls taiga_board.get_userstory() for a FRESH
+      `version` (never the proposal-time snapshot in inbox.json's own
+      current_value), then the matching taiga_board.set_status()/
+      amend_description()/append_comment() call -- set_status additionally
+      resolves inbox.json's own human-readable `value` (e.g. "In progress")
+      to the numeric status id that call requires, via
+      taiga_board.list_userstory_statuses() (docs/spec.md "status_id for
+      set_status": "the apply step uses the id"). On success: history entry
+      outcome_summary="approved and applied", full_result_text includes the
+      Taiga response. On ANY taiga_board.TaigaPushError (network failure,
+      stale version/conflict, vanished ref, or no such status name on this
+      board): history entry outcome_summary=f"approved but Taiga rejected
+      the write: {detail}" -- the inbox is STILL resolved and the run STILL
+      resumes (never left permanently stuck on a Taiga outage or a conflict
+      a human already approved past); the lead sees the failure next round.
+    - Either branch: state["status"] = "running", persist, return
+      {"ok": True, "state": state} -- identical return shape to
+      resolve_ask_user() so a caller (the CLI's own team-board-resolve, or
+      a future web route) can reuse the exact same "resume driving the
+      loop" dispatch both already share.
+    """
+    try:
+        state = _load_state(run_id)
+    except FileNotFoundError:
+        return {"ok": False, "error": f"no such run_id: {run_id}"}
+    if state.get("status") != "blocked_board_write":
+        return {"ok": False,
+                "error": f"run {run_id} is not blocked on board_write (status={state.get('status')})"}
+    if action not in ("approve", "reject"):
+        return {"ok": False, "error": f"invalid action: {action!r} (must be 'approve' or 'reject')"}
+
+    inbox_path = _inbox_path(run_id)
+    try:
+        with open(inbox_path) as f:
+            inbox = json.load(f)
+    except (OSError, ValueError):
+        inbox = {}
+
+    try:
+        os.replace(inbox_path, _inbox_resolved_path(run_id))
+    except OSError:
+        try:
+            status_now = _load_state(run_id).get("status", "unknown")
+        except (OSError, ValueError):
+            status_now = "unknown"
+        return {"ok": False,
+                "error": f"run {run_id} is not blocked on board_write (status={status_now})"}
+
+    verb, ref, value = inbox.get("verb"), inbox.get("ref"), inbox.get("value")
+    round_n = len(state["history"]) + 1
+    if action == "reject":
+        outcome_summary = "rejected by human"
+        full_result_text = "rejected by human"
+        transcript_entries = [("tool_result", full_result_text, {"resolved": True, "approved": False})]
+    else:
+        try:
+            base_url, token, project_id = taiga_board.resolve_session()
+            current = taiga_board.get_userstory(base_url, token, project_id, ref)
+            us_id, version = current["id"], current["version"]
+            if verb == "set_status":
+                statuses = taiga_board.list_userstory_statuses(base_url, token, project_id)
+                target = next((s for s in statuses if str(s.get("name", "")).strip().lower()
+                              == str(value).strip().lower()), None)
+                if target is None:
+                    raise taiga_board.TaigaPushError(f"no such status on this board: {value!r}")
+                result = taiga_board.set_status(base_url, token, us_id, version, target["id"])
+            elif verb == "amend_description":
+                result = taiga_board.amend_description(base_url, token, us_id, version, value)
+            else:  # append_comment
+                result = taiga_board.append_comment(base_url, token, us_id, version, value)
+            outcome_summary = "approved and applied"
+            full_result_text = json.dumps(result)
+        except taiga_board.TaigaPushError as e:
+            outcome_summary = f"approved but Taiga rejected the write: {e}"
+            full_result_text = outcome_summary
+        transcript_entries = [("tool_result", full_result_text, {"resolved": True, "approved": True})]
+
+    _append_history(state, round_n, tool="board_write_resolved",
+                    args_summary=f"board_write_resolved(verb={verb}, ref={ref})",
+                    outcome_summary=outcome_summary, full_result_text=full_result_text, log_path=None,
+                    transcript_entries=transcript_entries)
+    state["status"] = "running"
+    _persist(state)
+    return {"ok": True, "state": state}
+
+
 # ─── CLI ────────────────────────────────────────────────────────────────
 def _tail_log_once(log_path: str, offset: int) -> int:
     try:
@@ -3942,10 +4266,12 @@ def _cli_roster(args: argparse.Namespace) -> int:
 
 
 def _team_exit_code(status: str) -> int:
-    # "blocked_ask_user" is a normal, expected stopping point (a human needs
-    # to answer), not a failure -- same reasoning "cancelled" isn't treated
-    # as ok=False's own failure category in agent_run()'s result shape.
-    return 0 if status in ("finished", "blocked_ask_user") else 1
+    # "blocked_ask_user"/"blocked_board_write" (the latter added by backlog
+    # item 7 part 1) are both normal, expected stopping points (a human
+    # needs to answer/approve), not a failure -- same reasoning "cancelled"
+    # isn't treated as ok=False's own failure category in agent_run()'s
+    # result shape.
+    return 0 if status in ("finished", "blocked_ask_user", "blocked_board_write") else 1
 
 
 def _drive_and_report(state: dict) -> int:
@@ -4029,6 +4355,23 @@ def _cli_team_resolve(args: argparse.Namespace) -> int:
     via _drive_and_report() on success.
     """
     result = resolve_ask_user(args.run_id, args.answer)
+    if not result["ok"]:
+        print(f"error: {result['error']}", file=sys.stderr)
+        return 1
+    return _drive_and_report(result["state"])
+
+
+def _cli_team_board_resolve(args: argparse.Namespace) -> int:
+    """
+    Thin CLI wrapper over resolve_board_write() (backlog item 7 part 1,
+    docs/spec.md §5), mirroring _cli_team_resolve()'s own shape exactly: on
+    success, drives the resumed run to its next stopping point via
+    _drive_and_report(); on failure, prints the shaped error and exits 1.
+    This is part 1's own only human-facing surface -- zero app.py/web
+    involvement, matching 6f part 1's identical "CLI-testable, no web UI
+    yet" precedent for the ask_user escalation.
+    """
+    result = resolve_board_write(args.run_id, args.action)
     if not result["ok"]:
         print(f"error: {result['error']}", file=sys.stderr)
         return 1
@@ -4156,6 +4499,12 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p_team_resolve.add_argument("--answer", required=True,
                                 help="Label or free text answering the pending question.")
 
+    p_team_board_resolve = sub.add_parser("team-board-resolve", help="Approve or reject a "
+                                          "pending board_write proposal and resume the run "
+                                          "(backlog item 7 part 1).")
+    p_team_board_resolve.add_argument("--run-id", required=True)
+    p_team_board_resolve.add_argument("--action", required=True, choices=["approve", "reject"])
+
     p_team_resume = sub.add_parser("team-resume", help="Resume a running/crashed run "
                                    "from persisted state, not from memory.")
     p_team_resume.add_argument("run_id")
@@ -4206,6 +4555,8 @@ def main(argv=None) -> int:
             return _cli_team_status(args)
         if args.command == "team-resolve":
             return _cli_team_resolve(args)
+        if args.command == "team-board-resolve":
+            return _cli_team_board_resolve(args)
         if args.command == "team-resume":
             return _cli_team_resume(args)
         if args.command == "team-launch":
