@@ -532,6 +532,38 @@ partial failure or concurrency. Carried forward:
   Installs nothing locally, and refuses to point at an endpoint it cannot
   reach rather than writing config that fails later at team start.
 
+**Part 2 status: done** (both sub-cycles reviewer-approved: 2a round 2
+`docs/test-review.md`, 2b `docs/test-review.md`). Part 2a (web routes,
+background driving thread, cooperative cancellation) needed one round-2
+fix beyond round 1's own must-fix: a second, more severe race in
+`_create_team_session()`'s own failure-cleanup path (a legitimately-created
+session destroyed by an unrelated caller's cleanup, 20/20 in the developer's
+own repro and the reviewer's independent one) — fixed by making session
+creation + `remain-on-exit` + run-id stamping one atomic `;`-chained tmux
+invocation. Part 2b (`install.sh --with-ollama` as a link step) approved
+clean on its first round. Carried forward, none blocking:
+
+- **`set_env()`'s unescaped `sed` upsert can abort `install.sh` or corrupt
+  config on a re-run** whose value contains a literal `|` or `&` — found by
+  the part 2b reviewer, pre-existing in a shared helper that cycle didn't
+  otherwise touch. Recorded as `docs/BACKLOG.md` item 10 rather than fixed
+  inline; narrow trigger (an operator-supplied `TEAM_LLM_BASE_URL`/model tag
+  containing one of those characters), not folded into 6e since 6e doesn't
+  touch `install.sh`.
+- **`docs/design.md`'s WCAG contrast section still doesn't analyze
+  `.team-sub`** (the "Lead is waiting for input" subtitle, `#888` on
+  `#1c1c1c`) — passes AA at 4.81:1 (independently computed by the reviewer
+  twice, unchanged across both review rounds) but only barely, and fails
+  AAA. Documentation-accuracy gap only, not a shipped-code defect; flagged
+  again here so it isn't rediscovered from scratch.
+- **Cooperative-cancellation worst-case latency is ≈25.5s**, not the
+  part 2a spec's own stated ~20s — the gap is `_run_headless_session()`'s
+  pre-existing, uncancellable 5s pid-wait ceiling plus one poll interval,
+  both omitted from the spec's original math. Bounded and rarely material
+  in practice (a real process backgrounding and writing its own pid
+  typically takes milliseconds); not a regression, just a documentation
+  correction worth carrying forward.
+
 ### 6e — Roster & composition UI
 
 **Deliverable.** A settings screen listing every roster member — `engines.d`
