@@ -2306,3 +2306,250 @@ print(app.detect_project_origin('<a project name under PROJECTS_DIR>'))
 # Confirm 'local' for a Gitea-created project, 'github' (with owner/repo)
 # for one cloned from github.com, 'none' for a project with no origin.
 ```
+
+---
+
+# Implementation: Backlog item 18 -- HTTP-level smoke check ("Smoke check" button)
+
+## Summary
+Added a manual, per-project "Smoke check" button that makes a single
+in-process `urllib.request` GET against that project's own already-captured
+hosted dev-server URL (`_session_urls`, the same source `/status`'s own
+`url` field already reads) and reports status code, elapsed time in
+milliseconds, and an optional response-body substring check -- an honest,
+dependency-free HTTP-level health check, explicitly not real browser
+QA/testing automation (no JS execution, no rendering, no DOM interaction).
+This is the buildable increment of backlog item 18, following the
+reconciliation `docs/spec.md`'s "Background" section documents (cross-model
+review already shipped as item 8; a security-audit skill already exists as
+the `claude-security` plugin; real browser QA stays blocked pending a
+Chromium/Bun decision the user explicitly declined this round).
+
+## Changes by file
+- `app/app.py`:
+  - Two new env-configurable constants, `SMOKE_CHECK_TIMEOUT_SECONDS`
+    (default `10`) and `SMOKE_CHECK_MAX_BODY_BYTES` (default `65536`),
+    added next to `AI_REVIEWER_STATE_FILE` following the existing
+    `int(os.environ.get(...))` pattern.
+  - `_smoke_check_locks`/`_smoke_check_lock_for()` -- a per-project
+    non-blocking `threading.Lock` guard, identical shape to
+    `_deploy_locks`/`_deploy_lock_for()`, placed directly after
+    `deploy_run()`.
+  - `smoke_check_run(name, expect_contains) -> dict` -- the dispatch
+    function itself (docstring covers the full return-shape contract).
+    Looks up `_session_urls.get(name)` (returns a clean `ok: False` dict
+    immediately if absent, before the lock is even touched); acquires the
+    per-project lock non-blocking (returns a dict with an internal-only
+    `"locked": True` marker on contention -- see "Key decisions" below);
+    times a `urllib.request.urlopen(url, timeout=SMOKE_CHECK_TIMEOUT_SECONDS)`
+    call with `time.monotonic()`; reads at most
+    `SMOKE_CHECK_MAX_BODY_BYTES` of the body; treats `HTTPError` as a
+    *completed* check (the target's real status code, not a mechanism
+    failure); catches `URLError`/bare `TimeoutError`/`ConnectionRefusedError`
+    (both wrapped-in-`URLError.reason` and bare shapes -- see "Key
+    decisions") as a clean transport failure; decodes the body
+    `errors="ignore"` before the substring check, so `content_ok` is
+    `None` (never `False`) when `expect_contains` is empty.
+  - New route `POST /projects/<name>/smoke-check`, added right before the
+    final `else: 404` fallback in the POST dispatch chain, after
+    `/projects/<name>/team/interject`. Validates the project name (404 if
+    unknown), reads and trims `expect_contains` from the body (coerced to
+    `""` if missing or non-string), calls `smoke_check_run()`, pops the
+    internal `"locked"` marker to decide 409 vs. 200.
+  - Frontend (inline `<script>`/`<style>` inside `render_page()`):
+    `smokeCheckExpect` (per-project client-state map, survives `refresh()`
+    re-renders, mirrors `teamTaskText`), `smokeCheckRow(name, url)` (mirrors
+    `deployRow()`'s "return '' if not present" shape, gated on `url` not
+    `deploy`), wired into `row()` right after `codeRow()`/before
+    `deployRow()`; `doSmokeCheck(name)` (mirrors `doDeploy()`'s
+    `toggle()`/`performAction()`/`handleActionResult()` plumbing --
+    including the shared TOTP code-overlay retry path -- but with **no**
+    `confirm()` call); `actionPath()`/`actionBody()` gained a
+    `'smoke-check'` branch each; `handleActionResult()` gained a
+    `kind === 'smoke-check'` branch (renders into `.smoke-check-msg`,
+    reading `data.ok` not `r.ok` -- see "Key decisions") and a
+    `kind === 'smoke-check'` case in the 428 code-overlay label ternary.
+    New CSS: `.smoke-check-row`, `.smoke-check-row input`, `.smoke-btn`
+    (own class, `#4da6ff`/`#111` -- see "Key decisions"), `.smoke-check-msg`
+    (+ `.success`/`.error` variants, same shape as `.deploy-msg`).
+- `config/switchboard.env.example`: new "HTTP-level smoke check (backlog
+  item 18)" section documenting both new env vars, placed right after the
+  existing deploy-dispatch section's `DEPLOY_KEYS_DIR` block.
+- `tests/test_smoke_check.py` (new): `SmokeCheckLockTests`
+  (`_smoke_check_lock_for()`'s per-project identity), `SmokeCheckRunTests`
+  (`smoke_check_run()` exercised against *real* local `http.server`
+  instances and raw sockets -- no `urllib` mocking anywhere in this class,
+  matching `tests/test_deploy_dispatch.py`'s own "provision something real"
+  philosophy scaled down to a local server/socket since no privileged
+  receiver is needed here), `SmokeCheckEndpointTests` (route-level 404/428/
+  409/200 contract against a real `ThreadingHTTPServer`, `smoke_check_run`
+  monkeypatched, same technique as `DeployEndpointTests`). 25 tests total.
+- `tests/test_smoke_check_frontend.js` (new): button visibility, the no-
+  `confirm()` dispatch path, `expect_contains` surviving a `refresh()`
+  re-render, all three result-rendering shapes (success/no-check,
+  content-found, content-not-found-but-still-200), a connection-refused
+  failure, 409 lock contention, and the 428 TOTP-retry path -- same
+  extract-the-real-`<script>`-and-run-it-in-`vm` technique as
+  `tests/test_deploy_frontend.js`. 10 tests total.
+
+## Key decisions / tradeoffs
+- **`smoke_check_run()`'s lock-contention return uses an internal-only
+  `"locked": True` dict key, not a `(status, dict)` tuple.** `docs/spec.md`
+  types the function as `-> dict` (unlike `deploy_run()`'s own `-> tuple`)
+  but also says "the route returns 409" on contention -- the function
+  itself has no HTTP-status concept in its return type. Resolved by having
+  the route `pop("locked", False)` before ever sending the dict to the
+  client, so the marker never leaks over the wire (covered by
+  `test_smoke_check_post_lock_contention_surfaces_as_409`'s explicit
+  `assertNotIn("locked", payload)`). This is my own reading of a spec detail
+  the text left slightly underspecified, not a deviation from anything the
+  spec explicitly required.
+- **Two exception shapes for the same underlying failure, both handled.**
+  Verified empirically (not assumed) that `urlopen()` raises a *bare*
+  `TimeoutError` for a connect/header-phase timeout on this Python version,
+  while a connection refusal comes wrapped as
+  `URLError(reason=ConnectionRefusedError(...))` -- see the two `python3 -c`
+  probes referenced in "How to verify locally" below. `smoke_check_run()`
+  unwraps `e.reason` only when `e` is a `URLError`, else treats the caught
+  exception itself as the reason, so both shapes map to the same two
+  error-message branches ("timed out after Ns" / "connection refused").
+  `test_timeout_returns_within_roughly_the_configured_bound` uses a raw
+  listening socket that accepts but never writes a byte back (not a mock)
+  specifically because the spec's own risk note called out testing the
+  real timeout path, not trusting the stdlib parameter alone.
+- **`.smoke-btn` reuses `#4da6ff`/`#111`** (the same pairing
+  `.pill.code-pill.active` already ships), not `.deploy-btn`/`.team-btn`'s
+  green -- independently computed via WCAG relative luminance (see below)
+  at **7.39:1**, comfortably passing AA's 4.5:1 minimum, rather than
+  assumed safe by association with item 20's already-fixed green pairing.
+  A brand-new class was chosen deliberately (not a reuse of `.deploy-btn`)
+  so this control's color is never silently coupled to a future change to
+  the deploy/team green.
+- **`handleActionResult()`'s `kind === 'smoke-check'` branch reads
+  `data.ok`, not `r.ok`.** The route answers HTTP 200 for both a
+  successfully *completed* check (target reachable, any status code) and a
+  target-side failure (connection refused/timeout) alike -- only 404
+  (unknown project) and 409 (lock contention) are non-200. Rendering off
+  `data.ok` (falling back to `data.error`) handles all four shapes
+  correctly with one branch, covered by
+  `test_smoke_check_post_target_side_failure_still_returns_http_200` (Python)
+  and the frontend's own "connection refused" test.
+- **Display text is `"<code> · <ms>ms"`, not the spec's illustrative
+  `"200 OK · 84ms"`.** The backend dict contract (docs/spec.md "Proposed
+  approach") only specifies `status_code`/`elapsed_ms`/`content_ok` keys --
+  no HTTP reason-phrase field -- so rendering a literal `"OK"` word would
+  require either inventing a status-code-to-reason-phrase table client-side
+  or adding an unscoped new field server-side just for cosmetic text. Kept
+  the dict contract exactly as specified and treated the spec's exact
+  wording as an illustrative example, not a literal format requirement
+  (acceptance criteria only requires "displays the status code and an
+  elapsed time in milliseconds", which this satisfies). Noted here rather
+  than silently reinterpreted.
+- **`doSmokeCheck()` routes through the existing `toggle()`/`actionPath()`/
+  `actionBody()`/`handleActionResult()` machinery, not a standalone
+  `fetch()`.** This was not just style-matching: EVERY mutating POST route
+  in this app (including ones with no real on/off concept, like
+  `team-interject`/`team-resolve`) passes through a single shared
+  once-per-session TOTP gate in `do_POST()` before the route dispatch chain
+  runs. A hand-rolled `fetch()` bypassing `toggle()` would get a bare 428
+  on a session's first click with no code-overlay retry logic to recover
+  from it -- a real functional bug, not a stylistic shortcut. Verified by
+  the frontend test's own 428-retry case.
+
+## Deviations from spec
+- **`smoke_check_run()`'s internal `"locked"` dict key** (see "Key
+  decisions" above) -- a concrete resolution of an underspecified detail
+  (the spec names the function's return type as `dict` while also
+  describing a 409-mapping "the route" performs), not a change to any
+  stated behavior. The client-visible contract (dict shapes, HTTP status
+  codes) matches `docs/spec.md`'s "Proposed approach" and every listed
+  acceptance criterion exactly.
+- **Display text omits the literal word "OK"** from the spec's own
+  illustrative `"200 OK · 84ms"` example (see "Key decisions" above) --
+  cosmetic only; the acceptance criteria this maps to ("displays the status
+  code and an elapsed time in milliseconds") are satisfied either way.
+- No other deviations. Redirect-following, non-UTF-8 body decoding, the
+  body-size cap's "truncated prefix only" substring-check limitation, and
+  every other edge case `docs/spec.md` lists are implemented and tested
+  exactly as described.
+
+## Known limitations
+- **Pre-existing, unrelated regression found (not introduced, not fixed)
+  in `tests/test_deploy_frontend.js`.** Backlog item 13 (surviving team
+  branch discoverability, already shipped before this cycle) added an
+  unconditional one-time-per-project `/projects/<name>/team/branches` fetch
+  as a side effect of rendering ANY `kind='inst'` row
+  (`renderTeamBranches()`, called unconditionally from `teamRow()`).
+  `tests/test_deploy_frontend.js` was written before that side effect
+  existed and never drains it, so 4 of its 9 cases now fail with an extra
+  unexpected pending fetch -- confirmed via `git stash` that this failure
+  exists identically at this branch's base commit, before any change this
+  cycle made. This cycle's own new `tests/test_smoke_check_frontend.js`
+  drains that same fetch explicitly in its `setupCase()` helper (see its
+  own header comment) so it isn't affected. Fixing
+  `test_deploy_frontend.js` itself is out of scope for backlog item 18 (a
+  different feature's test file, no code-behavior change needed) --
+  flagged here for a follow-up rather than silently left for the reviewer
+  to rediscover.
+- No configurable HTTP method/headers/auth/body, no scheduling, no
+  persisted history -- all explicit non-goals in `docs/spec.md`, confirmed
+  not built.
+
+## How to verify locally
+```
+# New backend tests (25 tests, real local http.server/sockets, no urllib
+# mocking):
+python3 tests/test_smoke_check.py -v
+# Ran 25 tests ... OK
+
+# New frontend tests (10 tests, real rendered <script> extracted and run
+# in a vm context, no framework):
+node tests/test_smoke_check_frontend.js
+# ALL PASS (10/10)
+
+# No regression in the closest-precedent existing suites (deploy dispatch,
+# AI reviewer, upload -- run alongside this cycle's own new tests):
+python3 -m unittest tests.test_smoke_check tests.test_deploy_dispatch tests.test_ai_reviewer tests.test_upload -v
+# Ran 180 tests ... OK
+
+# All existing frontend suites, unaffected:
+node tests/test_team_frontend.js               # ALL PASS (94/94)
+node tests/test_singleton_toggle_frontend.js    # ALL PASS (15/15)
+node tests/test_clone_frontend.js               # ALL PASS (8/8)
+node tests/test_upload_frontend.js              # ALL PASS (8/8)
+
+# Syntax/compile check:
+python3 -m py_compile app/app.py
+
+# Full `python3 -m unittest discover -s tests` was attempted but not run to
+# completion in this session: this repo's full suite includes several
+# genuinely slow, unrelated real-timeout/e2e-style tests (e.g.
+# tests/test_install_ollama.py's own test_stalling_endpoint_is_bounded_
+# does_not_hang, tests/test_deploy_target.py's PrivilegedEndToEndTests --
+# real sudo/systemd/sshd provisioning) that push total wall-clock time well
+# past 10 minutes in this environment, independent of this cycle's change.
+# Every test observed to complete during two attempted full runs passed
+# (no failure anywhere outside the pre-existing tests/test_deploy_frontend.js
+# regression noted above, which is unrelated to this diff). The targeted
+# runs above are this cycle's actual verification evidence.
+
+# The two empirical exception-shape probes referenced in "Key decisions"
+# above (bare TimeoutError vs. URLError-wrapped ConnectionRefusedError):
+python3 -c "
+import urllib.request
+try:
+    urllib.request.urlopen('http://127.0.0.1:1/', timeout=2)
+except Exception as e:
+    print(type(e), repr(e))
+"
+# -> URLError(ConnectionRefusedError(111, 'Connection refused'))
+
+# Manual smoke test against a real running project's dev server:
+cd app && python3 -c "
+import app
+app._session_urls['some-project'] = 'http://127.0.0.1:3000/'
+print(app.smoke_check_run('some-project', 'expected text'))
+"
+# Confirm {'ok': True, 'status_code': 200, 'elapsed_ms': <int>,
+# 'content_ok': True|False} against a real locally running dev server.
+```

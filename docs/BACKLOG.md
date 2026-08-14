@@ -923,8 +923,90 @@ surface.
 4. Are `gstack`'s own new runtime dependencies acceptable to add to the
    LXC, and via what install mechanism?
 
-Do not re-litigate this finding by re-reading the repo from scratch in a
-future session — start from the questions above.
+**Answered directly by the user (2026-08-14):**
+1. All three named capabilities are wanted: browser QA/testing
+   automation, cross-model code review, AND a security audit skill (not
+   "whole workflow," not "not sure," not a single pick).
+2. gstack's own new runtime dependencies (Bun runtime, Chromium for
+   browser automation, optionally ngrok/Supabase) are **not** acceptable
+   to add to the LXC.
+
+**Reconciled (2026-08-14) — resolved per-capability, not treated as one
+bundled decision, since the two answers pull in different directions for
+different pieces of the ask:**
+
+- **Cross-model code review: already fully shipped, no new code needed.**
+  Verified directly against the actual implementation: `app/teams.py`'s
+  `review_pr_diff()` (backlog item 8) already takes any roster
+  model/engine — an Ollama model or any `engines.d/*.engine` entry, i.e.
+  genuinely cross-model and cross-engine, not Claude-Code-specific —
+  grounds it in the project's own documented conventions
+  (`load_grounding()`), runs it against a PR diff, and the result gets
+  posted as a PR comment via `app/app.py`'s `AI_REVIEWER_*` poll
+  mechanism. This is a closer, more integrated match to "cross-model code
+  review" than anything `gstack` itself offers (gstack has no equivalent
+  cross-model selection — it runs whatever single model the invoking
+  Claude Code session happens to be). The user's request almost certainly
+  predates knowing item 8 — built earlier in this very session — already
+  delivers this. **No second, parallel review mechanism should be built.**
+  Nothing to do here beyond this note.
+
+- **Security audit skill: already covered, at a different layer, no new
+  code needed in this repo.** Verified: the `claude-security` plugin
+  (`claude-plugins-official` marketplace, already installed in the local
+  Claude Code plugin registry — `~/.claude/plugins/marketplaces/
+  claude-plugins-official/plugins/claude-security/`) ships a
+  `skills/claude-security/SKILL.md` with concrete jobs
+  (`scan-codebase.md`, `scan-changes.md`) plus scan/patch/verify
+  sub-agents and report rendering. This is exactly the kind of
+  review-only, audit-only capability this project's own CLAUDE.md already
+  says to route directly to a matching skill rather than build inside a
+  project's own pipeline ("Use a dedicated skill instead of the full
+  pipeline for review-only or audit-only work... Route these to the
+  matching skill (e.g. `security-review`) directly"). It's invocable
+  against `ai-dev-switchboard`'s own codebase, or any other project on
+  this box, today, with zero new code in this repo. Same
+  Claude-Code-only limitation as gstack itself (it's a plugin skill, not
+  a per-engine hook) — but that's an inherent property of "skill" as an
+  extension mechanism, not something worth rebuilding a parallel in-repo
+  audit tool to work around, especially given the user just declined new
+  install-surface dependencies. **Nothing to build here either.**
+
+- **Browser QA/testing automation: the one genuinely novel ask, and
+  genuinely in tension with answer 2.** Real browser QA (JS execution,
+  DOM rendering, click/type interaction, screenshots) fundamentally needs
+  a headless browser engine — there is no way around that; it is not an
+  implementation-detail choice. The user declined exactly that dependency
+  class. **Decision: real browser QA is blocked, full stop, and is not
+  being built as a diminished or misleadingly-named substitute.** What
+  IS honestly buildable without any new dependency: an **HTTP-level smoke
+  check** — status code, response timing, an optional response-body
+  substring assertion — against a project's already-running dev server.
+  Confirmed buildable with zero new install-surface cost: `curl` and
+  `python3` are already installed by `install.sh`'s existing baseline
+  `apt-get install` line (`install.sh:214`), and this codebase's
+  established in-process HTTP convention is already stdlib
+  `urllib.request` (`_gitea_api()`, `_github_api()`, the login/
+  description-LLM calls), so this needs no `curl` subprocess and no
+  third-party library either — genuinely free to add. **This is
+  explicitly NOT "browser QA"** and is named and documented as a smoke
+  check throughout, precisely so it is never confused with, or presented
+  as satisfying, the actual browser-QA ask. Speced this session:
+  `docs/spec.md` — a per-project "Smoke check" button (rendered only when
+  `/status`'s already-captured `url` field is present for that project),
+  one GET request, reports status code + elapsed ms + optional substring
+  match, manual-trigger only, no persisted history, no new runtime
+  dependency.
+
+**Status: reconciled 2026-08-14.** Two of the three requested capabilities
+(cross-model review, security audit) require **no new code in this repo**
+— both are already fully covered, one by this project's own item 8, one
+by an existing Claude Code plugin at a different layer entirely. The
+third (real browser QA) remains genuinely blocked by the user's own
+no-new-runtime-dependencies answer, and is not being faked. The one real,
+honest, buildable increment this reconciliation produced — an HTTP-level
+smoke check, deliberately NOT branded as browser QA — is speced in the
+current `docs/spec.md`, ready to build next.
 
 ---
 
