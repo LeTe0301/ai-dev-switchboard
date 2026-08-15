@@ -1,128 +1,172 @@
-# Spec: ct/create.sh fixes from Proxmox E2E test round 3 (items 31, 32)
+# Spec: taiga-up.sh resilience from Proxmox E2E test round 4 (item 30)
 
 ## Summary
-Two more bugs from the same Proxmox E2E test (`docs/BACKLOG.md` items 31,
-32), both in `ct/create.sh`. Both fully diagnosed with exact repro and a
-clear fix already established by the E2E tester.
+Last item from the Proxmox E2E test (`docs/BACKLOG.md` item 30):
+`taiga-up.sh` has zero resilience to a real, reproduced Docker Compose
+port-bind race that can leave `taiga-gateway` (the stack's only public
+entrypoint) permanently network-less after a transient failure. Root cause
+of the *initial* failure is explicitly NOT fully pinned down by the E2E
+tester (flagged honestly rather than guessed at) — this spec does not
+attempt to fix that. What it does fix: `taiga-up.sh` currently has no way
+to detect this happened, and no retry — one bad pass leaves the feature
+silently, indefinitely broken (correctly reported as "off," not a lying
+UI, but with no automatic path back to "on"). This is a mitigation for the
+*symptom* (a wedged container after a failed attempt), not a fix for
+whatever transient condition first triggers it.
 
 ## Orchestrator note
-No product-manager/ux-designer dispatch — same "fully-diagnosed follow-up"
-precedent as rounds 1/2 (PRs #27, #28).
+No product-manager/ux-designer dispatch. Unlike rounds 1-3, this one does
+involve a real (if narrow) design judgment call — the retry bound and
+backoff shape — but the underlying mechanism (detect-then-retry-then-fail-
+loudly) is fully specified by the E2E report and reuses an already-shipped
+detection pattern (`scripts/taiga-status.sh`'s own `docker compose ps
+taiga-gateway --format '{{.State}}'` check), so this stays a developer+
+reviewer cycle, not a full triage.
 
----
+## Background
+Current `scripts/taiga-up.sh` (13 lines): sources config, `cd`s into
+`$TAIGA_DIR`, and execs one `docker compose up -d` — no state check, no
+retry, no failure signal beyond whatever exit code `docker compose`
+itself returns (which nothing downstream currently inspects).
 
-## Fix 1 — Item 31: raise `DEFAULT_DISK_GB` — 8G fills completely once Gitea + Taiga + code-server are all enabled
-
-**Where**: `ct/create.sh:87`.
-
-**Current**:
+`scripts/taiga-status.sh` already establishes the exact detection idiom to
+reuse:
 ```bash
-DEFAULT_DISK_GB="8"
+state=$(docker compose -f docker-compose.yml -f docker-compose.override.yml \
+    ps taiga-gateway --format '{{.State}}' 2>/dev/null)
+if [ "$state" = "running" ]; then echo "on"; else echo "off"; fi
 ```
 
-**Problem**: following Advanced Install with all four optional features
-enabled and the installer's own default disk size fills the container's
-entire root disk (`df -h /` → 100% used, 0 available). The actual symptom
-a real user hits is not an out-of-space message — it's `taiga-db`'s
-Postgres instance failing to start with `FATAL: could not write init
-file`, giving no hint the real problem is disk space.
+`app/app.py`'s `taiga_run("up")` calls this script with a fixed 90-second
+timeout and does not currently inspect its exit code or stderr (only
+`stdout.strip()` is used, and nothing today captures stdout from
+`taiga-up.sh` — its only output today would be `docker compose`'s own
+noise). This spec's retry loop must fit comfortably inside that 90s
+budget.
 
-**Fix**: raise the default to `20`:
+## Proposed approach
+Rewrite `scripts/taiga-up.sh` to attempt `docker compose up -d`, check
+`taiga-gateway`'s resulting state via the same idiom `taiga-status.sh`
+already uses, and — if not `running` — remove just the gateway container
+and retry, up to a bounded number of attempts, before failing loudly
+(non-zero exit, a clear stderr message) rather than silently leaving
+things broken:
+
 ```bash
-DEFAULT_DISK_GB="20"
-```
-(The E2E report suggested a 20-24G range; 20 is the conservative end of
-that range — enough headroom for all four optional features per the
-report's own measured breakdown (~2.2G base + apt, ~3.9G Docker images/
-volumes for Gitea+Taiga, ~683M for one pipx-installed engine, plus
-working room) without being needlessly large for an installer default
-aimed at a homelab-scale Proxmox host.)
+#!/usr/bin/env bash
+# Root-run wrapper: starts the self-hosted Taiga docker compose stack (see
+# docs/spec.md "Crossing the privilege boundary" -- Docker socket access is
+# root-equivalent, so this is command-narrowing at the sudoers layer instead
+# of RUN_USER/SVC_USER separation).
+#
+# Idempotent: `docker compose up -d` against an already-running stack is a
+# no-op. Item 30 (docs/BACKLOG.md): a real, reproduced Docker Compose
+# port-bind race can leave taiga-gateway -- the stack's only public
+# entrypoint -- created but never network-attached, and a bare `docker
+# start` retry never re-attempts the network-connect step (only a full
+# remove+recreate does). Detects this via the same `docker compose ps
+# taiga-gateway --format '{{.State}}'` idiom scripts/taiga-status.sh
+# already uses, and retries a bounded number of times before failing
+# loudly -- this does not fix whatever transient condition first triggers
+# the race (root cause wasn't pinned down), it makes one bad attempt
+# recoverable instead of silently, indefinitely wedging the feature.
+set -uo pipefail
 
-**Non-goal**: the E2E report also suggests `taiga-up.sh`/`gitea-up.sh`
-could `df`-check the target filesystem before calling `docker compose up`
-and refuse with a clear message instead of letting Postgres's own opaque
-error be the first sign of trouble, and that the storage-pool step could
-size its own suggested default off the pool's live free space. Both are
-real, reasonable follow-ups but are separate, not-yet-scoped features —
-out of scope for this fix, which only raises the static default.
+CONFIG=/etc/ai-dev-switchboard/switchboard.env
+[ -f "$CONFIG" ] && source "$CONFIG"
+TAIGA_DIR="${TAIGA_DIR:-/opt/ai-dev-switchboard-taiga}"
+TAIGA_UP_MAX_ATTEMPTS="${TAIGA_UP_MAX_ATTEMPTS:-3}"
 
-**Acceptance**: `grep 'DEFAULT_DISK_GB=' ct/create.sh` shows `"20"`. No
-behavior change to the Advanced path's own disk-size prompt (still shows
-this as its pre-filled default, still fully editable).
+cd "$TAIGA_DIR" || { echo "taiga-up: $TAIGA_DIR not found" >&2; exit 1; }
 
----
+COMPOSE=(docker compose -f docker-compose.yml -f docker-compose.override.yml)
 
-## Fix 2 — Item 32: filter Proxmox's own per-container firewall bridges out of the live bridge-enumeration menu
-
-**Where**: `ct/create.sh:64-75` (`_enumerate_bridges()`).
-
-**Current**:
-```bash
-_enumerate_bridges() {
-    BRIDGE_MENU_OPTS=()
-    local _br _vnet
-    while IFS= read -r _br; do
-        [ -n "$_br" ] && BRIDGE_MENU_OPTS+=("$_br" "kernel bridge")
-    done < <(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1)
-    if [ -f /etc/pve/sdn/vnets.cfg ]; then
-        while IFS= read -r _vnet; do
-            [ -n "$_vnet" ] && BRIDGE_MENU_OPTS+=("sdn:${_vnet}" "SDN vnet")
-        done < <(awk '/^vnet:/{print $2}' /etc/pve/sdn/vnets.cfg 2>/dev/null)
+attempt=1
+while [ "$attempt" -le "$TAIGA_UP_MAX_ATTEMPTS" ]; do
+    "${COMPOSE[@]}" up -d
+    state=$("${COMPOSE[@]}" ps taiga-gateway --format '{{.State}}' 2>/dev/null)
+    if [ "$state" = "running" ]; then
+        exit 0
     fi
-}
-```
-
-**Problem**: on a host with per-container firewalling enabled, `ip -o link
-show type bridge` also lists the auto-created `fwbrXXXiY` bridges Proxmox
-creates for *other* containers' firewall rules (e.g. `fwbr101i0`,
-`fwbr106i0`) — not just real switch/uplink bridges (`vmbr0`) a new
-container should actually attach to. Picking one of these by mistake would
-create a container with effectively no working uplink. Nothing in the
-current menu distinguishes them from a real bridge.
-
-**Fix**: exclude Proxmox's own fixed `fwbrNNNiM` naming convention (always
-`fwbr` + digits + `i` + digits) from the kernel-bridge loop:
-```bash
-_enumerate_bridges() {
-    BRIDGE_MENU_OPTS=()
-    local _br _vnet
-    while IFS= read -r _br; do
-        [ -n "$_br" ] || continue
-        case "$_br" in
-            fwbr[0-9]*i[0-9]*) continue ;;  # item 32: Proxmox's own per-container firewall bridge, not a real uplink
-        esac
-        BRIDGE_MENU_OPTS+=("$_br" "kernel bridge")
-    done < <(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1)
-    if [ -f /etc/pve/sdn/vnets.cfg ]; then
-        while IFS= read -r _vnet; do
-            [ -n "$_vnet" ] && BRIDGE_MENU_OPTS+=("sdn:${_vnet}" "SDN vnet")
-        done < <(awk '/^vnet:/{print $2}' /etc/pve/sdn/vnets.cfg 2>/dev/null)
+    echo "taiga-up: taiga-gateway didn't come up cleanly (state: ${state:-<none>}), attempt $attempt/$TAIGA_UP_MAX_ATTEMPTS" >&2
+    if [ "$attempt" -lt "$TAIGA_UP_MAX_ATTEMPTS" ]; then
+        "${COMPOSE[@]}" rm -f taiga-gateway >/dev/null 2>&1 || true
+        sleep 2
     fi
-}
-```
-The `case` pattern `fwbr[0-9]*i[0-9]*` matches bash's own glob syntax
-(this file uses `case`/glob patterns elsewhere, e.g. the URL-scheme
-matching in the Advanced path's ollama/clone-adjacent logic — consistent
-with the file's existing idiom, not a new pattern style). Verify it
-matches `fwbr101i0`/`fwbr106i0`/`fwbr107i0` (the report's own examples)
-and does NOT match a real bridge name like `vmbr0` or an operator-named
-bridge like `vmbr1`.
+    attempt=$((attempt + 1))
+done
 
-**Acceptance**: given a host with both `vmbr0` and one or more
-`fwbrNNNiM`-pattern interfaces present (`ip -o link show type bridge`),
-`_enumerate_bridges()`'s resulting `BRIDGE_MENU_OPTS` contains `vmbr0` but
-none of the `fwbrNNNiM` entries.
+echo "taiga-up: taiga-gateway failed to come up after $TAIGA_UP_MAX_ATTEMPTS attempts -- manual intervention needed (check 'docker compose logs taiga-gateway' in $TAIGA_DIR, 'docker network ls', and available disk space)." >&2
+exit 1
+```
+
+Key decisions, stated explicitly since this is the one real judgment call
+in this round:
+- **`TAIGA_UP_MAX_ATTEMPTS=3` default, env-overridable** — matches this
+  project's own established convention (every tunable elsewhere in this
+  codebase is an `os.environ.get(...)`-with-default in Python or
+  `${VAR:-default}` in bash, always overridable, never hardcoded silently).
+  3 attempts × (a `docker compose up -d` call, typically a few seconds for
+  an already-mostly-up stack, + a 2s sleep between retries) comfortably
+  fits inside `taiga_run()`'s existing 90-second timeout in `app/app.py`
+  — do not change that timeout as part of this fix.
+- **`rm -f taiga-gateway` between attempts, not a full stack `down`** —
+  narrowest retry that still forces Compose's full create→connect-
+  network→publish-ports sequence to run again for the one broken
+  container, without disrupting the other 8 already-healthy containers
+  (Postgres, RabbitMQ, etc.) on every retry.
+- **Exit non-zero with a specific, actionable stderr message on final
+  failure** — today's script has no failure signal at all beyond
+  whatever `docker compose` itself returns (unobserved by any caller).
+  This doesn't change `taiga_run()`'s current behavior of not surfacing
+  script stderr to the web UI (out of scope for this fix — see
+  Non-goals) but does mean `journalctl`/direct script invocation now
+  gives an operator a real, specific signal instead of silence.
+
+## Non-goals
+- **Fixing the underlying transient port-bind race's root cause.** Not
+  pinned down by the E2E tester, not guessed at here. This is a mitigation
+  for the resulting wedged state, not a fix for whatever triggers it.
+- **Changing `app/app.py`'s `taiga_run()`** to surface `taiga-up.sh`'s
+  stderr to the web UI, or to change its 90s timeout. A real UX
+  improvement, but the E2E report scoped this fix to the shell script
+  itself; a caller-side surfacing change is a separate, larger decision
+  (does every `taiga_run()` caller in the UI want a verbose failure
+  reason shown, or just the existing on/off toggle state?) not asked for
+  here.
+- **A pre-flight `df` check before `docker compose up`** — a different,
+  already-tracked follow-up (mentioned alongside item 31/`DEFAULT_DISK_GB`
+  in the E2E report), not part of this item's own scoped fix.
+- **`gitea-up.sh`** — the E2E report's own retry suggestion is specific to
+  Taiga's 9-container, multi-network-attachment stack; Gitea's 2-container
+  stack was not reported as hitting this race, and applying the same
+  pattern there without a reported failure to fix would be speculative.
+
+## Acceptance criteria
+- [ ] Given `taiga-gateway` comes up `running` on the first `docker
+      compose up -d` (the common case), the script exits 0 immediately —
+      no unnecessary retry/sleep delay added to the normal path.
+- [ ] Given the first attempt leaves `taiga-gateway` in a non-`running`
+      state, the script removes just that container and retries, up to
+      `TAIGA_UP_MAX_ATTEMPTS` total attempts.
+- [ ] Given all attempts fail, the script exits non-zero with a specific
+      stderr message naming the container, the attempt count, and where
+      to look next (compose logs, docker network state, disk space) —
+      not a bare failure with no explanation.
+- [ ] `TAIGA_UP_MAX_ATTEMPTS` is read from the environment with a default
+      of `3`, matching this project's own established tunable-constant
+      convention.
+- [ ] `bash -n` / `shellcheck` clean.
 
 ## Affected areas
-`ct/create.sh` only, two independent, non-overlapping edits (a constant
-value and a filter added to one existing loop).
+`scripts/taiga-up.sh` only. No Python/JS changes.
 
 ## Risk / rollback notes
-Both changes are small and low-risk. Fix 1 only changes a default value
-(fully overridable by the operator either way, in both Default and
-Advanced modes). Fix 2 only narrows what's already a live-enumerated,
-operator-reviewed menu — worst case of an over-broad filter pattern is
-hiding a real bridge that happens to look like the excluded pattern,
-which is why the acceptance criterion above explicitly checks the filter
-against a real bridge name too, not just the excluded ones. Plain `git
-revert` if anything regresses.
+Low risk: the retry logic only runs additional `docker compose` calls
+against a stack that's already in a broken state (never touches a
+healthy stack beyond the one now-conditional `rm -f` on the specific
+already-non-running container). Worst case of a bug here is the same
+"stays broken, reported as off" behavior the script already has today —
+not a new failure mode, not data loss (Postgres/RabbitMQ data volumes are
+untouched by this script regardless). Plain `git revert` if anything
+regresses.

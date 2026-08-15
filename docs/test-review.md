@@ -1,146 +1,99 @@
-# Test & Review: ct/create.sh fixes from Proxmox E2E test round 3 (items 31, 32)
+# Test & Review: taiga-up.sh resilience from Proxmox E2E test round 4 (item 30)
 
 ## Scope
-Two independent fixes to `ct/create.sh` from `docs/spec.md`: (1) item 31,
-`DEFAULT_DISK_GB` raised `"8"` → `"20"`; (2) item 32, a `case` filter added
-to `_enumerate_bridges()`'s kernel-bridge loop to exclude Proxmox's own
-auto-created `fwbrNNNiM` per-container firewall bridges from the live
-bridge-selection menu. Verified against the actual working-tree diff
-(`git diff HEAD -- ct/create.sh`), not developer self-report.
+Independent re-verification of `scripts/taiga-up.sh`'s retry/detect/fail-loudly
+rewrite and its new test harness (`tests/test_taiga_up_retry.py`) against
+`docs/spec.md`'s five acceptance criteria, plus a full-suite regression check
+and a final isolation check that this branch's own diff (vs.
+`backlog/e2e-fixes-round3`) contains nothing but this item's changes.
 
 ## Test cases
 
 | # | Criterion / case | Method | Result | Evidence |
 |---|---|---|---|---|
-| 1 | Item 31: `DEFAULT_DISK_GB` is exactly `"20"`, nothing else in the constant block changed | `grep -n 'DEFAULT_DISK_GB=' ct/create.sh`; `git diff HEAD -- ct/create.sh` read in full | pass | Line 91: `DEFAULT_DISK_GB="20"`. Full diff shows only two hunks total in the file: the item-32 filter (lines 65-72) and this one-line constant change (line 91) — no other lines touched |
-| 2 | Item 31: Advanced path's disk-size prompt still uses this as pre-filled default, still fully editable (no behavior change beyond the value) | Read `ct/create.sh` around the Advanced disk-size prompt; confirmed only the constant's assignment changed, the prompt call site is untouched | pass | No diff hunk anywhere near the prompt call site itself; only the constant declaration changed |
-| 3 | Item 32: real `fwbrNNNiM` examples from the report (`fwbr101i0`, `fwbr106i0`, `fwbr107i0`) are excluded, `vmbr0`/`vmbr1` survive | Automated: `python3 tests/test_create_enumerate_bridges.py -v` (extracts the real `_enumerate_bridges()` out of `ct/create.sh`, stubs `ip`, runs it for real) | pass | `test_real_bridges_kept_firewall_bridges_excluded` — `ok` |
-| 4 | Item 32: host with only `fwbrNNNiM` interfaces yields an empty menu (no crash, no stray entries) | Automated, same harness | pass | `test_only_firewall_bridges_yields_empty_menu` — `ok` |
-| 5 | Item 32: host with no `fwbrNNNiM` interfaces at all is unaffected (regression) | Automated, same harness | pass | `test_no_firewall_bridges_present_regression` — `ok` |
-| 6 | Item 32: near-miss names `fwbridge0` (starts with "fwbr" but no digit immediately after) and `vmbr-media0` (contains "i0" but doesn't start with "fwbr") survive the filter | Automated, same harness | pass | `test_pattern_not_too_broad_similar_looking_names_survive` — `ok` |
-| 7 | Item 32: a firewall bridge with an `@if12`-style VLAN suffix (stripped upstream by the existing `cut -d'@' -f1`) is still excluded | Automated, same harness | pass | `test_firewall_bridge_with_at_suffix_still_excluded` — `ok` |
-| 8 | Item 32: independent verification of the actual bash glob-match semantics of `fwbr[0-9]*i[0-9]*` (not trusting the developer's test suite or the code comment's paraphrase) against a wider adversarial name list | Manual/automated: wrote a standalone script exercising the exact `case`/glob pattern from the diff directly in `bash` against 27 constructed names (`vmbr0`, `vmbr1`, `vmbr-media0`, real `fwbrNNNiM` examples incl. multi-digit and single-digit forms, `fwbridge0`, `fwbr123index5`, `fwbri0`, `fwbrlan0`, `fwbr0-lan`, `fwbr0vlan15`, `fwbr10internal5`, `FWBR1I2`, `xfwbr1i2`, plus trailing-garbage forms `fwbr1i2x`/`fwbr1i2extra`/`fwbr1abci2`) | pass (see Findings for one non-blocking observation) | Full transcript below. All real Proxmox-shaped names matched; all realistic operator/near-miss names did not match; see finding #1 for the one edge case (contrived trailing garbage) that does match but has no real-world naming collision |
-| 9 | `bash -n ct/create.sh` (syntax) | Ran directly | pass | No output, exit 0 |
-| 10 | `shellcheck ct/create.sh` (lint) | Ran directly | pass | Exit 0, zero warnings |
-| 11 | Full existing suite (regression) | `python3 -m unittest discover -s tests`, run directly, full run to completion (not truncated) | pass | `Ran 1205 tests in 161.024s` / `OK`, exit code 0 |
+| 1 | AC1: `taiga-gateway` runs on first `up -d` → exit 0 immediately, zero retry/sleep overhead | Automated (`test_succeeds_on_first_attempt_no_retry`) + code trace | pass | `python3 tests/test_taiga_up_retry.py -v` → ok; asserts `up_calls==1`, `rm_calls==0`; loop's `exit 0` fires before the `rm`/`sleep` block on the first iteration |
+| 2 | AC2: non-`running` state → removes just `taiga-gateway`, retries, capped at `TAIGA_UP_MAX_ATTEMPTS` total attempts | Automated (`test_succeeds_on_second_attempt_after_one_retry`, `test_exhausts_all_attempts_and_fails_loudly`) + deliberate off-by-one mutation test | pass | See "Loop-bound trace" below — mutating `-le`→`-lt` caused `up_calls` to drop from 3→2, caught by the existing tests, then reverted and diff-confirmed clean |
+| 3 | AC3: all attempts fail → exit non-zero, stderr names container, attempt count, and 3 "look next" pointers | Automated (`test_exhausts_all_attempts_and_fails_loudly`) | pass | asserts exact substrings: `taiga-gateway failed to come up after 3 attempts`, `manual intervention needed`, `docker compose logs taiga-gateway`, `docker network ls`, `disk space` |
+| 4 | AC4: `TAIGA_UP_MAX_ATTEMPTS` env-overridable, default 3 | Automated (`test_max_attempts_env_override_is_honored`, default used implicitly by all other cases) | pass | override to 5 → `up_calls==5`, `rm_calls==4`, stderr `after 5 attempts` |
+| 5 | AC5: `bash -n` / `shellcheck` clean | Manual command run | pass | `bash -n scripts/taiga-up.sh` exit 0; `shellcheck scripts/taiga-up.sh` exit 0, zero warnings/output |
+| 6 | Final failure message fires only after full exhaustion, not on every intermediate failure | Code trace | pass | message is textually after the `done` closing the `while` loop — only reachable once the loop condition (`attempt -le MAX`) goes false; both retry tests confirm the *intermediate* message (`didn't come up cleanly`) is what's seen on non-final attempts |
+| 7 | `rm -f taiga-gateway` targets only the one container, never a full stack `down` | Code read + test | pass | script never calls `down`; `"${COMPOSE[@]}" rm -f taiga-gateway` is the only removal call, gated inside `if [ "$attempt" -lt "$TAIGA_UP_MAX_ATTEMPTS" ]` so it never runs after the final attempt (exhaustion test: `rm_calls==2` for `max_attempts=3`) |
+| 8 | Test harness runs the REAL script, not a reimplementation | Code read + deliberate revert-and-watch-it-fail check | pass | harness reads `scripts/taiga-up.sh` verbatim via `open(TAIGA_UP_SH).read()` and appends it after stub definitions, run via `bash -c`; confirmed by mutating the real script (`-le`→`-lt`) and observing 2 of 4 tests fail with the exact expected wrong counts, then reverting |
+| 9 | Disclosed SC1090 deviation is accurate and scoped to only that one warning | Manual shellcheck runs, before/after directive | pass | `taiga-status.sh`, `gitea-up.sh`, `taiga-down.sh` each independently show the identical unaddressed `SC1090` warning today; removing the new `# shellcheck disable=SC1090` line from a scratch copy of `taiga-up.sh` reproduces exactly that one warning and no other — directive suppresses nothing beyond the disclosed finding |
+| 10 | `app/app.py::taiga_run()` and `scripts/gitea-up.sh` untouched (Non-goals) | `git diff HEAD -- app/app.py scripts/gitea-up.sh` | pass | empty diff for both files |
 
-### Case 8 transcript (bash, real `case`/glob evaluation of the literal pattern from the diff)
-```
-$ pattern: fwbr[0-9]*i[0-9]*
-no-match: vmbr0
-no-match: vmbr1
-no-match: vmbr-media0
-MATCH   : fwbr101i0
-MATCH   : fwbr106i0
-MATCH   : fwbr107i0
-MATCH   : fwbr0i0
-MATCH   : fwbr1000i5
-no-match: fwbridge0
-no-match: fwbr123index5
-no-match: fwbr1i
-no-match: fwbriggle
-no-match: fwbr
-no-match: fwbri0
-MATCH   : fwbr9999999i9999999
-no-match: xfwbr1i2
-MATCH   : fwbr1i2x        <- see finding #1
-no-match: FWBR1I2
-MATCH   : fwbr1i2extra    <- see finding #1
-no-match: fwbr1iX
-no-match: fwbr10internal5
-no-match: fwbrlan0
-no-match: fwbr0-lan
-no-match: fwbr0vlan15
-MATCH   : fwbr1abci2      <- see finding #1
-no-match: fwbr1i
-no-match: fwbr0i
-```
-Reasoning for the specific case the task flagged (`fwbridge0`): bash `case`
-glob semantics, not regex. After the literal `fwbr` prefix, the string
-remaining is `idge0`. `[0-9]` requires *exactly one* digit character next —
-the very next character is `i`, not a digit, so this branch fails
-immediately; there is no other position in the string where `[0-9]`
-(prefix digit) through `i` (literal) through `[0-9]` (suffix digit) can
-all be satisfied while the whole pattern consumes the whole string. So
-`fwbridge0` correctly does **not** match — the specific false-positive
-trap the task asked me to trace through does not occur.
+## Loop-bound trace (off-by-one check)
+Traced by hand and then confirmed empirically: `while [ "$attempt" -le "$TAIGA_UP_MAX_ATTEMPTS" ]` with `attempt` starting at 1 and incrementing once per full loop body — this runs the body exactly `TAIGA_UP_MAX_ATTEMPTS` times (attempts 1..N inclusive), matching the spec's "up to `TAIGA_UP_MAX_ATTEMPTS` total attempts." To make sure this wasn't just my own re-derivation being wrong in the same way the code might be wrong, I mutated the real script's comparison from `-le` to `-lt` (which would make it an off-by-one, running only N-1 attempts) and reran the real test suite: `test_exhausts_all_attempts_and_fails_loudly` and `test_max_attempts_env_override_is_honored` both failed with exactly the predicted wrong counts (`2 != 3`, `4 != 5`). Reverted immediately after (`diff` confirmed byte-identical to the pre-mutation file). This also served as the "genuinely exercises this fix, not a vacuous test" check called for in the task.
 
 ## Regression check
-Full suite run directly by me to completion: `python3 -m unittest discover
--s tests` → `Ran 1205 tests in 161.024s` / `OK`, exit code 0. Matches the
-developer's reported count exactly. No regressions.
+Full existing suite run: `python3 -m unittest discover -s tests`
+
+- Baseline (this diff stashed, i.e. `backlog/e2e-fixes-round3` tip): **1205 tests, OK, 0 failures.**
+- With diff applied, run in isolation with no other test processes on the box: **1209 tests, OK, 0 failures** (1205 + the 4 new `test_taiga_up_retry.py` cases — matches the developer's claimed count exactly).
+
+One earlier run *with the diff applied* did show 4 failures, all in
+`PrivilegedEndToEndTests`/`PrivilegedDeployRunEndToEndTests` (`test_deploy_target.py`,
+`test_deploy_dispatch.py`) with errors like `switchboard-deploy-wrapper.sh: not found`.
+I did not take this at face value — these tests provision real system users, a
+real sshd session against 127.0.0.1, and real systemd units
+(`docs/spec.md`'s own Non-goals confirm this change touches nothing in that
+area), so a causal link to a `taiga-up.sh`-only diff plus an independent new
+test file is not plausible on its face. I re-ran exactly those 4 tests in
+isolation (both with and without the diff stashed) and they passed cleanly
+both times, then re-ran the entire suite once more end-to-end with no other
+test processes running concurrently on the box and got a clean `1209 OK`.
+Root cause: I had a stray overlapping background full-suite invocation of my
+own running at the same time as that one failing run, which raced the same
+real system user / sshd / systemd-unit provisioning the privileged tests use.
+This is pre-existing environment flakiness under concurrent invocation, not a
+regression introduced by this diff — confirmed, not assumed, via the
+baseline-vs-diff comparison above. Documenting it here since the developer's
+own implementation.md claim of "Ran 1209 tests ... OK" should not be taken on
+faith either, and this record shows it checks out under a clean run.
+
+Type-check/lint: `bash -n scripts/taiga-up.sh` and `shellcheck scripts/taiga-up.sh` both clean (see test case 5).
 
 ## Defects found
-None (testing pass is clean; proceeding to review pass).
+None. Testing pass is clean.
 
 ---
 
 ## Spec coverage
-- **Item 31** acceptance criterion (`grep 'DEFAULT_DISK_GB=' ct/create.sh`
-  shows `"20"`, no other behavior change) — implemented and tested,
-  case 1-2. The working-tree diff confirms this is the *only* line touched
-  besides the item-32 filter — no scope creep.
-- **Item 32** acceptance criterion (`_enumerate_bridges()`'s
-  `BRIDGE_MENU_OPTS` contains `vmbr0` but none of the `fwbrNNNiM` entries,
-  given both present) — implemented and tested by the developer's 5-test
-  harness (cases 3-7) plus my own independent 27-name adversarial glob
-  trace directly against the real `case` pattern (case 8), run for real in
-  `bash`, not inferred. Both the developer's near-miss cases and mine agree
-  the pattern is neither too narrow (misses no real `fwbrNNNiM` shape,
-  including multi-digit and single-digit CTID/netid) nor too broad against
-  any *realistic* bridge name (`vmbr0`, `vmbr-media0`, `fwbridge0`,
-  `fwbrlan0`, `fwbr0-lan`, etc. all correctly survive).
+All 5 acceptance criteria in `docs/spec.md` are implemented and covered by
+either the automated harness or a direct code/behavior trace (see test cases
+1-5 above; no gaps found). The spec's "Proposed approach" code block was
+compared line-by-line against `scripts/taiga-up.sh` and matches exactly,
+with one disclosed, verified-accurate deviation (the `SC1090` suppression
+comment, needed to satisfy the spec's own "shellcheck clean" criterion —
+see test case 9). Both Non-goals items that name specific files
+(`app/app.py::taiga_run()`, `scripts/gitea-up.sh`) were confirmed untouched
+(test case 10). The other two Non-goals (root-cause fix, pre-flight `df`
+check) are correctly absent from the diff — nothing in the script attempts
+either.
+
+## Isolation check (this round's own diff vs. round 3)
+`git diff backlog/e2e-fixes-round3 HEAD --stat` is empty — `HEAD` on this
+branch is still exactly `backlog/e2e-fixes-round3`'s tip (no commits made
+yet this round). The only changes present are uncommitted working-tree
+changes: `git status --porcelain` shows exactly `docs/implementation.md`
+(modified), `docs/spec.md` (modified), `scripts/taiga-up.sh` (modified),
+and `tests/test_taiga_up_retry.py` (untracked/new) — nothing left over from
+an earlier round, nothing extraneous.
 
 ## Findings (most severe first)
-
-### 1. `case` pattern is looser than its own comment claims — matches arbitrary trailing/embedded characters, not just digits — should-fix
-- File: `ct/create.sh:70`
-- Issue: the inline comment says the pattern is Proxmox's "fixed
-  `fwbrNNNiM` naming convention (always `fwbr` + digits + `i` + digits)",
-  and `docs/spec.md` describes it the same way. That's not quite what
-  `fwbr[0-9]*i[0-9]*` actually matches in bash glob semantics: `[0-9]` is
-  a single-character class (exactly one digit), and each `*` that follows
-  it is an independent wildcard matching **any characters at all**, not a
-  digit-repeat quantifier (glob has no `+`/`{n,}`-style repetition; that
-  would need `extglob`'s `+([0-9])`). So the real matched shape is `fwbr`
-  + exactly one digit + *anything* + `i` + exactly one digit + *anything*.
-  Concretely: `fwbr1i2extra`, `fwbr1i2x`, and `fwbr1abci2` all match the
-  filter today, even though none of them is an actual
-  `fwbr<digits>i<digits>`-only Proxmox bridge name (verified directly in
-  `bash`, case 8 above).
-- Failure scenario: this is not a false negative (every real
-  Proxmox-generated `fwbrNNNiM` name, including edge cases like
-  single-digit or 7-digit CTID/netid, still matches and gets excluded
-  correctly — confirmed). It's a theoretical false positive: a
-  hypothetical kernel bridge whose name happens to be `fwbr<digit>` +
-  arbitrary characters + `i<digit>` + arbitrary trailing characters (e.g.
-  an operator naming a real uplink bridge `fwbr1i2-uplink`) would be
-  silently hidden from the menu by this filter even though it isn't a
-  Proxmox firewall bridge. In practice this is very low risk: `fwbr` is
-  Proxmox's own reserved prefix for auto-generated firewall bridges, no
-  operator is likely to hand-name a real uplink bridge that way, and none
-  of the acceptance criterion's real-world examples (`vmbr0`, `vmbr1`,
-  operator-named bridges) are anywhere near this shape. Does not violate
-  `docs/spec.md`'s literal acceptance criterion and does not warrant
-  blocking this round, but the comment/spec description of the pattern's
-  behavior is inaccurate and worth tightening in a follow-up (either fix
-  the comment to describe what the pattern actually does, or tighten the
-  pattern itself, e.g. with `extglob`'s `+([0-9])i+([0-9])` or an
-  explicit `[[ "$_br" =~ ^fwbr[0-9]+i[0-9]+$ ]]` regex check, so the code
-  matches its own stated intent).
+None — no must-fix, should-fix, or nit findings from the correctness,
+security, or simplicity passes. The diff is a near-verbatim implementation
+of the spec's own proposed code (one disclosed, verified line added), the
+new test file follows this session's already-proven real-script-with-
+stubbed-`docker` technique faithfully, and there is no unnecessary
+abstraction, dead code, or scope creep beyond `scripts/taiga-up.sh` and its
+dedicated test file.
 
 ## Follow-ups (non-blocking)
-- Consider the tightened pattern from finding #1 in a future small fix, or
-  at minimum correct the inline comment/spec wording so it accurately
-  describes "starts with `fwbr`+digit, contains `i`+digit somewhere after,
-  arbitrary characters otherwise" rather than "always digits only" — since
-  this file already reaches for `[[ =~ ]]` elsewhere it would be a small,
-  low-risk follow-up, not urgent.
-- (Carried over from `docs/spec.md`'s own non-goal, unchanged by this
-  round): `taiga-up.sh`/`gitea-up.sh` proactively `df`-checking free space
-  before `docker compose up`, and sizing the storage-pool step's suggested
-  disk default off live free space, remain real, separately-scoped
-  follow-ups.
+- None specific to this item. (The spec's own Non-goals already list the
+  known adjacent follow-ups — root-cause investigation, `df` pre-flight
+  check, `app.py` stderr surfacing — as explicitly out of scope, not as
+  gaps in this change.)
 
 ## Overall verdict
 Approve.
