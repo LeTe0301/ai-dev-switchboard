@@ -33,10 +33,30 @@
 #                         tracker), left OFF until toggled in the web UI —
 #                         see docs/spec.md and the "Optional: self-hosted
 #                         Taiga" section below
+#   --with-ollama         LINK an existing, already-running remote Ollama for
+#                         multi-agent team leads (docs/story.md §2.5) —
+#                         installs nothing locally (no package, no model
+#                         pull, no container, no systemd unit). Prompts for
+#                         an endpoint URL + model name, validates both are
+#                         actually reachable/present, writes TEAM_LLM_BASE_URL/
+#                         TEAM_LLM_MODEL. Refuses to write config it can't
+#                         verify — see docs/spec.md (6d part 2b)
+#   --update, --upgrade   update an already-installed box: fast-forwards
+#                         this checkout to origin/$REPO_BRANCH (never a
+#                         destructive reset — refuses on local changes, a
+#                         branch mismatch, or real divergence from origin),
+#                         re-runs the steps below against that fresh
+#                         checkout, then restarts ai-dev-switchboard — but
+#                         ONLY if RUN_USER has no live tmux session; if one
+#                         is live, the restart is deferred (code is still
+#                         updated) and the script prints how to finish by
+#                         hand once it's safe. Exact synonyms, same flag.
 #
 # Safe to re-run: every step here either checks for existing state first or
 # overwrites deterministically-generated files (units, sudoers), never
-# clobbers switchboard.env values that are already set.
+# clobbers switchboard.env values that are already set. --update
+# additionally pulls $REPO_DIR first and may defer its own service restart
+# around live sessions (see above) — nothing else changes when it's absent.
 set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/LeTe0301/ai-dev-switchboard.git}"
@@ -66,6 +86,8 @@ WITH_CODE_SERVER=0
 WITH_HOST_CONTROL=0
 WITH_DEPLOY_TARGET=0
 WITH_TAIGA=0
+WITH_OLLAMA=0
+UPDATE=0
 for arg in "$@"; do
     case "$arg" in
         --yes) YES=1 ;;
@@ -74,6 +96,8 @@ for arg in "$@"; do
         --with-host-control) WITH_HOST_CONTROL=1 ;;
         --with-deploy-target) WITH_DEPLOY_TARGET=1 ;;
         --with-taiga) WITH_TAIGA=1 ;;
+        --with-ollama) WITH_OLLAMA=1 ;;
+        --update|--upgrade) UPDATE=1 ;;
         *) echo "Unknown flag: $arg (see the top of install.sh for the list)" >&2; exit 1 ;;
     esac
 done
@@ -87,6 +111,41 @@ CONFIG_DIR=/etc/ai-dev-switchboard
 INSTALL_DIR=/opt/ai-dev-switchboard
 STATE_DIR=/var/lib/ai-dev-switchboard
 mkdir -p "$CONFIG_DIR" "$INSTALL_DIR" "$STATE_DIR"
+# Hoisted up from the "-- Config --" step below (still assigned there too,
+# idempotently) so the RUN_USER/SVC_USER prompts further down can read an
+# already-configured value via get_env, same as PVE_HOST/SIMPLE_USERNAME/
+# PUBLISH_MODE already do (docs/BACKLOG.md item 14).
+ENV_FILE="$CONFIG_DIR/switchboard.env"
+
+# ── Update (--update/--upgrade): pull latest $REPO_BRANCH into $REPO_DIR,
+# before anything else in this script reads from it (docs/BACKLOG.md item
+# 14). Never a destructive `git reset --hard` -- fetch, then a
+# `merge --ff-only`, mirroring scripts/gitea-sync-project.sh's own
+# fetch-then-ff-only-merge shape (dirty check, ancestor check, never reset
+# --hard).
+if [ "$UPDATE" -eq 1 ]; then
+    echo "-- Update (--update/--upgrade): pulling $REPO_BRANCH into $REPO_DIR --"
+    if [ ! -d "$REPO_DIR/.git" ]; then
+        echo "ERROR: $REPO_DIR is not a git checkout, so --update has nothing to pull. Re-run via the curl-pipe installer (which clones \$SRC_DIR itself), or 'git clone $REPO_URL' and run install.sh --update from inside that clone." >&2
+        exit 1
+    fi
+    if [ -n "$(git -C "$REPO_DIR" status --porcelain)" ]; then
+        echo "ERROR: $REPO_DIR has uncommitted local changes -- refusing to pull over them. Commit, stash, or discard them, then re-run --update." >&2
+        exit 1
+    fi
+    CURRENT_BRANCH="$(git -C "$REPO_DIR" symbolic-ref --short -q HEAD || true)"
+    if [ "$CURRENT_BRANCH" != "$REPO_BRANCH" ]; then
+        echo "ERROR: $REPO_DIR is checked out on '${CURRENT_BRANCH:-<detached HEAD>}', not \$REPO_BRANCH ('$REPO_BRANCH') -- switch to $REPO_BRANCH yourself (or set REPO_BRANCH to match what's checked out) before re-running --update." >&2
+        exit 1
+    fi
+    git -C "$REPO_DIR" fetch origin "$REPO_BRANCH"
+    if ! git -C "$REPO_DIR" merge-base --is-ancestor HEAD "origin/$REPO_BRANCH"; then
+        echo "ERROR: $REPO_DIR's local $REPO_BRANCH has diverged from origin/$REPO_BRANCH -- refusing to merge. Resolve by hand, then re-run --update." >&2
+        exit 1
+    fi
+    git -C "$REPO_DIR" merge --ff-only "origin/$REPO_BRANCH"
+    echo "Pulled $(git -C "$REPO_DIR" rev-parse --short HEAD) ($REPO_BRANCH)."
+fi
 
 interactive() { [ "$YES" -eq 0 ] && [ -t 0 ]; }
 prompt() {  # prompt <message> <default> -> echoes the answer
@@ -100,9 +159,18 @@ prompt_secret() {  # prompt_secret <message> -> echoes the answer (may be empty)
     echo "$ans"
 }
 set_env() {  # set_env <file> <KEY> <value> — idempotent upsert
-    local file="$1" key="$2" val="$3"
+    local file="$1" key="$2" val="$3" val_escaped
+    # $val is operator-supplied and must never be shelled through sed's
+    # pattern language unescaped (docs/BACKLOG.md item 10): a literal `|`
+    # breaks this sed expression (aborting the whole install.sh run on a
+    # re-run) and a literal `&` is silently corrupted via sed's whole-match
+    # backreference. Escape backslash first (so the escaping added for
+    # `&`/`|` below isn't itself re-escaped), then `&`, then the `|`
+    # delimiter. The `>>` append path (first-write case) never goes through
+    # sed, so it already handles any character correctly and is untouched.
+    val_escaped=$(printf '%s' "$val" | sed -e 's/\\/\\\\/g' -e 's/&/\\&/g' -e 's/|/\\|/g')
     if grep -q "^${key}=" "$file" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=${val}|" "$file"
+        sed -i "s|^${key}=.*|${key}=${val_escaped}|" "$file"
     else
         printf '%s=%s\n' "$key" "$val" >> "$file"
     fi
@@ -166,8 +234,10 @@ if [ "$WITH_CODE_SERVER" -eq 1 ] && [ ! -x /usr/local/bin/code-server ]; then
 fi
 
 echo "-- Users --"
-RUN_USER=$(prompt "Unprivileged user to run coding sessions as" "dev")
-SVC_USER=$(prompt "Unprivileged user to run the web UI process as" "switchboard-svc")
+RUN_USER_DEFAULT="$(get_env "$ENV_FILE" RUN_USER)"; RUN_USER_DEFAULT="${RUN_USER_DEFAULT:-dev}"
+SVC_USER_DEFAULT="$(get_env "$ENV_FILE" SVC_USER)"; SVC_USER_DEFAULT="${SVC_USER_DEFAULT:-switchboard-svc}"
+RUN_USER=$(prompt "Unprivileged user to run coding sessions as" "$RUN_USER_DEFAULT")
+SVC_USER=$(prompt "Unprivileged user to run the web UI process as" "$SVC_USER_DEFAULT")
 
 id "$RUN_USER" &>/dev/null || { useradd -m -s /bin/bash "$RUN_USER"; echo "Created $RUN_USER"; }
 id "$SVC_USER" &>/dev/null || { useradd -r -m -d "/home/$SVC_USER" -s /usr/sbin/nologin "$SVC_USER"; echo "Created $SVC_USER"; }
@@ -212,6 +282,7 @@ fi
 
 echo "-- App + engines --"
 cp "$REPO_DIR/app/app.py" "$INSTALL_DIR/app.py"
+cp "$REPO_DIR/app/teams.py" "$INSTALL_DIR/teams.py"
 mkdir -p "$CONFIG_DIR/engines.d"
 for f in "$REPO_DIR"/engines.d/*.engine; do
     [ -e "$f" ] || continue
@@ -220,7 +291,8 @@ for f in "$REPO_DIR"/engines.d/*.engine; do
 done
 
 echo "-- Config --"
-ENV_FILE="$CONFIG_DIR/switchboard.env"
+# ENV_FILE itself is already assigned above (hoisted so the RUN_USER/
+# SVC_USER prompts could read it too -- see that comment).
 [ -f "$ENV_FILE" ] || cp "$REPO_DIR/config/switchboard.env.example" "$ENV_FILE"
 
 set_env "$ENV_FILE" RUN_USER "$RUN_USER"
@@ -400,6 +472,16 @@ set_env "$ENV_FILE" DEPLOY_KEYS_DIR "$CONFIG_DIR/deploy-keys"
 chown "$SVC_USER:$SVC_USER" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
+echo "-- Clone project from URL (backlog item 16, works standalone, no --with-git-hosting needed) --"
+install -m 755 "$REPO_DIR/scripts/new-project-from-url.sh" \
+    /usr/local/bin/ai-dev-switchboard-new-project-from-url.sh
+set_env "$ENV_FILE" NEW_PROJECT_FROM_URL_SCRIPT \
+    "/usr/local/bin/ai-dev-switchboard-new-project-from-url.sh"
+# CLONE_TIMEOUT_SECONDS/CLONE_MAX_BYTES stay commented-out optional
+# overrides in config/switchboard.env.example (app.py's/the script's own
+# defaults already cover them) -- same "not force-set by install.sh"
+# treatment UPLOAD_MAX_BYTES/UPLOAD_MAX_ENTRIES already get.
+
 echo "-- sudoers (scoped: $SVC_USER can only run tmux/ttyd/code-server AS $RUN_USER) --"
 SUDOERS=/etc/sudoers.d/ai-dev-switchboard
 {
@@ -418,6 +500,10 @@ SUDOERS=/etc/sudoers.d/ai-dev-switchboard
     # wizard is explicitly the project-registration path for people WITHOUT
     # git hosting installed.
     echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-new-project-from-upload.sh *"
+    # Also unconditional (backlog item 16, docs/spec.md) — cloning an
+    # arbitrary external repo URL never depends on --with-git-hosting
+    # either, same reasoning as the upload wizard's own rule above.
+    echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/ai-dev-switchboard-new-project-from-url.sh *"
     if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
         # Gitea's own toggle wrapper triplet (docs/spec.md "Crossing the
         # privilege boundary") — zero-argument narrowing, same as Taiga's
@@ -463,6 +549,32 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable --now ai-dev-switchboard
+
+# ── Update (--update/--upgrade): guarded restart -- refuses to restart the
+# service (not just warns) whenever RUN_USER has ANY live tmux session,
+# full stop, no --force override (mirrors _remove_worktree()'s own
+# no-`--force` `git worktree remove` precedent, item 13). New code was
+# already copied to $INSTALL_DIR above regardless -- this only gates the
+# restart that makes it take effect. The generated systemd unit above sets
+# no KillMode, so systemd's default (KillMode=control-group) applies: a
+# `systemctl restart` sends SIGTERM/SIGKILL to every process still in this
+# unit's cgroup, not just app.py itself -- every per-project engine/team
+# tmux session spawned via `sudo -u $RUN_USER tmux new-session -d` is a
+# descendant of this service's own process and nothing moves it to a
+# different cgroup first, so restarting while sessions are live can very
+# likely take down the entire RUN_USER tmux server (docs/ARCHITECTURE.md,
+# docs/BACKLOG.md item 14 "Background").
+if [ "$UPDATE" -eq 1 ]; then
+    LIVE_SESSIONS="$(sudo -u "$RUN_USER" tmux list-sessions -F '#{session_name}' 2>/dev/null || true)"
+    if [ -n "$LIVE_SESSIONS" ]; then
+        echo "WARNING: $RUN_USER has live tmux session(s):" >&2
+        echo "$LIVE_SESSIONS" | sed 's/^/  - /' >&2
+        echo "New code was copied to $INSTALL_DIR, but ai-dev-switchboard was NOT restarted -- restarting now would very likely interrupt these (see docs/ARCHITECTURE.md). Stop them (or wait for them to finish), then re-run 'install.sh --update' -- it will be a fast no-op pull, just the restart. Or, if you're sure it's safe: sudo systemctl restart ai-dev-switchboard." >&2
+    else
+        echo "-- Update: no live $RUN_USER sessions -- restarting ai-dev-switchboard to pick up the update --"
+        systemctl restart ai-dev-switchboard
+    fi
+fi
 
 if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
     # ── Self-hosted Gitea (part of --with-git-hosting). Backlog item 2b
@@ -620,6 +732,97 @@ if [ "$WITH_HOST_CONTROL" -eq 1 ]; then
     done
     [ -f "$CONFIG_DIR/host.env" ] || cp "$REPO_DIR/host-agent/host.env.example" "$CONFIG_DIR/host.env"
     set_env "$CONFIG_DIR/host.env" ENGINES_DIR "$CONFIG_DIR/engines.d"
+fi
+
+# ── Optional: link an existing remote Ollama for multi-agent team leads
+# (--with-ollama). This LINKS a remote endpoint — it never installs Ollama,
+# a model, a container, or a systemd unit on this machine. The standard
+# switchboard container has ~715MB free RAM with swap already exhausted
+# (docs/story.md §2.5); no tool-capable model fits here, so the endpoint
+# must already be running somewhere else. TEAM_LLM_BASE_URL/TEAM_LLM_MODEL
+# are already documented in config/switchboard.env.example (added in 6c) —
+# this block writes them, it does not introduce them.
+if [ "$WITH_OLLAMA" -eq 1 ]; then
+    echo "-- Link an existing Ollama (multi-agent team leads) --"
+    echo "This LINKS a remote Ollama endpoint — nothing is installed on this"
+    echo "machine. Point it at an Ollama instance already running elsewhere"
+    echo "(e.g. another host on your tailnet)."
+
+    OLLAMA_BASE_URL_DEFAULT="$(get_env "$ENV_FILE" TEAM_LLM_BASE_URL)"
+    OLLAMA_MODEL_DEFAULT="$(get_env "$ENV_FILE" TEAM_LLM_MODEL)"
+    OLLAMA_BASE_URL_INPUT=$(prompt "Ollama endpoint URL (OpenAI-compatible, e.g. an existing remote Ollama's /v1)" "${OLLAMA_BASE_URL_DEFAULT:-http://127.0.0.1:11434/v1}")
+    OLLAMA_MODEL_INPUT=$(prompt "Model name" "${OLLAMA_MODEL_DEFAULT:-qwen3:8b}")
+
+    # Normalise a trailing slash so we validate — and write — the exact URL
+    # TEAM_LLM_BASE_URL will be, never "//models" (docs/spec.md
+    # "Validation"). Deliberately does NOT append /v1 if the operator left
+    # it off — silently rewriting their URL is how the wrong endpoint gets
+    # validated instead of the one that was actually typed.
+    OLLAMA_BASE_URL_NORM="${OLLAMA_BASE_URL_INPUT%/}"
+
+    # Validate against the exact OpenAI-compatible path the lead adapter
+    # will really call (app/teams.py's _tier1_call() hits
+    # "$TEAM_LLM_BASE_URL/chat/completions") — NOT Ollama's native
+    # /api/tags, which lives outside /v1 and would validate a different URL
+    # than the one being written. Bounded so an unreachable/stalled host can
+    # never hang the installer.
+    OLLAMA_MODELS_JSON=$(curl -fsS --max-time 10 "$OLLAMA_BASE_URL_NORM/models" 2>/dev/null || true)
+
+    if [ -z "$OLLAMA_MODELS_JSON" ]; then
+        echo "Could not reach $OLLAMA_BASE_URL_NORM/models (unreachable, no response, or an HTTP error) — writing nothing. The team lead will fall back to an engines.d tier-2 engine until this is fixed. Re-run --with-ollama once the endpoint is reachable." >&2
+    else
+        # Parsed with python3 (unconditionally installed above), never
+        # grep — a substring match would false-positive "qwen3:8" against
+        # an endpoint advertising only "qwen3:8b". Exact id comparison
+        # only. A 200 response that isn't valid JSON (an HTML proxy login
+        # page, a captive portal) is treated as a parse failure, not as a
+        # valid empty model list.
+        #
+        # The script text is built into a variable via a heredoc, THEN run
+        # as `python3 -c "$VAR"` with the JSON piped separately — `python3
+        # - <<PYEOF` (script AND data both on stdin) doesn't work here, the
+        # heredoc always wins that fd and the piped JSON would never reach
+        # sys.stdin.
+        OLLAMA_MODEL_CHECK_SCRIPT=$(cat <<'PYEOF'
+import json
+import sys
+
+wanted = sys.argv[1]
+raw = sys.stdin.read()
+try:
+    data = json.loads(raw)
+    ids = [m.get("id") for m in data.get("data", []) if isinstance(m, dict)]
+except Exception:
+    print("PARSE_ERROR")
+    sys.exit(0)
+if wanted in ids:
+    print("OK")
+else:
+    print("MODEL_ABSENT:" + ",".join(str(i) for i in ids if i is not None))
+PYEOF
+)
+        OLLAMA_MODEL_CHECK=$(printf '%s' "$OLLAMA_MODELS_JSON" | \
+            python3 -c "$OLLAMA_MODEL_CHECK_SCRIPT" "$OLLAMA_MODEL_INPUT")
+        case "$OLLAMA_MODEL_CHECK" in
+            OK)
+                set_env "$ENV_FILE" TEAM_LLM_BASE_URL "$OLLAMA_BASE_URL_NORM"
+                set_env "$ENV_FILE" TEAM_LLM_MODEL "$OLLAMA_MODEL_INPUT"
+                echo "Linked remote Ollama: $OLLAMA_BASE_URL_NORM, model $OLLAMA_MODEL_INPUT."
+                echo "Nothing was installed locally — this endpoint runs elsewhere."
+                ;;
+            MODEL_ABSENT:*)
+                OLLAMA_AVAILABLE="${OLLAMA_MODEL_CHECK#MODEL_ABSENT:}"
+                if [ -z "$OLLAMA_AVAILABLE" ]; then
+                    echo "Reached $OLLAMA_BASE_URL_NORM but it has no models available — writing nothing." >&2
+                else
+                    echo "Reached $OLLAMA_BASE_URL_NORM but model '$OLLAMA_MODEL_INPUT' is not available there — writing nothing. Available models: $OLLAMA_AVAILABLE" >&2
+                fi
+                ;;
+            *)
+                echo "Reached $OLLAMA_BASE_URL_NORM/models but its response could not be parsed as JSON (a proxy login page or captive portal can look like this) — writing nothing." >&2
+                ;;
+        esac
+    fi
 fi
 
 # ── Optional: deploy-target receiver (--with-deploy-target). Fully

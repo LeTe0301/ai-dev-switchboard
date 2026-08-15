@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"019ffb03-synthetic-thread-id"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"agent_message"}}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"pineapple"}}
+{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":3}}

@@ -6,7 +6,18 @@
 value instead of always resetting to the constant default. Covers all four
 acceptance criteria in `docs/spec.md`.
 
-## Test cases
+1. The **original** testing/review pass (below, unchanged from the first
+   sitting) — found Defect 1 (must-fix: a TOCTOU in the episode-currency
+   check) and Defect 2 (should-fix: a TOCTOU in lock-dict cleanup), plus two
+   minor gaps, and blocked.
+2. A **re-review pass** (new section below, this sitting) — independently
+   re-verifies the developer's claimed fixes for both defects against the
+   actual shipped code (not the developer's summary), reruns the full
+   suite, and issues the final verdict for this cycle.
+
+---
+
+## Original pass (first sitting) — test cases
 
 | # | Criterion / case | Method | Result | Evidence |
 |---|---|---|---|---|

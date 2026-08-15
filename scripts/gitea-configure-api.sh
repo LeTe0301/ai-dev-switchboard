@@ -70,6 +70,17 @@ fi
 # with a write:repository-only token. write:user also happens to be what
 # `GET /user` (this script's own verification call below) requires, which a
 # docs.gitea.com-only reading missed. Still meaningfully narrower than `all`.
+#
+# read:issue,write:issue -- added for backlog item 8 (AI merge-request
+# reviewer, docs/spec.md "Token scope"): reading a PR's labels and posting a
+# PR comment are both, in Gitea's own data model, issue-family endpoints
+# (a PR IS an issue under the hood -- POST .../issues/{index}/comments is
+# how a PR comment is posted), distinct from the repository scope above.
+# This is the design's own best-informed assumption, flagged as the one
+# piece most worth confirming live against the real instance -- if Gitea
+# ever rejects a call with 403 for insufficient scope, this is the first
+# thing to check. Re-running this script (safe/idempotent, see the header
+# above) mints a fresh token with the widened scope for an existing install.
 # Token name includes a timestamp plus a random suffix -- verified live
 # (not assumed) that Gitea rejects a second generate-access-token call
 # reusing the same --token-name ("Command error: access token name has
@@ -93,10 +104,10 @@ fi
 # closes that window regardless of how fast the script runs.
 TOKEN_NAME="ai-dev-switchboard-$(date +%s)-$(head -c 8 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 8)"
 echo
-echo "Minting a write:repository,write:user-scoped token via 'docker exec --user git $GITEA_CONTAINER gitea admin user generate-access-token' (no password needed)..."
+echo "Minting a write:repository,write:user,read:issue,write:issue-scoped token via 'docker exec --user git $GITEA_CONTAINER gitea admin user generate-access-token' (no password needed)..."
 TOKEN_OUTPUT=$(docker exec --user git "$GITEA_CONTAINER" gitea admin user generate-access-token \
     --username "$GITEA_ADMIN_USER" --token-name "$TOKEN_NAME" \
-    --scopes write:repository,write:user --raw 2>&1) || {
+    --scopes write:repository,write:user,read:issue,write:issue --raw 2>&1) || {
     echo "Failed to generate a token. Output was:" >&2
     echo "$TOKEN_OUTPUT" >&2
     echo "Common causes: Gitea isn't running, '$GITEA_CONTAINER' is the wrong container name, or '$GITEA_ADMIN_USER' doesn't exist yet (create it first -- see install.sh's printed instructions)." >&2

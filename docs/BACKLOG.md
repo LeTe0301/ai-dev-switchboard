@@ -13,6 +13,12 @@ since they share a pattern. Item 3 (folder upload) is a self-contained
 architecturally novel — do it last, and give it a full spec of its own
 before touching code.
 
+Items 7 and 8 both **depend on item 6 being substantially done** and should
+not be started before it: item 7 extends 6c's lead loop with board tools,
+and item 8 reuses 6's roster for its "selectable model". Both also widen
+what an agent may change without a human in the loop, so both carry a scope
+decision to put to the user before building rather than after.
+
 ---
 
 ## 1. Local backlog tracker (Taiga), tracked by Claude

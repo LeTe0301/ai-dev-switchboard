@@ -413,9 +413,19 @@ class InstallScriptDeployTargetBlockTests(unittest.TestCase):
     """
 
     def setUp(self):
-        if subprocess.run(["id", "deploy"], capture_output=True).returncode == 0:
-            self.skipTest("a real 'deploy' user already exists on this "
-                          "machine -- refusing to touch it")
+        # Skips on EITHER a live 'deploy' user OR an orphaned /home/deploy
+        # directory left behind by an interrupted prior run (docs/spec.md,
+        # BACKLOG item 9) -- userdel can remove the account while leaving
+        # /home/deploy (and a stale authorized_keys) behind, which then
+        # causes a later run's own provisioning to fail mysteriously
+        # against pre-existing state. Directory presence alone is enough
+        # to refuse: this class only ever runs against a genuinely fresh
+        # machine, never atop leftover state.
+        if (subprocess.run(["id", "deploy"], capture_output=True).returncode == 0
+                or os.path.exists("/home/deploy")):
+            self.skipTest("a real 'deploy' user or an orphaned /home/deploy "
+                          "directory already exists on this machine -- "
+                          "refusing to touch it")
         self.config_dir = tempfile.mkdtemp(prefix="aidswb-cfgdir-")
         self.addCleanup(lambda: shutil.rmtree(self.config_dir, ignore_errors=True))
         self.deploy_paths = []
@@ -423,6 +433,15 @@ class InstallScriptDeployTargetBlockTests(unittest.TestCase):
     def tearDown(self):
         subprocess.run(["sudo", "pkill", "-9", "-u", "deploy"], capture_output=True)
         subprocess.run(["sudo", "userdel", "-r", "deploy"], capture_output=True)
+        # Unconditional backstop: userdel -r removes /home/deploy as a side
+        # effect of removing the account, but a partial failure (userdel
+        # itself failing, or a test crashing before userdel ever ran) must
+        # never leave the directory behind for the NEXT run's own setUp()
+        # to trip over (docs/spec.md, BACKLOG item 9). Safe to make
+        # unconditional specifically because it only runs at the end of a
+        # test that itself created /home/deploy in this same setUp/test
+        # lifecycle -- never a blind sweep against pre-existing state.
+        subprocess.run(["sudo", "rm", "-rf", "/home/deploy"])
         subprocess.run(["sudo", "rm", "-f",
                        "/etc/sudoers.d/ai-dev-switchboard-deploy-target"])
         subprocess.run(["sudo", "rm", "-f",
@@ -592,7 +611,8 @@ class InstallScriptDeployTargetBlockTests(unittest.TestCase):
         with open(INSTALL_SH) as f:
             source = f.read()
         host_control_block = _extract_between(
-            source, 'echo "-- Host-control agent', 'fi\n\n# ── Optional: deploy-target')
+            source, 'echo "-- Host-control agent',
+            'fi\n\n# ── Optional: link an existing remote Ollama')
         helpers = _extract_between(source, "interactive() {", "random_token() {")
         deploy_block = _extract_between(
             source, "# ── Optional: deploy-target receiver", 'echo "== Done =="')
@@ -625,6 +645,122 @@ class InstallScriptDeployTargetBlockTests(unittest.TestCase):
             subprocess.run(["id", "deploy"], capture_output=True).returncode, 0)
         self.assertTrue(os.path.exists(
             "/usr/local/bin/ai-dev-switchboard-deploy-wrapper.sh"))
+
+
+@unittest.skipUnless(HAVE_PASSWORDLESS_SUDO,
+                     "needs passwordless sudo to construct/remove a real "
+                     "orphaned /home/deploy for this test")
+class DeployTargetOrphanDetectionTests(unittest.TestCase):
+    """docs/BACKLOG.md item 9 (docs/spec.md): setUp()'s guard must trip on
+    an orphaned /home/deploy directory alone -- no 'deploy' user needed --
+    not just a live account. Proven by actually running a real test method
+    of InstallScriptDeployTargetBlockTests through unittest's own
+    TestResult/TestCase.run() machinery (not by re-implementing the guard's
+    condition here and asserting on that in isolation) and inspecting
+    result.skipped, so this proves the CLASS is genuinely skipped -- not
+    merely that some other test happens to pass coincidentally against
+    leftover state."""
+
+    def setUp(self):
+        if subprocess.run(["id", "deploy"], capture_output=True).returncode == 0:
+            self.skipTest("a real 'deploy' user already exists on this "
+                          "machine -- refusing to touch it")
+        if os.path.exists("/home/deploy"):
+            self.skipTest("a real /home/deploy already exists on this "
+                          "machine -- refusing to touch it")
+
+    def test_orphaned_home_deploy_directory_with_no_user_skips_the_class(self):
+        # Simulates exactly the interrupted-prior-run condition docs/
+        # spec.md describes: userdel already removed the 'deploy' account,
+        # but /home/deploy (and a stale authorized_keys) survived.
+        subprocess.run(["sudo", "mkdir", "-p", "/home/deploy/.ssh"], check=True)
+        subprocess.run(["sudo", "bash", "-c",
+                       "echo stale-key > /home/deploy/.ssh/authorized_keys"],
+                       check=True)
+        self.addCleanup(lambda: subprocess.run(["sudo", "rm", "-rf", "/home/deploy"]))
+        self.assertEqual(
+            subprocess.run(["id", "deploy"], capture_output=True).returncode, 1,
+            "the orphan condition requires no live 'deploy' account")
+
+        result = unittest.TestResult()
+        test = InstallScriptDeployTargetBlockTests(
+            "test_full_run_provisions_user_path_env_keys_sudoers")
+        test.run(result)
+
+        self.assertEqual(len(result.errors), 0, result.errors)
+        self.assertEqual(len(result.failures), 0, result.failures)
+        self.assertEqual(len(result.skipped), 1,
+                         "InstallScriptDeployTargetBlockTests must be skipped, "
+                         "not run against the orphaned /home/deploy")
+        reason = result.skipped[0][1]
+        self.assertIn("/home/deploy", reason)
+
+
+@unittest.skipUnless(HAVE_PASSWORDLESS_SUDO,
+                     "needs passwordless sudo to provision then force-fail "
+                     "a real deploy-target fixture for this test")
+class DeployTargetTearDownBackstopTests(unittest.TestCase):
+    """docs/BACKLOG.md item 9 (docs/spec.md): tearDown()'s unconditional
+    `sudo rm -rf /home/deploy` backstop must remove /home/deploy even when
+    the test body fails partway through, after the fixture was created but
+    before any of the test's own cleanup logic would run -- so the NEXT
+    run's own setUp() always sees a clean state. Proven by actually running
+    a real subclass of InstallScriptDeployTargetBlockTests (inheriting its
+    real setUp/tearDown, unmodified) whose test body constructs /home/deploy
+    directly (deliberately WITHOUT ever creating a 'deploy' user account --
+    same orphan shape as DeployTargetOrphanDetectionTests above) and then
+    deliberately raises, through unittest's own TestCase.run() (which always
+    calls tearDown() after a failing test body -- this is standard library
+    behavior, not something under test here), then asserting on real,
+    on-disk state afterward.
+
+    Deliberately NOT provisioning via run_block()/a real useradd: if a real
+    'deploy' account existed when tearDown() ran, its own pre-existing
+    `sudo userdel -r deploy` call would remove /home/deploy as an ordinary
+    side effect of removing the account -- which would make this test pass
+    regardless of whether the new backstop line exists at all (this was
+    exactly the reviewer's finding on the prior version of this test: it
+    proved nothing about the backstop specifically). With no 'deploy'
+    account ever created, `userdel -r deploy` has no matching account to
+    act on and fails as a no-op, so only the explicit `sudo rm -rf
+    /home/deploy` backstop line can be what removes the directory."""
+
+    def setUp(self):
+        if subprocess.run(["id", "deploy"], capture_output=True).returncode == 0:
+            self.skipTest("a real 'deploy' user already exists on this "
+                          "machine -- refusing to touch it")
+        if os.path.exists("/home/deploy"):
+            self.skipTest("a real /home/deploy already exists on this "
+                          "machine -- refusing to touch it")
+
+    def test_teardown_backstop_removes_home_deploy_after_a_forced_mid_test_failure(self):
+        class _ForcedFailureWithNoDeployUser(InstallScriptDeployTargetBlockTests):
+            def test_forced_failure_with_no_deploy_user(self):
+                # Construct /home/deploy directly -- no useradd, no 'deploy'
+                # account at all -- so the pre-existing `userdel -r deploy`
+                # call in the inherited tearDown() has nothing to act on.
+                subprocess.run(["sudo", "mkdir", "-p", "/home/deploy/.ssh"], check=True)
+                subprocess.run(["sudo", "bash", "-c",
+                               "echo stale-key > /home/deploy/.ssh/authorized_keys"],
+                               check=True)
+                self.assertTrue(os.path.exists("/home/deploy"))
+                self.assertNotEqual(
+                    subprocess.run(["id", "deploy"], capture_output=True).returncode, 0,
+                    "this scenario requires no live 'deploy' account -- "
+                    "otherwise userdel -r would remove /home/deploy as a "
+                    "side effect, independent of the backstop under test")
+                raise RuntimeError("simulated failure with no 'deploy' user ever created")
+
+        result = unittest.TestResult()
+        test = _ForcedFailureWithNoDeployUser("test_forced_failure_with_no_deploy_user")
+        test.run(result)
+
+        self.assertEqual(len(result.errors), 1, result.errors)
+        self.assertIn("simulated failure", result.errors[0][1])
+        self.assertFalse(os.path.exists("/home/deploy"),
+                         "tearDown's backstop must remove /home/deploy even "
+                         "when no 'deploy' user ever existed for userdel -r "
+                         "to clean it up as a side effect")
 
 
 AUTHORIZED_KEYS_TEMPLATE = (

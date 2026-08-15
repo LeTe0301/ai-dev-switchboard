@@ -1,12 +1,16 @@
 # Design: Install wizard UI — part 3, pieces 2-4 (live enumeration + hard-block validation)
 
 ## Summary
+A single-row team control rendered inline on each project row, positioned after the deploy row, with two visual modes: an idle state showing a task-text input and "Start team" button, and a running state showing a coarse status label (idle/running/blocked/finished/error) and "Stop team" button. Error messages (tier-3-only refusal, missing roster members) display inline in the same row, following the `deploy` row's messaging pattern. No new visual language — all styling and typography reuse the existing page conventions.
 
 Three new interactive dialogs added to the Advanced branch of `ct/create.sh`, replacing static free-text prompts with live-enumerated `whiptail --menu` pickers for storage pools and network bridges, plus hard-block retry loops (loop-until-valid) for CTID and hostname validation. All copy focuses on clarity, actionability, and fitting within whiptail's fixed 74-character terminal width.
 
 This is a TUI (terminal user interface) feature, following the pattern established in parts 1-2. No new components, design tokens, or visual systems introduced — only refined dialog copy and the enumeration/validation state coverage.
 
----
+## Component reuse
+- **Reused**: Existing HTML/JS patterns from `deployRow()` and `doDeploy()` — inline row rendering, direct `fetch()` POST plumbing, inline result message slot, existing TOTP code-overlay machinery for confirmation (via `toggle()`/`handleActionResult()`)
+- **Reused**: Existing `/status` poll (every 4 seconds, unchanged) — no new timer; team row updates from the existing `team` field added to the per-instance status dict
+- **New (none)**: No new component, no new library. Plain HTML/CSS/JS matching the page's embedded script.
 
 ## Dialog 1: Storage-pool selection menu
 
@@ -315,7 +319,7 @@ No error msgbox; validation succeeds. Script proceeds immediately to the storage
 - **Active voice:** "Container ID must be," "Use letters, digits," "Choose a different one" — action-oriented phrasing.
 - **Parallel structure:** Both CTID and hostname loops follow the same pattern (ask → validate → error msgbox if invalid → re-ask), so operator learns the pattern once.
 
-### Platform-specific notes
+**Behavior**: Compose box is completely absent. Any unsent draft is discarded. If a new run later starts for the same project, the draft does not reappear.
 
 - **TUI only:** Bash script running on Proxmox VE host (Linux terminal). No mobile, GUI, or web equivalent.
 - **Operator demographic:** System administrators familiar with SSH, Linux CLIs, and Proxmox. They expect terse, functional dialogs without hand-holding.
