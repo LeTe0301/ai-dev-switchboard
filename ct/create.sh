@@ -21,6 +21,7 @@ REPO_BRANCH="${REPO_BRANCH:-main}"
 
 command -v pct >/dev/null 2>&1 || { echo "pct not found — this script must run on a Proxmox VE host." >&2; exit 1; }
 command -v whiptail >/dev/null 2>&1 || apt-get install -y -qq whiptail
+command -v python3 >/dev/null 2>&1 || apt-get install -y -qq python3
 
 msg()   { whiptail --title "ai-dev-switchboard" --msgbox "$1" 14 74; }
 ask()   { whiptail --title "ai-dev-switchboard" --inputbox "$1" 10 74 "$2" 3>&1 1>&2 2>&3; }
@@ -53,14 +54,98 @@ if [ "$AUTH_MODE" = "simple" ]; then
     SIMPLE_PASSWORD=$(askpw "Web UI password:")
 fi
 
+FEATURES=$(whiptail --title "ai-dev-switchboard" --checklist \
+    "Optional features to enable on this container (Space to toggle, Enter to confirm):" \
+    18 78 4 \
+    "git-hosting" "Private repos over SSH + \"+ New project\" button" OFF \
+    "code-server" "VS Code in the browser, per project" OFF \
+    "taiga"       "Self-hosted Taiga backlog/kanban tracker" OFF \
+    "ollama"      "Link a remote Ollama for multi-agent team leads" OFF \
+    3>&1 1>&2 2>&3)
+
 WITH_GIT_HOSTING=0
-if yesno "Enable git-hosting on this container too?\n\nPrivate bare repos over SSH + the \"+ New project\" button in the UI (clone-and-register in one step). You can always add this later."; then
-    WITH_GIT_HOSTING=1
+WITH_CODE_SERVER=0
+WITH_TAIGA=0
+WITH_OLLAMA=0
+for _item in $FEATURES; do
+    _item="${_item%\"}"; _item="${_item#\"}"
+    case "$_item" in
+        git-hosting) WITH_GIT_HOSTING=1 ;;
+        code-server) WITH_CODE_SERVER=1 ;;
+        taiga)       WITH_TAIGA=1 ;;
+        ollama)      WITH_OLLAMA=1 ;;
+    esac
+done
+
+if [ "$WITH_TAIGA" -eq 1 ]; then
+    msg "Taiga runs 9 containers and can use several GB of RAM (and real disk, for Postgres/RabbitMQ data volumes) once turned on in the web UI; toggling it back off frees that RAM again right away."
 fi
 
-WITH_CODE_SERVER=0
-if yesno "Enable code-server (VS Code in the browser) per project?"; then
-    WITH_CODE_SERVER=1
+OLLAMA_BASE_URL_NORM=""
+OLLAMA_MODEL_INPUT=""
+if [ "$WITH_OLLAMA" -eq 1 ]; then
+    # Copied verbatim from install.sh's own --with-ollama block (exact
+    # model-id comparison against data[].id — never substring/grep, since
+    # e.g. "qwen3:8" must not false-positive-match "qwen3:8b").
+    OLLAMA_MODEL_CHECK_SCRIPT=$(cat <<'PYEOF'
+import json
+import sys
+
+wanted = sys.argv[1]
+raw = sys.stdin.read()
+try:
+    data = json.loads(raw)
+    ids = [m.get("id") for m in data.get("data", []) if isinstance(m, dict)]
+except Exception:
+    print("PARSE_ERROR")
+    sys.exit(0)
+if wanted in ids:
+    print("OK")
+else:
+    print("MODEL_ABSENT:" + ",".join(str(i) for i in ids if i is not None))
+PYEOF
+)
+    _ollama_url_default="http://127.0.0.1:11434/v1"
+    _ollama_model_default="qwen3:8b"
+    while :; do
+        _ollama_url_input=$(ask "Ollama endpoint URL (OpenAI-compatible, e.g. an existing remote Ollama's /v1)" "$_ollama_url_default")
+        _ollama_model_input=$(ask "Model name" "$_ollama_model_default")
+        _ollama_url_norm="${_ollama_url_input%/}"
+        _ollama_models_json=$(curl -fsS --max-time 10 "$_ollama_url_norm/models" 2>/dev/null || true)
+        if [ -z "$_ollama_models_json" ]; then
+            _ollama_fail_msg="Could not reach $_ollama_url_norm/models (unreachable, no response, or an HTTP error)."
+        else
+            _ollama_check=$(printf '%s' "$_ollama_models_json" | python3 -c "$OLLAMA_MODEL_CHECK_SCRIPT" "$_ollama_model_input")
+            case "$_ollama_check" in
+                OK)
+                    OLLAMA_BASE_URL_NORM="$_ollama_url_norm"
+                    OLLAMA_MODEL_INPUT="$_ollama_model_input"
+                    break
+                    ;;
+                MODEL_ABSENT:*)
+                    _ollama_available="${_ollama_check#MODEL_ABSENT:}"
+                    if [ -z "$_ollama_available" ]; then
+                        _ollama_fail_msg="Reached $_ollama_url_norm but it has no models available."
+                    else
+                        _ollama_fail_msg="Reached $_ollama_url_norm but model '$_ollama_model_input' is not available there. Available: $_ollama_available"
+                    fi
+                    ;;
+                *)
+                    _ollama_fail_msg="Reached $_ollama_url_norm/models but its response could not be parsed as JSON."
+                    ;;
+            esac
+        fi
+        msg "$_ollama_fail_msg"
+        if yesno "Try a different URL/model?"; then
+            _ollama_url_default="$_ollama_url_input"
+            _ollama_model_default="$_ollama_model_input"
+            continue
+        else
+            WITH_OLLAMA=0
+            msg "Continuing without linking Ollama. You can re-run 'install.sh --with-ollama' inside the container later once the endpoint is reachable."
+            break
+        fi
+    done
 fi
 
 PUBLISH_MODE=$(menu "How should per-project ttyd/VS Code terminals be published beyond this container?" \
@@ -116,6 +201,12 @@ LISTEN_HOST=127.0.0.1
 LISTEN_PORT=8333
 HOST_CONTROL_ENABLED=0
 EOF
+if [ "$WITH_OLLAMA" -eq 1 ]; then
+    {
+        echo "TEAM_LLM_BASE_URL=${OLLAMA_BASE_URL_NORM}"
+        echo "TEAM_LLM_MODEL=${OLLAMA_MODEL_INPUT}"
+    } >> "$TMP_ENV"
+fi
 pct push "$CTID" "$TMP_ENV" /etc/ai-dev-switchboard/switchboard.env
 rm -f "$TMP_ENV"
 trap - EXIT
@@ -123,6 +214,8 @@ trap - EXIT
 INSTALL_FLAGS="--yes"
 [ "$WITH_GIT_HOSTING" -eq 1 ] && INSTALL_FLAGS="$INSTALL_FLAGS --with-git-hosting"
 [ "$WITH_CODE_SERVER" -eq 1 ] && INSTALL_FLAGS="$INSTALL_FLAGS --with-code-server"
+[ "$WITH_TAIGA" -eq 1 ]       && INSTALL_FLAGS="$INSTALL_FLAGS --with-taiga"
+[ "$WITH_OLLAMA" -eq 1 ]      && INSTALL_FLAGS="$INSTALL_FLAGS --with-ollama"
 
 # shellcheck disable=SC2086
 pct exec "$CTID" -- bash /opt/ai-dev-switchboard-src/install.sh $INSTALL_FLAGS
