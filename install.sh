@@ -241,6 +241,23 @@ SVC_USER=$(prompt "Unprivileged user to run the web UI process as" "$SVC_USER_DE
 
 id "$RUN_USER" &>/dev/null || { useradd -m -s /bin/bash "$RUN_USER"; echo "Created $RUN_USER"; }
 id "$SVC_USER" &>/dev/null || { useradd -r -m -d "/home/$SVC_USER" -s /usr/sbin/nologin "$SVC_USER"; echo "Created $SVC_USER"; }
+# Item 24 fix: $STATE_DIR itself was never chowned (only its later-created
+# uploads/ subdirectory was) -- SVC_USER couldn't write directly under it
+# (e.g. GITEA_REPO_MAP_FILE). SVC_USER doesn't exist until the useradd
+# above, so this has to live here rather than next to $STATE_DIR's mkdir.
+chown "$SVC_USER:$SVC_USER" "$STATE_DIR"
+# Item 27 fix: SVC_USER (running app.py) needs to run read-only git
+# inspection commands (_check_git_repo_state()) against every RUN_USER-
+# owned project directory. Git's "dubious ownership" protection
+# (CVE-2022-24765) refuses this by default across a user boundary. `*`
+# (not a glob against a fixed path) is required -- git's own
+# safe.directory only matches literal paths or the literal string `*`,
+# and projects are created dynamically after install, so a fixed list of
+# literal paths can't work here. Bounded, deliberate trade-off: SVC_USER
+# only ever runs read-only inspection git commands directly (writes
+# already cross into RUN_USER via sudo -u), so this doesn't hand out any
+# privilege beyond what the account already effectively has.
+sudo -u "$SVC_USER" git config --global --add safe.directory '*'
 
 PROJECTS_DIR="/home/$RUN_USER/projects"
 mkdir -p "$PROJECTS_DIR"
@@ -276,13 +293,14 @@ if [ "$WITH_CODE_SERVER" -eq 1 ]; then
 }
 JSON
         fi
-        chown -R "$RUN_USER:$RUN_USER" "$CODE_SERVER_DIR"
+        chown -R "$RUN_USER:$RUN_USER" "/home/$RUN_USER/.local"
     fi
 fi
 
 echo "-- App + engines --"
 cp "$REPO_DIR/app/app.py" "$INSTALL_DIR/app.py"
 cp "$REPO_DIR/app/teams.py" "$INSTALL_DIR/teams.py"
+cp "$REPO_DIR/app/taiga_board.py" "$INSTALL_DIR/taiga_board.py"
 mkdir -p "$CONFIG_DIR/engines.d"
 for f in "$REPO_DIR"/engines.d/*.engine; do
     [ -e "$f" ] || continue
@@ -471,6 +489,18 @@ set_env "$ENV_FILE" DEPLOY_KEYS_DIR "$CONFIG_DIR/deploy-keys"
 
 chown "$SVC_USER:$SVC_USER" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
+
+# Item 25 fix: a small, deliberately world-readable (644) sibling file
+# holding ONLY non-secret, install-time-static values -- gitea-sync-
+# project.sh runs as RUN_USER (not SVC_USER) and cannot read the 600
+# switchboard.env, but needs RUN_USER/PROJECTS_DIR to locate the project
+# it's syncing. Never write a secret into this file.
+RUNTIME_ENV_FILE="$CONFIG_DIR/runtime.env"
+cat > "$RUNTIME_ENV_FILE" <<EOF
+RUN_USER=$RUN_USER
+PROJECTS_DIR=$PROJECTS_DIR
+EOF
+chmod 644 "$RUNTIME_ENV_FILE"
 
 echo "-- Clone project from URL (backlog item 16, works standalone, no --with-git-hosting needed) --"
 install -m 755 "$REPO_DIR/scripts/new-project-from-url.sh" \
@@ -934,7 +964,7 @@ if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
     echo "done TWO one-time steps, in order, after the Gitea toggle is on and the"
     echo "stack has finished starting:"
     echo "  1. Create Gitea's own admin account (a single non-interactive command):"
-    echo "       docker exec -it --user git ai-dev-switchboard-gitea gitea admin user create \\"
+    echo "       docker exec --user git ai-dev-switchboard-gitea gitea admin user create \\"
     echo "         --admin --username <name> --password <password> --email <email>"
     echo "  2. Run scripts/gitea-configure-api.sh once (as root) to mint an API token"
     echo "     for the web UI to use — see docs/GIT_HOSTING.md."

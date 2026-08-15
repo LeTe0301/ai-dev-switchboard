@@ -34,7 +34,7 @@
 # retries automatically rather than silently giving up.
 set -euo pipefail
 
-CONFIG=/etc/ai-dev-switchboard/switchboard.env
+CONFIG=/etc/ai-dev-switchboard/runtime.env
 [ -f "$CONFIG" ] && source "$CONFIG"
 RUN_USER="${RUN_USER:-dev}"
 PROJECTS_DIR="${PROJECTS_DIR:-/home/${RUN_USER}/projects}"

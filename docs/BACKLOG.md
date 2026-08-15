@@ -1339,3 +1339,453 @@ judgment call for a future session, not something to guess at here:**
   configured cap, not literally unbounded spawning from a single button.
 - UI: where does the "+" live — on the existing Teams page, the plain
   per-project row, or both, depending on which shape (1 vs 2) is chosen?
+
+---
+
+## Items 22-33: found by a real Proxmox end-to-end test (2026-08-15)
+
+Every item below was found by a separate Claude Code session running
+directly on a real Proxmox VE host, given a mission to create a genuinely
+new LXC container via `ct/create.sh` and hands-on test every feature —
+first real end-to-end validation of the items-1-21 consolidation, as
+opposed to the mocked/unit test suite and code review that had been the
+only prior verification. Items 22, 24, 25, 26, 27, 28, 29 mean **a fresh
+install is currently broken** in ways the existing 1198-test suite has no
+way to catch (wrong file ownership, wrong user context, a missing `cp`
+line) — none of these are logic bugs the mocked tests could ever have
+exercised, since the tests never run a real `useradd`/`chown`/multi-user
+`sudo -u` boundary the way an actual install does.
+
+---
+
+## 22. Fresh install crash-loops immediately — `install.sh` never copies `app/taiga_board.py`
+
+`ai-dev-switchboard.service` fails to start at all, on every single fresh
+install, regardless of which optional features are selected:
+
+```
+× ai-dev-switchboard.service - ai-dev-switchboard
+     Active: failed (Result: exit-code)
+    Process: 9380 ExecStart=/usr/bin/python3 /opt/ai-dev-switchboard/app.py (code=exited, status=1/FAILURE)
+```
+```
+ModuleNotFoundError: No module named 'taiga_board'
+  File "/opt/ai-dev-switchboard/app.py", line 2399, in <module>
+    import teams
+  File "/opt/ai-dev-switchboard/teams.py", line 55, in <module>
+    import taiga_board
+```
+
+`teams.py` unconditionally imports `taiga_board` at module load (not gated
+behind Taiga being enabled), and `app.py` unconditionally imports `teams`
+— so this crashes the whole service even for someone who never touched
+`--with-taiga`. Root cause: `install.sh`'s app-copy step only copies two
+of the three files that live in `app/`:
+
+```bash
+cp "$REPO_DIR/app/app.py" "$INSTALL_DIR/app.py"
+cp "$REPO_DIR/app/teams.py" "$INSTALL_DIR/teams.py"
+```
+
+`app/taiga_board.py` (added for item 7) was never added to this list.
+
+**Shape of the fix**: add `cp "$REPO_DIR/app/taiga_board.py"
+"$INSTALL_DIR/taiga_board.py"` next to the other two `cp` lines. Worth a
+quick grep of `app/` for any other `.py` file that isn't `app.py`/
+`teams.py` before calling this done, since this is exactly the kind of gap
+that silently reappears the next time a new module gets added there.
+
+---
+
+## 23. `install.sh`'s own printed Gitea-admin-bootstrap command fails non-interactively
+
+After `--with-git-hosting`, `install.sh` prints this as the required first
+one-time step:
+
+```
+docker exec -it --user git ai-dev-switchboard-gitea gitea admin user create \
+  --admin --username <name> --password <password> --email <email>
+```
+
+Run exactly as printed, without an attached TTY (e.g. via `pct exec` or
+any provisioning script):
+
+```
+cannot attach stdin to a TTY-enabled container because stdin is not a terminal
+```
+
+The command already passes every value as a flag — nothing about it is
+actually interactive — so `-it` serves no purpose and is the only thing
+breaking it. Dropping `-it` succeeds immediately.
+
+**Shape of the fix**: drop `-it` from the printed command in `install.sh`
+(the string around line 937).
+
+---
+
+## 24. `/var/lib/ai-dev-switchboard` is root-owned — silently breaks Gitea poll-sync and the description cache
+
+`create_project()`'s own repo-map write (`_save_gitea_repo_map_entry`) is
+documented as best-effort and swallows `OSError` — which is exactly what
+happens, every time, on a fresh install: `GITEA_REPO_MAP_FILE`
+(`/var/lib/ai-dev-switchboard/gitea-repo-map.json`) and `DESC_CACHE_FILE`
+can never be created, because `switchboard-svc` has no write access to
+their parent directory:
+
+```
+$ ls -la /var/lib/ai-dev-switchboard/
+drwxr-xr-x  3 root            root            4096 ... .
+drwxr-xr-x  2 switchboard-svc switchboard-svc 4096 ... uploads
+```
+
+Because the write is silently swallowed, a brand-new Gitea-hosted
+project's repo-map entry never gets written, so poll-sync (item 2c) has
+nothing to poll for it — no error anywhere, in logs or the UI. Root cause
+in `install.sh`:
+
+```bash
+STATE_DIR=/var/lib/ai-dev-switchboard
+mkdir -p "$CONFIG_DIR" "$INSTALL_DIR" "$STATE_DIR"   # created root:root, mode 755
+...
+mkdir -p "$STATE_DIR/uploads"
+chown "$SVC_USER:$SVC_USER" "$STATE_DIR/uploads"      # only this one subdir gets chowned
+```
+
+`$STATE_DIR` itself is never chowned — only the one subdirectory
+install.sh happens to pre-create. Same defect class as item 26 below.
+
+**Shape of the fix**: `chown "$SVC_USER:$SVC_USER" "$STATE_DIR"` right
+after creating it, before any of the more specific subdirectory chowns.
+Confirmed sufficient by direct test.
+
+---
+
+## 25. Gitea poll-sync is completely non-functional even after fixing item 24 — `gitea-sync-project.sh` runs as `RUN_USER` but can't read `switchboard.env`
+
+Even with item 24 fixed, sync still always fails silently (the poll's own
+non-zero-exit handling deliberately just retries next interval, never
+surfaces the failure), so a push to a Gitea-hosted project's repo never
+fast-forwards `PROJECTS_DIR`. Reproducing the actual dispatched subprocess
+call directly:
+
+```
+$ sudo -u dev /usr/local/bin/ai-dev-switchboard-gitea-sync-project.sh e2e-sync-test main
+/usr/local/bin/ai-dev-switchboard-gitea-sync-project.sh: line 38: /etc/ai-dev-switchboard/switchboard.env: Permission denied
+```
+
+`gitea-sync-project.sh` is explicitly documented and dispatched to run as
+`RUN_USER` (`dev`), not root, but its first real statement sources
+`/etc/ai-dev-switchboard/switchboard.env` — mode 600,
+`switchboard-svc`-owned. `dev` can't read it, `source` fails, and
+`set -euo pipefail` exits the whole script before doing anything.
+
+Verified the diagnosis by temporarily loosening the file to 644 (reverted
+immediately — this exposes `GITEA_API_TOKEN`/`SIMPLE_PASSWORD`/
+`TOTP_SECRET` to every local user): the exact same command then genuinely
+fast-forwards the repo and exits 0. The sync logic itself is correct —
+only the credential-file read is broken.
+
+**Shape of the fix**: `gitea-sync-project.sh` only actually needs
+`RUN_USER`/`PROJECTS_DIR` — both static per-install values already known
+at `install.sh` time. Have `install.sh` write those two specific values
+into a small, world-readable file the script sources instead of the same
+600 file that also holds live secrets. **Do not** just loosen
+`switchboard.env` to 644 — that leaks real credentials to every account on
+the box, including `RUN_USER`'s own coding-agent sessions.
+
+---
+
+## 26. `install.sh`'s code-server step leaves `~RUN_USER/.local` root-owned — blocks `pip --user`/`pipx`/any XDG user-install
+
+With `--with-code-server`, `dev` (RUN_USER) can never write directly under
+their own `~/.local`, blocking `pipx install`, `pip install --user`, and
+anything else following the XDG base-dir convention:
+
+```
+$ ls -la /home/dev/
+drwxr-xr-x 3 root root 4096 ... .local        <- root-owned!
+$ sudo -u dev mkdir /home/dev/.local/testdir
+mkdir: cannot create directory '/home/dev/.local/testdir': Permission denied
+```
+
+Root cause, `install.sh`:
+
+```bash
+CODE_SERVER_DIR="/home/$RUN_USER/.local/share/code-server"
+...
+mkdir -p "$CODE_SERVER_USER_DIR"          # creates .local, .local/share, etc — ALL as root
+...
+chown -R "$RUN_USER:$RUN_USER" "$CODE_SERVER_DIR"   # only chowns .local/share/code-server and below
+```
+
+Same defect class as item 24: `mkdir -p` run as root creates every
+intermediate directory as root:root, and the following `chown -R` only
+reaches the specific subtree the code already knew the name of — `.local`
+and `.local/share` themselves, two levels up, are never touched.
+
+**Shape of the fix**: chown the top-level `/home/$RUN_USER/.local`
+recursively instead of starting the recursive chown two levels deeper at
+`$CODE_SERVER_DIR`.
+
+---
+
+## 27. Multi-agent teams cannot start at all — git's "dubious ownership" check blocks `switchboard-svc` on every project, with a misleading error
+
+**The most severe finding in this round**: item 6 (multi-agent
+orchestration), the project's largest and most architecturally novel
+feature, cannot be exercised at all on a fresh install, against any
+project.
+
+```
+POST /projects/proj-a/team/start {"task": "..."}
+→ 400 {"error": "not a git repository"}
+```
+
+...against a project that unquestionably is a clean git repo. The error is
+flatly wrong and actively misleading. Root cause: `_check_git_repo_state()`
+runs `git -C workdir rev-parse --is-inside-work-tree` as `SVC_USER`
+(`switchboard-svc`), read-only, no `sudo -u dev` (a deliberate design
+choice — "no privilege crossing needed"). But every project directory is
+owned by `RUN_USER` (`dev`), a different user — and git ≥2.35.2's "dubious
+ownership" protection (CVE-2022-24765) refuses to operate on a repo owned
+by someone other than the calling user unless that path is in the
+caller's own `safe.directory` list:
+
+```
+$ sudo -u switchboard-svc git -C /home/dev/projects/proj-a rev-parse --is-inside-work-tree
+fatal: detected dubious ownership in repository at '/home/dev/projects/proj-a'
+```
+
+`_check_git_repo_state()`'s own error-mapping treats any non-"true" result
+as `"not a git repository"` — it can't distinguish "genuinely not a repo"
+from "blocked by a safety check," so the real cause is fully hidden.
+`install.sh` never configures `safe.directory` for `SVC_USER` at all — a
+total gap, not a partial one.
+
+**Shape of the fix**: `install.sh` should run, once, as `$SVC_USER`:
+```bash
+sudo -u "$SVC_USER" git config --global --add safe.directory '*'
+```
+Verified live that the literal `*` (git's documented "trust every
+directory" escape hatch) is what's actually needed — a glob does **not**
+work (git's `safe.directory` only matches literal paths or `*`), and a
+fixed list of literal paths can't work since projects are created
+dynamically after install. Real, bounded security trade-off worth being
+explicit about: `switchboard-svc` only ever runs read-only inspection git
+commands (this check) plus RUN_USER-crossing operations that already go
+through `sudo -u RUN_USER` for anything that writes — so trusting all
+directories for git operations run as `switchboard-svc` specifically
+doesn't hand out any new privilege beyond what the account already
+effectively has via those sudo rules. Worth a line in
+`docs/ARCHITECTURE.md`'s privilege-boundary writeup.
+
+---
+
+## 28. Every worktree creation and every headless engine turn fails — team-lifecycle scratch dirs are `switchboard-svc`-owned but written into by `RUN_USER`
+
+Second critical blocker for item 6, found immediately after fixing item
+27 — with both fixed, teams actually work end to end.
+
+```
+POST /projects/proj-a/team/start {...}
+→ 400 {"error": "failed to create worktree for 'aider': command session ended unexpectedly"}
+```
+
+That message is `_run_run_user_command()`'s own fallback for "the tmux
+session vanished and no rc-file was ever written" — a real, documented
+edge case for a fast command racing the poll loop, but that's not what's
+actually happening. The `tmux new-session` call itself succeeds cleanly,
+but the `git worktree add` command inside it can never actually run,
+because the directory it's asked to redirect its own stdout/stderr/pid/rc
+into is owned by a different user with no write access for anyone else:
+
+```
+$ ls -la /var/lib/ai-dev-switchboard/teams/_worktree_ops/
+drwx--x--x 2 switchboard-svc switchboard-svc ... <op_id>/
+```
+
+`rundir` is created by `app.py` (running as `switchboard-svc`) via
+`os.makedirs(rundir); os.chmod(rundir, 0o711)` — but the actual command
+inside it is dispatched via `sudo -u dev tmux new-session ...`, i.e. it
+runs as `RUN_USER`, which has no write bit on `0o711` at all. The whole
+redirect-and-background line fails at its very first redirect — nothing
+ever gets written, and the generic "vanished with no rc" fallback fires.
+Looks exactly like a fast-command race but is actually a hard,
+100%-reproducible permission wall.
+
+The exact same bug, independently, blocks every headless engine turn —
+every actual delegation to a teammate — via the sibling
+`_run_headless_session()`'s own `rundir`. Same ownership mismatch, same
+silent symptom.
+
+**Shape of the fix**: `os.chmod(rundir, 0o733)` (owner rwx, world -wx) at
+both call sites — `_run_run_user_command()` and `_run_headless_session()`
+— instead of `0o711`. Verified this exact change makes team-start,
+worktree creation, and headless delegation all work correctly. Files
+written into `rundir` by `RUN_USER` inherit a normal `022`-umask mode
+(world-readable), so `switchboard-svc` reading them back afterward is
+unaffected — only the directory's write bit for "other" was ever the
+problem. Also worth adding: the `subprocess.run(TMUX + ["new-session",
+...])` calls at both these sites (and a third at app.py:1139) don't
+capture/check their own return code or stderr at all — that's exactly
+what made this bug hard to diagnose from the outside. Capturing
+`capture_output=True` there and threading a real error message through
+would make any future failure of this kind far faster to diagnose.
+
+---
+
+## 29. `board_read`/`board_write` always report "Taiga isn't configured" — the shared config path resolves differently for the writer and the reader
+
+Item 7's core mechanism, broken by the exact documented setup flow.
+Following `scripts/taiga-configure-push.sh`'s own documented usage
+exactly ("Run once, by RUN_USER") writes
+`~/.config/ai-dev-switchboard/taiga-push.env`. Starting a team whose lead
+calls `board_read`:
+
+```
+{"kind": "tool_result", "text": "Taiga error: Taiga isn't configured — run scripts/taiga-configure-push.sh first (expected config at /home/switchboard-svc/.config/ai-dev-switchboard/taiga-push.env).", ...}
+```
+
+Note the path: `/home/switchboard-svc/...`, not `/home/dev/...` where the
+setup script actually wrote it. Root cause: both `taiga_push_spec.py`
+(invoked as `RUN_USER`) and `app/taiga_board.py` (invoked as `SVC_USER`,
+from inside the lead loop) independently compute the exact same-looking
+default:
+
+```python
+DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/ai-dev-switchboard/taiga-push.env")
+```
+
+...but `~` expands relative to whichever user's process evaluates it —
+two entirely separate files, and the one place the setup instructions
+tell you to create it is never the one the board tools read. Every team
+lead that ever calls `board_read`/`board_write` on a fresh install will
+report "not configured," even after a user follows the docs exactly.
+
+Confirmed the fix by copying the file to `switchboard-svc`'s own home,
+chowned correctly — after which `board_read`/`board_write` both worked
+correctly, including a real propose → approve landing on the real Taiga
+card, and a clean propose → reject path.
+
+**Shape of the fix**: pick one location and have both consumers agree on
+it explicitly — resolve the path relative to `RUN_USER`'s home
+(`f"/home/{RUN_USER}/.config/..."`, matching where the setup script and
+its own docs already point) in `taiga_board.py` too, rather than each side
+independently calling `os.path.expanduser("~/...")` in its own process
+context. `taiga-configure-push.sh` already writes 600-mode/RUN_USER-owned,
+so `app.py` (running as a different user) reading it will need either a
+narrowly-scoped read grant or for `install.sh` to create the file's
+directory with the right shared permissions up front.
+
+---
+
+## 30. Taiga's gateway container reliably fails to come up via `docker compose up` — no retry, and one failure can wedge it long-term
+
+Toggling Taiga on left the actual public entrypoint (`taiga-gateway`, port
+9000) failing every time, while the other 8 containers came up fine:
+
+```
+Error response from daemon: failed to set up container networking: driver failed
+programming external connectivity on endpoint ...taiga-gateway-1: failed to bind
+host port 127.0.0.1:9000/tcp: address already in use
+```
+
+Nothing was actually listening on 9000 at the moment of failure (checked
+directly, several ways) — looks like a genuine, brief Docker-internal
+port-bind race rather than a real conflicting process, but the container
+is left in a broken state by it (`NetworkSettings.Networks` comes back
+`{}`, and a full `docker rm -f` + recreate reliably reproduces the
+identical empty-network state, 8 consecutive attempts). A plain `docker
+run` with `--network`/`-p` given together at creation time attaches the
+network correctly on the first try, unlike Compose's separate
+create→connect→publish sequence — suggesting a real ordering bug in this
+specific Docker/Compose version combination when the port-bind step hits
+even a transient EADDRINUSE.
+
+Root cause not fully pinned down — flagging explicitly rather than
+guessing further. Best-supported theory (not confirmed): this container's
+root disk filled completely mid-`docker compose up` (item 31) right before
+this first appeared, and Docker's own internal state around that attempt
+may never have fully recovered even once disk space was restored. A
+genuinely fresh install with adequate disk from the start may not hit this
+at all — untested separately.
+
+**Shape of the fix**: regardless of root cause, `taiga-up.sh` has zero
+resilience to this — one bad `docker compose up -d` pass leaves the whole
+feature silently, indefinitely broken (correctly reported as "off" by
+`taiga-status.sh`, not a lying UI — but with no path back to "on" without
+manual `docker` surgery). Worth having `taiga-up.sh` detect a gateway
+container stuck in `Created`/`Exited` after the compose call and retry a
+`docker rm -f` + re-`up` a bounded number of times before giving up
+loudly.
+
+---
+
+## 31. Default 8G container disk is under-provisioned once git-hosting + code-server + Taiga are all enabled — fills completely, breaks Postgres with a misleading error
+
+Following Advanced Install exactly with the installer's own default disk
+size (`DEFAULT_DISK_GB="8"`) fills the container's entire root disk:
+
+```
+$ df -h /
+Filesystem                        Size  Used Avail Use% Mounted on
+/dev/mapper/pve-vm--900--disk--0   7.8G  7.4G     0 100% /
+```
+
+(base Debian 12 + apt packages ≈2.2G, Docker images/containers/volumes for
+Gitea+Taiga ≈3.9G, aider's own pipx venv ≈683M, plus the rest.) The actual
+symptom a real user would see is `taiga-db`'s Postgres instance failing to
+start with `FATAL: could not write init file` — no "no space left on
+device," nothing that points at `df`. Someone hitting this with the
+default install would have no reason to suspect disk space at all.
+
+**Shape of the fix**: raise `DEFAULT_DISK_GB` (`ct/create.sh`) — 8G is
+tight even without Taiga; with all four optional features it's not viable
+at all. A default closer to 20–24G (host permitting — the storage-pool
+step already shows free space live, so it could size its own suggestion
+off that) would give real headroom. Independent of the default,
+`taiga-up.sh`/`gitea-up.sh` could cheaply `df` the target filesystem
+before calling `docker compose up` and refuse with a clear message instead
+of letting Postgres's own opaque error be the first sign of trouble.
+
+---
+
+## 32. Live-enumerated network-bridge menu includes per-container firewall bridges, not just real uplinks
+
+Advanced Install's bridge-selection menu, populated via `ip -o link show
+type bridge`, also lists the auto-created `fwbrXXXiY` bridges Proxmox
+creates for other containers' firewall rules on a host with per-container
+firewalling enabled — not just real switch/uplink bridges a new container
+should attach to:
+
+```
+Network bridge:
+  vmbr0      kernel bridge
+  fwbr101i0  kernel bridge
+  fwbr106i0  kernel bridge
+  fwbr107i0  kernel bridge
+```
+
+Picking one of the `fwbrXXXiY` entries by mistake would create a
+container with effectively no working uplink — a plausible misclick on a
+host that's been running a while, since nothing in the menu distinguishes
+them from a real bridge.
+
+**Shape of the fix**: filter `_enumerate_bridges()`'s `ip -o link show
+type bridge` output to exclude the `fwbrNNNiM` naming pattern (Proxmox's
+own fixed convention for these).
+
+---
+
+## 33. `/team/interject`'s error message names the wrong field
+
+Minor/cosmetic. The interject route's actual JSON body key is `text`, but
+its validation error says `"message must be non-empty and at most 2000
+characters"` — nothing tells you the key it actually wants is `text`, not
+`message`, and the mission's own wording ("interject a message") makes
+`message` the natural first guess.
+
+**Shape of the fix**: either rename the error text to say `text`
+(matching the real field), or accept both key names. One-line fix either
+way.
+  per-project row, or both, depending on which shape (1 vs 2) is chosen?
