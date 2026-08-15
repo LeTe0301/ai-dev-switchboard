@@ -723,22 +723,182 @@ restart a running session) is in `docs/spec.md`.
 
 ## 15. Install wizard UI
 
-**Added 2026-08-14**, user-requested: "install should be an install wizard
-like this picture" — **the referenced image was not attached to the
-request**. Needs the actual reference before this can be scoped at all;
-follow up with the user for the image (or a link/description of the
-wizard UI they have in mind) before writing a spec.
+**Status: shipped in full (2026-08-15), parts 1-3 covering all six shaped
+pieces below (5: part 1; 1: part 2; 2-4: part 3; 6 stays an explicit
+non-goal).** `ct/create.sh`'s Advanced branch now has an optional-feature
+checklist, a Default/Advanced entry fork, live storage/bridge enumeration,
+and hard-block CTID/hostname validation — reviewer should confirm before
+this is treated as fully closed, per the normal approval gate.
 
-**What's known without the image:** today, `install.sh` is a single
-non-interactive-by-default script (`--yes` flag) with a series of
-`prompt()`-driven optional `--with-*` blocks, run over SSH/terminal — there
-is no browser-based or step-by-step graphical installer. If the picture
-turns out to depict a web-based multi-step wizard (name/logo suggests
-something in the shape of a typical "welcome → configure → confirm →
-install" flow), this would be a materially different delivery mechanism
-than the current shell script and deserves its own architecture
-discussion — don't assume it's a small tweak to `install.sh` until the
-picture clarifies what's actually wanted.
+**Added 2026-08-14**, user-requested: "install should be an install wizard
+like this picture" — the referenced image was not attached at the time.
+**Reference supplied 2026-08-15**: screenshots + a blog post
+(bjoerns-techblog.de) of the **Proxmox VE Community Scripts** helper-script
+wizard (`community-scripts/ProxmoxVE`), plus its `ollama.sh` one-liner as a
+concrete example. Deep research done this session (fetched and read the
+actual `misc/build.func` source, not just the blog description) — this
+item is now unblocked and scopeable.
+
+**How the community-scripts wizard actually works (grounded in
+`misc/build.func`, ~7300 lines, fetched 2026-08-15):**
+- **Invocation**: a single `bash -c "$(curl -fsSL .../ct/ollama.sh)"`
+  one-liner. Each per-app script (e.g. `ct/ollama.sh`, 65 lines) is a thin
+  shim: it sets `APP`, `var_tags`, `var_cpu`, `var_ram`, `var_disk`,
+  `var_os`, `var_version`, etc., defines an app-specific `update_script()`,
+  then sources the shared framework —
+  `source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)`
+  — and calls `start`, `build_container`, `description`. All the wizard
+  logic lives once in `build.func`/`install.func`, not duplicated per app.
+- **Entry menu** (`install_script()`, `build.func:3391`): after
+  preflight checks (root, PVE version, arch, SSH-key sanity), shows a
+  `whiptail --menu` with **Default Install / Advanced Install / User
+  Defaults / App Defaults (if saved) / Settings** — not just a bare
+  yes/no. Selecting "Default" calls `base_settings()` and proceeds
+  immediately; "Advanced" calls `base_settings()` then
+  `advanced_settings()`.
+- **`advanced_settings()`** (`build.func:2002`) is an explicit **step
+  state-machine** (`STEP=1`, `((STEP++))`/`((STEP--))` to go
+  forward/back, cancel-at-step-1 exits, cancel-later steps back one) that
+  walks: container type (priv/unpriv) → root password → container ID
+  (`validate_container_id`, auto-bumps on collision) → hostname
+  (`validate_hostname`, RFC1123) → disk size → CPU cores → RAM → network
+  bridge (dynamically enumerated from real host bridges/SDN vnets) → IPv4
+  mode (DHCP/static/range-scan) → IPv6 mode → MTU/DNS/MAC/VLAN → tags.
+  Every field has real-time validation functions
+  (`validate_hostname`/`validate_mac_address`/`validate_vlan_tag`/
+  `validate_gateway_in_subnet`/…) rather than accepting anything typed.
+- **Storage pool selection**: enumerated live via
+  `pvesm status -content rootdir` (or `vztmpl` for templates) — silently
+  auto-picks if only one pool exists, otherwise shows a `select_storage()`
+  menu; `validate_storage_space()` checks the chosen pool actually has
+  room before proceeding.
+- **Build step** (`create_lxc_container()`, `build.func:6110`): resolves/
+  downloads the OS template via `pveam`, assembles `PCT_OPTIONS` (hostname,
+  features, storage, net, etc.) as a multi-line string, then runs
+  `pct create "$CTID" "$TEMPLATE_STORAGE:vztmpl/$TEMPLATE" $PCT_OPTIONS`,
+  with automatic **fallback to an older OS template version** and a
+  verbose-log-on-failure whiptail prompt if `pct create` fails, then
+  `pct start`. Optionally offers to save the just-used values as
+  reusable **app defaults** (`maybe_offer_save_app_defaults()`) so a
+  re-run can skip the wizard entirely next time.
+- **Net effect**: same 5 primitives throughout — `whiptail`
+  `--menu`/`--radiolist`/`--inputbox`/`--passwordbox`/`--yesno`, real
+  per-field validators, live enumeration of host resources (bridges,
+  storage pools, templates) instead of free-text guessing, and a
+  Default/Advanced fork so a first-time user needs one keypress while an
+  operator who cares still gets full control.
+
+**What this project already has — closer to this pattern than the
+original backlog note assumed:** `ct/create.sh` (already in this repo,
+referenced by item 5) is a **smaller instance of the exact same shape**:
+a `bash -c "$(curl -fsSL .../ct/create.sh)"` one-liner, `command -v
+pct`/`whiptail` preflight, a `msg`/`ask`/`askpw`/`yesno`/`menu` helper
+set built directly on `whiptail`, sequential prompts for CTID/hostname/
+storage/disk/cores/memory/bridge/IP, then `pct create` + `pct start` +
+in-container bootstrap (clone repo, write `switchboard.env`, run
+`install.sh`). It is **not** using the community-scripts framework (no
+shared `build.func` — this project deliberately keeps `ct/create.sh`
+self-contained per its own header comment, "no shared framework, just
+pct and whiptail") and is missing, relative to the researched pattern:
+  - No Default-vs-Advanced fork — every field is always asked, flat,
+    in one pass (no "press Enter three times and you're done" path).
+  - No live storage-pool enumeration (`pvesm status`) or bridge
+    enumeration — `STORAGE`/`BRIDGE` are free-text inputs with a string
+    default, not a menu built from what's actually on the host.
+  - No per-field validation beyond what `install.sh` itself later
+    enforces — a malformed CTID/hostname/IP isn't caught until `pct
+    create` fails.
+  - No app-defaults save/reuse, no step-back navigation (each `ask` is a
+    one-shot prompt; whiptail's own per-dialog Back button exists but
+    isn't wired to a step machine — cancelling anywhere aborts the whole
+    script per `set -euo pipefail`, matching this project's own
+    documented "abort the run" default *outside* the optional `--with-*`
+    blocks, but unlike community-scripts' per-step back navigation).
+
+**Shape of the work for a future spec:** this is a **refinement of
+`ct/create.sh`** adopting the concrete, load-bearing pieces of the
+researched pattern — not a from-scratch rebuild, and not a pivot to a
+browser-based wizard (nothing in the reference material depicts one; it's
+a terminal/`whiptail` TUI end to end, run over an SSH/console session on
+the Proxmox host itself, before there's even a container to serve a web
+UI from). Concretely scopeable pieces, roughly in the order they'd add
+value:
+  1. Default-vs-Advanced entry menu, mirroring `install_script()`'s
+     `whiptail --menu` fork — Default runs today's current defaults with
+     zero prompts beyond confirmation; Advanced walks the existing
+     `ask`/`menu`/`yesno` sequence unchanged.
+  2. Live storage-pool enumeration (`pvesm status -content rootdir`,
+     already single-line-safe the way item 3's zip-slip validation is)
+     feeding a `whiptail --menu` instead of `ask`'s free-text default —
+     directly prevents a mistyped storage pool from failing `pct create`
+     partway through.
+  3. Live bridge enumeration (`ip link show type bridge` or Proxmox's own
+     `/etc/network/interfaces` parse, whichever `build.func` is shown to
+     rely on) feeding the same menu treatment as bridge/storage.
+  4. CTID/hostname validation before `pct create` is attempted, reusing
+     the same regex/range checks `build.func`'s `validate_container_id`/
+     `validate_hostname` apply, adapted to this script's existing
+     `ask()` helper rather than importing the whole framework.
+  5. **Optional-feature checklist menu** — settled decision, 2026-08-15
+     (see below): replace the current two standalone `yesno` prompts
+     (`WITH_GIT_HOSTING`, `WITH_CODE_SERVER`) with one `whiptail
+     --checklist` multi-select covering all switchboard-box-installable
+     `install.sh` flags, mirroring community-scripts' own
+     multi-select-style menus rather than one `yesno` per flag.
+  6. **Explicitly out of scope for this item**: the app-defaults
+     save/reuse file, IPv6/MTU/VLAN/SDN-vnet fields (this project's own
+     `IPCONFIG` free-text field already covers the static/DHCP cases this
+     project actually needs), and adopting `build.func` itself as a
+     dependency — `ct/create.sh`'s own header comment's "no shared
+     framework" decision stands; borrow the *pattern*, not the *code*.
+
+**Scope decision — settled (2026-08-15):** the checklist (item 5 above)
+covers exactly the four `--with-*` flags `install.sh` documents as
+running **on the switchboard box itself** —
+`--with-git-hosting`/`--with-code-server`/`--with-taiga`/`--with-ollama`.
+`--with-host-control` and `--with-deploy-target` are explicitly
+**excluded** from `ct/create.sh`'s wizard: `install.sh`'s own header
+comments say these are "usually installed on a *different* machine than
+the web UI" / "run on a *separate* target machine, never the switchboard
+box itself" — surfacing them in the container-creation wizard would
+invite enabling infrastructure-receiver features on the wrong box. They
+remain CLI-only flags on `install.sh`, unchanged, run by hand on whatever
+machine actually needs them.
+
+**Shape of the checklist item specifically:**
+- One `whiptail --checklist` screen, default-unchecked (matching
+  `WITH_GIT_HOSTING=0`/`WITH_CODE_SERVER=0`'s current off-by-default
+  posture), listing: git-hosting, code-server, taiga, ollama — each with
+  the same one-line description `ask()`/`yesno()`'s current prompt text
+  already gives, condensed to fit a checklist row.
+- Checking **taiga** should carry the same resource-cost callout item 1's
+  own install prompt gives (multi-service: Django + RabbitMQ + Postgres +
+  frontend) — either inline in the checklist row text or a follow-up
+  `msgbox` shown only if taiga is checked, not a blocking confirmation.
+- Checking **ollama** needs a follow-up step the checklist itself can't
+  capture: `--with-ollama` requires an endpoint URL + model name,
+  validated as actually reachable (`install.sh`'s own documented
+  behavior — "refuses to write config it can't verify"). This must stay
+  a **separate `ask()`/validation step shown only when ollama is
+  checked**, not folded into the checklist itself.
+- Selected items map to `INSTALL_FLAGS` the same way `WITH_GIT_HOSTING`/
+  `WITH_CODE_SERVER` already do today (`[ "$WITH_GIT_HOSTING" -eq 1 ] &&
+  INSTALL_FLAGS="$INSTALL_FLAGS --with-git-hosting"`) — one conditional
+  append per checked item, no new dispatch mechanism needed.
+
+~~**Open for the future session:** whether step 1 (Default/Advanced fork)
+alone satisfies "install wizard" well enough to ship alone, or whether the
+user wants storage/bridge live-enumeration (steps 2–3) and the checklist
+(step 5) in the same pass; whether validation (step 4) should hard-block
+on failure or just warn and let `pct create`'s own error surface,
+consistent with this project's existing preference for real errors over
+guessed validation.~~ **Resolved (2026-08-15, part 3):** all of steps 1-3/5
+shipped together across parts 1-3, not step 1 alone; validation (step 4)
+is a hard block with no "continue anyway" escape hatch, per part 1's own
+settled reasoning (checking CTID/hostname before `pct create` surfaces the
+same rule `pct create` would enforce anyway, just earlier and more
+clearly). Reviewer-confirmed during part 3's test-review pass — see
+`docs/test-review.md` for that cycle.
 
 ---
 

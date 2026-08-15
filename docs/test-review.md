@@ -1,10 +1,10 @@
-# Test & Review: follow-up fixes — items 8, 12 (piece C), 20 (broader audit)
+# Test & Review: carry forward rejected CTID/hostname on retry (ct/create.sh)
 
 ## Scope
-Independent re-verification of `docs/implementation.md`'s three bundled
-fixes against `docs/spec.md`'s acceptance criteria: item 8 (episode-keyed
-AI-reviewer lock), item 12 piece C (widened poll-boundary gate), item 20
-(broader button/control contrast audit). This document has two passes:
+`ct/create.sh`'s Advanced-path CTID and hostname validation retry loops
+(part 3, PR #22) now pre-fill the retry `ask()` box with the just-rejected
+value instead of always resetting to the constant default. Covers all four
+acceptance criteria in `docs/spec.md`.
 
 1. The **original** testing/review pass (below, unchanged from the first
    sitting) — found Defect 1 (must-fix: a TOCTOU in the episode-currency
@@ -21,131 +21,105 @@ AI-reviewer lock), item 12 piece C (widened poll-boundary gate), item 20
 
 | # | Criterion / case | Method | Result | Evidence |
 |---|---|---|---|---|
-| 1 | Piece 1 AC1 — label removed-and-readded while previous episode's thread is still in-flight dispatches a NEW thread, not silently dropped | Automated: `tests.test_ai_reviewer.AiReviewerEpisodeRaceTests.test_new_episode_is_dispatched_not_dropped_while_stale_episode_in_flight`, run directly; also independently reverted `lock_key = (pr_key, episode)` back to `lock_key = pr_key` and reran — test failed with the exact message the developer's docs claim ("episode 2's review thread was never dispatched -- dropped by the stale (pr_key, episode-1) lock"), then restored and reconfirmed green | pass | Ran locally: `Ran 2 tests ... FAILED (failures=1)` on revert, `OK` after restore |
-| 2 | Piece 1 AC2 — a stale (old-episode) thread's eventual completion write is a no-op; state stays on whichever episode is actually current | Automated (developer's own coarse-timing test) + a new, targeted adversarial repro racing the trigger-edge write directly against the stale thread's own check-then-write window | **FAIL** | `race_repro3.py` reproduced a real clobber against the shipped `_ai_reviewer_record_failure`/`_save_ai_reviewer_state_entry` code — see original Defect 1 below |
-| 3 | Piece 1 AC3 — normal, non-racing single-episode review is unaffected | Automated: full `tests.test_ai_reviewer` suite (83 tests) | pass | `Ran 83 tests in 0.668s ... OK` |
-| 4 | Piece 1 AC4 — `_ai_reviewer_pr_locks` does not grow unbounded; a finished thread's `(pr_key, episode)` entry is removed | Automated + adversarial repro targeting the cleanup mechanism | pass (AC holds), but see original Defect 2 (should-fix) | Both dedicated tests pass; `race_repro2.py` showed the underlying release/pop TOCTOU |
-| 5 | Piece 1 AC5 — pre-existing state entries with no `episode` key read correctly, no crash | Manual script (`backcompat_check.py`) | pass | manual only; no dedicated unit test yet — flagged as a minor gap |
-| 6 | Piece 1 — retry branch passes the SAME lock key as the original trigger | Code read | pass | `app/app.py:1619,1648-1649` |
-| 7-11 | Piece 2 AC1-AC4 + backend status vocabulary | Automated `tests/test_team_frontend.js` + code read | pass | `node tests/test_team_frontend.js` → `ALL PASS (106/106)` |
-| 12-14 | Piece 3 AC1-AC3 — audit table, `.wizard-step` fix, `.team-btn`/`.deploy-btn` untouched | Independent WCAG recompute of all 16 pairs + code read | pass, with one gap (`.card .back` misclassified in "Considered and excluded") | `contrast.py` output matched table; `.card .back` gap noted |
+| 1 | Invalid CTID rejected → re-prompt pre-fills the just-rejected CTID, not `default_ctid()` | Automated: extracted the literal lines 127-138 from `ct/create.sh` via `sed`, sourced them into a harness with stubbed `ask`/`msg`/`pct` (recording every pre-fill `ask()` received, via disk-backed queues to survive the `$(...)` subshell) and the real `default_ctid`/`_valid_hostname` functions copied verbatim from the file | pass | `harness2.sh`/`harness3.sh` run: 1st CTID prefill `900` (default), 2nd prefill `abc` (the rejected value) — see below |
+| 2 | CTID rejected for "already in use" (`pct status` branch) also carries forward | Automated, same harness, 3-value queue (`abc` → format-invalid, `999999999` → in-use, `150` → accepted) | pass | 3rd CTID prefill = `999999999`, the just-rejected in-use id |
+| 3 | Invalid hostname rejected → re-prompt pre-fills the just-rejected hostname, not `$DEFAULT_CT_HOSTNAME` | Automated, same harness | pass | 1st hostname prefill `ai-dev-switchboard` (default), 2nd prefill `bad_host!` (the rejected value) |
+| 4 | First prompt (nothing entered yet): pre-fill unchanged from today | Automated, same harness, run under `set -euo pipefail` (matching the file's own `set -u`) with `CTID`/`CT_HOSTNAME` unset at harness start | pass | 1st CTID prefill = `900` (`default_ctid()`'s value), 1st hostname prefill = `ai-dev-switchboard` (`$DEFAULT_CT_HOSTNAME`); no `nounset` error |
+| 5 | `bash -n` / `shellcheck` clean | Automated: ran both directly against `ct/create.sh` | pass | `bash -n ct/create.sh` — no output, exit 0; `shellcheck ct/create.sh` — no output, exit 0 |
+| 6 | `set -u` safety of `"${VAR:-$DEFAULT}"` on an unset var | Automated, part of harness runs (loop entered with `CTID`/`CT_HOSTNAME` unset, script has `set -euo pipefail`) | pass | Harness completed without a "unbound variable" error; also isolated microbench (`test_expansion.sh`) confirmed `${CT_HOSTNAME:-$DEFAULT_CT_HOSTNAME}` on an unset var resolves to the default under `set -u` |
+| 7 | `default_ctid()` (live `pvesh` call) now runs once per Advanced session instead of once per CTID retry | Automated, same harness — `default_ctid` stub counts its own invocations | pass | Call count = 1 across a 3-iteration CTID retry sequence |
+| 8 | Nothing else in `ct/create.sh` changed | `git diff --stat` / manual read of `git diff ct/create.sh` | pass | `1 file changed, 2 insertions(+), 2 deletions(-)` — exactly the two intended `ask()` pre-fill lines (127→128, 140→141 in new file); no other line touched |
 
-### Original pass — defects found
-**Defect 1 (must-fix)**: `_ai_reviewer_record_failure()` and the final
-success-write guard checked `prev.get("episode", 0) == episode` via an
-**unlocked** read, then separately called `_save_ai_reviewer_state_entry()`
-under the lock — not atomic with each other. A concurrent trigger-edge write
-landing in the gap let a stale thread's already-passed check clobber the
-newer episode's state, moving `episode` backwards. Repro'd against the
-actual shipped code, no modification needed.
+All eight cases directly execute the literal diff lines (extracted verbatim
+via `sed` from the current `ct/create.sh`, not a re-typed reimplementation),
+so they exercise the actual shipped code, not a stand-in for it.
 
-**Defect 2 (should-fix, not blocking)**: `_ai_reviewer_review_bg()`'s
-`_run()` closure did `lock.release()` then, as a separate statement,
-`_ai_reviewer_pr_locks.pop(lock_key, None)` — a TOCTOU that could let two
-callers run concurrently for the same `(pr_key, episode)` key. Judged
-currently unreachable via the app's real call graph (poll passes are
-serialized, tens of seconds to minutes apart — many orders of magnitude
-wider than the microsecond release-to-pop gap), so non-blocking, but worth
-closing defensively.
+## Regression check
+No existing automated test suite in this repo covers `ct/create.sh` (the
+project's Python/JS suite under `tests/` — `test_deploy_*`, `test_gitea_*`,
+`test_taiga_*`, `test_upload*`, etc. — targets the web-app backend/frontend,
+none of which import or invoke `ct/create.sh`). The established verification
+bar for this file, per its own history (part 1/part 3 reviews) and
+`docs/implementation.md`'s "How to verify locally", is `bash -n` +
+`shellcheck`, both run above and clean. `git diff --stat` confirms the
+change is isolated to `ct/create.sh`'s two pre-fill lines plus this cycle's
+`docs/spec.md`/`docs/implementation.md`; no other file in the repo is
+touched, so there is nothing else to regress.
 
-**Minor gaps**: no dedicated AC5 regression test; `.card .back` audit note
-factually wrong (called it an anchor; it's a `<span onclick=...>`).
-
-### Original pass — verdict
-**Blocked** on Defect 1. Route back to developer.
+## Defects found
+None.
 
 ---
 
-## Re-review pass (this sitting) — verifying the developer's fix
+## Spec coverage
+All four acceptance criteria in `docs/spec.md` are implemented and directly
+tested (see table above):
+- CTID retry pre-fill carries forward the rejected value — covered (cases 1, 2).
+- Hostname retry pre-fill carries forward the rejected value — covered (case 3).
+- First-prompt pre-fill unchanged (`default_ctid()` / `$DEFAULT_CT_HOSTNAME`) — covered (case 4).
+- `bash -n`/`shellcheck` clean — covered (case 5).
 
-The developer's claim: Defect 1 fixed via a new
-`_ai_reviewer_save_if_current_episode(pr_key, episode, **fields)`
-(`app/app.py:1397-1421`) that performs the read, the episode-currency check,
-and the write all inside one `_ai_reviewer_state_lock` critical section.
-Defect 2 fixed by popping the lock-dict entry before releasing the lock,
-inside the same `_ai_reviewer_pr_locks_guard` critical section
-(`app/app.py:1604-1624`). New regression test
-`AiReviewerEpisodeAtomicWriteRaceTests` (`tests/test_ai_reviewer.py:956-1063`).
-AC5 gained dedicated coverage; the `.card .back` doc error corrected.
+The spec's stated non-goal ("nothing else in `ct/create.sh` changes,"
+ollama loop from part 1 untouched) is confirmed by the diff stat (case 8) —
+the ollama retry loop does not appear in the diff at all.
 
-### Re-review test cases
+## Correctness review (independent re-read of the diff)
+Read `git diff ct/create.sh` directly (not just the spec's/implementation's
+description of it):
 
-| # | Item | Method | Result | Evidence |
-|---|---|---|---|---|
-| 1 | `_ai_reviewer_save_if_current_episode` — read+check+write genuinely all inside `_ai_reviewer_state_lock`; no early-return-before-acquire or reentrant-deadlock path | Read the function directly (`app/app.py:1397-1421`): single `with _ai_reviewer_state_lock:` block wraps `_load_ai_reviewer_state()`, the `episode` check, `_ai_reviewer_state_entry_dict()`, and `_write_ai_reviewer_state()`. `_write_ai_reviewer_state()` and `_load_ai_reviewer_state()` do plain file I/O and never touch `_ai_reviewer_state_lock` themselves (confirmed by reading both — `_write_ai_reviewer_state`'s own docstring: "Assumes the caller already holds `_ai_reviewer_state_lock`") | pass | No code path returns before the `with` statement acquires the lock; no nested lock acquisition anywhere in the call chain |
-| 2 | Reproduce the ORIGINAL Defect 1 race against the NEW code, using my own independently-written repro (not the developer's test) | Wrote `race_repro_v3.py`: hooks `_load_ai_reviewer_state()` to inject a concurrent fresh trigger-edge write (episode 2) exactly at the second (currency-check) read inside `_ai_reviewer_record_failure`→`_ai_reviewer_save_if_current_episode`'s call chain, then lets the stale (episode 1) call finish | pass — **no clobber** against current code; **confirmed clobbers** when I temporarily reverted `_ai_reviewer_save_if_current_episode()` to the old unlocked-check-then-separate-write shape, then confirmed clean again after restoring | Current code: `final state: {'episode': 2, 'last_error': None, 'attempts': 0, ...}` → `NO CLOBBER`. Reverted code: `final state: {'episode': 1, 'last_error': 'stale failure from episode 1', 'attempts': 2}` → `CLOBBERED`. Restored, diff stat confirmed unchanged (`app/app.py \| 199 ++...`), `AiReviewerEpisodeAtomicWriteRaceTests` also independently re-run: passes on current code, fails with `1 != 2` on the reverted code, matching the developer's own claimed repro exactly |
-| 3 | Defect 2 fix (pop-before-release) doesn't create a NEW problem — traced whether a caller acquiring via `_ai_reviewer_pr_lock_for()` between pop and release could get an orphaned/duplicate lock | Read `app/app.py:1450-1456` (`_ai_reviewer_pr_lock_for`) and `1604-1624` (`_run()`'s cleanup) together | pass — no new problem introduced by this specific fix | Both the pop and the release happen inside the SAME `_ai_reviewer_pr_locks_guard` critical section, and `_ai_reviewer_pr_lock_for()` also acquires that same guard before reading/inserting into the dict — so no other thread can observe the dict in a state where the entry has been popped but the lock not yet released, or vice versa; that specific window is genuinely closed. (See "Residual observation" below for a narrower, structurally pre-existing race this fix does not — and was never claimed to — close.) |
-| 4 | Full suite re-run | `python3 -m unittest discover -s tests` (twice), `python3 -m unittest tests.test_ai_reviewer -v`, `node tests/test_team_frontend.js` | pass | Run 1: `Ran 1198 tests ... FAILED (failures=1)` — the one failure, `RealTmuxHeadlessTests.test_forced_session_kill_mid_run_is_classified_as_cancelled_not_success`, is in a file this diff doesn't touch (`git diff --stat -- tests/test_teams_headless.py app/teams.py` is empty) and passed both standalone and on a full immediate re-run (Run 2: `Ran 1198 tests ... OK`) — pre-existing environment flakiness (real-tmux session-name collision visible in the log: `duplicate session: team-sessionrace-p<pid>` immediately preceding the failure), not a regression from this diff. `tests.test_ai_reviewer`: `Ran 85 tests ... OK` (matches claim: 83 + 2 new). `node tests/test_team_frontend.js`: `ALL PASS (106/106)` (matches claim) |
-| 5 | `.card .back` correction is accurate and in the audit table | Read `app/app.py:2989` (`.card { background: #1c1c1c; ...}`) and `app/app.py:3000-3001` (`.card .back { ...color: #888; cursor: pointer; }`), confirmed it's a `<span class="back" onclick=...>` (`app/app.py:3080,3093`), not an `<a>`. Independently recomputed WCAG contrast from the literal hex values (own script, standard relative-luminance formula) | pass | `#888888` on `#1c1c1c` = **4.81:1** (recomputed independently, matches `docs/implementation.md`'s claimed figure exactly) — passes AA's 4.5:1 by a real but modest margin. Confirmed present in the audit table (`docs/implementation.md` line ~251) and removed from "Considered and excluded" (line ~271-273), replaced with an accurate note that it was previously mis-grouped there |
-| 6 | AC5 regression test is genuine, not just present | Read `tests/test_ai_reviewer.py:284-316` (`test_pre_existing_state_entry_missing_episode_key_is_backward_compatible`) | pass | Seeds a raw pre-fix-format JSON entry (no `episode` key, bypasses `_save_ai_reviewer_state_entry`), drives both the no-op poll path and the label-removed-then-readded path, asserts no crash, `episode` defaults to `0`, then bumps to `1` on the next trigger edge. Ran as part of the 85-test `test_ai_reviewer` run above |
+```diff
+-        CTID=$(ask "Container ID (must be free):" "$(default_ctid)")
++        CTID=$(ask "Container ID (must be free):" "${CTID:-$(default_ctid)}")
+...
+-        CT_HOSTNAME=$(ask "Hostname:" "$DEFAULT_CT_HOSTNAME")
++        CT_HOSTNAME=$(ask "Hostname:" "${CT_HOSTNAME:-$DEFAULT_CT_HOSTNAME}")
+```
 
-### Residual observation (non-blocking, not a new defect, pre-existing)
-While tracing item 3 above, I confirmed a narrower, structurally different
-race still theoretically exists: `_ai_reviewer_review_bg()`'s
-`lock = _ai_reviewer_pr_lock_for(lock_key); if not lock.acquire(blocking=False)`
-is itself two separate statements with no lock held between them. A caller
-that fetches a lock reference from the dict *before* another thread's
-pop-then-release cleanup runs, then calls `.acquire()` *after* that cleanup
-completes, can succeed in acquiring an orphaned lock object no longer
-present in the dict — and a third, later caller for the same key would then
-create a genuinely new lock and could run concurrently with the second. This
-is **not created by this fix** (it exists independent of pop/release
-ordering — it's inherent to the two-step fetch-then-acquire pattern at the
-call site) and is subject to the exact same "unreachable via the app's real
-call graph" reasoning the original Defect 2 finding already established:
-`_ai_reviewer_review_bg()` is only reachable from a single-pass-at-a-time
-poll loop, so two dispatches for the identical `(pr_key, episode)` key are
-tens of seconds to minutes apart in practice, not microseconds. Not raised
-as a new defect; noted for completeness since the task asked me to trace
-this specifically. Worth folding into the same defensive follow-up as the
-original Defect 2 note if this code is ever touched again.
+- `${VAR:-$DEFAULT}` is the correct bash operator for this: it substitutes
+  `$DEFAULT` only when `VAR` is unset *or* empty, and does not trip
+  `nounset` (`set -u`, active at `ct/create.sh:17`) when `VAR` is unset —
+  confirmed empirically, not just by citing the bash manual (test case 6).
+- Traced backward from line 128/141 to confirm `CTID`/`CT_HOSTNAME` are
+  genuinely unset the first time the Advanced-path `else` branch runs: the
+  only other assignments to these two variables in the file are at lines
+  100-101, inside the mutually-exclusive `if [ "$INSTALL_MODE" = "default" ]`
+  branch — so on the Advanced path the first `ask()` call is a true
+  first-use, matching the "first iteration unchanged" claim.
+- One incidental edge case worth noting (not a defect): if an operator
+  clears the input box to an empty string and submits, `${CTID:-...}` /
+  `${CT_HOSTNAME:-...}` treats empty the same as unset and falls back to
+  the original default on the next pre-fill rather than re-offering the
+  empty string. This is standard/expected `:-` behavior, isn't called out
+  as a distinct case in `docs/spec.md`'s acceptance criteria, and arguably
+  the more useful behavior (there's nothing to "edit" in an empty field);
+  not flagged as a finding.
+- Both loops' post-`ask()` validation logic (`_valid_hostname`, the
+  numeric-range regex, `pct status`) is byte-for-byte unchanged — only the
+  `ask()` pre-fill argument differs.
 
-### Regression check (re-review pass)
-- `python3 -m unittest discover -s tests` — run twice: `Ran 1198 tests`
-  both times (matches `docs/implementation.md`'s claimed count exactly);
-  first run had one unrelated, pre-existing flaky failure (see test case 4
-  above), second run clean (`OK`).
-- `python3 -m unittest tests.test_ai_reviewer -v` — `Ran 85 tests ... OK`
-  (matches claim: 83 original + 2 new this pass).
-- `node tests/test_team_frontend.js` — `ALL PASS (106/106)` (matches claim).
+## Security review
+No new external input handling, no new shell injection surface (`ask()`'s
+return value is unchanged in how it flows into validation and later
+`pct`/`whiptail` calls — this diff only changes the *pre-fill* argument
+passed *into* `ask()`, which is always one of: a value already produced by
+this same `ask()` call in a prior iteration, or the pre-existing
+`default_ctid()`/`$DEFAULT_CT_HOSTNAME`). No new secrets, no new
+network/host calls. Not applicable beyond what part 3's original review
+already covered for these loops.
 
-### Spec coverage (re-review)
-- Piece 1 (item 8) AC1-AC5: all five now genuinely covered and verified.
-  AC2 (stale completion is a no-op) — the one AC the original pass found
-  unmet — is now independently confirmed fixed via a fresh, differently-
-  constructed repro against the shipped code (not just re-running the
-  developer's own test), including a revert-and-watch-it-fail check.
-- Piece 2 (item 12 piece C): unchanged since the original pass, which found
-  no gaps; re-confirmed via the full frontend suite this sitting.
-- Piece 3 (item 20): the one completeness gap from the original pass
-  (`.card .back`) is now closed — recomputed and confirmed accurate.
+## Simplicity/scope review
+Matches the spec's proposed approach exactly: two one-line changes, no new
+functions, no new abstractions, no unrelated cleanup. `git diff --stat`
+confirms scope: `ct/create.sh | 4 +-` (2 lines changed, counted as 2
+insertions + 2 deletions in unified diff form) plus this cycle's own
+`docs/spec.md`/`docs/implementation.md` updates. Nothing else in the repo
+touched.
 
-### Findings (re-review)
-No must-fix or should-fix findings from this pass. The one residual
-observation above is explicitly non-blocking, pre-existing (not introduced
-by this fix), and already covered by the original Defect 2 finding's own
-"currently unreachable via the real call graph" reasoning.
+## Findings (most severe first)
+None. No must-fix, should-fix, or nit findings.
 
-### Re-review verdict
-**Approve.** Both defects from the original pass are genuinely closed:
-Defect 1's fix makes the episode-currency check and the write atomic under
-one lock, and I independently reproduced the original clobber against a
-temporarily-reverted copy of the fix and confirmed it no longer occurs
-against the shipped code. Defect 2's fix closes the specific TOCTOU it
-targeted (pop and release are now atomic under the same guard). AC5 has
-dedicated regression coverage. The `.card .back` documentation error is
-corrected and its ratio independently reconfirmed. Full test suite (1198),
-`test_ai_reviewer` (85), and frontend suite (106) all pass, matching the
-developer's claimed counts exactly; the one full-suite failure observed on
-the first run is an unrelated, pre-existing, environment-dependent flaky
-test (real tmux session-name collision) in a file this diff never touches,
-and it passed on immediate re-run and in isolation.
+## Follow-ups (non-blocking)
+None.
 
-## Follow-ups (non-blocking, optional)
-- Fold the residual fetch-then-acquire race noted above into the same
-  defensive cleanup as the original (now-closed) Defect 2 finding, if
-  `_ai_reviewer_review_bg()`/`_ai_reviewer_pr_lock_for()` are touched again.
-- `RealTmuxHeadlessTests.test_forced_session_kill_mid_run_is_classified_as_cancelled_not_success`
-  intermittently fails under `unittest discover`'s full-suite run (passes in
-  isolation) — likely real-tmux session-name collision with another test in
-  the same process; unrelated to this cycle but worth a look if it recurs.
+## Overall verdict
+Approve.
