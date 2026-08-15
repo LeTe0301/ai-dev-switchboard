@@ -2093,3 +2093,134 @@ carried forward as its own item since it's the same class of bug as
 **Shape of the fix**: mirror round 5's on-path fix — disable the toggle
 for the duration of the off-dispatch's in-flight window too, re-enabling
 on the terminal response (or timeout).
+
+---
+
+## Round 5 regression verification (2026-08-15)
+
+Verified against a fresh container (CTID 902, `ai-dev-switchboard-e2e-verify2`)
+built from `main` @ `89aeb83`, by the same Proxmox verification session as
+the earlier passes. `ct/create.sh` couldn't be driven interactively from
+that session (whiptail-only, no non-interactive flag), so its `pct
+create`/`install.sh` invocation was replicated verbatim instead — all
+four round-5 items live in `install.sh`/the app, so this doesn't weaken
+the verdicts below, but wizard-specific paths (item 32's bridge menu)
+were not re-exercised this pass.
+
+- **29 — confirmed fixed.** `setfacl` grant lands narrowly
+  (`user:switchboard-svc:r--`, `group::---`, `other::---`); `sudo -u
+  switchboard-svc cat` succeeds where it previously got Permission
+  denied; `load_config()` returns all 4 keys as that user, and the two
+  error paths are properly distinct. A real team lead's `board_write`
+  now fails with a genuine connectivity error ("Could not reach Taiga at
+  http://127.0.0.1:9000") instead of "isn't configured" — exactly the
+  distinction the fix was for. The full propose→approve-onto-a-real-card
+  cycle couldn't be re-run because item 30 kept the gateway down the
+  whole session. **See item 37: this fix silently reverts under normal
+  operator behavior.**
+- **34 — confirmed fixed.** All `GITEA_*` keys present in the first
+  process's environment with no manual restart; `POST /gitea/on` → `200
+  {"ok": true}`.
+- **35 — confirmed fixed.** Drove a real run to `escalated_max_rounds`,
+  then `/team/stop` → `{"session_removed": true, "worktrees": {"aider":
+  "removed"}}` (previously a silent no-op), and the next `/team/start`
+  succeeded with a fresh `run_id`.
+- **30 — still broken.** The race reproduced on the very first `POST
+  /taiga/on` of a fresh install; the round-5 backoff ran to full
+  exhaustion (164s) without recovering.
+
+  New evidence changes the diagnosis: while Docker reports `address
+  already in use` for port 9000, nothing is actually bound to it
+  (`ss -ltnap` empty, no docker-proxy, `/proc/net/tcp{,6}` clean).
+  Meanwhile `taiga-front` is up and resolvable from a sibling container
+  — Docker DNS itself is fine. The gateway container ends up `Created`
+  with `NetworkSettings.Networks == {}` — never actually attached to the
+  network.
+
+  Read as one causal chain, not two independent races: the gateway
+  binds 9000 → nginx dies immediately because it can't resolve the
+  `taiga-front` upstream yet (a startup-ordering issue, not a DNS
+  outage) → the exited container retains the port reservation → every
+  remove+recreate collides on that retained port → the one attempt that
+  gets past the collision lands network-unattached → `docker start`
+  can't reattach it → nginx fails on the same unresolved upstream again.
+  If this is right, **the retry can never win** — every attempt
+  recreates straight back into the same nginx crash, because the
+  fix targets the port-bind symptom, which is downstream of the real
+  cause.
+
+  Attempted recoveries, all failed: backoff exhaustion; manual `rm -f` +
+  `up -d`; full `down` (network removed) + `up -d`; `systemctl restart
+  docker` + `up -d` (started, then exited 1 on the same DNS failure
+  seconds later); remove + 45s wait + recreate. The opt-in
+  `TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION` fallback was not meaningfully
+  exercised — the one run with it set happened to succeed on its first
+  attempt (the port had cleared on its own by then), so this pass has no
+  evidence either way on whether it actually recovers a wedged state.
+
+  Separately (not the root cause, but worth folding into the same fix):
+  `taiga-up.sh`'s success check is a single point-in-time `ps` state
+  check. One run showed the gateway `Up` for under a second before
+  crashing, so the script exited 0 and `taiga-status.sh` briefly
+  reported `on` for a stack whose only public entrypoint was already
+  dead — needs a settle/health confirmation, not just an initial state
+  read.
+
+  **Revised shape of the fix**: point the fix at nginx's upstream
+  resolution instead of the port-bind symptom — e.g. an nginx `resolver`
+  directive with its own retry/backoff so it doesn't crash-loop while
+  waiting for `taiga-front` to become resolvable, or gate the gateway's
+  own startup on `taiga-front` health before nginx ever starts. Also
+  strengthen `taiga-up.sh`'s success check to confirm the container
+  stays up past some settle window, not just that it was up at the
+  moment of the check.
+
+---
+
+## 37. Item 29's fix silently reverts — the security-hygiene check that recommends `chmod 600` collapses the ACL grant that item 29 depends on
+
+Found during round-5 regression verification, live. Setting the item-29
+ACL grant (`setfacl -m u:switchboard-svc:r`) moves the group
+permission bits into the ACL mask entry, so `stat` on the file now
+reports mode `0640` even though the real *effective* permissions are
+still narrow. `taiga_push_spec.py`'s existing security check reads that
+raw `st_mode & 0o077` and, seeing group-readable bits, treats the file
+as loosely permissioned and prints `Run: chmod 600 <path>` on every
+`board_read`/`board_write` call.
+
+Following that printed advice — the obvious thing an operator would do,
+since it's presented as a fix — runs `chmod 600`, which recomputes the
+ACL mask down to `mask::---`. That makes the `switchboard-svc` grant's
+*effective* permission `---` even though the ACL entry itself is still
+listed, and `switchboard-svc` goes back to Permission denied. Item 29
+is silently undone by the tool's own advice, with no indication to the
+operator that anything changed.
+
+**Shape of the fix**: make the security check ACL-aware — read the
+actual effective permissions (e.g. via `os.access()` for the specific
+concern, or parse `getfacl`'s mask/effective annotations) rather than
+raw `st_mode`, so a narrowly-ACL'd-but-`0640`-looking file isn't flagged
+as loose, and the printed remediation never suggests an action that
+breaks a legitimate cross-user grant.
+
+---
+
+## 38. `/status` reports a finished/escalated team run as `blocked` indefinitely — any poller waiting for completion hangs forever
+
+Found during round-5 regression verification. A test run that had
+already reached `escalated_max_rounds` in `run.json` (and which
+`/team/stop` correctly treated as terminal, per the item-35 fix) was
+still reported as `blocked` by `/status` 17+ minutes later. Anything
+polling `/status` to detect completion — including this verification
+pass's own poller — waits forever, since `blocked` is never resolved to
+a terminal state on that endpoint. That run's `run.json` also carries
+`"project": null` despite being correctly associated with `testproj`
+everywhere else it's referenced; may share a root cause with the status
+staleness.
+
+**Shape of the fix**: find wherever `/status` derives its reported state
+and make sure it's reading the same terminal-status source `/team/stop`
+already uses (per item 35), not a stale/separately-computed value.
+Worth checking why `run.json`'s `project` field ends up `null` in the
+same run as a first step, since it may point at the same underlying
+write path being incomplete or racy.
