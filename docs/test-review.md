@@ -807,3 +807,152 @@ block this cycle (no data-loss, no double-post, no workdir-isolation
 breach, self-recovers on the next true label cycle) but is worth a
 follow-up. Two nits (Findings 2–3) are test-coverage-only, no behavior
 risk.
+
+# Test & Review: Backlog item 13 — surviving team branch discoverability
+
+## Scope
+Testing + review pass against `docs/spec.md`'s 6 acceptance criteria for
+read-only team-branch discoverability: `app/teams.py`'s
+`list_team_branches()`/`_TEAM_BRANCH_RE`, the `team-branches` CLI
+subcommand, the `GET /projects/<name>/team/branches` route, the Teams
+page's "Past team branches" panel, and the new `docs/ARCHITECTURE.md`
+section — plus the two disclosed deviations (full-vs-short commit hash,
+plain `YYYY-MM-DD` instead of relative date) and the four specific things
+the assigning prompt called out for hands-on verification (never-raises
+failure paths, the naming-convention regex on a non-matching branch, the
+web route's auth/project-scoping guard, and genuine end-to-end read-only-
+ness).
+
+## Test cases
+
+| # | Criterion / case | Method | Result | Evidence |
+|---|---|---|---|---|
+| 1a | Multiple `team-*` branches, correct `branch`/`commit`/`subject`/`committer_date`, `run_id`/`agent` parsed from naming convention | Automated (real git, no mocks) | pass | `tests/test_teams_lifecycle.py::ListTeamBranchesRealGitTests::test_multiple_branches_correct_metadata_and_run_id_agent_parsed` |
+| 1b | Zero matching branches → `[]`, not an exception | Automated | pass | `...::test_zero_matching_branches_returns_empty_list` |
+| 1c | Non-git directory → `[]` | Automated + manual (`list_team_branches('/tmp/nongit')` → `[]`, exit 0 via CLI) | pass | `...::test_non_git_directory_returns_empty_list_not_an_exception`; manual CLI run this session |
+| 1d | Nonexistent directory → `[]` | Automated | pass | `...::test_nonexistent_directory_returns_empty_list_not_an_exception` |
+| 1e | Missing `git` binary → `[]`, never raises | Manual (patched `subprocess.run` to raise `FileNotFoundError`, called `list_team_branches()` directly this session) | pass | inline repro this session: `patch('teams.subprocess.run', side_effect=FileNotFoundError(...))` → `[]` |
+| 1f | Malformed/short `--format` line → skipped, never raises | Read code path (`len(parts) != 4: continue`) — no adversarial-format test exists, but the parse loop can't crash on it | pass (by construction) | `app/teams.py` `list_team_branches()` |
+| 1g | Branch name not matching `team-{run_id}-{agent}` convention → `run_id`/`agent` both `None`, no crash, no mis-parse (e.g. a hand-made branch with embedded hyphens) | Automated + manual (`team-my-hand-made-branch`) | pass | `...::test_branch_not_matching_naming_convention_gets_none_run_id_and_agent`; manual CLI run this session (`team-my-hand-made` → `run_id: null, agent: null`) |
+| 1h | Branch survives worktree removal (the actual scenario item 13 exists for) | Automated, real `_create_worktree()`/`_remove_worktree()` pair | pass | `...::test_survives_worktree_removal_same_as_create_remove_worktree_tests_above` |
+| 2a | `team-branches <workdir>` CLI prints same JSON as `list_team_branches()` | Automated | pass | `...::CliTeamBranchesTests::test_prints_same_data_as_list_team_branches_as_json` |
+| 2b | CLI exits 0 on an empty list | Automated + manual | pass | `...::test_exits_0_when_list_is_empty`; manual CLI run this session |
+| 3a | `GET /projects/<name>/team/branches` reachable through the real HTTP guard, same JSON shape as `list_team_branches()` | Automated (real `HTTPServer`, real login flow) | pass | `tests/test_team_routes.py::TeamBranchesEndpointTests::test_matching_branches_returned_same_shape_as_list_team_branches` |
+| 3b | Unknown project → 404 | Automated | pass | `...::test_unknown_project_404` |
+| 3c | Empty list → 200 `[]`, not an error | Automated | pass | `...::test_no_matching_branches_returns_empty_list_not_an_error` |
+| 3d | No TOTP required (read-only, matches `/team/grounding` gating) | Automated | pass | `...::test_read_only_no_totp_required` |
+| 3e | Guard is genuinely the same code path as sibling `/team/*` routes, not just similar | Read code directly (`app/app.py` `do_GET()`) | pass | `_authed()` check at top of `do_GET` (line 4431) is unconditional for every branch below it; the new `/team/branches` arm (line 4621) uses the identical `name not in instance_names(): 404` guard, same lines-away pattern as `/team/grounding` immediately above it — not a re-implementation, same literal idiom |
+| 4a | Teams page shows "Past team branches" panel populated from the route | Automated (Node/vm harness, no browser) | pass | `tests/test_team_frontend.js`: `'branch entries render name/short commit/subject/date, no action buttons'` |
+| 4b | No action buttons (list-only) | Automated | pass | same test, explicit `!/<button[^>]*>/` assertion scoped to the panel's own markup |
+| 4c | Panel renders for both idle and running rows | Automated | pass | `'idle row fetches team branches once...'`, `'a running team row also renders the past branches panel'` |
+| 4d | Fetched once per project, not joined to the 4s poll | Automated | pass | `'team branches are fetched only once per project, cached across later poll cycles'` |
+| 4e | Fetch failure degrades to a clear message, not a crash | Automated | pass | `'a fetch failure (non-ok status) renders "Past team branches unavailable"'` |
+| 5 | `docs/ARCHITECTURE.md` gains the new section with `git log`/`git merge`/`git branch -D` | Read diff directly | pass | `docs/ARCHITECTURE.md` "Reviewing a team's work after it stops" — all three commands present, against `team-<run_id>-<agent>` |
+| 6a | No existing test regresses | Automated, full suite | pass (see Regression check — 3 unrelated pre-existing failures, not caused by this diff) | `.test_full_run.log` (932 tests) |
+| 6b | New tests cover multiple branches, zero branches, non-git dir, non-matching name, CLI, route | Automated | pass | see rows 1a–3d above |
+| — | Genuinely read-only end-to-end (explicit ask) | Read code directly: the only `subprocess`/git invocation anywhere in `list_team_branches()`, the CLI wrapper, and the route handler is the single `git branch --list ... --format=...` call | pass | `app/teams.py` lines ~3460–3524 (no `branch -D`/`checkout`/`merge`/`push`/`commit` anywhere in the new code path); `app/app.py`'s route handler only calls `teams.list_team_branches(...)` and JSON-serializes the result |
+
+## Regression check
+Full existing suite run: `python3 -m unittest discover -s tests -v` (932
+tests, 138s) — **3 failures, all pre-existing and unrelated to this diff**:
+
+- `test_deploy_dispatch.PrivilegedDeployRunEndToEndTests.test_restart_failure_on_target_surfaces_distinct_502`
+- `test_deploy_dispatch.PrivilegedDeployRunEndToEndTests.test_success_pushes_file_and_restarts_service`
+- `test_deploy_target.InstallScriptDeployTargetBlockTests.test_blank_pubkey_leaves_authorized_keys_untouched_prints_instructions`
+
+All three are in the real-host-mutating "provisions a throwaway system
+user, sudoers rule, and systemd unit" test classes for a completely
+separate subsystem (deploy dispatch / install-script deploy-target
+provisioning); the failures are `switchboard-deploy-wrapper.sh: not found`
+/ `ai-dev-switchboard-deploy-wrapper.sh: not found` and an
+`authorized_keys` assertion — host-state/wrapper-installation issues on
+this sandbox, not logic failures. Confirmed unrelated by: (1) neither
+failing test file contains any reference to "team" or the new code at all
+(`grep -i team tests/test_deploy_dispatch.py tests/test_deploy_target.py`
+→ no hits), (2) this cycle's diff touches only `app/teams.py`'s new
+`list_team_branches()`/CLI, `app/app.py`'s new route/frontend panel, and
+team-specific test files — nothing in deploy dispatch or install.sh, (3)
+`git status` at the start of this review showed these two test files and
+`install.sh` already committed (from an earlier, already-merged cycle),
+not part of the working tree under review here. Flagged for the
+orchestrator's awareness as a separate, pre-existing environment issue
+worth its own follow-up — not a regression this cycle introduced, and not
+blocking this backlog item's verdict.
+
+All 12 new backend tests (`ListTeamBranchesRealGitTests` × 6,
+`CliTeamBranchesTests` × 2, `TeamBranchesEndpointTests` × 4) pass. Frontend:
+`node tests/test_team_frontend.js` → **ALL PASS (80/80)**, including the 6
+new tests for this panel.
+
+## Spec coverage
+All 6 acceptance criteria implemented and tested — see the Test cases
+table above (rows grouped 1a–1h → criterion 1, 2a–2b → criterion 2, 3a–3e →
+criterion 3, 4a–4e → criterion 4, 5 → criterion 5, 6a–6b → criterion 6). No
+gaps.
+
+The two disclosed deviations were independently re-checked against
+`docs/spec.md`'s own literal text, not taken on trust:
+- Full (not abbreviated) commit hash from the function/CLI/route, shortened
+  to 7 chars only in the UI panel — matches `docs/spec.md`'s own literal
+  `--format` string (`%(objectname)`, full hash) for the backend/CLI/route,
+  and its separate UI description ("short commit hash") for the panel only.
+  Not actually a deviation from anything acceptance-criteria-visible; sound.
+- Plain `YYYY-MM-DD` date slice instead of a relative ("3 days ago") string
+  — `docs/spec.md`'s acceptance criteria don't test for a specific date
+  format (criterion 4 only requires the panel to be "populated... with no
+  action buttons"), and the developer's stated rationale (no relative-time
+  formatting dependency exists anywhere else in this stdlib-only codebase)
+  is verified true by inspection — no other `app/app.py`/`app/teams.py`
+  code does relative-time formatting. Proportionate, correctly scoped.
+
+## Findings (most severe first)
+
+### 1. Possible duplicate in-flight `/team/branches` fetch on rapid re-render — nit
+- File: `app/app.py`, `renderTeamBranches()` (~line 2581) /
+  `fetchTeamBranches()` (~line 2560)
+- Issue: `renderTeamBranches()` fires `fetchTeamBranches(name)` whenever
+  `teamBranchesCache[name] === undefined`, with no in-flight sentinel. If
+  `refresh()`/`teamRow()` renders again before the first fetch resolves
+  (e.g. a second poll tick or an explicit `refresh()` from an unrelated
+  action within that window), the cache is still `undefined`, so a second
+  concurrent GET fires.
+- Failure scenario: harmless in practice — the request is a side-effect-
+  free GET, and this is the exact same pattern this codebase's own
+  `teamGroundingCache`/`fetchTeamGrounding()` already uses (no in-flight
+  guard there either), just with a wider exposure window since
+  `renderTeamBranches()` is called from every unconditional `teamRow()`
+  render rather than gated behind a user gesture like opening the picker.
+  Not a correctness bug, not new to this diff's own convention — noted for
+  awareness only, not worth a fix.
+
+### 2. No explicit "no cookie → 401" test for `/team/branches` — nit
+- File: `tests/test_team_routes.py`, `TeamBranchesEndpointTests`
+- Issue: the new test class doesn't include a case asserting an
+  unauthenticated request gets a 401.
+- Failure scenario: none observed — `_authed()` is checked unconditionally
+  at the top of `do_GET()` before any route matching happens, so this is
+  covered by construction, and the sibling `TeamGroundingEndpointTests`
+  class this one was modeled on has the identical omission. Consistent with
+  existing project convention, not a gap this diff introduced.
+
+## Follow-ups (non-blocking)
+- Investigate/fix the 3 pre-existing `PrivilegedDeployRunEndToEndTests`/
+  `InstallScriptDeployTargetBlockTests` host-state failures (missing deploy
+  wrapper script on this sandbox) as its own separate item — unrelated to
+  backlog item 13, but real and currently red.
+
+## Overall verdict: **Approve**
+
+All 6 acceptance criteria are implemented and directly tested, all four
+specifically-called-out verification points check out against the actual
+code (never-raises failure paths including a live simulated missing-`git`-
+binary repro, the naming-convention regex's non-matching-branch handling,
+an auth/project-scoping guard confirmed identical to its sibling
+`/team/*` routes by reading `do_GET()` directly rather than trusting the
+developer's claim, and a read-only code path confirmed by inspection to
+contain exactly one git subprocess call, a `branch --list`). Both disclosed
+deviations are sound and within scope. The full 932-test suite has 3
+failures, both investigated and confirmed pre-existing/environmental
+(real-host deploy-wrapper provisioning, a wholly separate subsystem with
+zero references to this diff's code) rather than caused by this change.
+Two nits noted for awareness, neither blocking.

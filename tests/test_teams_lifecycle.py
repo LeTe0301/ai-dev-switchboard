@@ -42,6 +42,8 @@ SessionOwnershipCollisionRealTmuxTests's own docstring for the mechanism.
 Run with:
     python3 -m unittest discover -s tests -v
 """
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -497,6 +499,134 @@ class CreateRemoveWorktreeRealGitTests(unittest.TestCase):
         self.assertIn("claude", result["error"])
         self.assertIn(teamsmod._worktree_path(self.repo, "claude"), result["error"])
         self.assertIn("git worktree remove --force", result["error"])
+
+
+class ListTeamBranchesRealGitTests(unittest.TestCase):
+    """Real git, no tmux (backlog item 13, docs/spec.md acceptance
+    criterion 1) -- list_team_branches() is a plain subprocess.run() call
+    against the project's own checkout, same convention _validate_project_
+    for_team() above already establishes; no _run_run_user_command()/tmux
+    involvement at all."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="switchboard-lifecycle-branches-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_zero_matching_branches_returns_empty_list(self):
+        repo = os.path.join(self.tmp, "clean")
+        _init_repo(repo)
+        self.assertEqual(teamsmod.list_team_branches(repo), [])
+
+    def test_non_git_directory_returns_empty_list_not_an_exception(self):
+        nongit = os.path.join(self.tmp, "nongit")
+        os.makedirs(nongit)
+        self.assertEqual(teamsmod.list_team_branches(nongit), [])
+
+    def test_nonexistent_directory_returns_empty_list_not_an_exception(self):
+        self.assertEqual(teamsmod.list_team_branches(os.path.join(self.tmp, "does-not-exist")), [])
+
+    def test_multiple_branches_correct_metadata_and_run_id_agent_parsed(self):
+        repo = os.path.join(self.tmp, "multi")
+        _init_repo(repo)
+        head_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+        run_id = "1700000000-abc123def456"  # shaped exactly like _run_id()'s own output
+        _git(repo, "branch", f"team-{run_id}-claude", "HEAD")
+        _git(repo, "branch", f"team-{run_id}-gpt", "HEAD")
+        # A real second commit on one of the two, so committer_date/subject/
+        # commit are independently verified per-branch, not just copy-pasted
+        # off HEAD for both.
+        _git(repo, "checkout", "-q", f"team-{run_id}-claude")
+        with open(os.path.join(repo, "work.txt"), "w") as f:
+            f.write("teammate work\n")
+        _git(repo, "add", "work.txt")
+        _git(repo, "commit", "-q", "-m", "teammate commit")
+        claude_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+        _git(repo, "checkout", "-q", "master" if "master" in _git(repo, "branch").stdout
+             else "main")
+
+        result = teamsmod.list_team_branches(repo)
+        by_branch = {b["branch"]: b for b in result}
+        self.assertEqual(set(by_branch), {f"team-{run_id}-claude", f"team-{run_id}-gpt"})
+
+        claude = by_branch[f"team-{run_id}-claude"]
+        self.assertEqual(claude["run_id"], run_id)
+        self.assertEqual(claude["agent"], "claude")
+        self.assertEqual(claude["commit"], claude_sha)
+        self.assertEqual(claude["subject"], "teammate commit")
+        self.assertTrue(claude["committer_date"])
+
+        gpt = by_branch[f"team-{run_id}-gpt"]
+        self.assertEqual(gpt["run_id"], run_id)
+        self.assertEqual(gpt["agent"], "gpt")
+        self.assertEqual(gpt["commit"], head_sha)
+        self.assertEqual(gpt["subject"], "init")
+
+    def test_branch_not_matching_naming_convention_gets_none_run_id_and_agent(self):
+        repo = os.path.join(self.tmp, "handmade")
+        _init_repo(repo)
+        _git(repo, "branch", "team-my-hand-made-branch", "HEAD")
+        result = teamsmod.list_team_branches(repo)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["branch"], "team-my-hand-made-branch")
+        self.assertIsNone(result[0]["run_id"])
+        self.assertIsNone(result[0]["agent"])
+
+    def test_survives_worktree_removal_same_as_create_remove_worktree_tests_above(self):
+        # End-to-end against the real _create_worktree()/_remove_worktree()
+        # pair above -- the exact scenario item 13 exists to surface: once
+        # the worktree is gone, list_team_branches() is the only remaining
+        # way to discover the branch.
+        _patch_tmux(self, ["tmux"])
+        state_dir = tempfile.mkdtemp(prefix="switchboard-lifecycle-branches-state-")
+        orig_state_dir = teamsmod.TEAM_STATE_DIR
+        teamsmod.TEAM_STATE_DIR = state_dir
+        try:
+            repo = os.path.join(self.tmp, "survives")
+            _init_repo(repo)
+            created = teamsmod._create_worktree(repo, "claude", "survive-run")
+            self.assertTrue(created["ok"], created)
+            outcome = teamsmod._remove_worktree(repo, created["path"])
+            self.assertEqual(outcome, "removed")
+            result = teamsmod.list_team_branches(repo)
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0]["branch"], "team-survive-run-claude")
+        finally:
+            teamsmod.TEAM_STATE_DIR = orig_state_dir
+            shutil.rmtree(state_dir, ignore_errors=True)
+
+
+class CliTeamBranchesTests(unittest.TestCase):
+    """`team-branches <workdir>` CLI subcommand (backlog item 13, docs/
+    spec.md acceptance criterion 2) -- same io.StringIO/redirect_stdout
+    technique tests/test_teams_lead.py's test_cli_roster_subcommand_prints_
+    json already establishes."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="switchboard-lifecycle-cli-branches-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_prints_same_data_as_list_team_branches_as_json(self):
+        repo = os.path.join(self.tmp, "proj")
+        _init_repo(repo)
+        _git(repo, "branch", "team-1700000000-abc123def456-claude", "HEAD")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = teamsmod.main(["team-branches", repo])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(buf.getvalue()), teamsmod.list_team_branches(repo))
+
+    def test_exits_0_when_list_is_empty(self):
+        repo = os.path.join(self.tmp, "clean")
+        _init_repo(repo)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = teamsmod.main(["team-branches", repo])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(buf.getvalue()), [])
 
 
 class RunRunUserCommandRealTmuxTests(unittest.TestCase):

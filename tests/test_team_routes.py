@@ -996,6 +996,41 @@ class TeamGroundingEndpointTests(_RealHTTPTeamTestCase):
         self.assertEqual(resp.status, 200)
 
 
+# ─── GET /projects/<name>/team/branches (backlog item 13) ──────────────────
+class TeamBranchesEndpointTests(_RealHTTPTeamTestCase):
+    def test_unknown_project_404(self):
+        cookie = self._login()
+        status, payload = self._get("/projects/nope/team/branches", cookie)
+        self.assertEqual(status, 404)
+
+    def test_no_matching_branches_returns_empty_list_not_an_error(self):
+        self._project(_PROJ)
+        cookie = self._login()
+        status, payload = self._get(f"/projects/{_PROJ}/team/branches", cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, [])
+
+    def test_matching_branches_returned_same_shape_as_list_team_branches(self):
+        repo = self._project(_PROJ)
+        _git(repo, "branch", "team-1700000000-abc123def456-claude", "HEAD")
+        cookie = self._login()
+        status, payload = self._get(f"/projects/{_PROJ}/team/branches", cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, teamsmod.list_team_branches(repo))
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]["run_id"], "1700000000-abc123def456")
+        self.assertEqual(payload[0]["agent"], "claude")
+
+    def test_read_only_no_totp_required(self):
+        # Matches /team/grounding's own gating -- _authed() only.
+        self._project(_PROJ)
+        cookie = self._login()
+        req = urllib.request.Request(f"{self.base}/projects/{_PROJ}/team/branches",
+                                     headers={"Cookie": cookie})
+        resp = urllib.request.urlopen(req)
+        self.assertEqual(resp.status, 200)
+
+
 # ─── GET /projects/<name>/team/events (backlog item 6f part 1, docs/spec.md) ──
 class TeamEventsEndpointTests(_RealHTTPTeamTestCase):
     """Hand-constructs run.json + raw .jsonl log files directly (no real
