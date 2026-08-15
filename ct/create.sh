@@ -63,6 +63,15 @@ if yesno "Enable code-server (VS Code in the browser) per project?"; then
     WITH_CODE_SERVER=1
 fi
 
+PUBLISH_MODE=$(menu "How should per-project ttyd/VS Code terminals be published beyond this container?" \
+    "none"      "Loopback only — you handle exposing them yourself" \
+    "tailscale" "Publish via 'tailscale serve --set-path' (requires tailscale installed+logged in later)")
+
+BASE_URL=""
+if [ "$PUBLISH_MODE" = "tailscale" ]; then
+    BASE_URL=$(ask "Tailnet hostname per-project terminals get published under (see 'tailscale status' inside the container later — leave blank to fill in afterward):" "")
+fi
+
 TOTP_SECRET="$(head -c20 /dev/urandom | base32 | tr -d '=' | head -c32)"
 
 # ── template
@@ -101,7 +110,8 @@ AUTH_MODE=${AUTH_MODE}
 SIMPLE_USERNAME=${SIMPLE_USERNAME}
 SIMPLE_PASSWORD=${SIMPLE_PASSWORD}
 TOTP_SECRET=${TOTP_SECRET}
-PUBLISH_MODE=none
+PUBLISH_MODE=${PUBLISH_MODE}
+BASE_URL=${BASE_URL}
 LISTEN_HOST=127.0.0.1
 LISTEN_PORT=8333
 HOST_CONTROL_ENABLED=0
@@ -119,7 +129,18 @@ pct exec "$CTID" -- bash /opt/ai-dev-switchboard-src/install.sh $INSTALL_FLAGS
 
 CT_IP=$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}')
 
-SUMMARY="Done.\n\nContainer ${CTID} (${CT_HOSTNAME}) is running at ${CT_IP:-<unknown>}.\n\nWeb UI (bound to 127.0.0.1:8333 inside the container by default — see README.md to expose it via tailscale serve / a reverse proxy / an SSH tunnel):\n  pct exec ${CTID} -- ss -ltnp | grep 8333   # confirm it's listening\n  ssh -L 8333:127.0.0.1:8333 root@${CT_IP:-<container-ip>}   # quick one-off tunnel\n  then open http://127.0.0.1:8333\n\nTOTP secret (add to an authenticator app):\n  ${TOTP_SECRET}\n\nNext: log in inside the container as ${RUN_USER} and run your engine's CLI once interactively (e.g. \`claude\`) to finish ITS login, before starting sessions from the web UI."
+PUBLISH_NOTE=""
+if [ "$PUBLISH_MODE" = "tailscale" ]; then
+    PUBLISH_NOTE="\n\nPublish mode: tailscale (per-project terminals will auto-publish via 'tailscale serve --set-path' once tailscale is installed+logged in inside the container). The main UI itself is NOT auto-published — still run 'tailscale serve --bg https+insecure://127.0.0.1:8333' inside the container yourself (see README.md \"Reaching the UI\")."
+fi
 
-whiptail --title "ai-dev-switchboard" --msgbox "$SUMMARY" 24 78
+SUMMARY="Done.\n\nContainer ${CTID} (${CT_HOSTNAME}) is running at ${CT_IP:-<unknown>}.\n\nWeb UI (bound to 127.0.0.1:8333 inside the container by default — see README.md to expose it via tailscale serve / a reverse proxy / an SSH tunnel):\n  pct exec ${CTID} -- ss -ltnp | grep 8333   # confirm it's listening\n  ssh -L 8333:127.0.0.1:8333 root@${CT_IP:-<container-ip>}   # quick one-off tunnel\n  then open http://127.0.0.1:8333${PUBLISH_NOTE}\n\nTOTP secret (add to an authenticator app):\n  ${TOTP_SECRET}\n\nNext: log in inside the container as ${RUN_USER} and run your engine's CLI once interactively (e.g. \`claude\`) to finish ITS login, before starting sessions from the web UI."
+
+# The tailscale PUBLISH_NOTE adds several wrapped lines on top of the
+# baseline summary — a fixed 24-row box clips the TOTP secret/login
+# instructions off the bottom in that case (whiptail --msgbox doesn't
+# scroll), so grow the box when that note is present.
+SUMMARY_HEIGHT=24
+[ "$PUBLISH_MODE" = "tailscale" ] && SUMMARY_HEIGHT=32
+whiptail --title "ai-dev-switchboard" --msgbox "$SUMMARY" "$SUMMARY_HEIGHT" 78
 echo -e "$SUMMARY"

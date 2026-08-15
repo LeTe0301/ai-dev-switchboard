@@ -1,0 +1,59 @@
+# ai-dev-switchboard's own Gitea Docker Compose stack — authored directly
+# by this project (no upstream repo to clone/pin the way taiga-docker is
+# for Taiga; see docs/spec.md "Background" / "Authoring the compose file
+# directly"). Shape verified live against
+# docs.gitea.com/installation/install-with-docker's own Postgres example:
+# two services (server + db), no RabbitMQ/workers/gateway the way Taiga
+# needs.
+#
+# Installed to $GITEA_DIR/docker-compose.yml by install.sh and OVERWRITTEN
+# deterministically on every re-run (like the generated sudoers file) —
+# this is this project's own file, not a user checkout, so there's nothing
+# to preserve across a re-run. Don't hand-edit the installed copy; edit
+# this file + switchboard.env instead and re-run install.sh.
+#
+# Both services load $GITEA_DIR/.env (written by install.sh via set_env)
+# via env_file: — the same file both configures each container's runtime
+# environment (GITEA__section__KEY / POSTGRES_*) and drives Compose's own
+# ${VAR} substitution below (GITEA_PORT/GITEA_SSH_PORT) — Compose
+# auto-loads .env from the project directory for the latter, exactly like
+# taiga-docker's own .env already does for ${TAIGA_PORT}.
+networks:
+  gitea:
+    external: false
+
+services:
+  server:
+    image: docker.gitea.com/gitea:1.27.1
+    container_name: ai-dev-switchboard-gitea
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+    networks:
+      - gitea
+    volumes:
+      - ./gitea:/data
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    # Loopback-only (docs/spec.md "Loopback-only binding") — baked directly
+    # into this file since this project authors the whole compose file,
+    # unlike Taiga's separate docker-compose.override.yml merge trick.
+    ports:
+      - "127.0.0.1:${GITEA_PORT}:3000"
+      - "127.0.0.1:${GITEA_SSH_PORT}:22"
+    depends_on:
+      - db
+
+  db:
+    image: docker.io/library/postgres:14
+    container_name: ai-dev-switchboard-gitea-db
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - gitea
+    volumes:
+      - ./postgres:/var/lib/postgresql/data

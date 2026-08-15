@@ -97,3 +97,178 @@ that simply don't have one.
 The same `.engine` file format is read by both `app/app.py` (per-project
 sessions) and `host-agent/lib/engine-lib.sh` (the optional single
 persistent host session) — write it once, both use it.
+
+## Headless invocation (`HEADLESS_*`, backlog item 6a)
+
+Four more optional `KEY=value` lines, read by `app/teams.py`'s
+`agent_run()` — a *separate* code path from everything above. They're about
+one bounded, non-interactive turn with structured output (for a future
+multi-agent team to delegate to), not the interactive tmux session the rest
+of this doc covers. An engine file with none of these four keys is
+completely unaffected — parses and runs exactly as it does today.
+
+```
+HEADLESS_CMD=claude -p {resume} --output-format stream-json --verbose
+HEADLESS_FORMAT=claude-stream-json      # claude-stream-json | codex-jsonl | plain
+HEADLESS_PROMPT=arg                     # arg | stdin | file
+HEADLESS_RESUME=--resume {session_id}   # optional -- omit entirely if the engine has no resume concept
+```
+
+- **`HEADLESS_CMD`** — the non-interactive command template. Two
+  placeholders, substituted with plain string replacement (never
+  `str.format()`, so a literal `{`/`}` elsewhere in the command — e.g. a
+  future JSON Schema flag — can't break it):
+  - **`{resume}`** — the empty string on a first turn, or `HEADLESS_RESUME`
+    (with `{session_id}` substituted into *that* first) when resuming.
+    Sits inline because some engines take resume as a flag (Claude Code:
+    `--resume <id>`) and others as a subcommand swap (Codex:
+    `exec resume <id>`, not `exec ... --resume <id>`).
+  - **`{prompt_file}`** — only meaningful when `HEADLESS_PROMPT=file`;
+    substituted with the path of a file `agent_run()` already wrote the
+    prompt into.
+- **`HEADLESS_FORMAT`** *(required if `HEADLESS_CMD` is set)* — one of
+  `claude-stream-json`, `codex-jsonl`, `plain`. Tells `agent_run()` how to
+  translate the engine's native stdout into the normalized event envelope
+  (`docs/story.md` §4.1). `plain` means "no structured stream at all" (e.g.
+  aider) — the whole captured stdout becomes one `message` event.
+- **`HEADLESS_PROMPT`** *(required if `HEADLESS_CMD` is set)* — how the
+  prompt is delivered: `arg` (appended as its own argv element, e.g. Claude
+  Code's positional query), `stdin` (piped in as the process's actual
+  stdin), or `file` (written to `{prompt_file}`, e.g. aider's
+  `--message-file`). `arg` mode has a materially tighter byte cap than
+  `stdin`/`file` — see `TEAM_HEADLESS_ARG_PROMPT_MAX_BYTES` in
+  `config/switchboard.env.example` — since the prompt ends up as its own
+  argv element when the engine binary itself is exec'd, capped by Linux's
+  own per-argv-element `MAX_ARG_STRLEN`. `stdin`/`file` mode has no such
+  constraint — the prompt never appears in any argv at all.
+- **`HEADLESS_RESUME`** *(optional)* — omit entirely for an engine with no
+  resume/session concept at all (aider). If a `session_id` is ever passed to
+  `agent_run()` for such an engine, it raises `ValueError` before spawning
+  anything, rather than silently ignoring it.
+
+If `HEADLESS_CMD` is present but `HEADLESS_FORMAT`/`HEADLESS_PROMPT` are
+missing or not one of the recognized values above, the rest of the file
+still parses normally (`LABEL`/`CMD`/`URL_REGEX`/`STARTUP_*` all still
+work) — the engine is just left headless-ineligible
+(`Engine.headless_enabled == False`), never a `load_engines()` failure.
+
+**Reserved names: the whole `switchboard` and `team` prefixes.** Any
+`.engine` file whose filename stem (with `.engine` stripped) *starts with*
+either `switchboard` or `team` is ignored by `load_engines()` — same
+"intentionally inert" treatment `.engine.example` templates get. `switchboard`
+is what keeps a headless run's own throwaway tmux session
+(`switchboard-headless-<run_id>`) structurally unable to collide with any
+real project's own `<engine>-<project>` session name, including the
+non-obvious case of an engine literally named `switchboard` combined with a
+project directory named `headless-<run_id>`. `team` (backlog item 6d part 1)
+guards the identical collision shape for a **team**'s own
+`team-<project>` tmux dashboard session (`app/teams.py`) — an engine
+literally named `team` (or `team-anything`) would otherwise produce a
+single-engine session name `f"{engine}-{project}"` == `f"team-{project}"`
+for any project. Don't name your own engine file starting with `switchboard`
+or `team`.
+
+**`HEADLESS_ROLE_FLAG`** (mentioned in `docs/story.md` §4.2) stays
+**reserved** — 6c deliberately did not implement it (see `docs/spec.md`
+"Deviation: no `HEADLESS_ROLE_FLAG` this round" for why: every lead tier
+already needs a working "put instructions in front of the model" path
+anyway, so a fourth, engine-specific, partially-available channel for the
+identical content isn't worth its complexity yet). Not yet parsed or
+consumed by anything in this codebase.
+
+## Lead-adapter hints (`HEADLESS_SCHEMA_FLAG`/`HEADLESS_LEAD_FORMAT`, backlog item 6c)
+
+Two more optional `KEY=value` lines, read by `app/teams.py`'s
+`roster()`/`_lead_tier_for_engine()` and consumed by `agent_run()`'s
+`schema=` keyword argument. Together they decide which of the three lead
+adapters (`docs/story.md` §4.2) an engine uses when it's picked as a team's
+lead — unrelated to whether it can be *delegated to*, which only ever
+depends on the four `HEADLESS_*` keys above.
+
+```
+HEADLESS_SCHEMA_FLAG=--json-schema {schema}        # optional; inline JSON text
+HEADLESS_SCHEMA_FLAG=--output-schema {schema_file} # optional; a file path
+HEADLESS_LEAD_FORMAT=schema                        # optional override: schema | prose
+```
+
+- **`HEADLESS_SCHEMA_FLAG`** — a command-line flag TEMPLATE for asking the
+  engine to constrain its output to a JSON Schema. **Two placeholders, not
+  one** — mirroring the `{prompt}`/`{prompt_file}` distinction
+  `HEADLESS_PROMPT=arg|file` already established, an existing pattern
+  rather than a new mechanism (this replaced an earlier, single-placeholder
+  design that turned out to be wrong for one of the two shipped engines —
+  see "Real, verified finding" below):
+  - `{schema}` — substituted with the schema's own **JSON text**,
+    `shlex.quote()`'d as a single argv element (Claude Code's own
+    `--json-schema <schema>`, whose own `--help` example is inline JSON,
+    not a path).
+  - `{schema_file}` — substituted with the **path** of a `schema.json`
+    file `agent_run(..., schema=...)` writes under the run's own throwaway
+    rundir (mirrors `{prompt_file}`'s existing handling exactly: written by
+    `SVC_USER`, chmod `0o644` so `RUN_USER`'s tmux pane can read it, thrown
+    away in `agent_run()`'s existing rundir cleanup) — Codex's own
+    `--output-schema <FILE>`.
+
+  Presence of `HEADLESS_SCHEMA_FLAG` at all is what makes an engine
+  auto-detect as **tier 2** (schema-constrained) rather than **tier 3**
+  (prose-parse) — see `HEADLESS_LEAD_FORMAT` below for the explicit
+  override. `HEADLESS_CMD` must itself contain a `{schema}` token
+  somewhere (this is `HEADLESS_CMD`'s OWN insertion point for the whole
+  resolved flag+value fragment — a separate thing from which placeholder
+  `HEADLESS_SCHEMA_FLAG` uses internally) for this to have any effect; when
+  `agent_run()` is called without `schema=`, that token is substituted with
+  the empty string, same as `{resume}`'s own first-turn behavior.
+
+  **A `HEADLESS_SCHEMA_FLAG` declaring neither `{schema}` nor
+  `{schema_file}` is a configuration error**, surfaced at **roster-build
+  time** (`roster()`'s own `schema_flag_error` field, and `team-start`'s
+  own early rejection of a misconfigured `--lead`) rather than only once
+  the first real tier-2 lead call fails.
+- **`HEADLESS_LEAD_FORMAT`** — explicit override for the auto-detected
+  tier: `schema` forces tier 2 even without a `HEADLESS_SCHEMA_FLAG`;
+  `prose` forces tier 3 even *with* one. Any other value (or its absence)
+  falls through to auto-detection based on whether
+  `HEADLESS_SCHEMA_FLAG` is set. No enum is enforced at parse time — there
+  is nothing to validate beyond "is it a non-empty string", since an
+  unrecognized value simply behaves the same as leaving the key unset.
+
+**Real, verified finding: Claude Code's own `--json-schema` flag does NOT
+take a file path.** It takes the schema's JSON text INLINE (`claude -p
+--help`'s own example: `--json-schema {"type":"object",...}`), not a
+`--json-schema <path-to-file>` form the way Codex's `--output-schema
+<FILE>` does. This was discovered by actually running a real, logged-in
+`claude` CLI as a tier-2 lead during this sub-spec's own build — the
+original, single-placeholder design (`{schema}` meaning "a file path",
+mirroring `{prompt_file}` too literally) failed live with `Error:
+--json-schema is not valid JSON: JSON Parse error: Unrecognized token
+'/'`. The failure itself degraded correctly (two malformed retries, then a
+clean `ask_user` escalation with the raw error text included, per
+`docs/spec.md` §9) — no crash — but tier 2 was not actually usable for
+`claude.engine` as originally configured. Corrected to the two-placeholder
+design above; see `docs/implementation.md` for both the original failing
+run and the corrected, reverified one.
+
+**Verification status of the three shipped engines' `HEADLESS_*` keys** (see
+`docs/implementation.md` for the full writeup): `claude.engine` is verified
+end to end, including `--resume`, against a real logged-in `claude` CLI.
+`codex.engine`'s plumbing (process spawn, NDJSON capture, real exit code) is
+confirmed against a real `codex` CLI, but that CLI was not logged in during
+verification, so a *successful* turn and the `resume <SESSION_ID>` syntax
+specifically remain unconfirmed. `aider.engine` is **unverified** — `aider`
+was not installed in the environment this sub-spec was built in; believed
+correct per aider's own documented CLI flags as of 2026-08-13, not yet run
+end-to-end.
+
+**Verification status of the lead-adapter tiers (backlog item 6c):** tier 1
+(Ollama `/v1/chat/completions`) is verified end to end against a real
+remote `qwen3:8b`, including a real `delegate` handoff to a real logged-in
+`claude` teammate. Tier 2 is verified end to end against the same real,
+logged-in `claude` CLI, using the corrected inline `{schema}` form — see
+`docs/implementation.md` for the exact command/output. `codex` remains
+unauthenticated in this environment (same limitation 6a already disclosed
+for `codex.engine`), so tier 2's `{schema_file}` (path) form is verified
+only against a test-authored stand-in engine, not the real `codex` CLI.
+Tier 3 is verified via shell-script stand-ins
+(`tests/fixtures/headless/tier3_stub_*.sh`) driving a real `team_run()` end
+to end through real tmux — `aider` itself remains **UNVERIFIED**, same
+disclosure as above.

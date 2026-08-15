@@ -11,7 +11,7 @@ It grew out of a real homelab setup (Proxmox host + LXC container running
 several projects side by side) and has since been generalized: which
 engines are available is a config file, not code (see
 [`docs/ADDING_AN_ENGINE.md`](docs/ADDING_AN_ENGINE.md)), auth works with or
-without a Proxmox host, and the git-hosting/auto-deploy pieces are optional.
+without a Proxmox host, and the self-hosted git-hosting piece is optional.
 
 ## Quickstart
 
@@ -77,9 +77,10 @@ pipx install aider-chat                    # aider
   is rate-limited, one needs LAN-only data handling, or you're just curious
   which one handles a given task better.
 - **A private git-hosting box that also runs the agents.** With
-  `--with-git-hosting`, "push a new project" and "start an agent on it" are
-  two clicks total, including auto-sync back to disk on every future push
-  — see [`docs/GIT_HOSTING.md`](docs/GIT_HOSTING.md).
+  `--with-git-hosting`, a self-hosted Gitea instance (own singleton toggle
+  row, off by default) creates real private repos and clones them straight
+  into `PROJECTS_DIR` — "create a new project" and "start an agent on it"
+  are two clicks total — see [`docs/GIT_HOSTING.md`](docs/GIT_HOSTING.md).
 
 ## What you get
 
@@ -96,14 +97,27 @@ pipx install aider-chat                    # aider
   surfaced directly. Anything else gets a small ttyd web terminal sharing
   the exact tmux pane, no config needed.
 - **VS Code in the browser**, independent on/off per project
-  (`code-server`, `--with-code-server`).
-- **A "+ New project" button** — optional, needs
-  [`--with-git-hosting`](docs/GIT_HOSTING.md): creates a private bare repo
-  + a working copy in one step, kept in sync automatically on every future
-  `git push`.
+  (`code-server`, `--with-code-server`; opens in a dark theme by default).
+- **An "Upload folder / .zip" wizard** — pick a local folder (zipped
+  client-side with a progress bar) or an already-made `.zip`, review the
+  server-detected structure (single repo, a folder of independent repos, or
+  a monorepo with nested/vendored repos), choose which pieces become their
+  own projects, and confirm. Works standalone — unlike "+ New project"
+  below, it does **not** need `--with-git-hosting`.
+- **A self-hosted Gitea singleton row** — optional, needs
+  [`--with-git-hosting`](docs/GIT_HOSTING.md): a 2-container (Gitea +
+  Postgres) Docker Compose stack, well under 1 GB RAM once toggled on, off
+  by default.
+- **A "+ New project" button** — needs Gitea (above) toggled on plus a
+  one-time API token bootstrap (`scripts/gitea-configure-api.sh`): creates a
+  real, private Gitea repo via its own REST API and clones it into
+  `PROJECTS_DIR` in one step, ready to `git push` immediately.
 - **An optional extra row** for a persistent session on a *different*
   machine (e.g. the Proxmox host itself, outside any container) — see
   [`host-agent/README.md`](host-agent/README.md).
+- **Push a spec into a Taiga backlog item** via
+  `scripts/taiga_push_spec.py`, a standalone CLI tool (no new web UI) — see
+  `docs/spec.md`.
 
 ## Reaching the UI
 
@@ -113,8 +127,11 @@ whichever fits how you already reach your machines:
 
 - **Tailscale**: `tailscale serve --bg https+insecure://127.0.0.1:8333` (or
   `--https=443` for a real cert) from the box itself, then open the tailnet
-  hostname it gives you. Also set `PUBLISH_MODE=tailscale` and `BASE_URL`
-  in `switchboard.env` so per-project terminals get published the same way.
+  hostname it gives you. `install.sh`/`ct/create.sh` already prompt for
+  `PUBLISH_MODE`/`BASE_URL` at setup time so per-project terminals get
+  published the same way — choose `tailscale` there and enter the tailnet
+  hostname (from `tailscale status`); edit `switchboard.env` and restart
+  only if you want to change that choice later.
 - **SSH tunnel**: `ssh -L 8333:127.0.0.1:8333 you@the-box`, then open
   `http://127.0.0.1:8333` locally. Fine for occasional use, not for the
   per-project terminals (those need `PUBLISH_MODE=tailscale` or your own
@@ -138,11 +155,14 @@ don't even need that — they're re-read live).
 ```
 app/app.py              the web UI itself — stdlib-only Python, one file
 engines.d/               engine definitions (see docs/ADDING_AN_ENGINE.md)
-config/                  *.env.example reference configs
+config/                  *.env.example reference configs, deploy-map.json.example
 install.sh               installer — run on any existing box
 ct/create.sh             Proxmox-host wrapper: creates a container, then runs install.sh inside it
-scripts/                 optional git-hosting + project-scaffolding (docs/GIT_HOSTING.md)
+scripts/                 optional git-hosting + project-scaffolding (docs/GIT_HOSTING.md);
+                          also scripts/taiga_push_spec.py + taiga-configure-push.sh (docs/spec.md)
 host-agent/               optional persistent session on a separate machine (host-agent/README.md)
+deploy-target/           optional deploy receiver on a separate machine (deploy-target/README.md);
+                          the web UI's own per-project "Deploy" button calls this over SSH
 systemd/                 reference systemd unit for manual installs
 docs/                    architecture notes, engine format, git-hosting detail
 ```
@@ -163,6 +183,21 @@ docs/                    architecture notes, engine format, git-hosting detail
 - The optional host-control SSH channel is scoped to exactly three
   whitelisted scripts via `sudoers.d` — see
   [`host-agent/README.md`](host-agent/README.md).
+- The optional deploy-target SSH channel (`--with-deploy-target`, run on a
+  *separate* target machine) is restricted to write-only `rrsync` into one
+  configured path or one exact, sudoers-scoped restart script — no shell,
+  no port/X11/agent forwarding, no pty — see
+  [`deploy-target/README.md`](deploy-target/README.md). The web UI's own
+  caller against it (a per-project "Deploy" button) is driven by a
+  hand-edited, never-UI-editable `deploy-map.json` and stores each target's
+  private key under a mode-700, service-user-owned directory
+  (`DEPLOY_KEYS_DIR`, default `/etc/ai-dev-switchboard/deploy-keys/`) — no
+  new privilege boundary, same account that already holds
+  `HOST_CONTROL_KEY`. Dispatch is manual-only: it never fires off a Gitea
+  push automatically, only an explicit, `confirm()`-gated click.
+- `scripts/taiga_push_spec.py` stores its password in plain text in
+  `~/.config/ai-dev-switchboard/taiga-push.env` (file mode `600`, owned by
+  `RUN_USER`).
 
 ## Contributing
 
