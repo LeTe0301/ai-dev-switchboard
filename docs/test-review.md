@@ -1,111 +1,292 @@
-# Test & Review: Backend hardening — `set_env()` sed-injection fix + team `run_id` path-traversal validation (backlog #10 + #11(b))
+# Test & Review: test-infrastructure isolation (BACKLOG item 9)
 
 ## Scope
-Covers `docs/spec.md`'s full acceptance-criteria list: `install.sh`'s
-`set_env()` sed-escaping fix (backlog item 10) and `app/teams.py`/`app/app.py`'s
-`run_id` path-traversal validation (backlog item 11(b)). Both fixes reviewed
-against the actual diff (`git diff` on `app/app.py`, `app/teams.py`,
-`install.sh`, `tests/test_team_routes.py`, `tests/test_teams_lifecycle.py`,
-plus new `tests/test_install_set_env.py`), with particular scrutiny on the
-developer's documented deviation from the spec's proposed fix location for
-item 11(b) (validation moved from `app/teams.py:_run_dir()` to two intake
-points in `app/app.py`, per `docs/implementation.md` "Deviations from spec").
+Covers `docs/spec.md`'s 6 acceptance criteria (committed `5503d24`) for the
+uncommitted, test-only diff on `backlog/test-isolation-9`:
+`tests/test_deploy_target.py` (Part A: orphan detection + tearDown backstop),
+`tests/test_teams_lifecycle.py` and `tests/test_team_routes.py` (Part B:
+per-process tmux session scoping). Reviewed against `docs/implementation.md`'s
+own claims, re-derived independently (own concurrent-process run, own planted
+foreign sessions, own revert-and-rewatch-it-fail checks) rather than trusted
+from the developer's report.
 
 ## Test cases
 
 | # | Criterion / case | Method | Result | Evidence |
 |---|---|---|---|---|
-| 1 | `set_env()` upsert of a `\|`-bearing value on re-run: exit 0, value round-trips | Automated (`tests/test_install_set_env.py`) + my own adversarial bash harness (12 values incl. `\|`, `\&`, `\\`, `a\|b&c`, bare `\|`/`\|`/`&`) | pass | `python3 -m unittest tests.test_install_set_env -v` → 8/8 ok; my own `run_case.sh` sweep, all 12 cases PASS |
-| 2 | `set_env()` `&`-bearing value round-trips byte-for-byte (no backreference corruption) | Automated + my own harness | pass | same as above |
-| 3 | `set_env()` `\`-bearing value round-trips byte-for-byte | Automated + my own harness | pass | same as above |
-| 4 | Plain value (no special chars) unchanged regression | Automated (`test_plain_value_unchanged_behavior`) + my own | pass | same as above |
-| 5 | Empty value upserts cleanly | Automated (`test_empty_value_upserts_cleanly`) + my own | pass | same as above |
-| 6 | First-write (`>>`) path untouched, handles all special chars | Automated (`test_first_write_append_path_handles_all_special_chars_already`) | pass | included in the 8/8 run above |
-| 7 | `GET .../team/events?run_id=../../outside/evilrun` → 404, planted file never opened | Automated (`_get_forbidding_open_of` monkeypatch) + my own standalone live-server repro (with `_leads_root()` pre-created to make the traversal actually OS-resolvable — see Findings) | pass | full suite run; my own `manual_repro.py`, Part 1 |
-| 8 | Same for `GET .../team/inbox` | Automated + my own live repro | pass | same as above |
-| 9 | `POST .../team/resolve` with traversal `run_id` → 400, no state mutated (`_team_threads_get` stays None) | Automated (asserts `appmod._team_threads_get("proj")` is None) + my own live repro | pass | same as above |
-| 10 | Real, `_run_id()`-generated `run_id` works identically through all three routes (regression) | Automated (full existing `TeamEventsEndpointTests`/`TeamInboxEndpointTests`/`TeamResolveEndpointTests` pass unmodified) + my own live repro using a real `teams.launch_team()` run (real tmux session, not a synthetic id) | pass | 790/790 suite; my own `manual_repro.py`, Part 2 (200/200/400-ordinary-business-logic across all 3 routes) |
-| 11 | Malformed-but-non-traversal `run_id` (`"not-a-real-run"`, uppercase hex) → clean 404/400, no 500 | Automated (`test_malformed_non_traversal_run_id_*` in all 3 endpoint test classes + `RunIdRegexValidationTests` unit tests) | pass | full suite run |
-| 12 | Edge cases: empty `run_id` still "no override" (not validation failure); URL-encoded traversal; wrong-length hex; NUL byte | Automated (`RunIdRegexValidationTests`, `test_url_encoded_traversal_run_id_404`, `test_run_id_with_nul_byte_404_no_500`) | pass | full suite run |
-| 13 | `_run_dir()` itself remains unvalidated by design, only intake points gained the check | Automated (`test_run_dir_itself_does_not_validate_shared_internal_helper_unchanged`) + my own trace of every caller of `_run_dir`/`_run_json_path`/`_transcript_path`/`_inbox_path`/`_agent_log_path` in both `teams.py` and `app.py` | pass | grep trace below (Findings); confirmed only `state["run_id"]`-derived (already-validated) values reach these helpers from `app.py`, and `teams.main()`'s CLI subcommands are not attacker-reachable (no HTTP route spawns them) |
-| 14 | Full existing test suite passes with no regressions | Automated | pass | `python3 -m unittest discover -s tests` → **790/790 OK** (matches developer's claim) |
-| 15 | Node frontend suite unaffected | Automated | pass | `node tests/test_team_frontend.js && ... test_deploy_frontend.js && ... test_singleton_toggle_frontend.js && ... test_upload_frontend.js` → **84/84 (52+9+15+8) all PASS** |
-| 16 | `bash -n install.sh` / `py_compile app.py teams.py` clean | Automated | pass | both ran clean |
+| 1 | Orphan `/home/deploy` (no `deploy` user, directory present) causes `InstallScriptDeployTargetBlockTests` to be **skipped**, not run against stale state | Automated (`DeployTargetOrphanDetectionTests`, ran as-is) + my own revert check: reverted just `setUp`'s guard back to "user exists only", reran the same test in isolation | pass (as shipped); **as-shipped test correctly fails when the fix is reverted**, proving it's discriminating | `python3 -m unittest tests.test_deploy_target.DeployTargetOrphanDetectionTests -v` → OK with fix in place; same command with `setUp` reverted → `FAILED (failures=1)`, `AssertionError: 0 != 1: InstallScriptDeployTargetBlockTests must be skipped...` |
+| 2 | `tearDown`'s backstop actually removes `/home/deploy` after a forced mid-test failure, so the *next* run's `setUp` sees clean state | Automated (`DeployTargetTearDownBackstopTests`, ran as-is) + my own revert check: reverted only the `sudo rm -rf /home/deploy` backstop line (kept `userdel -r deploy`), reran the same test in isolation | **FAIL — see Defect 1** | See Defect 1 below |
+| 3 | Two full runs of `test_team_routes.py`/`test_teams_lifecycle.py`'s real-tmux classes launched **concurrently** (two separate processes), both pass, zero session-name collisions | Automated — launched two genuinely separate background `python3 -m unittest` processes myself (not reusing the developer's report) | pass | Both processes: `Ran 136 tests ... OK`, 18.5s/18.7s respectively; `tmux list-sessions` afterward showed zero leftover `team-*`/`switchboard-*` sessions |
+| 4 | No test in either file still creates a session literally named `team-demo`/`team-proj`/`team-atomicdemo`/`team-failchain`/`team-sessionrace`/`team-clidemo` | Automated grep of both files post-fix, done independently (not trusting the diff description) | pass | `grep -n '"team-demo"\|"team-proj"\|"team-atomicdemo"\|"team-failchain"\|"team-sessionrace"\|"team-clidemo"'` against both files: zero matches. Broader sweep of every remaining bare project-name literal (`"demo"`, `"proj"`, etc.) confirmed the only unscoped survivors are in `NewStateAdditiveFieldsTests`/`SweepDeadTeamsPureTests`, which are pure/mocked (`tmux_has` monkeypatched, no real tmux touched) — correctly out of the criterion's own scope ("not synthetic/mocked ones") |
+| 5 | `switchboard-worktree-op-` sweep in `test_teams_lifecycle.py`'s `tearDown` only targets this process's own scoped prefix — a concurrent process's own sessions survive | Automated — planted my own foreign sessions (a superset of the developer's own proof: `switchboard-worktree-op-8888888888-cafebabe0001`, `team-otherproj-p8888888`, and an additional `switchboard-headless-p8888888-somehow`), ran the full lifecycle+routes suite, confirmed survival | pass | All 3 planted sessions confirmed alive via `tmux list-sessions` both before and after `python3 -m unittest tests.test_teams_lifecycle tests.test_team_routes -q` (`Ran 136 tests ... OK`) |
+| 6 | Full existing suite passes with no regression (Python 790 baseline + 2 new = 792, Node 84) | Automated, ran myself | pass | `python3 -m unittest discover -s tests -v` → `Ran 792 tests in 137.553s`, `OK`; all 4 Node suites: 15/15, 8/8, 52/52, 9/9 = 84/84 |
+
+Additional verification performed (not a spec bullet, but part of the dispatch):
+- Read `app/teams.py:2931-3052` (`_run_run_user_command()`) directly. Confirmed
+  the entire body from session creation through completion sits inside a
+  single `try`/`finally` (finally at lines 3049-3052: `shutil.rmtree(rundir,
+  ignore_errors=True)` then `if tmux_has(session): kill-session`) — this
+  really is unconditional self-cleanup independent of success/failure/
+  timeout, so dropping `test_teams_lifecycle.py`'s own `"switchboard-"` sweep
+  branch (rather than scoping it) is a correct, verified call, not merely an
+  asserted one.
+- Confirmed `PrivilegedEndToEndTests` (fixed `TEST_USER = "aidswbtest"`,
+  `tests/test_deploy_target.py:762+`) is untouched by this diff, and re-read
+  `docs/spec.md`'s Background/Non-goals/acceptance-criteria sections myself:
+  the concurrency acceptance criterion (bullet 3) names only
+  `test_team_routes.py`/`test_teams_lifecycle.py`; Part A's Background and
+  acceptance criteria (bullets 1-2) are scoped specifically to
+  `InstallScriptDeployTargetBlockTests`'s `deploy`/`/home/deploy` fixture.
+  Nothing in scope asks this cycle to make `PrivilegedEndToEndTests`
+  concurrency-safe. The developer's "known limitation, out of scope" framing
+  is accurate — not a spec gap being waved away.
+- `tests/test_deploy_dispatch.py`, named in spec's Non-goals as sharing the
+  same risk class but explicitly out of scope beyond confirming it's
+  unaffected: `git diff --stat -- tests/test_deploy_dispatch.py` shows no
+  changes, and it's part of the 792 that passed clean.
 
 ## Regression check
-Full existing suite run: `python3 -m unittest discover -s tests` — **790 tests, 136s, OK** (765 baseline + 25 new, matches developer's stated count). Ran personally this session, not inferred from the developer's report. Node suite (`test_team_frontend.js`, `test_deploy_frontend.js`, `test_singleton_toggle_frontend.js`, `test_upload_frontend.js`) also run personally — 84/84 pass, no Node-facing code touched by this diff so this is a pure confirmation, not expected to have changed.
-
-## Deep-dive: the spec deviation (item 11(b) validation location)
-
-The developer moved validation from the spec's proposed single choke point
-(`app/teams.py:_run_dir()`) to two intake points in `app/app.py`
-(`_team_events_run_and_ownership()` and the `POST .../team/resolve` handler),
-documented in `docs/implementation.md` "Deviations from spec" as necessitated
-by 42 pre-existing test failures and a CLI UX regression when validating
-inside `_run_dir()` itself.
-
-I did not just accept this reasoning — I independently verified it:
-
-1. **Traced every caller of `_run_dir()`/`_run_json_path()`/`_transcript_path()`/`_inbox_path()`/`_inbox_resolved_path()`/`_agent_log_path()`** in both `app/teams.py` and `app/app.py` via grep. Confirmed: the only places `app/app.py` passes an *unvalidated, client-supplied* `run_id` into any of these are the two now-patched intake points; every other reference in `app/app.py` (lines 4107–4139) uses `run_id = state["run_id"]`, where `state` was already resolved through one of the two validated intake points (or is the internally-derived "latest run" with no client input at all). No third route, and no CLI-adjacent path, reaches these helpers with attacker-controlled input — `teams.main()`'s `team-status`/`team-stop`/`team-reap` CLI subcommands are a separate `argparse` entry point never invoked by the running web server.
-2. **Reproduced the original path-traversal exploit against a real running server myself**, independent of the test suite — see `manual_repro.py` below. Confirmed all three routes reject `run_id=../../outside/evilrun` (404/404/400) and a planted file's secret marker never appears in any response.
-3. **Found and closed a gap in my own first attempt**: my first repro ran the traversal check *before* any team had ever been launched, meaning `_leads_root()` (`TEAM_STATE_DIR/leads`) didn't exist yet on disk. On Linux, path resolution through `..` requires every intermediate directory component to physically exist — so a `FileNotFoundError` in that state proves nothing about whether the fix's `_RUN_ID_RE` check is doing any work, only that the parent directory doesn't exist yet. I confirmed this by bypassing `teams._RUN_ID_RE` (patching it to `re.compile(r".*")`, simulating "no validation") with `_leads_root()` *not* pre-created, and got the identical `FileNotFoundError` — i.e., a false-negative-shaped "pass" that would occur even without the fix. I then re-ran with `_leads_root()` pre-created (realistic: true in any install after its first team run) with the bypass still in place, and confirmed the vulnerability **is** real under that realistic condition: `teams._load_state("../../outside/evilrun")` returned the planted file's full contents unmodified. Finally I reverted the bypass and reran against the real, shipped fix with `_leads_root()` pre-created — confirmed the fix still blocks it cleanly (404/404/400, no leak). This mirrors the project's own established "verify the technique itself discriminates, don't just trust a clean pass" discipline (seen elsewhere in this codebase, e.g. `TeamThreadsLockTests`'s own naive-vs-fixed comparison).
-   - Separately, I confirmed the *existing* test suite's own traversal tests (`_get_forbidding_open_of`, which monkeypatches `builtins.open` to assert on the call itself rather than relying on real filesystem resolution) are immune to this caveat — they detect an attempted `open()` call regardless of whether `_leads_root()` exists on disk, so their "pass" was never subject to the false-negative risk my first naive repro attempt was.
-4. **Confirmed the "real `run_id` still works" side of the criterion with an actual `teams.launch_team()`-issued run** (real tmux session via `tmux`, not a synthetic test value) through all three routes on a real live server — 200/200/400(ordinary "no pending question", not a rejection).
-5. **Confirmed the `_scope_run_ids()` test-helper rework doesn't regress toward BACKLOG item 9's collision class.** The new fixed-width, 8-digit, all-digit `_RUN_ID_SCOPE = f"{os.getpid():08d}"` prefix is same-length for every process, so no two distinct pids' scope tokens can ever be a `startswith`-prefix of one another (a fixed-length string can only be a prefix of another string of equal length if they're identical) — this is a mathematically sound replacement for the old `"p<pid>-"` delimiter-terminated scheme, which achieved the same collision-freedom property via its own trailing `-` delimiter rather than fixed width. One minor, non-blocking caveat noted in Findings below: the zero-padding only *guarantees* fixed width if `os.getpid()` never exceeds 8 digits, which is true for every real-world Linux `pid_max` configuration but isn't enforced by the code itself.
-
-Sample of the manual repro's real output (from my own script, run against the unmodified, shipped diff):
-```
-GET /team/events?run_id='../../outside/evilrun' -> status=404 payload={'error': 'unknown run_id for this project'}
-GET /team/inbox?run_id='../../outside/evilrun' -> status=404 payload={'error': 'unknown run_id for this project'}
-POST /team/resolve run_id='../../outside/evilrun' -> status=400 payload={'error': 'no run found for this project'}
-*** PART 1 PASSED: all three routes reject the traversal run_id; planted file's secret content never appears in any response. ***
-
-launch_team() result: ok=True run_id='1786706880-7737846340f4'
-GET /team/events?run_id=1786706880-7737846340f4 -> status=200 run_id_in_payload=1786706880-7737846340f4
-GET /team/inbox?run_id=1786706880-7737846340f4 -> status=200 payload={'pending': False}
-POST /team/resolve run_id=1786706880-7737846340f4 -> status=400 payload={'error': 'no pending question for this project'}
-*** PART 2 PASSED: a real, launch_team()-generated run_id works end-to-end through all three routes -- no regression. ***
-```
+Full suite run by me: `python3 -m unittest discover -s tests -v` → 792/792,
+`OK`. All 4 Node suites run individually → 84/84 total. No regressions
+outside the two files under test.
 
 ## Defects found
-None. Testing pass is clean; proceeding to review.
+
+### Defect 1: `DeployTargetTearDownBackstopTests` does not actually prove the backstop does anything — it passes identically with the backstop line removed
+- **File**: `tests/test_deploy_target.py`, new class `DeployTargetTearDownBackstopTests`
+  (test method `test_teardown_backstop_removes_home_deploy_after_a_forced_mid_test_failure`),
+  exercising the `tearDown()` backstop added at line ~444
+  (`subprocess.run(["sudo", "rm", "-rf", "/home/deploy"])`).
+- **Repro** (exactly the "prove the test is real" technique this project's
+  own review history uses, applied here for real):
+  1. With the diff as-shipped: `python3 -m unittest
+     tests.test_deploy_target.DeployTargetTearDownBackstopTests -v` → `OK`.
+  2. Temporarily removed *only* the new `sudo rm -rf /home/deploy` backstop
+     line from `tearDown()` (kept everything else, including the existing
+     `userdel -r deploy` immediately above it — i.e. reverted to
+     pre-BACKLOG-item-9 `tearDown()` exactly).
+  3. Re-ran the identical command: `python3 -m unittest
+     tests.test_deploy_target.DeployTargetTearDownBackstopTests -v` →
+     **still `OK`** (1/1 pass). `/home/deploy` and the `deploy` account were
+     both confirmed gone afterward regardless.
+  4. Restored the file to the original diff (`diff` against the pre-edit
+     copy confirmed byte-identical).
+- **Root cause**: the test's forced-failure body
+  (`_ForcedFailureAfterFixtureCreated.test_forced_failure_after_fixture_created`)
+  calls `self.run_block(...)`, asserts `r.returncode == 0` (i.e. the full
+  `--with-deploy-target` block, including `useradd deploy`, completed
+  successfully) *before* raising. By the time `tearDown()` runs, a fully,
+  successfully provisioned `deploy` account genuinely exists. `sudo userdel
+  -r deploy` (the pre-existing line, immediately above the new backstop)
+  already removes `/home/deploy` as a normal side effect of `-r` whenever the
+  account exists and removal succeeds — which it always does here, since
+  nothing in the harness spawns a long-running process owned by `deploy`
+  (`service="myapp.service"` is never actually started; `pkill -9 -u deploy`
+  is a no-op) that could cause `userdel` to fail. So the assertion
+  `self.assertFalse(os.path.exists("/home/deploy"))` is satisfied by the
+  *pre-existing* `userdel -r` line alone, and the new backstop line
+  contributes nothing observable in this specific scenario.
+  The test's own docstring claim — "only `tearDown()`'s own unconditional
+  backstop is what can remove it" — is factually false for the scenario it
+  actually constructs.
+- **Why this matters**: `docs/spec.md`'s acceptance criterion 2 ("`tearDown`'s
+  backstop actually removes `/home/deploy` even when simulating a failure
+  partway through the privileged test body... test this by forcing an
+  exception after the fixture is created but before normal cleanup would
+  run") is reported as verified in `docs/implementation.md` but is not
+  actually exercised by any test in this diff: if a future edit silently
+  broke or deleted the backstop line, this regression test would not catch
+  it, as long as `userdel -r` kept working normally. The scenario the
+  backstop genuinely protects against (per `docs/spec.md`'s own "Background"
+  — an interrupted run where `userdel` either already ran with nothing to
+  remove, or where a partially-provisioned `/home/deploy` exists with no
+  matching account at all) is structurally different from — and not
+  covered by — what this test constructs. `DeployTargetOrphanDetectionTests`
+  (criterion 1) does cover the "directory with no account" shape for
+  `setUp()`'s guard, but nothing in this diff isolates and proves the
+  `tearDown()` backstop's own contribution.
+- **Severity**: must-fix (uncovered/falsely-claimed acceptance criterion —
+  the test needs to construct a scenario where the pre-existing `userdel -r`
+  line would *not* already clean up `/home/deploy` on its own, e.g. forcing
+  the failure before `useradd` ever completes so no `deploy` account exists
+  for `userdel` to act on while `/home/deploy` is already on disk, or making
+  `userdel` itself fail/no-op for the duration of the test).
+
+## Overall verdict (first pass)
+**Blocked.** Criteria 1, 3, 4, 5, 6 are independently verified and pass.
+Criterion 2 (`tearDown` backstop) is not — the only test written for it does
+not discriminate between the backstop being present or absent, so it does
+not actually prove the acceptance criterion. Per process, the review pass
+was not performed since the testing pass did not come back clean; routing
+back to the developer to fix `DeployTargetTearDownBackstopTests` so it
+constructs a scenario where `userdel -r deploy` alone would not already
+remove `/home/deploy`, then re-verify with the same revert-and-rewatch-it-
+fail check before resubmitting.
 
 ---
 
-## Spec coverage
-All 9 acceptance criteria in `docs/spec.md` are implemented and covered by an automated test I personally ran, plus my own independent manual verification for the two highest-risk ones (traversal blocked on all 3 routes; real run_id unaffected):
+## Re-review (after developer's "Review fix" in `docs/implementation.md`)
 
-- [x] `set_env()` `\|` on re-run: exit 0, value preserved — `test_pipe_in_value_does_not_abort_reupsert_and_round_trips`, `test_value_can_be_changed_again_after_a_pipe_bearing_value`
-- [x] `set_env()` `&` byte-for-byte — `test_ampersand_in_value_round_trips_byte_for_byte`
-- [x] `set_env()` `\` byte-for-byte — `test_backslash_in_value_round_trips_byte_for_byte`
-- [x] `set_env()` plain-value regression — `test_plain_value_unchanged_behavior`
-- [x] GET `/team/events` traversal → 404, file never opened — `test_path_traversal_run_id_404_planted_file_never_opened` + my own live repro
-- [x] GET `/team/inbox` traversal → 404, file never opened — same in `TeamInboxEndpointTests` + my own live repro
-- [x] POST `/team/resolve` traversal → 400, no state mutated — same in `TeamResolveEndpointTests` (asserts no thread started) + my own live repro
-- [x] Real run_id unaffected on all 3 routes (regression) — full existing endpoint test classes pass unmodified + my own live `launch_team()` repro
-- [x] Malformed-non-traversal run_id → clean 404/400, no 500 — `test_malformed_non_traversal_run_id_404_no_500` (×3 classes) + `RunIdRegexValidationTests`
-- [x] Full suite passes — 790/790, run personally
+### Re-verification of Defect 1's fix
 
-No gaps found. The spec's "Affected areas" note ("reviewer should confirm this holds rather than assume it" re: `app.py`'s existing exception handling doing the right thing with zero route-level changes) is moot as written, since the developer's deviation *did* add route-level changes — but I independently confirmed the deviation's actual security property (validated at intake, before any path-join) fully satisfies the spec's stated goal in "Proposed approach" §2, and that the response shapes are byte-identical to what already existed for the "not found" case, matching the spec's own "Risk / rollback notes" claim.
+Read the reworked `DeployTargetTearDownBackstopTests`
+(`tests/test_deploy_target.py:699-762`) directly rather than trusting the
+developer's own revert-and-fail proof in `docs/implementation.md`. The
+class now:
+- constructs `/home/deploy/.ssh/authorized_keys` directly (`sudo mkdir -p`
+  + a stale key), the same shape `DeployTargetOrphanDetectionTests` already
+  uses, and deliberately never runs `useradd`/`run_block()`;
+- asserts `id deploy` returns non-zero (no account) before raising, so the
+  scenario's shape is verified inline, not merely assumed;
+- runs a real `_ForcedFailureWithNoDeployUser` subclass of
+  `InstallScriptDeployTargetBlockTests` through `unittest`'s own
+  `TestCase.run()`, which raises `RuntimeError` after constructing the
+  fixture, then relies on the inherited, unmodified `tearDown()` running
+  normally.
 
-## Findings (most severe first)
+Own repro, performed independently in this session (host confirmed clean
+before and after — `id deploy` → no such user, `/home/deploy` absent):
+1. `python3 -m unittest
+   tests.test_deploy_target.DeployTargetTearDownBackstopTests -v` (as
+   shipped) → `OK` (1/1).
+2. Backed up the file, then edited only the backstop line out of
+   `InstallScriptDeployTargetBlockTests.tearDown()` (removed
+   `subprocess.run(["sudo", "rm", "-rf", "/home/deploy"])`, line 444;
+   left the pre-existing `userdel -r deploy` call in place, immediately
+   above).
+3. Re-ran the identical command → **genuine failure**:
+   ```
+   AssertionError: True is not false : tearDown's backstop must remove
+   /home/deploy even when no 'deploy' user ever existed for userdel -r
+   to clean it up as a side effect
+   FAILED (failures=1)
+   ```
+   This is the same test, same command, only the production-of-test-fixture
+   line removed — and it now fails with a message that names the backstop
+   directly, unlike the prior round where the identical revert produced a
+   silent pass. This is the discriminating result Defect 1 required.
+4. Cleaned up the `/home/deploy` this proof run left behind (`sudo rm -rf
+   /home/deploy` — the reverted `tearDown()` had no way to do this itself,
+   by design of the experiment), restored the file from the backup
+   (`diff` against the pre-edit copy: byte-identical), reran the same
+   command → `OK` (1/1) again.
 
-### 1. `_RUN_ID_SCOPE`'s fixed-width assumption is not enforced by the code — nit
-- File: `tests/test_team_routes.py:195` (`_RUN_ID_SCOPE = f"{os.getpid():08d}"`)
-- Issue: Python's `:08d` format spec is a *minimum* width, not a truncating fixed width — if `os.getpid()` ever exceeded 8 digits (99,999,999), the resulting scope token would be 9+ digits and the "same-length strings can't prefix each other" collision-freedom property this relies on would no longer hold for a pid straddling that boundary (e.g., pid `12345678` and pid `123456780` would produce prefix-colliding tokens).
-- Failure scenario: This requires a Linux `pid_max` configured above 99,999,999, which is far outside any default or realistic production configuration (`pid_max` traditionally caps at 4,194,304 on 64-bit Linux) — this is test-infrastructure-only code, not attacker-reachable, and the risk is effectively theoretical. Not blocking; the comment in the code itself already correctly identifies this as "comfortably covering any real pid" rather than claiming an absolute guarantee.
+Defect 1 is resolved. Verdict: **fix confirmed independently, not just
+trusted from the developer's report.**
 
-### 2. Two near-identical validation blocks in `app/app.py`, not factored into a shared helper — nit
-- File: `app/app.py:4084-4085` and `app/app.py:4345-4346`
-- Issue: `if not teams._RUN_ID_RE.match(run_id): return ...` is duplicated (with different error shapes/status codes) at both intake points rather than factored into one small helper.
-- Failure scenario: None — this is a simplicity observation, not a correctness or security issue. The two call sites already had structurally similar-but-distinct exception handling before this cycle (different error messages/status codes for GET vs POST), so this duplication is consistent with the pre-existing pattern rather than newly introduced sprawl. The developer's stated rationale for not adding a new `teams.py` wrapper function (matching this repo's existing convention of `app.py` calling `teams._load_state()`/`teams._persist()`/`teams._inbox_path()` directly) is reasonable and documented. Not worth blocking on.
+### Scope of this round's diff
+`git diff --stat` shows all three test files still modified (expected —
+nothing has been committed yet on this branch; the whole cycle's diff
+remains uncommitted pending this approval). Confirmed this fix round itself
+only touched `tests/test_deploy_target.py`:
+- File mtimes: `tests/test_team_routes.py` and `tests/test_teams_lifecycle.py`
+  both last modified *before* this file's first review pass completed
+  (`docs/test-review.md`'s own mtime), while `tests/test_deploy_target.py`'s
+  mtime is later than both — consistent with only the deploy-target file
+  being touched after the first review round.
+- `git diff --stat` sizes for `test_team_routes.py` (306 lines) and
+  `test_teams_lifecycle.py` (120 lines) match what was already verified in
+  the first pass; no new edits to reconcile.
+- Read the current `test_deploy_target.py` diff in full: the only
+  substantive change from the first-pass version is the body of
+  `DeployTargetTearDownBackstopTests` (renamed inner class
+  `_ForcedFailureAfterFixtureCreated` → `_ForcedFailureWithNoDeployUser`,
+  fixture construction swapped from `run_block()` to direct
+  `mkdir`/`authorized_keys`). `InstallScriptDeployTargetBlockTests.setUp`/
+  `tearDown` and `DeployTargetOrphanDetectionTests` are unchanged from what
+  was already verified and passed in the first round.
 
-No must-fix or should-fix findings. Correctness, security, and simplicity all check out against the diff.
+### Full suite re-run (this session)
+- `python3 -m unittest tests.test_deploy_target -v` → `Ran 32 tests ... OK`.
+- `python3 -m unittest discover -s tests -v` → `Ran 792 tests in 136.171s`,
+  `OK`.
+- Node, run individually: `test_singleton_toggle_frontend.js` 15/15,
+  `test_upload_frontend.js` 8/8, `test_team_frontend.js` 52/52,
+  `test_deploy_frontend.js` 9/9 — 84/84 total.
 
-## Follow-ups (non-blocking)
-- None required. The two nits above are optional and don't need a dedicated follow-up cycle.
+No regressions. Testing pass is now clean — proceeding to the review pass.
 
-## Overall verdict
-**Approve.**
+### Review pass
 
-Both fixes are correctly implemented, fully covered by automated tests I personally ran (790/790 Python, 84/84 Node, both fresh test files clean), and independently verified against a real running server using my own from-scratch repro scripts (not just re-reading the developer's or the test suite's own assertions) — including catching and resolving a subtlety in my own first repro attempt (the `_leads_root()`-must-pre-exist caveat) before trusting a "pass." The developer's documented deviation from the spec's proposed fix location (validation at the two `app.py` intake points instead of inside `teams.py:_run_dir()`) is sound, narrower in blast radius than the spec's original proposal, and I traced every caller of the path-join helpers myself to confirm no other route or CLI-adjacent path is left exposed. No must-fix or should-fix issues found; two optional nits noted above, neither blocking.
+**Spec-to-code traceability** (`docs/spec.md` acceptance criteria, all six):
+1. Orphan `/home/deploy` (no user, directory present) → class skipped:
+   covered by `DeployTargetOrphanDetectionTests`, unchanged from the first
+   pass, independently verified there. **Met.**
+2. `tearDown` backstop removes `/home/deploy` after a forced mid-body
+   failure: now genuinely covered by the reworked
+   `DeployTargetTearDownBackstopTests`, independently re-verified above via
+   revert-and-fail. **Met.**
+3. Two full concurrent runs of the real-tmux classes in both files, zero
+   collisions: unchanged from the first pass (already independently
+   verified with two of my own separate background processes). **Met.**
+4. No test creates a session literally named `team-demo`/`team-proj`/etc.:
+   unchanged from the first pass (already independently grepped). **Met.**
+5. `switchboard-worktree-op-` sweep only targets this process's own scope:
+   unchanged from the first pass (already independently verified by
+   planting foreign sessions). **Met.**
+6. Full existing suite passes with no regression: re-run fresh this round,
+   792/792 Python, 84/84 Node. **Met.**
+
+All six acceptance criteria are implemented and covered by a test that
+actually discriminates pass/fail on the behavior in question — no gaps.
+
+**Correctness.** The reworked test correctly isolates the variable under
+test: by never creating a `deploy` account, the pre-existing `userdel -r
+deploy` call in the inherited `tearDown()` genuinely has nothing to act on
+(a no-op), so only the new backstop line can be responsible for removing
+`/home/deploy` — confirmed by the revert-and-fail check both the developer
+and I ran independently, with matching results. The test still satisfies
+the literal acceptance-criterion wording ("forcing an exception after the
+fixture is created but before normal cleanup would run") — the "fixture"
+here is `/home/deploy` itself, which is what's actually under test; the
+account-creation step was never load-bearing for what criterion 2 asks to
+be proven, only incidental to how the first-pass version of the test
+happened to construct it.
+
+One asymmetry worth noting but not blocking: `DeployTargetOrphanDetectionTests`
+registers `self.addCleanup(lambda: subprocess.run(["sudo", "rm", "-rf",
+"/home/deploy"]))` for its own directly-created fixture, but
+`DeployTargetTearDownBackstopTests`'s outer test method has no equivalent
+`addCleanup` — it relies entirely on the inner subclass's own `tearDown()`
+(the very thing under test) to clean up. If the backstop were ever broken
+again, this specific test would leave `/home/deploy` on disk after failing.
+This isn't a false-pass risk (the test would still fail, correctly), and
+the consequence is fail-safe rather than fail-dangerous: any subsequent
+test run would trip the criterion-1 orphan guard in `setUp()` and skip
+cleanly rather than run against dirty state, exactly as designed. Noted as
+a should-fix / nice-to-have, not a blocker.
+
+**Security.** No new production code. All new `subprocess.run()` calls in
+this round use fixed argument lists or hardcoded shell strings with no
+interpolated external input — no injection surface. Real host mutation
+(`/home/deploy` creation/removal) remains gated behind
+`HAVE_PASSWORDLESS_SUDO` and the class's own `setUp()` pre-flight checks,
+consistent with the rest of the file's existing convention.
+
+**Simplicity / scope.** The fix is a minimal, surgical rework of exactly
+the one test method Defect 1 named — no other test, no production file,
+touched. Matches `docs/spec.md`'s non-goals (test-only diff) and doesn't
+introduce any new abstraction or generalization beyond what's needed to
+isolate the fixture-construction step.
+
+## Findings (ranked)
+
+1. **Should-fix (non-blocking):** `DeployTargetTearDownBackstopTests`
+   (`tests/test_deploy_target.py:702-762`) doesn't `addCleanup` its own
+   directly-constructed `/home/deploy` fixture the way
+   `DeployTargetOrphanDetectionTests` does. Low-value but consistent hygiene
+   fix — wrap the fixture creation with the same `self.addCleanup(lambda:
+   subprocess.run(["sudo", "rm", "-rf", "/home/deploy"]))` pattern used two
+   classes above it, so a future regression in the backstop doesn't also
+   leave state dirty on this test's own failure path. No functional impact
+   given the fail-safe interaction with the criterion-1 orphan guard.
+
+No must-fix findings. No nits beyond the above.
+
+## Overall verdict (this round)
+**Approved.** All six acceptance criteria in `docs/spec.md` are implemented
+and independently, discriminately verified (including a from-scratch
+revert-and-fail re-check of the specific fix this round addresses). Full
+regression suite is clean (792/792 Python, 84/84 Node). One should-fix
+follow-up noted above (test cleanup hygiene) — does not block approval.
+Ready to hand back to product-manager for the next iteration.

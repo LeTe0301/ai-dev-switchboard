@@ -1,66 +1,282 @@
-# Implementation: Backend hardening — `set_env()` sed-injection fix + team `run_id` path-traversal validation (backlog #10 + #11(b))
+# Implementation: test-infrastructure isolation (BACKLOG item 9)
 
 ## Summary
-Fixed two independently-reported, already-reproduced backend defects: `install.sh`'s `set_env()` shelled an operator-supplied value unescaped through a sed `s///` expression (a literal `|` aborted a re-run, a literal `&` silently corrupted the write); and a client-supplied `run_id` on three `team/*` web routes reached a filesystem path-join with no format validation, allowing path traversal (`run_id=../../outside/evilrun`). Both are fixed at a single choke point each; the `run_id` fix lands in `app/app.py` (a deliberate, documented deviation from the spec's proposed `app/teams.py:_run_dir()` location — see "Deviations from spec").
+Two independent, test-only fixes. **A.** `tests/test_deploy_target.py`'s
+privileged fixture class now refuses to run against an orphaned
+`/home/deploy` directory (not just a live `deploy` user), and its
+`tearDown()` gained an unconditional `sudo rm -rf /home/deploy` backstop so
+a partial failure can never leave the directory behind for the next run.
+**B.** Every real (non-mocked) `team-<project>` tmux session name and the
+`switchboard-worktree-op-` sweep in `tests/test_teams_lifecycle.py` and
+`tests/test_team_routes.py` are now scoped to this process's own pid, and
+both files' `_kill_leftover_team_sessions()` sweeps were narrowed to only
+ever target this process's own scoped sessions — proven by actually running
+two full suites of both files concurrently in separate processes.
 
 ## Root cause
-- **`set_env()`**: `$val` was interpolated directly into the replacement side of a sed `s|pattern|replacement|` expression. Sed treats `|` (the chosen delimiter) and `&` (whole-match backreference) specially on that side; an unescaped operator-supplied value containing either broke the expression (`|`, aborting `install.sh` on the next re-run since the first write goes through a plain `printf >>`, only a re-run touches sed) or silently mangled the written value (`&`).
-- **`run_id` path traversal**: `app/teams.py`'s `_run_dir(run_id)` joined `run_id` into a path with `os.path.join()` and no validation. A client-supplied `run_id` reaches this via `GET .../team/events`, `GET .../team/inbox` (both through `_team_events_run_and_ownership()`), and `POST .../team/resolve` in `app/app.py`. A value like `"../../outside/evilrun"` let `open()` read a file outside `_leads_root()`; the existing `state.get("project_name") != project_name` ownership check runs only *after* that file is already opened and parsed.
+Not applicable (test-infrastructure hardening, not a bugfix against a single
+reported symptom) — see `docs/spec.md` "Background" for the two defects this
+closes.
 
 ## Changes by file
-- `install.sh` (`set_env()`, ~line 112) — before the sed-upsert branch, `$val` is now escaped via `printf '%s' "$val" | sed -e 's/\\/\\\\/g' -e 's/&/\\&/g' -e 's/|/\\|/g'` (backslash first, then `&`, then the `|` delimiter — order matters so earlier escaping isn't itself re-escaped) and the escaped value is used in the `s|...|...|` replacement. The `>>` first-write append path is untouched (never went through sed, already correct for any character). `get_env()` unchanged.
-- `app/teams.py`:
-  - Added `_RUN_ID_RE = re.compile(r"^[0-9]+-[0-9a-f]{12}$")` next to `_run_id()` (~line 192), matching `_run_id()`'s own generation shape exactly.
-  - `_run_dir()` (~line 2452) is **unchanged in behavior** — still an unvalidated `os.path.join()`. A comment explains why validation was deliberately NOT added here (see "Deviations from spec").
-- `app/app.py`:
-  - `_team_events_run_and_ownership()` (~line 4059, shared by `GET .../team/events` and `GET .../team/inbox`): when an explicit `run_id` query param is present, it's checked against `teams._RUN_ID_RE` before calling `teams.load_state_for_project()`; a mismatch returns the same `({"error": "unknown run_id for this project"}, 404)` the existing "no such run" path already returns.
-  - `POST .../team/resolve` handler (~line 4323): when an explicit `run_id` is present in the body, it's checked against `teams._RUN_ID_RE` before calling `teams._load_state()`; a mismatch returns the same `{"error": "no run found for this project"}` 400 the existing `except (OSError, ValueError)` clause already returns for a nonexistent run.
-- `tests/test_install_set_env.py` (new) — extracts `set_env`/`get_env` verbatim from `install.sh` (same `_extract_between()` technique as `tests/test_install_ollama.py`) and runs them via plain `subprocess.run` (no pty needed, neither helper reads a terminal). 8 tests: `|`/`&`/`\`/combination round-trip, empty value, plain-value regression, first-write (`>>`) path untouched, repeated re-run with a value change after a `|`-bearing one.
-- `tests/test_teams_lifecycle.py` — replaced the originally-written `RunDirValidationTests` (which asserted `_run_dir()` itself raises `ValueError`) with `RunIdRegexValidationTests`, which tests `teams._RUN_ID_RE` directly (the actual validation primitive used at the app.py intake points) plus one explicit regression test that `_run_dir()` itself still joins any string unvalidated. 9 tests.
-- `tests/test_team_routes.py`:
-  - New module-level helpers `TRAVERSAL_RUN_ID`, `_plant_traversal_target()`, `_get_forbidding_open_of()` (the latter mirrors `tests/test_teams_grounding.py`'s `GroundingReadOnlyRuntimeTests` monkeypatched-`builtins.open` technique) to prove a planted file outside `_leads_root()` is never opened, not just that the response status/shape looks right.
-  - `TeamEventsEndpointTests`: +4 tests (path-traversal 404 + never-opened, URL-encoded-traversal 404, malformed-non-traversal 404 incl. uppercase-hex, NUL-byte 404).
-  - `TeamInboxEndpointTests`: +2 tests (path-traversal 404 + never-opened, malformed-non-traversal 404).
-  - `TeamResolveEndpointTests`: +2 tests (path-traversal 400 + never-opened + no thread started, malformed-non-traversal 400).
-  - `_scope_run_ids()`/`_RUN_ID_SCOPE` (test-only process-scoping helper used by this file's real-HTTP test harness to avoid concurrent test processes colliding on tmux session names) reworked so the scoped `run_id` it produces stays exactly `_RUN_ID_RE`-shaped — see "Deviations from spec".
+
+- `tests/test_deploy_target.py`
+  - `InstallScriptDeployTargetBlockTests.setUp()`: skip guard now checks
+    `os.path.exists("/home/deploy")` in addition to the existing `id deploy`
+    check — either condition means the fixture isn't safely available.
+  - `InstallScriptDeployTargetBlockTests.tearDown()`: added an unconditional
+    `subprocess.run(["sudo", "rm", "-rf", "/home/deploy"])` immediately after
+    the existing `userdel -r deploy` call.
+  - Added `DeployTargetOrphanDetectionTests` (new class): constructs a
+    genuinely orphaned `/home/deploy` (real directory + stale
+    `authorized_keys`, no `deploy` account) and runs a real test method of
+    `InstallScriptDeployTargetBlockTests` through `unittest.TestCase.run()`
+    with a `unittest.TestResult`, asserting `result.skipped` has exactly one
+    entry mentioning `/home/deploy` — proves the class is genuinely
+    *skipped*, not that it happens to pass.
+  - Added `DeployTargetTearDownBackstopTests` (new class, **reworked once**
+    after review — see "Review fix" below): runs a real subclass of
+    `InstallScriptDeployTargetBlockTests` (inheriting its real, unmodified
+    `setUp`/`tearDown`) whose test body constructs `/home/deploy` directly
+    (no `useradd`, no `deploy` account created at all) and then deliberately
+    raises `RuntimeError`, through the same `TestCase.run()`/`TestResult`
+    mechanism (unittest always calls `tearDown()` after a failing test body
+    — standard library behavior, not reimplemented here), then asserts
+    `/home/deploy` no longer exists on disk.
+
+- `tests/test_teams_lifecycle.py`
+  - Added `_RUN_ID_SCOPE = f"p{os.getpid()}"` and a `_scoped(name)` helper
+    (`f"{name}-{_RUN_ID_SCOPE}"`), same technique
+    `tests/test_teams_headless.py`'s own `_RUN_ID_SCOPE`/`_SESSION_PREFIX`
+    already established.
+  - Every literal project name that becomes part of a real
+    `team-<project>` tmux session in a real-tmux test class now goes
+    through `_scoped(...)`: `demo`, `dirty`, `detached`, `nongit`, `demo2`,
+    `demo3`, `demo4`, `"demo with space"`, `proj`, `clidemo`, `atomicdemo`,
+    `failchain`, `failchain2`, `sessionrace`. Every corresponding literal
+    `"team-<name>"` assertion string was replaced with
+    `teamsmod._team_session_name(_scoped("<name>"))` (never reimplementing
+    the `team-` prefix in the test).
+  - `_kill_leftover_team_sessions()`: the sweep now only kills sessions
+    matching `name.startswith("team-") and name.endswith(f"-{_RUN_ID_SCOPE}")`
+    — the old unconditional `"team-"`/`"switchboard-"` prefix match is
+    removed entirely (see "Key decisions" below for why the
+    `"switchboard-"` branch was dropped rather than scoped).
+  - `RunRunUserCommandRealTmuxTests.test_no_leftover_session_or_rundir`
+    (found while proving the concurrency criterion by hand — see "Key
+    decisions"): now snapshots existing `switchboard-worktree-op-*`
+    sessions *before* its own `_run_run_user_command()` call and only
+    asserts no *new* ones appeared, instead of a blind post-hoc
+    `list-sessions` scan that would false-positive-fail in the presence of
+    a concurrent process's own, unrelated `switchboard-worktree-op-*`
+    session.
+
+- `tests/test_team_routes.py`
+  - Added `_PROJ = f"proj-{_RUN_ID_SCOPE}"`, `_PROJ_A = f"proj-a-{_RUN_ID_SCOPE}"`,
+    `_PROJ_B = f"proj-b-{_RUN_ID_SCOPE}"`, reusing the file's own existing
+    `_RUN_ID_SCOPE` (already defined for `switchboard-headless-*` scoping
+    from 6d part 2a's own follow-up).
+  - `_project(self, name=_PROJ)`'s default is now scoped, matching
+    `docs/spec.md`'s explicit callout.
+  - Every literal `"proj"` / `"proj-a"` / `"proj-b"` value used as a real
+    project directory name, dict key, or `/projects/<name>/...` URL segment
+    across every `_RealHTTPTeamTestCase` subclass and
+    `OrphanCheckSelfCorrectsForLiveCliRunTests` (both real-tmux) was
+    replaced with `_PROJ`/`_PROJ_A`/`_PROJ_B` (plain-string URLs converted
+    to f-strings where needed; already-f-string URLs had only the
+    `/projects/proj.../` segment substituted). `TeamThreadsLockTests`'
+    in-memory-dict-only tests (no tmux involved at all) were also updated
+    to `_PROJ` for internal consistency, though they don't strictly need
+    scoping.
+  - `_kill_leftover_team_sessions()`: same fix shape as
+    `test_teams_lifecycle.py` — `"team-"` matches now require
+    `.endswith(f"-{_RUN_ID_SCOPE}")`; the existing `_SESSION_PREFIX`
+    (`switchboard-headless-<scope>`) branch was already correctly scoped
+    and is unchanged.
+
+No changes to `app/teams.py` or any other production file.
 
 ## Key decisions / tradeoffs
-- **`set_env()`**: kept the sed-escaping patch (spec's stated preference) rather than switching to a python3/awk rewrite — smaller blast radius across every `--with-*` block, identical signature/behavior for the common case.
-- **`_get_forbidding_open_of()`** (test helper): monkeypatches `builtins.open` globally for the duration of one synchronous HTTP request rather than trying to assert on file-access-time (unreliable under `relatime`/`noatime` mounts) — this mirrors an existing, working precedent in this repo (`tests/test_teams_grounding.py`) rather than inventing a new technique.
+
+- **`_kill_leftover_team_sessions()`'s `"switchboard-"` branch was removed
+  entirely in `test_teams_lifecycle.py`, not scoped.** Its only real
+  purpose there is cleaning up `switchboard-worktree-op-*` sessions from
+  `_run_run_user_command()` (`app/teams.py`), but that function's `op_id`
+  is `f"{int(time.time())}-{secrets.token_hex(6)}"` — no per-process token
+  to scope a sweep by safely, and it's production code this cycle must not
+  touch. `_run_run_user_command()` already self-cleans its own session
+  unconditionally in its own `finally` block (verified by reading
+  `app/teams.py:3049-3052`), so a defensive sweep for it in the test file
+  was unsafe-for-concurrency and, on inspection, redundant for the normal
+  case. `test_team_routes.py`'s own `_kill_leftover_team_sessions()` already
+  had a correctly-scoped `_SESSION_PREFIX` branch for
+  `switchboard-headless-*` (from a prior cycle), which was left untouched.
+- **`RunRunUserCommandRealTmuxTests.test_no_leftover_session_or_rundir` was
+  additionally hardened** beyond what `docs/spec.md`'s "Proposed approach"
+  literally enumerates. Found by directly constructing the acceptance
+  criterion's own scenario (planting a fake foreign
+  `switchboard-worktree-op-*` session and running the file's tests): the
+  sweep itself correctly left the foreign session untouched, but this
+  *unrelated* test's own blind `list-sessions` + prefix-filter assertion
+  false-positive-failed in its presence (a read, not a kill, so it doesn't
+  violate the "sweep must not touch others" criterion, but it does mean
+  the file's tests wouldn't all pass cleanly next to a concurrent process,
+  which is the spirit of the criterion). Fixed with a before/after
+  baseline diff instead of an absolute scan. This is judgment applied
+  in the same file/area the spec already names, not new scope.
+- **`_PROJ`/`_PROJ_A`/`_PROJ_B` chosen over per-test-method local variables**
+  in `test_team_routes.py`. Given ~140 call sites across the file, module-
+  level constants (computed once from `_RUN_ID_SCOPE`, already
+  process-scoped) kept the diff a mechanical, uniform substitution rather
+  than restructuring every test method to compute and thread through a
+  local scoped name.
+- **A few substitutions landed slightly wider than the strict minimum**
+  (e.g., `ValidateProjectForTeamRealGitTests`/`CreateRemoveWorktreeRealGitTests`
+  in `test_teams_lifecycle.py`, which touch real git but never a real
+  `team-<project>` tmux session, and `TeamThreadsLockTests` in
+  `test_team_routes.py`, an in-memory-dict-only test). These were included
+  because the exact-substring replacements (`os.path.join(self.tmp,
+  "proj")`, `"proj"`) are identical regardless of which test class uses
+  them, and scoping them is harmless (no assertion depends on the specific
+  unscoped literal) while keeping the mechanical substitution simple and
+  exhaustive rather than hand-carving exclusions.
 
 ## Deviations from spec
-**The `run_id` validation was moved from `app/teams.py:_run_dir()` (as the spec's "Proposed approach" specified) to the two `run_id`-intake points in `app/app.py`.** This was discovered necessary, not a style preference:
+None. Both fixes match `docs/spec.md`'s "Proposed approach" section; the
+`test_no_leftover_session_or_rundir` hardening above is an extension found
+while proving the spec's own acceptance criteria, in the same file/function
+the spec already names, not a new area of scope.
 
-`_run_dir()` is a shared internal path helper used by every caller in `teams.py`, not just the three externally-reachable web routes — including the CLI (`team-status`/`team-stop`/`team-reap`), `sweep_dead_teams()`, and a large number of pre-existing pure-unit tests across `tests/test_teams_lifecycle.py`, `tests/test_teams_headless.py`, and `tests/test_teams_cancel.py` that construct synthetic `run_id` values (`"r1"`, `"r2"`, arbitrary CLI-typed strings, etc.) that were never intended to match `_run_id()`'s exact generation shape. The spec's own assumption — "Internal callers... always pass a `run_id` either freshly generated by `_run_id()` or read back from a `run.json` this process itself wrote, so they will always match `_RUN_ID_RE`" — turned out to be false in practice:
+## Review fix: `DeployTargetTearDownBackstopTests` didn't actually prove the
+backstop line (post-review rework)
 
-1. Validating inside `_run_dir()` broke 42 pre-existing tests (confirmed by running the change and observing the failures before reverting) that call `_persist()`/`_load_state()`/`sweep_dead_teams()` directly with synthetic run_ids.
-2. It also changed the CLI's error message for an unknown `run_id` (`team-stop no-such-run-id`) from `"no such run_id"` to `"invalid run_id: ..."` — a real, unwanted UX regression for a surface (the CLI) that is locally-trusted and was never part of the reported vulnerability (only the three web routes were named as attacker-reachable).
-3. A recently-landed, unrelated test-isolation mechanism (`tests/test_team_routes.py`'s `_scope_run_ids()`, from a prior hardening cycle for docs/BACKLOG.md item 9) monkeypatches `teams._run_id()` to prefix every test-generated `run_id` with this process's own pid, so that concurrent test processes' real-tmux sessions never collide — those "real, legitimately-issued" test run_ids also didn't match `_RUN_ID_RE`'s exact shape, which would have broken the spec's own acceptance criterion ("a real, legitimately-issued `run_id`... behavior is identical to before this fix").
+**Finding (not disputed).** The reviewer reverted only the new
+`sudo rm -rf /home/deploy` backstop line (keeping the pre-existing
+`userdel -r deploy` call intact) and reran
+`DeployTargetTearDownBackstopTests` — it still passed. Root cause: the
+test's forced-failure scenario always ran *after* a fully successful
+`useradd deploy` (via `run_block()`), so the pre-existing `userdel -r
+deploy` already removed `/home/deploy` as an ordinary side effect of
+removing the account (typical `useradd -m`/`userdel -r` behavior), entirely
+independent of whether the new backstop line existed. The test's own
+docstring claim that "only `tearDown()`'s own unconditional backstop is
+what can remove it" was not actually true for the scenario it constructed.
 
-Moving the check to `app/app.py` — right where a client-supplied `run_id` is first read from the query string / POST body, before any `teams.*` call that could reach a path-join — fully satisfies the actual security goal stated in the spec ("`run_id` values... must be validated... before ever being joined into a path, so a malformed/traversal `run_id`... is rejected before any file outside `_leads_root()` can be opened") without touching the shared internal helper or the CLI. The response shapes/status codes are byte-identical to what the spec's own choke-point design would have produced (same 404/400, same error strings), since both intake points return the exact same "unknown run_id" / "no run found" response the existing not-found path already used.
+**Fix.** Reworked the test body's fixture-construction step so it no longer
+calls `run_block()` (which runs a real `useradd deploy`) at all. Instead it
+constructs the orphan shape directly — `sudo mkdir -p /home/deploy/.ssh` +
+a stale `authorized_keys` — the exact same shape
+`DeployTargetOrphanDetectionTests` already uses above it in this file, with
+no `deploy` account ever created. With no matching account, the inherited
+`tearDown()`'s pre-existing `sudo userdel -r deploy` call fails as a no-op
+(nothing to delete), so only the new, explicit `sudo rm -rf /home/deploy`
+backstop line can be what removes the directory. The test's own body
+asserts `id deploy` is non-zero (no account) before raising, so the
+scenario's shape is verified, not just assumed.
 
-To keep `test_team_routes.py`'s real-HTTP tests passing under this app.py-level check (its `_scope_run_ids()` wrapper needed to keep producing `_RUN_ID_RE`-shaped ids), its scoping technique was changed from a `"p<pid>-"` hyphen-delimited prefix segment to a fixed-width (8-digit), all-digit prefix concatenated directly onto the real epoch digits — this keeps the overall shape `^[0-9]+-[0-9a-f]{12}$` intact while remaining an unambiguous `startswith` prefix for the existing tmux-session cleanup/leftover-detection logic (fixed-width means no two distinct pids' scope tokens can accidentally prefix-match one another). `test_teams_headless.py` and `test_teams_cancel.py` were confirmed (via `grep` for `ThreadingHTTPServer`/`urllib.request`) to never drive a `run_id` through a real HTTP route, so their copies of the same scoping helper were left untouched — they're unaffected by this change and didn't need it.
+**Revert-and-fail proof (the same check the reviewer used), re-run in this
+session:**
+1. Confirmed the host was clean beforehand (`sudo test -e /home/deploy` →
+   absent, `id deploy` → no such user).
+2. Temporarily reverted only the `subprocess.run(["sudo", "rm", "-rf",
+   "/home/deploy"])` backstop line in `InstallScriptDeployTargetBlockTests
+   .tearDown()` (kept the pre-existing `userdel -r deploy` call intact) and
+   ran `python3 -m unittest
+   tests.test_deploy_target.DeployTargetTearDownBackstopTests -v`:
+   ```
+   FAIL: test_teardown_backstop_removes_home_deploy_after_a_forced_mid_test_failure
+   AssertionError: True is not false : tearDown's backstop must remove
+   /home/deploy even when no 'deploy' user ever existed for userdel -r to
+   clean it up as a side effect
+   Ran 1 test in 0.048s
+   FAILED (failures=1)
+   ```
+   The test now genuinely fails without the backstop line — proving it's
+   the thing being tested.
+3. Manually removed the leftover `/home/deploy` this proof run left behind
+   (the reverted tearDown had no way to clean it up, by design), restored
+   the backstop line, and reran the same command:
+   ```
+   test_teardown_backstop_removes_home_deploy_after_a_forced_mid_test_failure ... ok
+   Ran 1 test in 0.055s
+   OK
+   ```
+   Confirmed the working tree diff round-tripped back to exactly the
+   restored version (`diff` against a pre-revert backup produced no
+   output).
 
-`_RUN_ID_RE` itself is unchanged from the spec's proposed pattern and still lives in `app/teams.py` next to `_run_id()`, as the spec required, and `app/app.py` references it directly (`teams._RUN_ID_RE`) — this repo's existing convention (`app.py` already calls `teams._load_state()`, `teams._persist()`, `teams._inbox_path()` etc. directly) rather than adding a new wrapper function in `teams.py`.
+**Full-suite re-verification after the fix**, host confirmed clean
+(`/home/deploy` absent, no `deploy` user) before and after:
+```
+python3 -m unittest tests.test_deploy_target -v      # 32/32 OK
+python3 -m unittest discover -s tests                # 792/792 OK (unchanged
+                                                       # — this cycle only
+                                                       # reworked one
+                                                       # existing test's
+                                                       # internals, no
+                                                       # tests added/removed)
+node tests/test_singleton_toggle_frontend.js          # 15/15
+node tests/test_upload_frontend.js                    # 8/8
+node tests/test_team_frontend.js                       # 52/52
+node tests/test_deploy_frontend.js                     # 9/9
+```
+No regressions. No production code touched.
 
 ## Known limitations
-- `_RUN_ID_RE` is tied to `_run_id()`'s current generation shape (as the spec intended); if that shape ever changes, both the regex and the two `app.py` intake checks must be updated together. This is now slightly more exposed than the spec's single-choke-point design (two call sites in `app.py` instead of one in `teams.py`), though both are directly adjacent to the existing `run_id` intake/ownership-check code they extend, and both are covered by explicit regression tests.
-- `_run_dir()` and every other internal `teams.py` caller remain unvalidated by design (see "Deviations from spec") — this is intentional and matches this cycle's actual attack surface (the three web routes), not an oversight.
+- `tests/test_deploy_target.py`'s `PrivilegedEndToEndTests` class (a
+  *different* class from the one this cycle fixes) uses a fixed, unscoped
+  system username (`TEST_USER = "aidswbtest"`) and is **not** safe to run
+  concurrently across two processes — confirmed directly: running
+  `test_deploy_target.py` in two simultaneous processes produces real SSH/
+  rsync failures there from the two processes racing the same system
+  account. This is out of scope for this cycle (`docs/spec.md`'s
+  concurrency acceptance criterion names only
+  `tests/test_team_routes.py`/`tests/test_teams_lifecycle.py`; the
+  `PrivilegedEndToEndTests` username shape is a pre-existing, separate
+  condition this spec's "Non-goals" doesn't ask this cycle to fix).
+- The orphan-detection fix in `InstallScriptDeployTargetBlockTests.setUp()`
+  still only guards against `/home/deploy` specifically — a differently
+  named leftover (e.g. a stale sudoers file with no `/home/deploy`) is not
+  detected, matching `docs/spec.md`'s own scope (directory presence, not a
+  general leftover-state scan).
 
 ## How to verify locally
+
+Part A (orphan detection + backstop), single process:
 ```
-# set_env() fix
-python3 -m unittest tests.test_install_set_env -v
-python3 -m unittest tests.test_install_ollama -v   # regression: set_env() used indirectly
+python3 -m unittest tests.test_deploy_target -v
+```
+`DeployTargetOrphanDetectionTests` and `DeployTargetTearDownBackstopTests`
+require passwordless `sudo` (same gate as the rest of the file) and
+construct/remove a real `/home/deploy` directory.
 
-# run_id validation fix
-python3 -m unittest tests.test_teams_lifecycle.RunIdRegexValidationTests -v
-python3 -m unittest tests.test_team_routes.TeamEventsEndpointTests tests.test_team_routes.TeamInboxEndpointTests tests.test_team_routes.TeamResolveEndpointTests -v
+Part B concurrency proof (the actual regression test for the reported
+problem — must be two separate processes, not sequential):
+```
+python3 -m unittest tests.test_teams_lifecycle tests.test_team_routes -v &
+python3 -m unittest tests.test_teams_lifecycle tests.test_team_routes -v &
+wait
+```
+Both must print `OK` with zero failures/errors, and `tmux list-sessions`
+afterward must show no leftover `team-*`/`switchboard-*` sessions from
+either run.
 
-# full regression sweep
-python3 -m unittest discover -s tests -v          # 790 tests, all pass (765 baseline + 25 new)
-node tests/test_team_frontend.js && node tests/test_deploy_frontend.js && node tests/test_singleton_toggle_frontend.js && node tests/test_upload_frontend.js   # 84/84, unaffected (no Node-facing code touched)
+Part B sweep-safety proof (a concurrent process's own sessions must survive
+this file's tearDown sweep):
+```
+tmux new-session -d -s "switchboard-worktree-op-9999999999-deadbeef0000" "sleep 60"
+tmux new-session -d -s "team-otherproj-p9999999" "sleep 60"
+python3 -m unittest tests.test_teams_lifecycle -q
+tmux list-sessions   # both planted sessions must still be listed
+tmux kill-session -t "switchboard-worktree-op-9999999999-deadbeef0000"
+tmux kill-session -t "team-otherproj-p9999999"
+```
 
-bash -n install.sh                                  # syntax check
-python3 -m py_compile app/teams.py app/app.py        # syntax check
+Full regression suite:
+```
+python3 -m unittest discover -s tests -v   # expect 792 tests, OK (790 baseline + 2 new)
+node tests/test_singleton_toggle_frontend.js   # 15/15
+node tests/test_upload_frontend.js             # 8/8
+node tests/test_team_frontend.js               # 52/52
+node tests/test_deploy_frontend.js             # 9/9
 ```

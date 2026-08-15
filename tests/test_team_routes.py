@@ -80,7 +80,7 @@ def _plant_traversal_target(tmp_dir, relative="run.json", content=None):
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, relative)
     with open(path, "w") as f:
-        json.dump(content or {"run_id": "evilrun", "project_name": "proj",
+        json.dump(content or {"run_id": "evilrun", "project_name": _PROJ,
                               "status": "blocked_ask_user", "members": []}, f)
     return path
 
@@ -196,6 +196,17 @@ _RUN_ID_SCOPE = f"{os.getpid():08d}"
 _SESSION_PREFIX = f"switchboard-headless-{_RUN_ID_SCOPE}"
 
 
+# Test-isolation (continued): every real _PROJ/_PROJ_A/_PROJ_B project
+# name in this file becomes a real team-<project> tmux session name
+# (_team_session_name()) once launch_team()/_create_team_session() touches
+# it -- scoped the same way as _RUN_ID_SCOPE above, for the same reason
+# (BACKLOG item 9): two concurrent runs of this file must never contend
+# for the same tmux session name.
+_PROJ = f"proj-{_RUN_ID_SCOPE}"
+_PROJ_A = f"proj-a-{_RUN_ID_SCOPE}"
+_PROJ_B = f"proj-b-{_RUN_ID_SCOPE}"
+
+
 def _scope_run_ids(testcase):
     """Wraps teamsmod._run_id() so every run_id it produces for the
     duration of testcase carries this process's own scope token WHILE
@@ -212,9 +223,14 @@ def _scope_run_ids(testcase):
 
 
 def _kill_leftover_team_sessions():
+    # "team-" is scoped to this process's own team-<project>-<scope>
+    # sessions only (see _PROJ/_PROJ_A/_PROJ_B above) -- an unscoped
+    # "team-" prefix match would kill a CONCURRENT process's own live team
+    # sessions too, defeating the whole point of scoping project names
+    # (docs/spec.md, BACKLOG item 9).
     r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True)
     for name in r.stdout.splitlines():
-        if name.startswith("team-") or name.startswith(_SESSION_PREFIX):
+        if (name.startswith("team-") and name.endswith(f"-{_RUN_ID_SCOPE}")) or name.startswith(_SESSION_PREFIX):
             subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
 
 
@@ -276,16 +292,16 @@ class TeamThreadsLockTests(unittest.TestCase):
     def test_pop_if_owned_survives_a_widened_window_against_a_concurrent_relaunch(self):
         old_entry = {"run_id": "old-run", "thread": None, "cancel_event": threading.Event()}
         new_entry = {"run_id": "new-run", "thread": None, "cancel_event": threading.Event()}
-        appmod._team_threads = _SlowGetDict({"proj": old_entry}, slow_key="proj", delay=0.3)
+        appmod._team_threads = _SlowGetDict({_PROJ: old_entry}, slow_key=_PROJ, delay=0.3)
 
-        t = threading.Thread(target=appmod._team_threads_pop_if_owned, args=("proj", "old-run"))
+        t = threading.Thread(target=appmod._team_threads_pop_if_owned, args=(_PROJ, "old-run"))
         t.start()
         time.sleep(0.05)  # let the old thread's cleanup actually enter its (slow) read
-        appmod._team_threads_set("proj", new_entry)  # the concurrent relaunch
+        appmod._team_threads_set(_PROJ, new_entry)  # the concurrent relaunch
         t.join(timeout=5)
         self.assertFalse(t.is_alive(), "old thread's cleanup did not finish in time")
 
-        result = appmod._team_threads.get("proj")
+        result = appmod._team_threads.get(_PROJ)
         self.assertEqual(result, new_entry,
                          "the concurrent relaunch's fresh entry must survive the old thread's "
                          "own cleanup even under an artificially widened window -- got "
@@ -297,20 +313,20 @@ class TeamThreadsLockTests(unittest.TestCase):
         # same delay, same timing, same relaunch trigger as the test above,
         # so a clean pass there is not merely because the technique itself
         # is too weak to ever catch anything.
-        threads = _SlowGetDict({"proj": {"run_id": "old-run"}}, slow_key="proj", delay=0.3)
+        threads = _SlowGetDict({_PROJ: {"run_id": "old-run"}}, slow_key=_PROJ, delay=0.3)
 
         def naive_pop_if_owned(name, run_id):
             entry = threads.get(name)  # slow, no lock -- the exact pre-fix shape
             if entry is not None and entry.get("run_id") == run_id:
                 threads.pop(name, None)
 
-        t = threading.Thread(target=naive_pop_if_owned, args=("proj", "old-run"))
+        t = threading.Thread(target=naive_pop_if_owned, args=(_PROJ, "old-run"))
         t.start()
         time.sleep(0.05)
-        threads["proj"] = {"run_id": "new-run"}  # unlocked relaunch write -- nothing to block on
+        threads[_PROJ] = {"run_id": "new-run"}  # unlocked relaunch write -- nothing to block on
         t.join(timeout=5)
 
-        self.assertIsNone(threads.get("proj"),
+        self.assertIsNone(threads.get(_PROJ),
                           "sanity check: the naive, unlocked pattern is expected to lose the "
                           "concurrent relaunch's entry -- if this assertion fails, the widening "
                           "technique itself isn't discriminating, and the test above's clean "
@@ -420,7 +436,7 @@ class _RealHTTPTeamTestCase(unittest.TestCase):
             except ValueError:
                 return e.code, {}
 
-    def _project(self, name="proj"):
+    def _project(self, name=_PROJ):
         path = os.path.join(self.projects_dir, name)
         _init_repo(path)
         return path
@@ -460,10 +476,10 @@ class TeamStartEndpointTests(_RealHTTPTeamTestCase):
         self.assertFalse(os.path.isdir(teamsmod._leads_root()))
 
     def test_missing_task_returns_400(self):
-        self._project("proj")
+        self._project(_PROJ)
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/start", cookie, {"task": "  ", "code": code})
+        status, payload = self._post(f"/projects/{_PROJ}/team/start", cookie, {"task": "  ", "code": code})
         self.assertEqual(status, 400)
         self.assertIn("task description", payload["error"])
         self.assertFalse(os.path.isdir(teamsmod._leads_root()))
@@ -472,7 +488,7 @@ class TeamStartEndpointTests(_RealHTTPTeamTestCase):
         # docs/spec.md §2, SETTLED BY THE USER 2026-08-13: the DEFAULT
         # composition never picks a tier-3 lead. No TEAM_LLM_*, and the only
         # headless-eligible engine is tier 3 (no HEADLESS_SCHEMA_FLAG).
-        self._project("proj")
+        self._project(_PROJ)
         _write_engine_file(self.engines_dir, "prose.engine", """\
             LABEL=Prose
             CMD=unused
@@ -482,7 +498,7 @@ class TeamStartEndpointTests(_RealHTTPTeamTestCase):
             """)
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/start", cookie,
+        status, payload = self._post(f"/projects/{_PROJ}/team/start", cookie,
                                      {"task": "do it", "code": code})
         self.assertEqual(status, 400)
         self.assertIn("tier-3", payload["error"])
@@ -492,11 +508,11 @@ class TeamStartEndpointTests(_RealHTTPTeamTestCase):
         # session, no run.json at all (docs/spec.md Defect #4's own class:
         # a refusal that still leaves something behind).
         self.assertFalse(os.path.isdir(teamsmod._leads_root()))
-        self.assertFalse(appmod.tmux_has("team-proj"))
-        self.assertFalse(os.path.isdir(f"{os.path.join(self.projects_dir, 'proj')}.teams"))
+        self.assertFalse(appmod.tmux_has(f"team-{_PROJ}"))
+        self.assertFalse(os.path.isdir(f"{os.path.join(self.projects_dir, _PROJ)}.teams"))
 
     def test_happy_path_tier2_default_lead_persisted_correctly(self):
-        self._project("proj")
+        self._project(_PROJ)
         self._write_fast_finisher_engine("lead2")
         _write_engine_file(self.engines_dir, "helper.engine", """\
             LABEL=Helper
@@ -507,7 +523,7 @@ class TeamStartEndpointTests(_RealHTTPTeamTestCase):
             """)
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/start", cookie,
+        status, payload = self._post(f"/projects/{_PROJ}/team/start", cookie,
                                      {"task": "do it", "code": code})
         self.assertEqual(status, 200, payload)
         self.assertTrue(payload["ok"])
@@ -520,11 +536,11 @@ class TeamStartEndpointTests(_RealHTTPTeamTestCase):
         state = teamsmod._load_state(run_id)
         self.assertEqual(state["lead"], {"kind": "engine", "name": "lead2", "tier": 2})
         self.assertEqual(state["members"], ["helper"])
-        self.assertEqual(state["project_name"], "proj")
+        self.assertEqual(state["project_name"], _PROJ)
         self.assertTrue(appmod.tmux_has(payload["session"]))
 
     def test_ollama_configured_selects_ollama_lead(self):
-        self._project("proj")
+        self._project(_PROJ)
         teamsmod.TEAM_LLM_BASE_URL = "http://127.0.0.1:1/v1"  # never dialed -- launch_team() doesn't call it
         teamsmod.TEAM_LLM_MODEL = "qwen3:8b"
         _write_engine_file(self.engines_dir, "onlymember.engine", """\
@@ -536,7 +552,7 @@ class TeamStartEndpointTests(_RealHTTPTeamTestCase):
             """)
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/start", cookie,
+        status, payload = self._post(f"/projects/{_PROJ}/team/start", cookie,
                                      {"task": "do it", "code": code})
         self.assertEqual(status, 200, payload)
         self.assertEqual(payload["lead"], {"kind": "ollama", "name": "qwen3:8b", "tier": 1})
@@ -547,7 +563,7 @@ class TeamStartEndpointTests(_RealHTTPTeamTestCase):
     def test_two_near_simultaneous_starts_exactly_one_succeeds(self):
         # Real concurrency -- two threads racing the same route, not two
         # sequential calls (docs/spec.md "Edge cases").
-        self._project("proj")
+        self._project(_PROJ)
         self._write_fast_finisher_engine("lead2")
         _write_engine_file(self.engines_dir, "helper.engine", """\
             LABEL=Helper
@@ -563,7 +579,7 @@ class TeamStartEndpointTests(_RealHTTPTeamTestCase):
 
         def _fire(i):
             barrier.wait()
-            results[i] = self._post("/projects/proj/team/start", cookie,
+            results[i] = self._post(f"/projects/{_PROJ}/team/start", cookie,
                                     {"task": f"do it {i}", "code": code})
 
         threads = [threading.Thread(target=_fire, args=(i,)) for i in range(2)]
@@ -623,10 +639,10 @@ class TeamStopEndpointTests(_RealHTTPTeamTestCase):
         super().tearDown()
 
     def test_stop_with_no_team_ever_started_is_idempotent_ok(self):
-        self._project("proj")
+        self._project(_PROJ)
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/stop", cookie, {"code": code})
+        status, payload = self._post(f"/projects/{_PROJ}/team/stop", cookie, {"code": code})
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
 
@@ -637,7 +653,7 @@ class TeamStopEndpointTests(_RealHTTPTeamTestCase):
         self.assertEqual(status, 404)
 
     def test_stop_on_already_finished_team_is_idempotent_ok(self):
-        repo = self._project("proj")
+        repo = self._project(_PROJ)
         result = teamsmod.launch_team(repo, "task", {"kind": "ollama", "name": "m", "tier": 1}, [])
         run_id = result["run_id"]
         state = teamsmod._load_state(run_id)
@@ -646,13 +662,13 @@ class TeamStopEndpointTests(_RealHTTPTeamTestCase):
         teamsmod._persist(state)
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/stop", cookie, {"code": code})
+        status, payload = self._post(f"/projects/{_PROJ}/team/stop", cookie, {"code": code})
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
         self.assertIn("no team currently running", payload["message"])
 
     def test_stop_mid_delegate_terminates_real_subprocess_promptly(self):
-        repo = self._project("proj")
+        repo = self._project(_PROJ)
         script = _write_script(self.engines_dir, "slow.py", """\
             #!/usr/bin/env python3
             import time
@@ -676,16 +692,16 @@ class TeamStopEndpointTests(_RealHTTPTeamTestCase):
         orig_call_lead = teamsmod._call_lead
         teamsmod._call_lead = fake_call_lead
         cancel_event = threading.Event()
-        appmod._team_threads["proj"] = {"run_id": run_id, "thread": None, "cancel_event": cancel_event}
-        t = threading.Thread(target=appmod._run_team_in_background, args=("proj", run_id, cancel_event))
-        appmod._team_threads["proj"]["thread"] = t
+        appmod._team_threads[_PROJ] = {"run_id": run_id, "thread": None, "cancel_event": cancel_event}
+        t = threading.Thread(target=appmod._run_team_in_background, args=(_PROJ, run_id, cancel_event))
+        appmod._team_threads[_PROJ]["thread"] = t
         t.start()
         try:
             time.sleep(0.5)  # let the real delegate subprocess actually spawn and get into its poll loop
             cookie = self._login()
             code = self._totp_code()
             start = time.time()
-            status, payload = self._post("/projects/proj/team/stop", cookie, {"code": code})
+            status, payload = self._post(f"/projects/{_PROJ}/team/stop", cookie, {"code": code})
             elapsed = time.time() - start
         finally:
             teamsmod._call_lead = orig_call_lead
@@ -705,7 +721,7 @@ class TeamStopEndpointTests(_RealHTTPTeamTestCase):
         self.assertEqual(leftover, [])
 
     def test_status_maps_every_run_status_to_the_coarse_label(self):
-        repo = self._project("proj")
+        repo = self._project(_PROJ)
         result = teamsmod.launch_team(repo, "task", {"kind": "ollama", "name": "m", "tier": 1}, [])
         run_id = result["run_id"]
         cookie = self._login()
@@ -720,11 +736,11 @@ class TeamStopEndpointTests(_RealHTTPTeamTestCase):
             teamsmod._persist(state)
             s = self._get_status(cookie)
             by_name = {i["name"]: i for i in s["instances"]}
-            self.assertEqual(by_name["proj"]["team"]["status"], expected, raw_status)
-            self.assertEqual(by_name["proj"]["team"]["run_id"], run_id)
+            self.assertEqual(by_name[_PROJ]["team"]["status"], expected, raw_status)
+            self.assertEqual(by_name[_PROJ]["team"]["run_id"], run_id)
 
     def test_status_idle_when_no_run_ever_started(self):
-        self._project("proj")
+        self._project(_PROJ)
         cookie = self._login()
         s = self._get_status(cookie)
         by_name = {i["name"]: i for i in s["instances"]}
@@ -734,7 +750,7 @@ class TeamStopEndpointTests(_RealHTTPTeamTestCase):
         # refuses, so composition is None here (no saved composition
         # either). "waiting_on_you" (backlog item 6f part 1) is additive
         # too -- False, no run at all.
-        self.assertEqual(by_name["proj"]["team"],
+        self.assertEqual(by_name[_PROJ]["team"],
                          {"status": "idle", "run_id": None, "composition": None,
                           "waiting_on_you": False})
 
@@ -746,7 +762,7 @@ class StatusRosterAndCompositionTests(_RealHTTPTeamTestCase):
     default_team_composition()'s own pick, else None)."""
 
     def test_roster_reflects_engines_d_live_no_cache(self):
-        self._project("proj")
+        self._project(_PROJ)
         cookie = self._login()
         s = self._get_status(cookie)
         self.assertEqual(s["roster"], [])  # nothing in engines_dir yet
@@ -762,7 +778,7 @@ class StatusRosterAndCompositionTests(_RealHTTPTeamTestCase):
         self.assertIn("helper", names)  # picked up without a restart
 
     def test_composition_falls_back_to_default_when_none_saved(self):
-        self._project("proj")
+        self._project(_PROJ)
         self._write_fast_finisher_engine("lead2")
         _write_engine_file(self.engines_dir, "helper.engine", """\
             LABEL=Helper
@@ -774,11 +790,11 @@ class StatusRosterAndCompositionTests(_RealHTTPTeamTestCase):
         cookie = self._login()
         s = self._get_status(cookie)
         by_name = {i["name"]: i for i in s["instances"]}
-        self.assertEqual(by_name["proj"]["team"]["composition"],
+        self.assertEqual(by_name[_PROJ]["team"]["composition"],
                          {"lead": {"kind": "engine", "name": "lead2", "tier": 2}, "members": ["helper"]})
 
     def test_composition_prefers_saved_over_default(self):
-        self._project("proj")
+        self._project(_PROJ)
         self._write_fast_finisher_engine("lead2")
         _write_engine_file(self.engines_dir, "helper.engine", """\
             LABEL=Helper
@@ -789,12 +805,12 @@ class StatusRosterAndCompositionTests(_RealHTTPTeamTestCase):
             """)
         # A saved composition that differs from what default_team_
         # composition() would itself pick (helper as lead instead).
-        teamsmod.save_composition("proj", {"kind": "engine", "name": "helper"},
+        teamsmod.save_composition(_PROJ, {"kind": "engine", "name": "helper"},
                                   [{"kind": "engine", "name": "lead2"}])
         cookie = self._login()
         s = self._get_status(cookie)
         by_name = {i["name"]: i for i in s["instances"]}
-        self.assertEqual(by_name["proj"]["team"]["composition"],
+        self.assertEqual(by_name[_PROJ]["team"]["composition"],
                          {"lead": {"kind": "engine", "name": "helper"}, "members": ["lead2"]})
 
     def test_composition_not_none_for_tier3_only_roster_with_no_saved_composition(self):
@@ -810,7 +826,7 @@ class StatusRosterAndCompositionTests(_RealHTTPTeamTestCase):
         # with no way to ever open the picker for exactly this case. This
         # reproduces the reviewer's own live repro: one tier-3 engines.d
         # entry, no Ollama configured, no saved composition.
-        self._project("proj")
+        self._project(_PROJ)
         _write_engine_file(self.engines_dir, "prose.engine", """\
             LABEL=Prose
             CMD=unused
@@ -826,7 +842,7 @@ class StatusRosterAndCompositionTests(_RealHTTPTeamTestCase):
         # composition must be a real (non-None) object with nothing
         # pre-selected -- the frontend opens the picker off this, not off
         # default_team_composition()'s own "ok" flag.
-        self.assertEqual(by_name["proj"]["team"]["composition"], {"lead": None, "members": []})
+        self.assertEqual(by_name[_PROJ]["team"]["composition"], {"lead": None, "members": []})
 
     def test_composition_stays_none_for_a_genuinely_empty_roster(self):
         # Contrast case for the fix above -- no engines.d entries, no
@@ -834,12 +850,12 @@ class StatusRosterAndCompositionTests(_RealHTTPTeamTestCase):
         # must remain None (the frontend's permanent-refusal, disabled-
         # Start state is still correct here; only the tier-3-only/single-
         # engine cases above changed).
-        self._project("proj")
+        self._project(_PROJ)
         cookie = self._login()
         s = self._get_status(cookie)
         by_name = {i["name"]: i for i in s["instances"]}
         self.assertEqual(s["roster"], [])
-        self.assertIsNone(by_name["proj"]["team"]["composition"])
+        self.assertIsNone(by_name[_PROJ]["team"]["composition"])
 
     def test_waiting_on_you_true_only_for_blocked_ask_user_never_for_escalated_max_rounds(self):
         # docs/spec.md §4/"Open questions": additive-only field, true iff
@@ -847,7 +863,7 @@ class StatusRosterAndCompositionTests(_RealHTTPTeamTestCase):
         # every existing /status field/value stays byte-for-byte unchanged
         # (this test only checks the one new key; the full-dict exact-match
         # tests above/elsewhere already pin the rest).
-        repo = self._project("proj")
+        repo = self._project(_PROJ)
         result = teamsmod.launch_team(repo, "task", {"kind": "ollama", "name": "m", "tier": 1}, [])
         run_id = result["run_id"]
         cookie = self._login()
@@ -862,7 +878,7 @@ class StatusRosterAndCompositionTests(_RealHTTPTeamTestCase):
             teamsmod._persist(state)
             s = self._get_status(cookie)
             by_name = {i["name"]: i for i in s["instances"]}
-            self.assertEqual(by_name["proj"]["team"]["waiting_on_you"], expected, raw_status)
+            self.assertEqual(by_name[_PROJ]["team"]["waiting_on_you"], expected, raw_status)
 
 
 # ─── GET /projects/<name>/team/grounding (backlog item 6e) ─────────────────
@@ -885,11 +901,11 @@ class TeamGroundingEndpointTests(_RealHTTPTeamTestCase):
         self.assertEqual(payload["files"], [])
 
     def test_found_files_shape_never_leaks_content_digest_or_headings(self):
-        repo = self._project("proj")
+        repo = self._project(_PROJ)
         with open(os.path.join(repo, "README.md"), "w") as f:
             f.write("# Title\n\nSecret internal detail that must never reach the browser.\n")
         cookie = self._login()
-        status, payload = self._get("/projects/proj/team/grounding", cookie)
+        status, payload = self._get(f"/projects/{_PROJ}/team/grounding", cookie)
         self.assertEqual(status, 200)
         readme = next(f for f in payload["files"] if f["relpath"] == "README.md")
         self.assertEqual(set(readme.keys()), {"label", "relpath", "byte_count"})
@@ -901,9 +917,9 @@ class TeamGroundingEndpointTests(_RealHTTPTeamTestCase):
     def test_read_only_no_totp_required(self):
         # Matches /status's own gating -- _authed() only, unlike every
         # mutating POST route (docs/spec.md "Read-only, no TOTP needed").
-        self._project("proj")
+        self._project(_PROJ)
         cookie = self._login()
-        req = urllib.request.Request(f"{self.base}/projects/proj/team/grounding",
+        req = urllib.request.Request(f"{self.base}/projects/{_PROJ}/team/grounding",
                                      headers={"Cookie": cookie})
         resp = urllib.request.urlopen(req)
         self.assertEqual(resp.status, 200)
@@ -916,7 +932,7 @@ class TeamEventsEndpointTests(_RealHTTPTeamTestCase):
     already-persisted state and log files) so event content/ordering/
     cursor behavior is deterministic and independent of a real lead loop."""
 
-    def _make_run(self, name="proj", members=None, status="running"):
+    def _make_run(self, name=_PROJ, members=None, status="running"):
         os.makedirs(os.path.join(self.projects_dir, name), exist_ok=True)
         run_id = teamsmod._run_id()
         state = teamsmod._new_state(run_id, os.path.join(self.projects_dir, name),
@@ -932,9 +948,9 @@ class TeamEventsEndpointTests(_RealHTTPTeamTestCase):
         self.assertEqual(status, 404)
 
     def test_no_run_ever_started_returns_clean_empty_state(self):
-        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        os.makedirs(os.path.join(self.projects_dir, _PROJ))
         cookie = self._login()
-        status, payload = self._get("/projects/proj/team/events", cookie)
+        status, payload = self._get(f"/projects/{_PROJ}/team/events", cookie)
         self.assertEqual(status, 200)
         self.assertEqual(payload, {"run_id": None, "events": [], "cursors": {}})
 
@@ -946,7 +962,7 @@ class TeamEventsEndpointTests(_RealHTTPTeamTestCase):
         _append_jsonl(teamsmod._agent_log_path(run_id, "claude"),
                      _envelope("claude", 1, text="second", ts="2026-01-01T00:00:01Z"))
         cookie = self._login()
-        status, payload = self._get("/projects/proj/team/events", cookie)
+        status, payload = self._get(f"/projects/{_PROJ}/team/events", cookie)
         self.assertEqual(status, 200)
         self.assertEqual(payload["run_id"], run_id)
         self.assertEqual([e["text"] for e in payload["events"]], ["first", "second", "third"])
@@ -959,7 +975,7 @@ class TeamEventsEndpointTests(_RealHTTPTeamTestCase):
     def test_a_member_with_no_log_file_yet_is_present_but_empty(self):
         run_id = self._make_run(members=["neverdelegated"])
         cookie = self._login()
-        status, payload = self._get("/projects/proj/team/events", cookie)
+        status, payload = self._get(f"/projects/{_PROJ}/team/events", cookie)
         self.assertEqual(status, 200)
         self.assertEqual(payload["events"], [])
         self.assertEqual(payload["cursors"].get("neverdelegated"), 0)
@@ -969,20 +985,20 @@ class TeamEventsEndpointTests(_RealHTTPTeamTestCase):
         lead_path = teamsmod._transcript_path(run_id)
         _append_jsonl(lead_path, _envelope("lead", 1, text="one"))
         cookie = self._login()
-        status, payload = self._get("/projects/proj/team/events", cookie)
+        status, payload = self._get(f"/projects/{_PROJ}/team/events", cookie)
         self.assertEqual(len(payload["events"]), 1)
         cursor_q = urllib.parse.quote(json.dumps(payload["cursors"]))
-        status2, payload2 = self._get(f"/projects/proj/team/events?cursor={cursor_q}", cookie)
+        status2, payload2 = self._get(f"/projects/{_PROJ}/team/events?cursor={cursor_q}", cookie)
         self.assertEqual(payload2["events"], [])
         _append_jsonl(lead_path, _envelope("lead", 2, text="two"))
-        status3, payload3 = self._get(f"/projects/proj/team/events?cursor={cursor_q}", cookie)
+        status3, payload3 = self._get(f"/projects/{_PROJ}/team/events?cursor={cursor_q}", cookie)
         self.assertEqual([e["text"] for e in payload3["events"]], ["two"])
 
     def test_malformed_cursor_falls_back_to_a_full_replay_not_a_400(self):
         run_id = self._make_run()
         _append_jsonl(teamsmod._transcript_path(run_id), _envelope("lead", 1, text="one"))
         cookie = self._login()
-        status, payload = self._get("/projects/proj/team/events?cursor=not-json", cookie)
+        status, payload = self._get(f"/projects/{_PROJ}/team/events?cursor=not-json", cookie)
         self.assertEqual(status, 200)
         self.assertEqual([e["text"] for e in payload["events"]], ["one"])
 
@@ -997,12 +1013,12 @@ class TeamEventsEndpointTests(_RealHTTPTeamTestCase):
                      _envelope("lead", 1, text="a"), _envelope("lead", 2, text="b"),
                      _envelope("lead", 3, text="c"))
         cookie = self._login()
-        status, payload = self._get("/projects/proj/team/events", cookie)
+        status, payload = self._get(f"/projects/{_PROJ}/team/events", cookie)
         self.assertEqual(status, 200)
         self.assertEqual([e["text"] for e in payload["events"]], ["a", "b"])
         self.assertEqual(payload["truncated"], {"lead": True})
         cursor_q = urllib.parse.quote(json.dumps(payload["cursors"]))
-        status2, payload2 = self._get(f"/projects/proj/team/events?cursor={cursor_q}", cookie)
+        status2, payload2 = self._get(f"/projects/{_PROJ}/team/events?cursor={cursor_q}", cookie)
         self.assertEqual([e["text"] for e in payload2["events"]], ["c"])
         self.assertEqual(payload2["truncated"], {})
 
@@ -1015,28 +1031,28 @@ class TeamEventsEndpointTests(_RealHTTPTeamTestCase):
             f.write("not valid json at all\n")
             f.write(json.dumps(_envelope("lead", 3, text="ok-after")) + "\n")
         cookie = self._login()
-        status, payload = self._get("/projects/proj/team/events", cookie)
+        status, payload = self._get(f"/projects/{_PROJ}/team/events", cookie)
         self.assertEqual(status, 200)
         kinds = [e["kind"] for e in payload["events"]]
         self.assertIn("error", kinds)
         self.assertEqual(len(payload["events"]), 3)
 
     def test_cross_project_run_id_404_no_data_leaked(self):
-        run_a = self._make_run(name="proj-a")
-        os.makedirs(os.path.join(self.projects_dir, "proj-b"))
+        run_a = self._make_run(name=_PROJ_A)
+        os.makedirs(os.path.join(self.projects_dir, _PROJ_B))
         cookie = self._login()
-        status, payload = self._get(f"/projects/proj-b/team/events?run_id={run_a}", cookie)
+        status, payload = self._get(f"/projects/{_PROJ_B}/team/events?run_id={run_a}", cookie)
         self.assertEqual(status, 404)
 
     # ── run_id path-traversal validation (docs/BACKLOG.md item 11(b)) ───
 
     def test_path_traversal_run_id_404_planted_file_never_opened(self):
-        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        os.makedirs(os.path.join(self.projects_dir, _PROJ))
         planted = _plant_traversal_target(self.tmp)
         cookie = self._login()
         status, payload = _get_forbidding_open_of(
             self, planted,
-            lambda: self._get(f"/projects/proj/team/events?run_id={TRAVERSAL_RUN_ID}", cookie))
+            lambda: self._get(f"/projects/{_PROJ}/team/events?run_id={TRAVERSAL_RUN_ID}", cookie))
         self.assertEqual(status, 404)
         self.assertEqual(payload, {"error": "unknown run_id for this project"})
 
@@ -1044,30 +1060,30 @@ class TeamEventsEndpointTests(_RealHTTPTeamTestCase):
         # %2e%2e%2f decodes to the same literal "../" the regex already
         # rejects (docs/spec.md "Edge cases") -- urllib.parse.parse_qs
         # decodes percent-encoding before the route ever sees the string.
-        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        os.makedirs(os.path.join(self.projects_dir, _PROJ))
         planted = _plant_traversal_target(self.tmp)
         encoded = "%2e%2e%2f%2e%2e%2foutside%2fevilrun"
         cookie = self._login()
         status, payload = _get_forbidding_open_of(
             self, planted,
-            lambda: self._get(f"/projects/proj/team/events?run_id={encoded}", cookie))
+            lambda: self._get(f"/projects/{_PROJ}/team/events?run_id={encoded}", cookie))
         self.assertEqual(status, 404)
         self.assertEqual(payload, {"error": "unknown run_id for this project"})
 
     def test_malformed_non_traversal_run_id_404_no_500(self):
-        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        os.makedirs(os.path.join(self.projects_dir, _PROJ))
         cookie = self._login()
         for bad_run_id in ("not-a-real-run", "1700000000-ABC123DEF456"):
             status, payload = self._get(
-                f"/projects/proj/team/events?run_id={bad_run_id}", cookie)
+                f"/projects/{_PROJ}/team/events?run_id={bad_run_id}", cookie)
             self.assertEqual(status, 404, bad_run_id)
             self.assertEqual(payload, {"error": "unknown run_id for this project"}, bad_run_id)
 
     def test_run_id_with_nul_byte_404_no_500(self):
-        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        os.makedirs(os.path.join(self.projects_dir, _PROJ))
         cookie = self._login()
         run_id = urllib.parse.quote("1700000000-abc123def456\x00/etc/passwd")
-        status, payload = self._get(f"/projects/proj/team/events?run_id={run_id}", cookie)
+        status, payload = self._get(f"/projects/{_PROJ}/team/events?run_id={run_id}", cookie)
         self.assertEqual(status, 404)
         self.assertEqual(payload, {"error": "unknown run_id for this project"})
 
@@ -1075,14 +1091,14 @@ class TeamEventsEndpointTests(_RealHTTPTeamTestCase):
         run_id = self._make_run(status="finished")
         _append_jsonl(teamsmod._transcript_path(run_id), _envelope("lead", 1, text="done"))
         cookie = self._login()
-        status, payload = self._get("/projects/proj/team/events", cookie)
+        status, payload = self._get(f"/projects/{_PROJ}/team/events", cookie)
         self.assertEqual(status, 200)
         self.assertEqual([e["text"] for e in payload["events"]], ["done"])
 
 
 # ─── GET /projects/<name>/team/inbox (backlog item 6f part 1, docs/spec.md) ──
 class TeamInboxEndpointTests(_RealHTTPTeamTestCase):
-    def _make_run(self, name="proj", status="blocked_ask_user"):
+    def _make_run(self, name=_PROJ, status="blocked_ask_user"):
         os.makedirs(os.path.join(self.projects_dir, name), exist_ok=True)
         run_id = teamsmod._run_id()
         state = teamsmod._new_state(run_id, os.path.join(self.projects_dir, name),
@@ -1098,16 +1114,16 @@ class TeamInboxEndpointTests(_RealHTTPTeamTestCase):
         self.assertEqual(status, 404)
 
     def test_no_run_ever_started_pending_false(self):
-        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        os.makedirs(os.path.join(self.projects_dir, _PROJ))
         cookie = self._login()
-        status, payload = self._get("/projects/proj/team/inbox", cookie)
+        status, payload = self._get(f"/projects/{_PROJ}/team/inbox", cookie)
         self.assertEqual(status, 200)
         self.assertEqual(payload, {"pending": False})
 
     def test_run_not_blocked_pending_false(self):
         self._make_run(status="running")
         cookie = self._login()
-        status, payload = self._get("/projects/proj/team/inbox", cookie)
+        status, payload = self._get(f"/projects/{_PROJ}/team/inbox", cookie)
         self.assertEqual(payload, {"pending": False})
 
     def test_genuinely_blocked_returns_exact_persisted_question_shape(self):
@@ -1117,14 +1133,14 @@ class TeamInboxEndpointTests(_RealHTTPTeamTestCase):
         with open(teamsmod._inbox_path(run_id), "w") as f:
             json.dump(inbox, f)
         cookie = self._login()
-        status, payload = self._get("/projects/proj/team/inbox", cookie)
+        status, payload = self._get(f"/projects/{_PROJ}/team/inbox", cookie)
         self.assertEqual(status, 200)
         self.assertEqual(payload, {"pending": True, "run_id": run_id, **inbox})
 
     def test_missing_inbox_json_still_pending_true_with_fallback_question(self):
         self._make_run()  # blocked, but inbox.json never written
         cookie = self._login()
-        status, payload = self._get("/projects/proj/team/inbox", cookie)
+        status, payload = self._get(f"/projects/{_PROJ}/team/inbox", cookie)
         self.assertEqual(status, 200)
         self.assertTrue(payload["pending"])
         self.assertTrue(payload["question"])  # non-empty fallback, never blank
@@ -1135,33 +1151,33 @@ class TeamInboxEndpointTests(_RealHTTPTeamTestCase):
         with open(teamsmod._inbox_path(run_id), "w") as f:
             f.write("not valid json")
         cookie = self._login()
-        status, payload = self._get("/projects/proj/team/inbox", cookie)
+        status, payload = self._get(f"/projects/{_PROJ}/team/inbox", cookie)
         self.assertTrue(payload["pending"])
         self.assertTrue(payload["question"])
 
     def test_cross_project_run_id_404(self):
-        run_a = self._make_run(name="proj-a")
-        os.makedirs(os.path.join(self.projects_dir, "proj-b"))
+        run_a = self._make_run(name=_PROJ_A)
+        os.makedirs(os.path.join(self.projects_dir, _PROJ_B))
         cookie = self._login()
-        status, payload = self._get(f"/projects/proj-b/team/inbox?run_id={run_a}", cookie)
+        status, payload = self._get(f"/projects/{_PROJ_B}/team/inbox?run_id={run_a}", cookie)
         self.assertEqual(status, 404)
 
     # ── run_id path-traversal validation (docs/BACKLOG.md item 11(b)) ───
 
     def test_path_traversal_run_id_404_planted_file_never_opened(self):
-        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        os.makedirs(os.path.join(self.projects_dir, _PROJ))
         planted = _plant_traversal_target(self.tmp)
         cookie = self._login()
         status, payload = _get_forbidding_open_of(
             self, planted,
-            lambda: self._get(f"/projects/proj/team/inbox?run_id={TRAVERSAL_RUN_ID}", cookie))
+            lambda: self._get(f"/projects/{_PROJ}/team/inbox?run_id={TRAVERSAL_RUN_ID}", cookie))
         self.assertEqual(status, 404)
         self.assertEqual(payload, {"error": "unknown run_id for this project"})
 
     def test_malformed_non_traversal_run_id_404_no_500(self):
-        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        os.makedirs(os.path.join(self.projects_dir, _PROJ))
         cookie = self._login()
-        status, payload = self._get("/projects/proj/team/inbox?run_id=not-a-real-run", cookie)
+        status, payload = self._get(f"/projects/{_PROJ}/team/inbox?run_id=not-a-real-run", cookie)
         self.assertEqual(status, 404)
         self.assertEqual(payload, {"error": "unknown run_id for this project"})
 
@@ -1184,21 +1200,21 @@ class TeamInboxEndpointTests(_RealHTTPTeamTestCase):
                        "options": [], "multi_select": False}, f)
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._get("/projects/proj/team/inbox", cookie)
+        status, payload = self._get(f"/projects/{_PROJ}/team/inbox", cookie)
         self.assertTrue(payload["pending"])
 
-        status2, payload2 = self._post("/projects/proj/team/resolve", cookie,
+        status2, payload2 = self._post(f"/projects/{_PROJ}/team/resolve", cookie,
                                        {"answer": "go left", "code": code})
         self.assertEqual(status2, 200, payload2)
 
-        status3, payload3 = self._get("/projects/proj/team/inbox", cookie)
+        status3, payload3 = self._get(f"/projects/{_PROJ}/team/inbox", cookie)
         self.assertEqual(status3, 200)
         self.assertEqual(payload3, {"pending": False})
 
 
 # ─── POST /projects/<name>/team/resolve (backlog item 6f part 1, docs/spec.md) ──
 class TeamResolveEndpointTests(_RealHTTPTeamTestCase):
-    def _make_run(self, name="proj", status="blocked_ask_user", write_inbox=True):
+    def _make_run(self, name=_PROJ, status="blocked_ask_user", write_inbox=True):
         os.makedirs(os.path.join(self.projects_dir, name), exist_ok=True)
         run_id = teamsmod._run_id()
         state = teamsmod._new_state(run_id, os.path.join(self.projects_dir, name),
@@ -1222,27 +1238,27 @@ class TeamResolveEndpointTests(_RealHTTPTeamTestCase):
         run_id = self._make_run(status="running", write_inbox=False)
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/resolve", cookie,
+        status, payload = self._post(f"/projects/{_PROJ}/team/resolve", cookie,
                                      {"answer": "yes", "code": code})
         self.assertEqual(status, 400)
         self.assertIn("no pending question", payload["error"])
         self.assertEqual(teamsmod._load_state(run_id)["status"], "running")
 
     def test_no_run_at_all_400_specific_reason(self):
-        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        os.makedirs(os.path.join(self.projects_dir, _PROJ))
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/resolve", cookie,
+        status, payload = self._post(f"/projects/{_PROJ}/team/resolve", cookie,
                                      {"answer": "yes", "code": code})
         self.assertEqual(status, 400)
         self.assertIn("no run found", payload["error"])
 
     def test_explicit_run_id_for_a_different_project_400_specific_reason(self):
-        run_a = self._make_run(name="proj-a")
-        os.makedirs(os.path.join(self.projects_dir, "proj-b"))
+        run_a = self._make_run(name=_PROJ_A)
+        os.makedirs(os.path.join(self.projects_dir, _PROJ_B))
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj-b/team/resolve", cookie,
+        status, payload = self._post(f"/projects/{_PROJ_B}/team/resolve", cookie,
                                      {"answer": "yes", "run_id": run_a, "code": code})
         self.assertEqual(status, 400)
         self.assertIn("different project", payload["error"])
@@ -1250,23 +1266,23 @@ class TeamResolveEndpointTests(_RealHTTPTeamTestCase):
     # ── run_id path-traversal validation (docs/BACKLOG.md item 11(b)) ───
 
     def test_path_traversal_run_id_400_planted_file_never_opened_no_thread_started(self):
-        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        os.makedirs(os.path.join(self.projects_dir, _PROJ))
         planted = _plant_traversal_target(self.tmp)
         cookie = self._login()
         code = self._totp_code()
         status, payload = _get_forbidding_open_of(
             self, planted,
-            lambda: self._post("/projects/proj/team/resolve", cookie,
+            lambda: self._post(f"/projects/{_PROJ}/team/resolve", cookie,
                                {"answer": "yes", "run_id": TRAVERSAL_RUN_ID, "code": code}))
         self.assertEqual(status, 400)
         self.assertEqual(payload, {"error": "no run found for this project"})
-        self.assertIsNone(appmod._team_threads_get("proj"))
+        self.assertIsNone(appmod._team_threads_get(_PROJ))
 
     def test_malformed_non_traversal_run_id_400_no_500(self):
-        os.makedirs(os.path.join(self.projects_dir, "proj"))
+        os.makedirs(os.path.join(self.projects_dir, _PROJ))
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/resolve", cookie,
+        status, payload = self._post(f"/projects/{_PROJ}/team/resolve", cookie,
                                      {"answer": "yes", "run_id": "not-a-real-run", "code": code})
         self.assertEqual(status, 400)
         self.assertEqual(payload, {"error": "no run found for this project"})
@@ -1275,7 +1291,7 @@ class TeamResolveEndpointTests(_RealHTTPTeamTestCase):
         run_id = self._make_run()
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/resolve", cookie,
+        status, payload = self._post(f"/projects/{_PROJ}/team/resolve", cookie,
                                      {"answer": "   ", "code": code})
         self.assertEqual(status, 400)
         self.assertEqual(teamsmod._load_state(run_id)["status"], "blocked_ask_user")
@@ -1288,7 +1304,7 @@ class TeamResolveEndpointTests(_RealHTTPTeamTestCase):
         self.addCleanup(setattr, teamsmod, "TEAM_ASK_USER_ANSWER_MAX_CHARS", orig)
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/resolve", cookie,
+        status, payload = self._post(f"/projects/{_PROJ}/team/resolve", cookie,
                                      {"answer": "way too long", "code": code})
         self.assertEqual(status, 400)
         self.assertEqual(teamsmod._load_state(run_id)["status"], "blocked_ask_user")
@@ -1298,7 +1314,7 @@ class TeamResolveEndpointTests(_RealHTTPTeamTestCase):
         cookie = self._login()
         code = self._totp_code()
         start = time.time()
-        status, payload = self._post("/projects/proj/team/resolve", cookie,
+        status, payload = self._post(f"/projects/{_PROJ}/team/resolve", cookie,
                                      {"answer": "Yes, proceed", "code": code})
         elapsed = time.time() - start
         self.assertEqual(status, 200)
@@ -1326,7 +1342,7 @@ class TeamResolveEndpointTests(_RealHTTPTeamTestCase):
         results = []
 
         def _do_post():
-            results.append(self._post("/projects/proj/team/resolve", cookie,
+            results.append(self._post(f"/projects/{_PROJ}/team/resolve", cookie,
                                       {"answer": "an answer", "code": code}))
 
         t1 = threading.Thread(target=_do_post)
@@ -1490,15 +1506,15 @@ class TeamResolveEndpointTests(_RealHTTPTeamTestCase):
         appmod._run_team_in_background = lambda *a, **kw: None
         self.addCleanup(setattr, appmod, "_run_team_in_background", orig_drive)
 
-        run_id_cli = self._make_run(name="proj")
+        run_id_cli = self._make_run(name=_PROJ)
         result_cli = teamsmod.resolve_ask_user(run_id_cli, "same answer")
         self.assertTrue(result_cli["ok"])
         state_cli = teamsmod._load_state(run_id_cli)
 
-        run_id_route = self._make_run(name="proj")
+        run_id_route = self._make_run(name=_PROJ)
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/resolve", cookie,
+        status, payload = self._post(f"/projects/{_PROJ}/team/resolve", cookie,
                                      {"answer": "same answer", "run_id": run_id_route, "code": code})
         self.assertEqual(status, 200)
         state_route = teamsmod._load_state(run_id_route)
@@ -1529,11 +1545,11 @@ class TeamStartWithCompositionEndpointTests(_RealHTTPTeamTestCase):
             """)
 
     def test_valid_submitted_composition_used_instead_of_default_and_persisted(self):
-        self._project("proj")
+        self._project(_PROJ)
         self._roster_engines()
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/start", cookie, {
+        status, payload = self._post(f"/projects/{_PROJ}/team/start", cookie, {
             "task": "do it", "code": code,
             "lead": {"kind": "engine", "name": "helper"},
             "members": [{"kind": "engine", "name": "lead2"}, {"kind": "engine", "name": "other"}],
@@ -1546,15 +1562,15 @@ class TeamStartWithCompositionEndpointTests(_RealHTTPTeamTestCase):
         state = teamsmod._load_state(payload["run_id"])
         self.assertEqual(state["lead"], {"kind": "engine", "name": "helper", "tier": 3})
         comps = teamsmod.load_compositions()
-        self.assertEqual(comps["proj"]["lead"], {"kind": "engine", "name": "helper"})
-        self.assertEqual(sorted(comps["proj"]["members"]), ["lead2", "other"])
+        self.assertEqual(comps[_PROJ]["lead"], {"kind": "engine", "name": "helper"})
+        self.assertEqual(sorted(comps[_PROJ]["members"]), ["lead2", "other"])
 
     def test_empty_members_rejected_no_launch_no_side_effects(self):
-        self._project("proj")
+        self._project(_PROJ)
         self._roster_engines()
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/start", cookie, {
+        status, payload = self._post(f"/projects/{_PROJ}/team/start", cookie, {
             "task": "do it", "code": code,
             "lead": {"kind": "engine", "name": "helper"}, "members": [],
         })
@@ -1563,11 +1579,11 @@ class TeamStartWithCompositionEndpointTests(_RealHTTPTeamTestCase):
         self.assertEqual(teamsmod.load_compositions(), {})
 
     def test_duplicate_member_rejected(self):
-        self._project("proj")
+        self._project(_PROJ)
         self._roster_engines()
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/start", cookie, {
+        status, payload = self._post(f"/projects/{_PROJ}/team/start", cookie, {
             "task": "do it", "code": code,
             "lead": {"kind": "engine", "name": "helper"},
             "members": [{"kind": "engine", "name": "lead2"}, {"kind": "engine", "name": "lead2"}],
@@ -1576,11 +1592,11 @@ class TeamStartWithCompositionEndpointTests(_RealHTTPTeamTestCase):
         self.assertIn("duplicate", payload["error"].lower())
 
     def test_lead_also_in_members_rejected(self):
-        self._project("proj")
+        self._project(_PROJ)
         self._roster_engines()
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/start", cookie, {
+        status, payload = self._post(f"/projects/{_PROJ}/team/start", cookie, {
             "task": "do it", "code": code,
             "lead": {"kind": "engine", "name": "helper"},
             "members": [{"kind": "engine", "name": "helper"}],
@@ -1589,11 +1605,11 @@ class TeamStartWithCompositionEndpointTests(_RealHTTPTeamTestCase):
         self.assertIn("also be a teammate", payload["error"])
 
     def test_unknown_lead_rejected_naming_it_never_falls_back_to_default(self):
-        self._project("proj")
+        self._project(_PROJ)
         self._roster_engines()
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/start", cookie, {
+        status, payload = self._post(f"/projects/{_PROJ}/team/start", cookie, {
             "task": "do it", "code": code,
             "lead": {"kind": "engine", "name": "ghost-engine-removed-since-saved"},
             "members": [{"kind": "engine", "name": "helper"}],
@@ -1607,14 +1623,14 @@ class TeamStartWithCompositionEndpointTests(_RealHTTPTeamTestCase):
         # Edge case (docs/spec.md): a composition saved while an engine
         # existed, then that engine's engines.d file is removed before the
         # next start -- rejected, not silently substituted.
-        self._project("proj")
+        self._project(_PROJ)
         self._roster_engines()
-        teamsmod.save_composition("proj", {"kind": "engine", "name": "helper"},
+        teamsmod.save_composition(_PROJ, {"kind": "engine", "name": "helper"},
                                   [{"kind": "engine", "name": "other"}])
         os.remove(os.path.join(self.engines_dir, "helper.engine"))
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/start", cookie, {
+        status, payload = self._post(f"/projects/{_PROJ}/team/start", cookie, {
             "task": "do it", "code": code,
             "lead": {"kind": "engine", "name": "helper"},
             "members": [{"kind": "engine", "name": "other"}],
@@ -1623,11 +1639,11 @@ class TeamStartWithCompositionEndpointTests(_RealHTTPTeamTestCase):
         self.assertIn("helper", payload["error"])
 
     def test_no_lead_members_in_body_is_byte_for_byte_unchanged_default_behavior(self):
-        self._project("proj")
+        self._project(_PROJ)
         self._roster_engines()
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/start", cookie,
+        status, payload = self._post(f"/projects/{_PROJ}/team/start", cookie,
                                      {"task": "do it", "code": code})
         self.assertEqual(status, 200, payload)
         # default_team_composition()'s own pick (lead2, tier 2).
@@ -1639,21 +1655,21 @@ class TeamStartWithCompositionEndpointTests(_RealHTTPTeamTestCase):
         # docs/spec.md: "saved on successful validation, independent of
         # whether launch_team() itself later succeeds" -- simulated here by
         # a team session name collision (a real, already-running team).
-        self._project("proj")
+        self._project(_PROJ)
         self._roster_engines()
-        result = teamsmod.launch_team(os.path.join(self.projects_dir, "proj"), "already running",
+        result = teamsmod.launch_team(os.path.join(self.projects_dir, _PROJ), "already running",
                                       {"kind": "ollama", "name": "m", "tier": 1}, ["helper"])
         self.assertTrue(result["ok"], result)
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/start", cookie, {
+        status, payload = self._post(f"/projects/{_PROJ}/team/start", cookie, {
             "task": "do it", "code": code,
             "lead": {"kind": "engine", "name": "other"},
             "members": [{"kind": "engine", "name": "helper"}],
         })
         self.assertEqual(status, 400)  # launch_team() itself refuses (session already taken)
         comps = teamsmod.load_compositions()
-        self.assertEqual(comps["proj"]["lead"], {"kind": "engine", "name": "other"})
+        self.assertEqual(comps[_PROJ]["lead"], {"kind": "engine", "name": "other"})
 
 
 # ─── Restart persistence for a saved composition (docs/spec.md acceptance
@@ -1676,7 +1692,7 @@ class CompositionSurvivesRealProcessRestartTests(_RealHTTPTeamTestCase):
     establishes for the analogous _team_threads case."""
 
     def test_get_status_from_a_freshly_started_separate_process_reflects_the_saved_composition(self):
-        self._project("proj")
+        self._project(_PROJ)
         self._write_fast_finisher_engine("lead2")
         _write_engine_file(self.engines_dir, "helper.engine", """\
             LABEL=Helper
@@ -1687,7 +1703,7 @@ class CompositionSurvivesRealProcessRestartTests(_RealHTTPTeamTestCase):
             """)
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/start", cookie, {
+        status, payload = self._post(f"/projects/{_PROJ}/team/start", cookie, {
             "task": "do it", "code": code,
             "lead": {"kind": "engine", "name": "helper"},
             "members": [{"kind": "engine", "name": "lead2"}],
@@ -1723,7 +1739,7 @@ class CompositionSurvivesRealProcessRestartTests(_RealHTTPTeamTestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         s = json.loads(r.stdout)
         by_name = {i["name"]: i for i in s["instances"]}
-        self.assertEqual(by_name["proj"]["team"]["composition"],
+        self.assertEqual(by_name[_PROJ]["team"]["composition"],
                          {"lead": {"kind": "engine", "name": "helper"}, "members": ["lead2"]})
 
 
@@ -1742,7 +1758,7 @@ class ServiceRestartSimulationTests(_RealHTTPTeamTestCase):
     claim is actually about."""
 
     def test_stop_after_simulated_restart_still_tears_down_real_session_and_worktrees(self):
-        repo = self._project("proj")
+        repo = self._project(_PROJ)
         _write_engine_file(self.engines_dir, "helper.engine", """\
             LABEL=Helper
             CMD=unused
@@ -1763,7 +1779,7 @@ class ServiceRestartSimulationTests(_RealHTTPTeamTestCase):
 
         cookie = self._login()
         code = self._totp_code()
-        status, payload = self._post("/projects/proj/team/stop", cookie, {"code": code})
+        status, payload = self._post(f"/projects/{_PROJ}/team/stop", cookie, {"code": code})
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
         self.assertFalse(appmod.tmux_has(session))
@@ -1772,7 +1788,7 @@ class ServiceRestartSimulationTests(_RealHTTPTeamTestCase):
         self.assertEqual(state["status"], "stopped")
 
     def test_status_shows_running_truthfully_until_reap_runs_then_flips_to_error(self):
-        repo = self._project("proj")
+        repo = self._project(_PROJ)
         result = teamsmod.launch_team(repo, "task", {"kind": "ollama", "name": "m", "tier": 1}, [])
         self.assertTrue(result["ok"], result)
         run_id = result["run_id"]
@@ -1784,7 +1800,7 @@ class ServiceRestartSimulationTests(_RealHTTPTeamTestCase):
         # state, not a lie.
         s = self._get_status(cookie)
         by_name = {i["name"]: i for i in s["instances"]}
-        self.assertEqual(by_name["proj"]["team"]["status"], "running")
+        self.assertEqual(by_name[_PROJ]["team"]["status"], "running")
 
         # Force the reap pass due (docs/spec.md acceptance criteria:
         # "monkeypatched to 0") -- the NEXT /status poll runs
@@ -1794,7 +1810,7 @@ class ServiceRestartSimulationTests(_RealHTTPTeamTestCase):
         appmod._team_reap_last_at = 0.0
         s2 = self._get_status(cookie)
         by_name2 = {i["name"]: i for i in s2["instances"]}
-        self.assertEqual(by_name2["proj"]["team"]["status"], "error")
+        self.assertEqual(by_name2[_PROJ]["team"]["status"], "error")
         state = teamsmod._load_state(run_id)
         self.assertEqual(state["status"], "error")
 
@@ -1817,7 +1833,7 @@ class OrphanCheckSelfCorrectsForLiveCliRunTests(unittest.TestCase):
         self.state_dir = os.path.join(self.tmp, "state")
         os.makedirs(self.projects_dir)
         os.makedirs(self.engines_dir)
-        self.workdir = os.path.join(self.projects_dir, "proj")
+        self.workdir = os.path.join(self.projects_dir, _PROJ)
         os.makedirs(self.workdir)
         self._orig_projects_dir = appmod.PROJECTS_DIR
         self._orig_engines_dir_app = appmod.ENGINES_DIR
@@ -1880,7 +1896,7 @@ class OrphanCheckSelfCorrectsForLiveCliRunTests(unittest.TestCase):
     def test_orphan_check_firing_once_does_not_permanently_disrupt_a_live_cli_run(self):
         lead = {"kind": "engine", "name": "multiround", "tier": 3}
         state = teamsmod._new_state(teamsmod._run_id(), self.workdir, lead, [], "task",
-                                    project_name="proj")
+                                    project_name=_PROJ)
         teamsmod._persist(state)
         run_id = state["run_id"]
 

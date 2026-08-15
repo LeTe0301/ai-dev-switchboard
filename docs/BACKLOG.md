@@ -404,11 +404,16 @@ changed by the human concurrently.
 
 ---
 
-## 8. AI merge-request reviewer, triggered by a Gitea tag
+## 8. AI merge-request reviewer, triggered by a Gitea tag (and GitHub)
 
 **Intent, as stated:** an AI reviewer for merge requests, checking **code
 consistency**, with a **selectable model**, firing **as soon as a "ready for
-review" tag/label is set** on the MR in Gitea.
+review" tag/label is set** on the MR. **Updated 2026-08-14: also wanted for
+GitHub-hosted repos, not just local Gitea** — see item 17 below, which
+covers tracking a project's real (non-Gitea) origin generally; this item's
+reviewer should work against whichever host a project's origin actually is
+once 17 exists. Until 17 lands, this item's own scope is still Gitea-only,
+per the shipped polling precedent below.
 
 **Already-settled decision this must respect — do not relitigate it:**
 **no webhook.** Item 2c part 1 originally proposed a webhook-based design
@@ -663,3 +668,202 @@ team's work after it stops" section to `docs/ARCHITECTURE.md` or
 `README.md` documenting the plain `git log`/`git merge`/`git branch -D`
 commands to review, merge, or discard one. Non-blocking: no data-loss risk
 exists today, this is pure discoverability polish.
+
+---
+
+## 14. Update path for an already-installed container when `main` moves
+
+**Added 2026-08-14**, user-requested: "migration scripts of container
+already exists and a new update to master is there." Read as: an operator
+who already ran `install.sh` on a container needs a way to pull in a newer
+switchboard release from `main`/`master` — including any config or state
+migration a given update requires — rather than the current implicit
+assumption that `install.sh` is a one-time, fresh-install-only operation.
+
+**Not yet scoped** — needs a real product-manager pass before building.
+Open questions to settle then, not now:
+- Is this a new `install.sh --update`/`--upgrade` flag (parallel to the
+  existing `--with-*` optional-feature flags), or a separate script?
+- What actually needs migrating between versions? So far this project has
+  added new `switchboard.env` keys (additive, already tolerant of being
+  unset) and new optional Docker Compose stacks (Taiga, Gitea) — a real
+  breaking schema change hasn't happened yet, so "migration scripts...
+  already exists" may be understating what's actually needed, or may be
+  referring to something the user has in mind that isn't yet visible in
+  this repo. Confirm with the user what "migration scripts" refers to
+  concretely before scoping further.
+- Does an update ever restart already-running engine sessions or team
+  runs? If so, this needs the same "never destructive, never surprise a
+  running session" discipline the rest of this project already holds to
+  (2c part 1's fast-forward-only sync, deploy being manual-click-only).
+
+---
+
+## 15. Install wizard UI
+
+**Added 2026-08-14**, user-requested: "install should be an install wizard
+like this picture" — **the referenced image was not attached to the
+request**. Needs the actual reference before this can be scoped at all;
+follow up with the user for the image (or a link/description of the
+wizard UI they have in mind) before writing a spec.
+
+**What's known without the image:** today, `install.sh` is a single
+non-interactive-by-default script (`--yes` flag) with a series of
+`prompt()`-driven optional `--with-*` blocks, run over SSH/terminal — there
+is no browser-based or step-by-step graphical installer. If the picture
+turns out to depict a web-based multi-step wizard (name/logo suggests
+something in the shape of a typical "welcome → configure → confirm →
+install" flow), this would be a materially different delivery mechanism
+than the current shell script and deserves its own architecture
+discussion — don't assume it's a small tweak to `install.sh` until the
+picture clarifies what's actually wanted.
+
+---
+
+## 16. Create a new project by `git clone <url>` directly
+
+**Added 2026-08-14**, user-requested: "container should be possible to
+create new projects with git clone and url."
+
+**Context — what exists today:** item 3 (folder upload) covers uploading
+an existing local folder and auto-detecting repo(s) inside it. Item 2b
+covers creating a *new*, empty repo through Gitea's own API
+(`create_project()`). Neither covers the third case this item asks for:
+handing the switchboard a URL to an **existing remote repo** (which may or
+may not already be on this switchboard's own Gitea) and having it clone
+that URL directly into `PROJECTS_DIR` as a new project — no upload, no
+Gitea-side repo creation, just "here's a URL, clone it and add it to my
+project list."
+
+**Shape of the work (not yet fully scoped):**
+- A new "add project from URL" entry point in the web UI, parallel to the
+  existing "new project" and "upload" flows.
+- Needs the same kind of privileged clone hand-off item 2b already built
+  for Gitea-originated clones (`scripts/new-project-from-gitea.sh`) — a
+  script that runs as (or hands off to) the correct system user, not the
+  request-handling process directly, following that established pattern
+  rather than reinventing clone privilege-separation.
+- Directly related to item 17 below: a project cloned from an arbitrary
+  URL is exactly the case where the project's real origin is *not* this
+  switchboard's own local Gitea, so this item and item 17 should likely be
+  scoped and built together, or in the order 16 → 17.
+- Open question: authentication for cloning a private remote repo (SSH
+  key, token) — needs a decision on where that credential lives and how
+  it's scoped, following this project's existing `switchboard.env`-style
+  credential-storage convention.
+
+---
+
+## 17. Track and remotely interact with a project's real (non-Gitea) origin
+
+**Added 2026-08-14**, user-requested: "if there is a cloned GitHub repo
+which is not a local Gitea repo it should be traced to origin. All the
+pull requests, comments, branches should be remotely fetchable."
+
+**Context:** items 2b/2c built deep integration with this switchboard's
+*own*, locally-hosted Gitea instance — repo creation via Gitea's REST API,
+polling Gitea for push/PR activity. This item asks for the same class of
+remote-repo-awareness (PRs, comments, branches, fetchable/visible from the
+switchboard UI) but for a project whose actual `origin` remote is
+somewhere else entirely — GitHub is the concrete example given, but the
+underlying need is "detect what origin actually is, and if it's not our
+own Gitea, talk to that host's own API instead."
+
+**Shape of the work (not yet fully scoped):**
+- Detect, per project, whether `origin` points at this switchboard's own
+  Gitea instance or somewhere external — `git remote get-url origin` plus
+  a hostname comparison is the obvious mechanism.
+- For an external origin, this needs its own API client per host type
+  (GitHub REST/GraphQL API to start, since that's the concrete case
+  named) — parallel to, not a replacement for, the existing Gitea client
+  code from 2c.
+  This is real new integration surface, not a small extension: auth
+  (a GitHub token, following the existing credential-storage convention),
+  rate-limit handling (GitHub's API has real limits unlike a
+  self-hosted Gitea instance), and a decision on whether polling (2c's
+  established no-webhook precedent) is the right model here too or
+  whether GitHub's own webhook support changes that calculus — needs a
+  real discussion, don't assume the Gitea polling precedent transfers
+  unmodified.
+- Directly feeds item 8's now-broadened GitHub scope (an AI reviewer
+  reacting to a "ready for review" label on a GitHub PR needs exactly
+  this remote-fetch capability to read the diff/comments) and item 16
+  (a project cloned from an arbitrary URL is the primary case this
+  applies to).
+- **Scope decision to put to the user before building:** should
+  read-write actions (posting a comment, per item 8) ever be allowed
+  against a project's *external* origin the same way they're allowed
+  against the switchboard's own Gitea, or does touching someone else's
+  GitHub repo warrant an extra confirmation step given it's not
+  infrastructure this switchboard operator fully controls?
+
+---
+
+## 18. Cross-agent capability parity — investigate `garrytan/gstack`
+
+**Added 2026-08-14**, user-requested: "possible to add these possibilities
+for all agents not just Claude Code on my LXC:
+https://github.com/garrytan/gstack" — the user wants whatever capability
+`gstack` provides extended to every engine/agent this switchboard already
+supports (Claude Code, Codex, aider, etc.), not just Claude Code
+specifically.
+
+**Not yet investigated.** This repo hasn't been read yet — a future
+session picking this up should start by actually reading
+`https://github.com/garrytan/gstack` (README, structure) to understand
+what capability is actually being requested before scoping anything,
+rather than guessing from the name alone. Once that's understood, check
+whether it's a per-engine capability (fits this project's existing
+`engines.d/*.engine` per-engine-config pattern) or a switchboard-level
+capability (fits the roster/lead-loop machinery from item 6) before
+proposing a shape.
+
+---
+
+## 19. Interactive chat UI for the AI team — watch, interrupt anytime, approve inline
+
+**Added 2026-08-14**, user-requested: "build a chatbot UI for the AI team
+so you can watch them talk to each other, interrupt at any point, approve
+ask_user questions."
+
+**Context — what already exists (item 6f, shipped):** a merged, per-agent-
+colored, cursor-polled live event feed with a status strip, and an
+escalation inbox that lets a human answer a blocked lead's `ask_user`
+call. This already covers "watch them talk" and "approve ask_user
+questions" in a read-mostly, log-styled form.
+
+**What this item asks for beyond 6f — genuinely new capability:**
+**"interrupt at any point"** is not the same as answering a pending
+`ask_user` block. Today, a human's only two levers on a running team are
+(a) wait for the lead to itself call `ask_user` and then answer it, or (b)
+stop the whole team outright (`stop_team()`). There is no way to inject a
+free-form message into a *running* team without either of those — no
+"interject/redirect" capability exists in `app/teams.py`'s lead loop today.
+This is the real scope of this item, not just a UI restyle from log-feed
+to chat-bubble.
+
+**Not yet scoped — real architecture questions for a future
+product-manager pass:**
+- Does an interjected message go to the lead only, or can a human message
+  a specific teammate directly? The four-tool lead loop (`delegate`/
+  `fact_check`/`ask_user`/`finish`) has no concept of an unsolicited
+  inbound human message today — this needs real design, not just a new
+  route.
+- Does interjecting pause the lead's current in-flight tool call, or queue
+  the message for the lead's next turn? Silently dropping/racing with an
+  in-flight call would be a real correctness bug in the same class 6f's
+  own concurrent-resolve races were.
+- Is "chatbot UI" purely a visual/interaction-model change on top of 6f's
+  existing event feed (chat bubbles instead of a log list), or does it
+  also imply a differently-shaped event envelope? Reuse 6f's existing
+  `{ts, agent, seq, kind, text, meta}` envelope and cursor-polling
+  mechanism rather than inventing a second live-feed mechanism, unless a
+  concrete gap is found.
+- Relationship to item 7 (kanban write access) and item 8 (AI reviewer):
+  both of those already settled on a propose-then-approve /
+  comment-only model specifically to avoid unattended writes — an
+  "interrupt at any point" capability is a *human*-initiated write into a
+  running agent's context, which is a different trust direction (human →
+  agent, not agent → external system) and likely doesn't need the same
+  caution, but state that explicitly in the eventual spec rather than
+  assuming it transfers.
