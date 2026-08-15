@@ -460,6 +460,19 @@ happens on a large diff that exceeds the selected model's context.
 locally as well as posted to Gitea; token/rate cost of reviewing every
 tagged PR against a hosted model versus the local Ollama one.
 
+**Status: shipped, Gitea-only (2026-08-14).** Standalone poll-triggered
+mechanism (not a lead-loop tool) hooked into item 2c's existing Gitea poll.
+Reviewer-approved with one non-blocking follow-up, not yet fixed: the
+per-PR lock is keyed only on `pr_key`, not episode, so if a label is
+removed and re-added while the *previous* episode's review is still
+in-flight, the old thread's later completion can overwrite state as if the
+new episode's own review had run, silently dropping the new trigger with
+no error surfaced. Narrow (needs a review to still be running when a
+human re-toggles the label) but real. Shape of the fix: key the lock (or
+the state file's in-flight marker) on `(pr_key, episode)` so a stale
+thread's completion can't clobber a newer episode's state. GitHub support
+remains deferred to item 17, per this item's original scope note.
+
 ---
 
 ## 9. Privileged tests mutate real host state and can't run concurrently

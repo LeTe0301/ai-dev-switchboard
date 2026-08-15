@@ -619,3 +619,191 @@ case #12 — this is now just a stale doc-only item, arguably moot), (2) file
 a project-wide `.team-btn` contrast fix and correct `docs/design.md`'s
 accessibility section to name the actual `#34c759` color instead of the
 unused `#4da6ff`.
+
+# Test & Review: Backlog item 8 — AI merge-request reviewer, Gitea-only
+
+## Scope
+Full testing + review pass against `docs/spec.md`'s 12 acceptance criteria
+for the poll-triggered AI PR reviewer (`app/app.py`'s
+`_ai_reviewer_poll_repo`/`_ai_reviewer_review_bg`/`_ai_reviewer_review_run`
++ `app/teams.py`'s `review_pr_diff`/`_build_review_prompt`), plus the three
+disclosed deviations in `docs/implementation.md` and the two safety
+properties the assigning prompt specifically called out for hands-on
+verification (engine-kind workdir isolation, the double-post race).
+
+## Test cases
+
+| # | Criterion / case | Method | Result | Evidence |
+|---|---|---|---|---|
+| 1 | `AI_REVIEWER_ENABLED=0` → no Gitea calls, no review | Automated | pass | `test_disabled_makes_no_calls` |
+| 2 | Label add edge → comment posted, state records `label_present:true` | Automated (split across dispatch + run layers, same layering as `_gitea_sync_bg`) | pass | `test_label_add_edge_triggers_dispatch_and_synchronous_state_write`, `test_empty_but_200_diff_is_still_reviewed_not_an_error` (posts to `/repos/admin/proj/issues/1/comments`) |
+| 3 | Label still present, no removal → no second comment-post | Automated | pass | `test_label_still_present_after_a_successful_review_does_not_redispatch` |
+| 4 | Label removed then re-added → exactly one new episode | Automated | pass* | `test_label_removed_then_readded_is_exactly_one_new_episode` — see Finding 1 for a narrower, untested cross-episode overlap case |
+| 5 | Diff over `AI_REVIEWER_MAX_DIFF_BYTES` → truncated, comment notes it | Automated | pass | `test_diff_exceeding_cap_is_truncated_and_comment_notes_it` (byte-exact assertion) |
+| 6 | `AI_REVIEWER_MODEL` unset/unknown → no crash, `last_error` recorded, other repos unaffected | Automated (per-repo isolation inferred by construction — see Spec coverage) | pass | `test_model_not_in_roster_records_failure_no_diff_fetch`, `test_model_unset_records_failure` |
+| 7 | Review failure → `attempts` increments, `label_present` stays true; gives up after `AI_REVIEWER_MAX_ATTEMPTS` | Automated | pass | `test_diff_fetch_non_200_records_failure_and_posts_no_comment`, `test_attempts_exhausted_gives_up_silently` |
+| 8 | Engine-kind review never touches `PROJECTS_DIR/<name>`; scratch dir always removed | Automated + hands-on adversarial revert-and-fail | pass | `ReviewPrDiffEngineTests` (5 tests) + my own revert (see "Hands-on verification" below) |
+| 9 | Ollama-kind review calls `_tier1_call_with_retry` with `tools=[]` | Automated | pass | `test_calls_tier1_with_empty_tools_list_and_returns_text` |
+| 10 | PR on unregistered repo never inspected | Structural (by construction — see Spec coverage) | pass | code read: `_ai_reviewer_poll_repo` only called from `_gitea_poll_if_due()`'s `_load_gitea_repo_map()` loop |
+| 11 | Grounding digest present in the constructed prompt | Automated | pass | `test_contains_grounding_digest_verbatim` |
+| 12 | No code path calls a Gitea approve/merge/branch-write endpoint | Automated + manual diff read | pass | `test_no_call_ever_targets_a_merge_or_approve_endpoint` + full read of the `app.py`/`teams.py` diff (only 3 new Gitea calls: `GET .../pulls`, `GET .../pulls/{n}.diff`, `POST .../issues/{n}/comments`) |
+
+\* Row 4: the automated test covers the AC as literally written (label
+cycles with no overlapping in-flight review). A related, narrower race
+*not* covered by any AC or test is documented as Finding 1 below.
+
+## Hands-on verification (per the assigning prompt's specific asks)
+
+**Engine-kind workdir isolation, traced not trusted.** Read `agent_run()`
+(`app/teams.py:993`): it launches `subprocess.run(TMUX + ["new-session",
+"-d", "-s", session, "-c", workdir, "bash", "-l", script_path])`, i.e. the
+tmux pane's cwd is set to whatever `workdir` argument `agent_run()` is
+given — and `TMUX = ["sudo", "-u", RUN_USER, "/usr/bin/tmux"]`
+(`app/app.py:226`), so this really is the reviewing engine's own process
+cwd, as `RUN_USER`, not just a display artifact. `review_pr_diff()`'s
+engine branch (`app/teams.py:1882`) passes `scratch` — never `workdir`
+(the real `PROJECTS_DIR/<name>` argument) — as that argument. I then did a
+genuine revert-and-fail check (not just a read): edited a scratch copy of
+`teams.py` to pass `workdir` instead of `scratch` into that `agent_run()`
+call, ran `ReviewPrDiffEngineTests`, and confirmed it fails (4/5 tests red,
+`AssertionError: ... == ...` on the workdir-equality assertion and on the
+scratch-dir-removed assertions), then restored the original file and
+re-confirmed all 5 pass green. This is real evidence the tests catch a
+broken isolation guarantee, not just that they pass against already-correct
+code. (Note: this revert-and-restore cycle transiently corrupted a stale
+`.pyc` cache — see "Process note" below — resolved by clearing
+`__pycache__`, not a code issue.)
+
+**Double-post race.** Traced `_gitea_poll_if_due()` (`app/app.py:842`):
+`_gitea_poll_lock` is held (non-blocking acquire) for the *entire* per-repo
+loop, including the new `_ai_reviewer_poll_repo()` call — so two poll
+passes can never run concurrently process-wide; a second `/status` request
+arriving mid-pass just no-ops (`if not _gitea_poll_lock.acquire(blocking=False):
+return`). The one place a real race is even possible is a
+review running on its own background thread outliving the poll pass that
+spawned it — and the deployment is a single `python3 app.py` process
+(`systemd/ai-dev-switchboard.service`: `Type=simple`, no worker pool), so
+all the in-process `threading.Lock`s here are the real synchronization
+primitive, not merely process-local theater. For that scenario: the
+synchronous `label_present:true` write happens in `_ai_reviewer_poll_repo()`
+*before* `_ai_reviewer_review_bg()` is even called, and the deviation's
+`last_error is not None` gate means a poll pass landing while a review for
+the *same episode* is still in flight (`attempts=0`, `last_error=None`,
+both set by that synchronous write) takes the "already reviewed, don't
+retry" branch, not a redispatch — confirmed by `test_label_still_present_after_a_successful_review_does_not_redispatch`'s
+same-shaped setup and reasoned through by hand for the in-flight case
+specifically (both reach the same state). The per-PR `threading.Lock` in
+`_ai_reviewer_review_bg()` is real defense-in-depth on top: even if a
+redispatch attempt were made, `lock.acquire(blocking=False)` would return
+`False` and the second dispatch would silently no-op. **This closes the
+double-post race the deviation and Edge Cases section are about.** In the
+course of constructing this scenario by hand I found a *different*,
+narrower race the per-PR lock does *not* close — see Finding 1.
+
+## Regression check
+Full existing suite: `python3 -m unittest discover -s tests` — **920 tests,
+OK** (re-run twice for confidence after a self-inflicted stale-`.pyc`
+false-failure, see "Process note" below; both clean runs post-cache-clear
+were 920/920 green, matching `docs/implementation.md`'s own claimed count).
+`tests.test_ai_reviewer` alone: 46/46 green. `python3 -m py_compile
+app/app.py app/teams.py`: clean. `bash -n scripts/gitea-configure-api.sh`:
+clean.
+
+## Process note (not a code defect)
+Mid-session, my own adversarial revert-and-restore of `app/teams.py`
+(edit → test → restore, all within the same filesystem second) left a
+stale `__pycache__/teams.cpython-313.pyc` that Python's mtime-based
+invalidation didn't detect, causing `ReviewPrDiffEngineTests` to
+transiently and non-deterministically fail against the *correct,
+unmodified* source on a couple of subsequent runs. `diff`-confirmed the
+restored `app/teams.py` was byte-identical to the pre-edit copy; clearing
+all `__pycache__` directories fixed it immediately and reproducibly.
+Recorded here per this role's "actual execution, not simulation" and
+"systematic debugging" discipline — flagging it so it isn't mistaken for a
+real flaky test in this suite, and because a future session hitting the
+same symptom should reach for `find . -name __pycache__ -exec rm -rf {} +`
+before assuming a genuine regression.
+
+## Spec coverage
+All 12 acceptance criteria: implemented and covered (automated test or,
+for #10, structurally guaranteed by control flow and confirmed by direct
+code read — `_ai_reviewer_poll_repo` is only ever called with `owner_repo`
+values drawn from `_load_gitea_repo_map()`'s own iteration, identical
+shape to the already-established `_gitea_poll_one` scoping, no dedicated
+test exists for this in `test_gitea_poll.py` either). Two deviations from
+the spec's own literal walkthrough text were independently re-verified
+against the spec's literal wording, not just taken on the developer's
+word:
+
+- **Deviation 1 (retry gate additionally requires `last_error is not
+  None`)**: confirmed by reading `docs/spec.md` line 73 ("2xx → record
+  success: `{label_present: True, attempts: 0, ... last_error: None}`")
+  against line 64 ("Present now, was already present, `attempts <
+  AI_REVIEWER_MAX_ATTEMPTS`: ... spawn `_ai_reviewer_review_bg()` again")
+  — the literal reading is indeed self-contradictory with acceptance
+  criterion #3 exactly as the developer describes (a successful review
+  resets `attempts` to 0, which is always `< AI_REVIEWER_MAX_ATTEMPTS`,
+  so the literal condition alone would redispatch forever). The
+  developer's fix is correct and necessary, not an unjustified
+  reinterpretation.
+- **Deviation 2 (empty-200-diff is not a failure)**: confirmed
+  `docs/spec.md` line 68 ("Non-200 or empty → record failure") directly
+  contradicts line 114's Edge Cases entry ("Empty diff ... still reviewed
+  ... not treated as an error"). No acceptance criterion mentions empty
+  diff as a failure case, so favoring the more specific, explicitly-settled
+  Edge Cases text over the terser walkthrough prose is the correct
+  resolution and doesn't regress any AC.
+- **Deviation 3 (`TEAM_STATE_DIR` explicit `chmod(0o711)`)**: sanity-checked
+  against `install.sh`, which never creates `$STATE_DIR/teams` itself —
+  it's lazily `os.makedirs`'d by `SVC_USER`-run code with no explicit
+  chmod anywhere pre-existing in `teams.py`. No `UMask=` directive is set
+  in `systemd/ai-dev-switchboard.service`, so under today's *default*
+  systemd umask this directory would likely end up `0755` (traversable by
+  `RUN_USER` regardless) — meaning the chmod is not strictly load-bearing
+  under the current default install. But it becomes load-bearing under any
+  stricter umask (a `UMask=0027` hardening directive, or a different
+  default shell/service umask), which is exactly the class of "don't rely
+  on `SVC_USER`'s ambient umask" problem `agent_run()`'s own `rundir`
+  chmod already exists to guard against. This is genuine, precedented
+  defensive coding, not scope creep — confirmed sound, not overreach.
+
+## Findings (most severe first)
+
+### 1. Cross-episode review overlap can silently drop a re-triggered review — should-fix
+- File: `app/app.py`, `_ai_reviewer_poll_repo()` (~line 1049, the trigger-edge branch) + `_ai_reviewer_review_bg()` (~line 1023, the per-PR lock)
+- Issue: the per-PR `threading.Lock` in `_ai_reviewer_review_bg()` is keyed only on `pr_key` (`owner/repo#number`), not on anything episode-specific. If a review genuinely outlives a full label-remove-then-re-add cycle (plausible: `TEAM_HEADLESS_TIMEOUT_SECONDS`/engine review latency can exceed several `GITEA_POLL_INTERVAL_SECONDS` — default 45s — intervals; a human or CI removing and re-adding the label in that window is realistic, not contrived), the sequence is: (1) old episode's review is still running, holding the per-PR lock; (2) label observed removed, state set `label_present:false`; (3) label observed re-added → this **is** a genuine new trigger edge, so `_ai_reviewer_poll_repo()` correctly writes the synchronous `label_present:true, attempts:0, last_error:None` state and calls `_ai_reviewer_review_bg()` for the *new* episode; (4) `_ai_reviewer_review_bg()`'s lock is still held by the *old* episode's thread, so the new dispatch is silently dropped (returns immediately, same as the "in-flight retry of the same episode" case it was designed for); (5) when the *old* thread eventually finishes — say, successfully — it calls `_save_ai_reviewer_state_entry(..., attempts=0, reviewed_at=now, last_error=None)`, overwriting the new episode's state with what looks like a completed, successful review of the *new* episode. Net effect: exactly one comment is posted (generated from the *old*, pre-removal diff), the new episode's own review never runs, and nothing in the state file or logs indicates anything was missed — `last_error` stays `None`. This undercuts the spec's own stated Goal ("Re-fire only when the label is explicitly removed and re-added") for this specific timing window, though it does not double-post, does not touch the real workdir, and does not crash.
+- Failure scenario: operator adds label → engine-kind review takes 3 minutes to run (within `TEAM_HEADLESS_TIMEOUT_SECONDS`, longer than one 45s poll interval) → operator, unaware the first review is still working, removes and re-adds the label after 90s (e.g. to fix a typo in the PR description first) → the old review finishes at the 3-minute mark and posts a comment based on the diff as it was *before* the operator's fix, while the newly-intended re-review silently never happens; state file shows a clean, error-free `reviewed_at` timestamp, giving no signal anything is wrong.
+- Not covered by any test or any acceptance criterion in `docs/spec.md` — none of the 12 ACs specify behavior for "label re-added while a previous review for an earlier episode is still in flight." Recommend either keying the per-PR lock (or a check inside it) to the specific episode/trigger-write, or having a review's completion re-check whether the state it's about to write still corresponds to the episode it was dispatched for before overwriting.
+
+### 2. No direct multi-repo isolation test for `_ai_reviewer_poll_repo`'s own try/except wrapper — nit
+- File: `app/app.py`, the `_gitea_poll_if_due()` call site (~line 865)
+- Issue: AC #6 ("other registered repos' polls in the same pass are unaffected") is verified only by analogy to `_gitea_poll_one`'s already-tested identical wrapper shape, not by a dedicated test that registers two repos, makes one raise inside `_ai_reviewer_poll_repo`, and asserts the second repo's poll still runs. Low risk given the wrapper is a two-line `try/except Exception: pass` identical to the already-covered precedent, but it's the one AC in this feature not backed by a test that would actually fail if the wrapper were accidentally removed.
+
+### 3. No direct test for "PR on unregistered repo never inspected" (AC #10) — nit
+- File: `tests/test_ai_reviewer.py`
+- Issue: verified only by code read (the poll only iterates `_load_gitea_repo_map()`); a one-line test constructing a repo map without the target repo and asserting `_gitea_api` is never called for it would make this AC self-verifying rather than inference-by-construction.
+
+## Follow-ups (non-blocking)
+- Consider Finding 1 for a near-term follow-up cycle — narrow but real, and self-diagnosing would help (e.g. logging when a dispatch is dropped due to an already-held per-PR lock, distinguishing "same-episode retry, expected" from "different episode, dropped").
+- Findings 2–3: add the two structural tests called out, next time this file is touched.
+
+## Overall verdict: **Approve with follow-ups**
+
+All 12 acceptance criteria are implemented and either directly tested or
+provably true by construction; the full 920-test suite is green with no
+regressions; the three disclosed deviations were each independently
+re-verified against the spec's own literal text (not taken on trust) and
+are all sound, necessary, and correctly scoped — not overreach. The two
+safety properties called out for hands-on verification both check out:
+engine-kind reviews are genuinely isolated to a throwaway scratch
+directory (confirmed via source trace through `agent_run()`'s real tmux
+`-c` argument *and* a live revert-and-fail check), and the double-post
+race is genuinely closed by the synchronous state write plus the
+deviation's `last_error` gate plus the per-PR lock, given the single-
+process deployment topology. One should-fix (Finding 1) is a real, if
+narrow, gap in the "re-fire on relabel" guarantee under review-overrun
+timing that no acceptance criterion or test currently covers — it doesn't
+block this cycle (no data-loss, no double-post, no workdir-isolation
+breach, self-recovers on the next true label cycle) but is worth a
+follow-up. Two nits (Findings 2–3) are test-coverage-only, no behavior
+risk.

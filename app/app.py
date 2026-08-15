@@ -169,6 +169,29 @@ GITEA_REPO_MAP_FILE = os.environ.get(
 # env-overridable constant, same style as UPLOAD_STAGING_TTL_SECONDS.
 GITEA_POLL_INTERVAL_SECONDS = int(os.environ.get("GITEA_POLL_INTERVAL_SECONDS", "45"))
 
+# AI merge-request reviewer (backlog item 8, docs/spec.md) -- rides the same
+# _gitea_poll_if_due() pass above: watches each registered project's open
+# Gitea PRs for a configurable label, and on the label-add edge, runs a
+# roster model (item 6's roster, item 6b's read-only grounding digest)
+# against the PR diff and posts the review back as a single Gitea PR
+# comment. Standalone/poll-triggered, not a lead-loop tool -- a PR can be
+# tagged with no team session running at all. Off by default. Gitea-only
+# (docs/spec.md "Non-goals" -- GitHub is item 17, not yet built).
+AI_REVIEWER_ENABLED = os.environ.get("AI_REVIEWER_ENABLED", "0") == "1"
+AI_REVIEWER_LABEL = os.environ.get("AI_REVIEWER_LABEL", "ready for review")
+# "kind:name" (e.g. "ollama:qwen3:8b" or "engine:claude") -- split on the
+# FIRST ':' only below, since an Ollama tag can itself contain ':'.
+# Validated against a live teams.roster() lookup at trigger time, not at
+# startup (same "engines.d is meant to be edited without a restart"
+# philosophy roster() itself documents) -- unset or naming a roster entry
+# that no longer exists is a per-repo, per-poll-pass no-op, logged via the
+# state file's last_error, never fatal.
+AI_REVIEWER_MODEL = os.environ.get("AI_REVIEWER_MODEL", "")
+AI_REVIEWER_MAX_DIFF_BYTES = int(os.environ.get("AI_REVIEWER_MAX_DIFF_BYTES", "40000"))
+AI_REVIEWER_MAX_ATTEMPTS = int(os.environ.get("AI_REVIEWER_MAX_ATTEMPTS", "3"))
+AI_REVIEWER_STATE_FILE = os.environ.get(
+    "AI_REVIEWER_STATE_FILE", "/var/lib/ai-dev-switchboard/ai-reviewer-state.json")
+
 # Team session lifecycle, part 2a (backlog item 6d, docs/spec.md §5) --
 # throttles _team_reap_if_due()'s own opportunistic sweep_dead_teams() call
 # inside _reap_dead_state(), same "not a background thread/timer, throttled
@@ -700,6 +723,26 @@ def _gitea_api(method: str, path: str, body: dict = None) -> tuple:
         raise ConnectionError("gitea unreachable")
 
 
+def _gitea_api_raw(method: str, path: str) -> tuple:
+    """Like _gitea_api() but returns (status, text) without attempting
+    json.loads on the body -- needed for Gitea's `.diff` endpoint (backlog
+    item 8), which returns plain diff text, not JSON. _gitea_api() itself
+    would misclassify a non-JSON 2xx body as ConnectionError, since its own
+    `except (URLError, TimeoutError, ValueError)` also catches json.loads's
+    ValueError. Same "raise ConnectionError only on a real transport
+    failure, never on a non-2xx status" contract as _gitea_api()."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{GITEA_PORT}/api/v1{path}", method=method,
+        headers={"Authorization": f"token {GITEA_API_TOKEN}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as e:
+        return e.code, (e.read() or b"").decode("utf-8", errors="ignore")
+    except (urllib.error.URLError, TimeoutError):
+        raise ConnectionError("gitea unreachable")
+
+
 # ─── poll-based sync-on-push (backlog item 2c, part 1) ─────────────────────
 # See docs/spec.md "Repo-map + sync-state file" -- resolves owner/repo ->
 # PROJECTS_DIR/<name> without app.py (running as SVC_USER) ever needing an
@@ -819,6 +862,13 @@ def _gitea_poll_if_due(gitea_on: bool) -> None:
                 # nit, never a correctness/safety issue" tolerance the rest
                 # of this feature already accepts.
                 pass
+            try:
+                _ai_reviewer_poll_repo(owner_repo, entry)
+            except Exception:
+                # Same per-repo isolation discipline as _gitea_poll_one above
+                # (docs/spec.md backlog item 8, "Edge cases" -- a malformed
+                # response for one repo must not stop other repos' polls).
+                pass
     finally:
         _gitea_poll_lock.release()
 
@@ -837,6 +887,235 @@ def _gitea_poll_one(owner_repo: str, entry: dict) -> None:
     if not remote_sha or remote_sha == entry.get("remote_sha"):
         return  # nothing new since the last time this was checked
     _gitea_sync_bg(entry["name"], branch, owner_repo, remote_sha)
+
+
+# ─── AI merge-request reviewer (backlog item 8) ────────────────────────────
+# See docs/spec.md "The poll extension" -- rides _gitea_poll_if_due()'s
+# existing per-repo loop above (_ai_reviewer_poll_repo is called right
+# alongside _gitea_poll_one, its own try/except at the call site). State
+# file: {"owner/repo#number": {"label_present": bool, "attempts": int,
+# "reviewed_at": iso|null, "last_error": str|null}}. Same tmp-file-then-
+# os.replace() atomic-write idiom, and the same "missing/corrupt file
+# tolerates to {}" idiom, as _load_gitea_repo_map()/_save_gitea_repo_map_
+# entry() above.
+_ai_reviewer_state_lock = threading.Lock()
+
+
+def _load_ai_reviewer_state() -> dict:
+    try:
+        with open(AI_REVIEWER_STATE_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_ai_reviewer_state_entry(pr_key: str, *, label_present: bool, attempts: int,
+                                  reviewed_at, last_error) -> None:
+    with _ai_reviewer_state_lock:
+        s = _load_ai_reviewer_state()
+        s[pr_key] = {"label_present": label_present, "attempts": attempts,
+                    "reviewed_at": reviewed_at, "last_error": last_error}
+        os.makedirs(os.path.dirname(AI_REVIEWER_STATE_FILE), exist_ok=True)
+        tmp = AI_REVIEWER_STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(s, f, indent=2, sort_keys=True)
+        os.replace(tmp, AI_REVIEWER_STATE_FILE)
+
+
+def _ai_reviewer_record_failure(pr_key: str, message: str) -> None:
+    """Re-reads the current state entry, increments attempts, records
+    last_error. label_present is left True -- already set synchronously by
+    the trigger edge in _ai_reviewer_poll_repo() below -- so a failed
+    attempt is retried by that function's own "already present" branch,
+    never re-triggered as a brand new episode (docs/spec.md "Record
+    failure")."""
+    prev = _load_ai_reviewer_state().get(pr_key, {})
+    _save_ai_reviewer_state_entry(
+        pr_key, label_present=True, attempts=prev.get("attempts", 0) + 1,
+        reviewed_at=prev.get("reviewed_at"), last_error=message)
+
+
+# Per-PR (owner/repo#number) non-blocking lock -- same _gitea_sync_lock_for
+# idiom as sync-on-push above: a review dispatch that finds the lock already
+# held (a previous attempt for this exact PR is still running) is dropped,
+# not queued -- the next poll interval sees `attempts` unchanged and retries.
+_ai_reviewer_pr_locks_guard = threading.Lock()
+_ai_reviewer_pr_locks = {}
+
+
+def _ai_reviewer_pr_lock_for(pr_key: str) -> threading.Lock:
+    with _ai_reviewer_pr_locks_guard:
+        lock = _ai_reviewer_pr_locks.get(pr_key)
+        if lock is None:
+            lock = threading.Lock()
+            _ai_reviewer_pr_locks[pr_key] = lock
+        return lock
+
+
+def _ai_reviewer_comment_body(model_entry: dict, review_text: str, diff_truncated: bool) -> str:
+    truncation_note = ""
+    if diff_truncated:
+        truncation_note = (
+            f"\n> Note: this diff was truncated to the first {AI_REVIEWER_MAX_DIFF_BYTES} "
+            "bytes before review -- some changes may not have been evaluated.\n")
+    return (
+        f"**AI code review** (model: `{model_entry['kind']}:{model_entry['name']}`, "
+        "via ai-dev-switchboard)\n"
+        f"{truncation_note}\n"
+        f"{review_text}\n\n"
+        "---\n"
+        "_Comment-only — this review never blocks, approves, or merges this PR._\n"
+    )
+
+
+def _ai_reviewer_review_run(owner_repo: str, entry: dict, pr: dict) -> None:
+    """The real review-generation + comment-post work, off the request
+    thread (see _ai_reviewer_review_bg). Never raises -- every failure path
+    records it via _ai_reviewer_record_failure() and returns."""
+    number = pr.get("number")
+    pr_key = f"{owner_repo}#{number}"
+    try:
+        try:
+            status, diff_text = _gitea_api_raw("GET", f"/repos/{owner_repo}/pulls/{number}.diff")
+        except ConnectionError as e:
+            _ai_reviewer_record_failure(pr_key, str(e))
+            return
+        if status != 200:
+            # Covers a PR closed/merged between label-add-detection and this
+            # background run actually running (404), and any other non-2xx
+            # response -- an ordinary retried failure, not a crash
+            # (docs/spec.md "Edge cases"). A genuinely EMPTY-but-200 diff
+            # (a PR with no net changes) is deliberately NOT treated as a
+            # failure here -- docs/spec.md's own "Edge cases" section
+            # settles that explicitly ("still reviewed... not treated as an
+            # error"), which this reads as authoritative over the more
+            # terse "non-200 or empty" phrasing in the walkthrough above it.
+            _ai_reviewer_record_failure(pr_key, f"diff fetch failed (status {status})")
+            return
+
+        diff_bytes = diff_text.encode("utf-8")
+        diff_truncated = len(diff_bytes) > AI_REVIEWER_MAX_DIFF_BYTES
+        if diff_truncated:
+            diff_text = diff_bytes[:AI_REVIEWER_MAX_DIFF_BYTES].decode("utf-8", errors="ignore")
+
+        kind, _sep, name = AI_REVIEWER_MODEL.partition(":")
+        model_entry = None
+        if name:
+            model_entry = next(
+                (m for m in teams.roster() if m["kind"] == kind and m["name"] == name), None)
+        if model_entry is None:
+            _ai_reviewer_record_failure(
+                pr_key, f"AI_REVIEWER_MODEL {AI_REVIEWER_MODEL!r} not found in roster")
+            return
+
+        workdir = os.path.join(PROJECTS_DIR, entry["name"])
+        result = teams.review_pr_diff(
+            model_entry, workdir=workdir, pr_title=pr.get("title", "") or "",
+            pr_body=pr.get("body") or "", diff_text=diff_text, diff_truncated=diff_truncated)
+        if not result.get("ok"):
+            _ai_reviewer_record_failure(pr_key, result.get("error") or "review generation failed")
+            return
+
+        comment = _ai_reviewer_comment_body(model_entry, result.get("text", ""), diff_truncated)
+        try:
+            status, _resp = _gitea_api(
+                "POST", f"/repos/{owner_repo}/issues/{number}/comments", {"body": comment})
+        except ConnectionError as e:
+            _ai_reviewer_record_failure(pr_key, str(e))
+            return
+        if status // 100 != 2:
+            _ai_reviewer_record_failure(pr_key, f"comment post failed (status {status})")
+            return
+
+        _save_ai_reviewer_state_entry(pr_key, label_present=True, attempts=0,
+                                      reviewed_at=teams._now_iso(), last_error=None)
+    except Exception as e:
+        # Defense in depth -- nothing above this point should be able to
+        # raise, but this runs on its own background thread (not inside
+        # _gitea_poll_if_due()'s own per-repo try/except), so an
+        # unanticipated exception here must still be recorded rather than
+        # silently killing the thread with attempts never incremented.
+        _ai_reviewer_record_failure(pr_key, f"{type(e).__name__}: {e}")
+
+
+def _ai_reviewer_review_bg(owner_repo: str, entry: dict, pr: dict) -> None:
+    """Non-blocking dispatch -- mirrors _gitea_sync_bg() exactly. Returns
+    immediately; if a previous attempt for this PR is still in flight, this
+    call is simply dropped (the next poll interval retries)."""
+    pr_key = f"{owner_repo}#{pr.get('number')}"
+    lock = _ai_reviewer_pr_lock_for(pr_key)
+    if not lock.acquire(blocking=False):
+        return
+
+    def _run():
+        try:
+            _ai_reviewer_review_run(owner_repo, entry, pr)
+        finally:
+            lock.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _ai_reviewer_poll_repo(owner_repo: str, entry: dict) -> None:
+    """Called from inside _gitea_poll_if_due()'s per-repo loop, gated on
+    AI_REVIEWER_ENABLED. Watches AI_REVIEWER_LABEL on owner_repo's open PRs
+    and fires a review on the label-absent -> label-present edge
+    (docs/spec.md "The poll extension" step 3).
+
+    The retry branch below (label present, was already present) is gated on
+    `last_error is not None`, not merely `attempts < AI_REVIEWER_MAX_
+    ATTEMPTS` as docs/spec.md's own walkthrough literally states -- see
+    docs/implementation.md "Deviations from spec" for why the literal
+    reading would re-post a review on every single poll interval forever
+    after the FIRST successful review of an episode (a successful review
+    resets attempts to 0, which is always < AI_REVIEWER_MAX_ATTEMPTS),
+    directly violating the spec's own acceptance criterion that a still-
+    present, never-removed label must not cause a second comment post.
+    """
+    if not AI_REVIEWER_ENABLED:
+        return
+    status, resp = _gitea_api("GET", f"/repos/{owner_repo}/pulls?state=open")
+    if status != 200 or not isinstance(resp, list):
+        return
+    state = _load_ai_reviewer_state()
+    for pr in resp:
+        if not isinstance(pr, dict):
+            continue
+        number = pr.get("number")
+        if number is None:
+            continue
+        pr_key = f"{owner_repo}#{number}"
+        labels = pr.get("labels") or []
+        label_present = AI_REVIEWER_LABEL in [
+            l.get("name") for l in labels if isinstance(l, dict)]
+        prev = state.get(pr_key, {})
+        was_present = prev.get("label_present")
+
+        if not label_present:
+            if was_present or pr_key not in state:
+                # Arms the next add as a fresh episode -- no-op if already
+                # recorded absent.
+                _save_ai_reviewer_state_entry(
+                    pr_key, label_present=False, attempts=0,
+                    reviewed_at=prev.get("reviewed_at"), last_error=None)
+            continue
+
+        if not was_present:
+            # Trigger edge -- write synchronously BEFORE any slow work so no
+            # other/later poll pass can re-decide this is a fresh edge while
+            # the review is in flight (closes the double-post race).
+            _save_ai_reviewer_state_entry(
+                pr_key, label_present=True, attempts=prev.get("attempts", 0),
+                reviewed_at=prev.get("reviewed_at"), last_error=None)
+            _ai_reviewer_review_bg(owner_repo, entry, pr)
+            continue
+
+        attempts = prev.get("attempts", 0)
+        if prev.get("last_error") is not None and attempts < AI_REVIEWER_MAX_ATTEMPTS:
+            _ai_reviewer_review_bg(owner_repo, entry, pr)
+        # else: either already successfully reviewed this episode (no
+        # retry needed) or the attempt budget is exhausted -- give up
+        # silently until the label cycles (removed, then re-added).
 
 
 # ─── switchboard-side deploy dispatch (backlog item 2c, part 2b) ──────────

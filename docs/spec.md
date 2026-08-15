@@ -1,567 +1,145 @@
-# Spec: Backlog item 7 part 2 — web UI for approving/rejecting board_write proposals
+# Spec: AI merge-request reviewer, triggered by a Gitea "ready for review" tag (backlog item 8, Gitea-only)
 
 ## Summary
-Extend the Teams page's already-shipped `blocked_ask_user` web UI (status
-pill, escalation panel, resolve action, Stop button) to also handle
-`blocked_board_write` runs — the second escalation kind part 1 (`app/
-teams.py`, already merged) introduced — reusing part 1's backend
-(`resolve_board_write()`, the generalized `inbox.json` `kind` discriminator)
-exactly where its shapes already match `blocked_ask_user`'s, and extending
-presentation only where a board-write proposal's own shape (Taiga verb,
-target userstory `ref`, proposed value, current value) needs it.
+Extend the existing Gitea poll (`app.py`'s `_gitea_poll_if_due`, backlog item 2c part 1) to watch each switchboard-registered project's open Gitea PRs for a configurable label (default `ready for review`); on the edge where that label transitions from absent to present, fetch the PR's diff, run it through an operator-selected roster model (reusing item 6's roster + item 6b's read-only grounding), and post the review back as a single, clearly-marked, comment-only PR comment — never a block/approve/merge action.
 
 ## Goals
-- `/status` and `GET .../team/inbox` report a `blocked_board_write` run as
-  pending/waiting-on-you, distinguishable from `blocked_ask_user` (today
-  `/team/inbox` is `ask_user`-only and silently reports `{"pending": false}`
-  for a `board_write` block).
-- A human can approve or reject a pending board-write proposal from the
-  Teams page, TOTP-gated the same way `doTeamResolve()`/`POST .../team/
-  resolve` already gate the `ask_user` answer flow, calling part 1's
-  already-shipped `resolve_board_write(run_id, action)` on the backend.
-- `POST .../team/stop` actually stops a run blocked on `blocked_board_write`
-  (currently a silent no-op — disclosed gap in `docs/implementation.md`
-  "Known limitations").
-- The escalation panel and the merged event feed render each of the three
-  `board_write` verbs (`set_status`, `amend_description`, `append_comment`)
-  with verb-specific, human-readable copy — not a generic "a change is
-  pending" box — using the fields part 1's proposal already carries
-  (`verb`, `ref`, `value`, `note`, `current_value`).
+- Detect a "ready for review" label appearing on an open PR within one Gitea poll interval (`GITEA_POLL_INTERVAL_SECONDS`, default 45s), no webhook, no new listener.
+- Generate a code-consistency review grounded in the project's own auto-discovered docs (reusing `teams.load_grounding()`, item 6b) and post it as one Gitea PR comment.
+- Let the operator pick which roster model (any `engines.d` entry or the configured Ollama model, item 6's roster) does the reviewing, via config.
+- Re-fire only when the label is explicitly removed and re-added — never on every new commit while the label stays present.
+- Handle a diff that exceeds what's reasonable to send to the model: truncate, and say so plainly in the posted comment.
+- Never touch the project's real working copy while generating a review.
 
 ## Non-goals
-- Any change to `app/teams.py`'s tool contract, `resolve_board_write()`'s
-  approve/reject mechanics, `app/taiga_board.py`'s client, the
-  `team-board-resolve` CLI, or the `blocked_board_write` status itself —
-  all already shipped and reviewed in part 1. This spec only adds
-  `app/app.py` routes/JS on top.
-- Inline editing of a pending proposal's `value` before approving — part
-  1's own explicit non-goal, unchanged. Approve or reject are the only two
-  actions; there is no free-text "Other" field for `board_write` the way
-  `ask_user`'s panel has one (`resolve_board_write()` takes no free-text
-  argument at all).
-- A general "browse the Taiga board" screen — `board_read` is a lead-only
-  tool; no new human-facing board browser is being added. The only new
-  human-visible surface is the pending-proposal panel itself.
-- A dedicated audit-log page for past board-write decisions. Every
-  `board_write`/`board_write_resolved` history and transcript entry is
-  already persisted (part 1) and already flows through 6f's existing
-  merged event feed once rendered with the verb-specific copy this spec
-  adds (see "Proposed approach" §4) — no new persistence or a second view.
-- Changing `ask_user`'s existing UI behavior, copy, or field names. Every
-  `ask_user` code path in `app/app.py` referenced below is read for
-  precedent, not modified, except where a shared helper (the status map,
-  the inbox route, the stop route, `actionPath`/`actionBody`/
-  `handleActionResult`) must branch to add the new kind alongside the
-  existing one.
-- Batching or queuing multiple simultaneous proposals — still exactly one
-  pending escalation (of either kind) per run, enforced by part 1's
-  backend; this spec doesn't add any new concurrency handling beyond
-  surfacing the backend's existing race-safe behavior in the UI (see
-  "Edge cases").
+- **GitHub support.** Item 17 (tracking a project's real non-Gitea origin) doesn't exist yet. This spec is Gitea-only; once item 17 lands, a future item routes this same reviewer at whichever host a project's origin actually is. Stated here explicitly per the backlog's own instruction, not an oversight.
+- **Any blocking/approving/merging action.** Comment-only, matching "deploy is manual-click only" and every other unattended-write precedent in this project. No code path in this feature ever calls a Gitea PR-approve, PR-merge, or branch-write endpoint.
+- **A web UI for model/label selection or a reviewed-PRs list.** This spec is backend-only: config is via `switchboard.env` (same pattern `TEAM_LLM_MODEL`/`GITEA_LABEL`/`GITEA_POLL_INTERVAL_SECONDS` already use), and the review's only visible surface is the Gitea PR comment itself, viewable through the Gitea link the switchboard UI already exposes (`gitea_url`). A runtime dropdown to change the model/label without editing `switchboard.env`, and any switchboard-side history/status of past reviews, is real, separable follow-on work (natural "part 2", parallel to how 2c part 1 shipped poll/sync before 2c part 2 added a UI button) — not needed for this feature to work end to end, so it's out of scope here rather than force-split into a same-cycle part 2.
+- **Reviewing PRs on repos the switchboard doesn't already know about.** Only repos present in `GITEA_REPO_MAP_FILE` (i.e., registered as switchboard projects via `create_project()`'s Gitea flow, item 2b) are watched. A Gitea repo that exists in the same Gitea instance but was never registered as a switchboard project is out of scope — this reuses the existing project↔repo registration surface rather than inventing a second one.
+- **Live tool-calling / multi-round review.** Review generation is one bounded, one-shot call per PR (diff + grounding digest in, review text out) — not a lead-loop session, no `board_read`/`board_write`/`ask_user`, no live `fact_check` round-trips. See "Why roster tiers don't matter here" below.
+- **Checking out the PR's actual branch/files anywhere.** The diff is fetched as text via Gitea's API and embedded directly in the prompt; nothing ever runs `git checkout`/`git fetch` against the PR branch, on the project's real working copy or otherwise.
 
 ## Background / current state
-
-### What part 1 already shipped (backend, CLI, no web UI) — see `docs/spec.md`/`docs/implementation.md` on `backlog/lead-kanban-write-7`, merged into this branch
-- `inbox.json` has a `"kind"` discriminator: `"ask_user"` (existing shape)
-  or `"board_write"`:
-  ```json
-  {"kind": "board_write", "verb": "set_status", "ref": 42,
-   "value": "In progress", "note": "moving to in-progress per delegate result",
-   "current_value": {"status_id": 1, "status_name": "New"},
-   "proposed_at": "2026-08-14T12:00:00Z"}
-  ```
-  `current_value`'s shape depends on `verb`: `{"status_id", "status_name"}`
-  for `set_status`, `{"description"}` for `amend_description`, `{}` (empty
-  — nothing to snapshot) for `append_comment`. `note` may be `null`.
-  **`current_value` does not include the userstory's `subject`/title** —
-  only a status/description snapshot relevant to the verb — see "Proposed
-  approach" §2 for how this spec surfaces the card's subject anyway.
-- `state["status"]` is `"blocked_board_write"` while a proposal is pending,
-  parallel to `"blocked_ask_user"`.
-- `teams.resolve_board_write(run_id, action)` (`app/teams.py` line 4085),
-  `action` is `"approve"` or `"reject"` (no free-text argument, unlike
-  `resolve_ask_user()`). Reuses `resolve_ask_user()`'s exact race-safety
-  shape (state always reloaded fresh from disk; `os.replace(inbox_path,
-  inbox_resolved_path)` is the sole arbiter of a concurrent-resolve race;
-  history/transcript entries appended only after that replace succeeds).
-  Returns `{"ok": True, "state": state}` on success (identical shape to
-  `resolve_ask_user()`) or `{"ok": False, "error": str}` — two error
-  causes: `status != "blocked_board_write"`, or `action` not one of
-  `approve`/`reject`. On `"approve"`, resolves `value` (a human-readable
-  status name for `set_status`) to a numeric status id via
-  `taiga_board.list_userstory_statuses()`, fetches a **fresh** `version`
-  (never `current_value`'s proposal-time snapshot), calls the matching
-  `taiga_board.set_status`/`amend_description`/`append_comment`. A Taiga-
-  side failure (conflict, network error, vanished `ref`, unknown status
-  name) does **not** leave the inbox unresolved — history records
-  `"approved but Taiga rejected the write: {detail}"` and `status` still
-  returns to `"running"`.
-  - History entries: `tool="board_write"` (proposal, `outcome_summary=
-    "blocked, awaiting board-write approval"`) and `tool=
-    "board_write_resolved"` (`outcome_summary` one of `"rejected by
-    human"`, `"approved and applied"`, or `"approved but Taiga rejected
-    the write: ..."`).
-  - Transcript entries: the proposal is `("tool_use", "board_write(verb,
-    ref=N)", {"verb": verb, "ref": ref})`; the resolution is
-    `("tool_result", full_result_text, {"resolved": True, "approved":
-    bool})` — **note `meta.resolved` is `True` on both approve and reject**
-    (see "Proposed approach" §4 for why this collides with the existing
-    feed's `ask_user`-resolution rendering and needs a new, more specific
-    check ahead of it).
-- New `team-board-resolve --run-id --action {approve,reject}` CLI
-  subcommand (`app/teams.py`'s `_cli_team_board_resolve()`), the CLI-only
-  equivalent of what this spec adds as a web route.
-- `app/app.py` is **entirely untouched** by part 1 — this spec is the
-  first change to `app/app.py` for this backlog item.
-
-### The `blocked_ask_user` web UI this must mirror (`app/app.py`)
-- `/status`'s per-project `team` object (line ~3989): `team_status` map
-  `{"running": "running", "blocked_ask_user": "blocked",
-  "escalated_max_rounds": "blocked", "finished": "finished", "error":
-  "error", "stopped": "idle"}` (falls through to `"idle"` for any status
-  not listed — **this is exactly why a `blocked_board_write` run shows as
-  `"idle"` today**, per `docs/implementation.md`'s disclosed gap).
-  `waiting_on_you = run is not None and run["status"] == "blocked_ask_user"`
-  (line 4046).
-- `GET /projects/<name>/team/inbox` (`_handle_team_inbox`, line 4167):
-  `{"pending": False}` unless `status == "blocked_ask_user"`; else reads
-  `inbox.json` and replies `{"pending": True, "run_id", "question",
-  "header", "options", "multi_select"}`, with a safe fallback question if
-  `inbox.json` is unreadable/malformed despite the status match.
-- `POST /projects/<name>/team/resolve` (line 4372): TOTP-gated (the shared
-  `session_totp_ok`/428/403 flow at line 4230, common to every mutating
-  route); validates `run_id` via `teams._RUN_ID_RE` and project ownership;
-  400s if `status != "blocked_ask_user"`; validates `answer` length; calls
-  `teams.resolve_ask_user()`; on success, asserts no live thread already
-  exists for the project then starts `_run_team_in_background()` on a new
-  thread (mirrors `/team/start`'s own non-blocking dispatch).
-- `POST /projects/<name>/team/stop` (line 4356): `if run is None or
-  run["status"] not in ("running", "blocked_ask_user"): return {"ok":
-  True, "message": "no team currently running..."}` — **this is the
-  literal no-op gap**: a `blocked_board_write` run falls into this
-  early-return branch and nothing happens, though the CLI's `team-stop`
-  still works directly against `teams.stop_team()`.
-- Frontend (`app/app.py`'s inline JS): `renderTeamStatusStrip(team)` (line
-  2346, 4-state strip: running/blocked+waiting-on-you/blocked+escalated/
-  finished/error), `fetchTeamInbox()`/`teamInboxCache` (line 2365, fetch-
-  once-per-`run_id`, client-cached), `renderEscalationPanel(name, team)`
-  (line 2408, gated on `team.waiting_on_you`, renders a `<fieldset>`/radio-
-  or-checkbox form from `inbox.options[]` plus a free-text "Other" field),
-  `computeTeamResolveAnswer()` (line 2396, shared by the panel's client
-  validation and `actionBody()`), `doTeamResolve()` (line 2670, calls
-  `toggle('team-resolve', name, true, null)` — the shared TOTP-
-  retry/code-overlay plumbing every mutating action reuses), `teamRow()`
-  (line 2683, the non-idle branch: status strip + escalation panel (if
-  `waiting_on_you`) + feed toggle + feed panel + Stop button),
-  `actionPath()`/`actionBody()`/`handleActionResult()` (lines 2766–2860,
-  the shared per-`kind` dispatch table every mutating action — `team-
-  start`/`team-stop`/`team-resolve` today — plugs into for its route path,
-  request body, and 428/403/200 handling, including the TOTP overlay's
-  per-`kind` label text).
-- The merged event feed (line 2495 `teamFeedEventKindClass()`, line 2523
-  `teamFeedEventBody()`) classifies each transcript event by `(kind,
-  meta)` shape into a CSS class + human-readable line. Relevant existing
-  branches: `tool_result` with `meta.resolved` truthy → class `'resolved'`
-  → `'Answer: ' + text`. **This branch will incorrectly also match a
-  `board_write_resolved` transcript entry** (its `meta.resolved` is also
-  `True` on both approve and reject) unless a more specific check for
-  `meta.approved !== undefined` is added ahead of it — see "Proposed
-  approach" §4.
+- `app/app.py`'s `_gitea_poll_if_due()` (line ~799) is called from every `/status` request, throttled to its own `GITEA_POLL_INTERVAL_SECONDS` (default 45s) via `_gitea_poll_last_at` + `_gitea_poll_lock`. When due, it iterates `_load_gitea_repo_map()` (`GITEA_REPO_MAP_FILE`, `owner/repo -> {name, branch, sync_state, sync_at, remote_sha}`) and calls `_gitea_poll_one(owner_repo, entry)` per registered project, which checks whether the branch's SHA moved and, if so, spawns `_gitea_sync_bg()` on its own thread (non-blocking, per-project non-reentrant lock via `_gitea_sync_lock_for()`). A malformed response for one repo is swallowed (`except Exception: pass`) so it can't kill polling for every other project — the exact must-fix the reviewer caught in 2c part 1.
+- `_gitea_api(method, path, body=None)` (line ~676) is the one authenticated Gitea REST client: always parses the response body as JSON, raises `ConnectionError` on transport failure. It is not usable as-is for Gitea's `.diff` endpoint, which returns raw diff text, not JSON.
+- `scripts/gitea-configure-api.sh` mints `GITEA_API_TOKEN` with scopes `write:repository,write:user` (Gitea 1.27.1's granular scoped-token model, v1.23+). Posting an issue/PR comment is a `POST /repos/{owner}/{repo}/issues/{index}/comments` call — in Gitea's scope model this is under the **issue** scope family, distinct from **repository**. The existing token almost certainly does not cover it.
+- `app/teams.py` (item 6) already has everything this feature needs to reuse, with zero new lower-level primitives required:
+  - `roster()` (line 1827): every headless-eligible `engines.d` entry plus the configured Ollama model, each tagged `kind` (`"engine"`|`"ollama"`) and a lead-adapter `tier` (1/2/3).
+  - `load_grounding(workdir)` (line 1571): read-only (guarded by both a runtime monkeypatch and a static AST scan, per 6b) auto-discovery of a project's own docs, returning `{"digest": <hard-byte-capped text>, "files": [...], ...}`.
+  - `agent_run(engine, workdir, prompt, *, timeout, ...)` (line 993): one bounded, non-interactive turn of a headless-eligible `engines.d` entry, run inside its own throwaway tmux session (via the existing `RUN_USER`-privileged `TMUX` sudoers rule), returning `{"ok", "text", "exit_code", ...}`. This already IS "run a one-shot task against an engine and get text back" — exactly what an engine-kind review needs.
+  - `_lead_tier1_call()` / `_tier1_call_with_retry()` / `_tier1_raw_text()` (lines 2297-2360): the tier-1 (Ollama, native `/v1/chat/completions`) HTTP call, already parameterized by an arbitrary `tools` list — passing `tools=[]` turns it into a plain completion call with no behavior change needed.
+  - `_run_run_user_command(argv, cwd, timeout)` (line 3135): runs an argv as `RUN_USER` synchronously — already used by `_create_worktree()`/`_remove_worktree()` for exactly the "I need a directory RUN_USER's tmux pane can read/write" problem this feature also has.
+- Item 7 part 1 shows the precedent for extending `_LEAD_TOOL_NAMES`/`_lead_tools()` when new capability is genuinely lead-driven (`board_read`/`board_write`). This feature is deliberately **not** shaped that way — see "Standalone, not a lead tool" below.
 
 ## Proposed approach
 
-### 1. `/status`: distinguish `blocked_board_write`
-- Extend the `team_status` map (line ~3991) with `"blocked_board_write":
-  "blocked"` — same coarse bucket as `blocked_ask_user` (status strip's
-  outer state is "blocked" either way; what differs is what's inside the
-  panel).
-- Extend `waiting_on_you` to `run is not None and run["status"] in
-  ("blocked_ask_user", "blocked_board_write")`.
-- Add a new field, `escalation_kind`, to the `team` object: `"ask_user"` if
-  `run["status"] == "blocked_ask_user"`, `"board_write"` if
-  `run["status"] == "blocked_board_write"`, else `None`. This is a direct
-  string comparison against `run["status"]` (already loaded for this same
-  computation) — no extra file read, no Taiga call. Computing it here
-  (rather than making the frontend wait for `GET .../team/inbox` to learn
-  the kind) lets the status strip render distinct copy/an icon
-  immediately, without a load flicker, the same instant it learns
-  `waiting_on_you`.
-- `renderTeamStatusStrip()` branches on `team.escalation_kind` when
-  `team.status === 'blocked' && team.waiting_on_you` to show distinct copy
-  for the two kinds (e.g. "⚠ Waiting on you" for `ask_user` vs "⚠ Board
-  write pending approval" for `board_write`) — exact wording/iconography
-  is the ux-designer's call; the functional requirement is that the two
-  are visually distinguishable without opening the panel.
+### Standalone poll-triggered mechanism, not a lead-loop tool
+A PR can be tagged "ready for review" with no team session running at all for that project — there is no lead, no `run_id`, no round loop to attach a tool to. This is a background action triggered purely by Gitea poll state, structurally identical in shape to `_gitea_sync_bg()` (item 2c part 1), not to `board_read`/`board_write` (item 7 part 1, which are tools a *running* lead calls mid-loop). All new code lives in `app.py` (Gitea-specific polling/API/state, mirroring where `_gitea_poll_one`/`_gitea_sync_run` already live) plus one new self-contained function in `teams.py` (`review_pr_diff()`, mirroring where `agent_run()`/`fact_check()` already live as roster/grounding-consuming primitives) — no changes to `_LEAD_TOOL_NAMES`, `_lead_tools()`, or any lead-loop state machine.
 
-### 2. `GET .../team/inbox`: board_write branch
-`_handle_team_inbox()` currently returns `{"pending": False}` for anything
-other than `status == "blocked_ask_user"`. Add a second branch:
-- `status == "blocked_board_write"`: read `inbox.json` (same
-  `teams._inbox_path(run_id)` helper, same try/except-malformed-fallback
-  discipline as the existing branch) and reply `{"pending": True, "kind":
-  "board_write", "run_id", "verb", "ref", "value", "note",
-  "current_value", "proposed_at"}` — every field read directly off
-  `inbox.json`, no new persistence.
-- **Card subject enrichment (new, additive read)**: since `current_value`
-  never carries the userstory's `subject`/title (see "Background"), the
-  route does one best-effort `taiga_board.get_userstory(...)` call (same
-  session-resolution helper `team_step()`/`resolve_board_write()` already
-  use — `taiga_board.resolve_session()` then `get_userstory(base_url,
-  token, project_id, ref)`) to attach `"subject"` to the response. This is
-  a **read**, not a proposal-affecting call, and mirrors part 1's own
-  `board_read` tool's read semantics — it never touches `version` or
-  applies anything. On any `taiga_board.TaigaPushError` (Taiga
-  unreachable, card deleted since proposal) this degrades gracefully:
-  `"subject"` is simply omitted from the response (`None`/absent), the
-  rest of the fields (verb/ref/value/etc., already known from `inbox.json`
-  itself) are still returned, and the Approve/Reject buttons remain fully
-  functional — the subject is decoration for the panel, never a
-  precondition. Fetched once per `run_id` (the frontend already caches
-  `/team/inbox`'s response client-side keyed by `run_id`, so this is one
-  extra Taiga call per pending proposal shown, not one per poll).
-- `status == "blocked_ask_user"` branch: **entirely unchanged** — same
-  code path, same response shape (a client that predates this change and
-  never sends/reads `kind` still works, since `kind` is additive).
-- Anything else: `{"pending": False}`, unchanged.
+### Why roster tiers don't matter here
+The roster's `tier` field (1 native tool-calling / 2 schema-constrained / 3 prose-parse) exists to answer "can this model reliably drive the four/six-tool lead loop." Review generation never drives that loop — it's one prompt in, one text blob out. `AI_REVIEWER_MODEL` may therefore name **any** roster entry regardless of `tier`/`delegate_capable`/`schema_flag_error` (including a tier-3 engine, which `default_team_composition()` deliberately refuses to auto-pick as a *lead* — that refusal doesn't apply here since nothing here is leading a team). This directly answers the backlog's own open question: the roster is reused for *listing available models*, not for its tiering.
 
-### 3. `POST /projects/<name>/team/board-resolve` (new route)
-A **new, dedicated route** — not an overload of the existing `POST
-.../team/resolve`'s `{run_id, answer}` contract — because
-`resolve_board_write()`'s own input shape (`run_id` + `action` enum, no
-free text) is different enough from `resolve_ask_user()`'s (`run_id` +
-free-text `answer`) that branching one route on two different body shapes
-would add a conditional split to an already-dense handler for no real
-benefit. This mirrors the CLI's own naming exactly (`team-board-resolve`
-vs `team-resolve`) — a deliberate, disclosed naming/routing decision, not
-left open.
-- Reached through the same shared TOTP gate every mutating POST route
-  already goes through (`session_totp_ok`/428/403, `do_POST`'s common
-  preamble) — no new gating code.
-- Body: `{"run_id": str, "action": "approve"|"reject", "code": str
-  (optional, TOTP)}`.
-- Validation, mirroring `/team/resolve`'s existing shape exactly:
-  - `name not in instance_names()` → 404.
-  - `run_id` empty → resolve via `teams.latest_run_for_project(name)`
-    (same "resolve the latest run if none given" fallback `/team/resolve`
-    already has); non-empty → validate via `teams._RUN_ID_RE` (same
-    path-traversal guard, backlog item 11(b)'s fix, already shared
-    infrastructure — no new regex), load state, check
-    `state["project_name"] == name`.
-  - `state.get("status") != "blocked_board_write"` → 400, `{"error": "no
-    pending board write for this project"}` (same wording convention as
-    `/team/resolve`'s own `"no pending question for this project"`).
-  - `action not in ("approve", "reject")` → 400, `{"error": "action must
-    be 'approve' or 'reject'"}` — validated before calling
-    `resolve_board_write()` (defense in depth; `resolve_board_write()`
-    itself also validates this and would return the same shape of
-    failure, but rejecting client-side-obviously-invalid input before any
-    state mutation matches this file's existing discipline elsewhere).
-  - Calls `teams.resolve_board_write(run_id, action)`; `result["ok"] ==
-    False` → 400 `{"error": result["error"]}`.
-  - Same defensive "a team thread is already running for this project" 400
-    check `/team/resolve` already has (line 4420) before starting the
-    background thread — should be unreachable by the same reasoning
-    documented there, cheap to keep consistent.
-  - On success: starts `_run_team_in_background()` on a new thread exactly
-    like `/team/resolve` does (same `_team_threads_set()` call), replies
-    `{"ok": True, "run_id": run_id}`.
+### Config (new, all in `config/switchboard.env.example` + `app.py`)
+```
+AI_REVIEWER_ENABLED=0                    # off by default, same opt-in posture as every other feature here
+AI_REVIEWER_LABEL="ready for review"     # configurable; matched by exact string equality against Gitea label names
+AI_REVIEWER_MODEL=                       # "kind:name", e.g. "ollama:qwen3:8b" or "engine:claude" -- split on the FIRST ':' only, since an Ollama tag can itself contain ':'
+AI_REVIEWER_MAX_DIFF_BYTES=40000         # hard truncation cap on the diff text sent to the model
+AI_REVIEWER_MAX_ATTEMPTS=3               # consecutive failed attempts for one label-add episode before giving up until the label cycles
+AI_REVIEWER_STATE_FILE=/var/lib/ai-dev-switchboard/ai-reviewer-state.json
+```
+`AI_REVIEWER_MODEL` is validated against a live `teams.roster()` lookup at trigger time, not at startup — same "engines.d is meant to be edited without a restart" philosophy `roster()` itself documents. `AI_REVIEWER_ENABLED=1` with `AI_REVIEWER_MODEL` unset or naming a roster entry that no longer exists is a per-repo, per-poll-pass no-op (logged, not fatal) — same tolerance `_gitea_poll_one`'s malformed-response handling already establishes. Reuses `GITEA_POLL_INTERVAL_SECONDS` for cadence and `TEAM_LLM_TIMEOUT_SECONDS`/`TEAM_LLM_TRANSPORT_RETRY_BUDGET`/`TEAM_HEADLESS_TIMEOUT_SECONDS` (already-existing constants) for the underlying model calls — no new timeout/retry knobs invented.
 
-### 4. `POST .../team/stop`: close the no-op gap
-Change line 4364's tuple from `("running", "blocked_ask_user")` to
-`("running", "blocked_ask_user", "blocked_board_write")` — the entire fix,
-one literal added to an existing tuple. `stop_team()` itself already
-handles any non-idle status generically (per `docs/implementation.md`'s
-own note that `stop_team()`'s terminal-status check needed no part-1
-change); this route-level tuple was the only place still missing the new
-status.
+### Token scope
+`scripts/gitea-configure-api.sh`'s `--scopes` argument grows from `write:repository,write:user` to `write:repository,write:user,read:issue,write:issue` (issue-family scope covers PR label reads and issue/PR comment writes in Gitea's granular scoped-token model; PRs are backed by issues in Gitea's own data model, hence `.../issues/{index}/comments` for PR comments). The script is already documented "safe to re-run: generates a fresh token and overwrites the old one" — an operator picking this feature up re-runs it once to widen the existing token's scope. Flagged as the one piece of this design most worth confirming against the real instance during the reviewer's live-testing pass (same "verified live against real Gitea 1.27.1" precedent 2b/2c already set) rather than trusted blind — if Gitea rejects a call with 403 for insufficient scope, that's the first thing to check.
 
-### 5. Frontend: escalation panel branches on `escalation_kind`
-- `renderEscalationPanel(name, team)` (currently unconditionally renders
-  the `ask_user` question/options form once `team.waiting_on_you` is true)
-  gains a branch on `team.escalation_kind`:
-  - `"ask_user"`: **entirely unchanged** — same function body, same
-    fetch/cache/render path.
-  - `"board_write"`: fetches/caches the same way (`fetchTeamInbox()`,
-    `teamInboxCache[runId]`, same `undefined`/`'pending'`/`null`/loaded
-    states, same "already resolved" race branch — see "Edge cases"), but
-    renders a **board-write proposal panel** instead of a question form:
-    - A verb-specific summary line per the three verbs (exact copy is the
-      ux-designer's call; the semantic content each needs is listed
-      below).
-    - `set_status`: "Move **{subject or `#ref`}** from **{current_value.
-      status_name}** to **{value}**."
-    - `amend_description`: "Replace **{subject or `#ref`}**'s description"
-      — with the current (`current_value.description`) and proposed
-      (`value`) text shown for comparison (e.g. a two-pane or before/after
-      block — long text, see "Edge cases" for length handling).
-    - `append_comment`: "Add a comment to **{subject or `#ref`}**:" —
-      shows only the proposed `value` (no current-value comparison; `
-      current_value` is `{}` for this verb by design).
-    - `note` (if non-null): rendered as the lead's own stated reason,
-      visually secondary to the verb summary (e.g. "Lead's note: ...").
-    - Two buttons, **Approve** and **Reject** — no free-text field (unlike
-      `ask_user`'s panel), since `resolve_board_write()` takes no free-text
-      argument.
-- New `doTeamBoardResolve(name, action)` (parallel to `doTeamResolve()`):
-  clears the row's message slot, calls `toggle('team-board-resolve', name,
-  true, {action})` — reusing the same TOTP-retry/code-overlay plumbing.
-  (`toggle()`'s existing signature/`pendingToggle` shape already carries
-  arbitrary extra data through a retry; the developer should confirm the
-  exact mechanism `doTeamStart()`'s task-text retry already uses — see
-  `actionBody()`'s `team-start` branch reading from a live DOM element as
-  a fallback — and pick the matching approach for `action` rather than
-  inventing a third one.)
-- `actionPath()` gains `if (kind === 'team-board-resolve') return
-  '/projects/' + encodeURIComponent(name) + '/team/board-resolve';`.
-- `actionBody()` gains `if (kind === 'team-board-resolve') body.action =
-  <the approve/reject choice>;` (sourced the same way `team-resolve`
-  already sources its answer — from a small client-side map keyed by
-  `name`, analogous to `teamEscalationSelected`/`teamEscalationOther`, or
-  read directly off the retry context — developer's call on the exact
-  plumbing, not architecturally significant).
-- `handleActionResult()`'s 428-overlay label switch gains a `kind ===
-  'team-board-resolve'` case (e.g. `'Resolving board write: ' + (name ||
-  'this')`), following the existing pattern exactly.
+### The poll extension (`app.py`)
+1. **`_gitea_api_raw(method, path)`** — new, small: identical shape to `_gitea_api()` but returns `(status, text)` without attempting `json.loads` on the body (needed for the `.diff` endpoint, which returns plain text, not JSON — `_gitea_api()` itself would misclassify a non-JSON 2xx body as `ConnectionError`, per its own `except (URLError, TimeoutError, ValueError)` catching `json.loads`'s `ValueError` too).
+2. **State file** (`AI_REVIEWER_STATE_FILE`): `{"owner/repo#number": {"label_present": bool, "attempts": int, "reviewed_at": iso|null, "last_error": str|null}}`. Same tmp-file-then-`os.replace()` atomic-write idiom as `_save_gitea_repo_map_entry`, guarded by its own `_ai_reviewer_state_lock` (mirrors `_gitea_map_lock`). `_load_ai_reviewer_state()` tolerates a missing/corrupt file the same way `_load_gitea_repo_map()` does (`-> {}`).
+3. **`_ai_reviewer_poll_repo(owner_repo, entry)`** — called from inside `_gitea_poll_if_due()`'s existing per-repo loop, right alongside the existing `_gitea_poll_one(owner_repo, entry)` call, wrapped in its own `try/except Exception: pass` (same "one bad repo/response can't kill the pass" discipline), gated on `AI_REVIEWER_ENABLED`:
+   - `GET /repos/{owner_repo}/pulls?state=open` (one call per registered repo per poll pass, same cost class as the existing per-repo branch check).
+   - For each PR: `pr_key = f"{owner_repo}#{pr['number']}"`, `label_present = AI_REVIEWER_LABEL in [l.get("name") for l in pr.get("labels") or []]`, `prev = state.get(pr_key, {})`.
+   - **Not present now:** if `prev.get("label_present")` was true (or the PR is unseen), write `{label_present: False, attempts: 0, reviewed_at: prev.get("reviewed_at"), last_error: None}` — this *arms* the next add as a fresh episode. No-op if already recorded absent.
+   - **Present now, and it was NOT present last poll (or the PR has never been seen before):** this is the trigger edge — first, **synchronously** (before any slow work) write `{label_present: True, attempts: prev.get("attempts", 0), reviewed_at: prev.get("reviewed_at"), last_error: None}` to the state file, so no other/later poll pass can re-decide this is a fresh edge while the review is in flight (closes the double-post race without needing the per-PR lock below to also cover state visibility). Then spawn `_ai_reviewer_review_bg(owner_repo, entry, pr)`.
+   - **Present now, was already present, `attempts < AI_REVIEWER_MAX_ATTEMPTS`:** a previous attempt for this same episode failed and hasn't exhausted its budget — spawn `_ai_reviewer_review_bg()` again (retry), same trigger path.
+   - **Present now, was already present, `attempts >= AI_REVIEWER_MAX_ATTEMPTS`:** give up silently until the label cycles (removed, then re-added) — `last_error` stays in the state file for operator inspection (no UI in this spec, but a human with shell access can read the JSON file, same as `GITEA_REPO_MAP_FILE` today).
+4. **`_ai_reviewer_review_bg(owner_repo, entry, pr)`** — non-blocking dispatch, mirrors `_gitea_sync_bg()` exactly: acquire `_ai_reviewer_pr_lock_for(pr_key)` (new dict of per-PR `threading.Lock`s, same `_gitea_sync_locks` pattern), and if already held (a previous attempt for this PR is still running), return immediately — the next poll interval will see `attempts` unchanged and retry. Otherwise spawn a daemon thread running `_ai_reviewer_review_run()`.
+5. **`_ai_reviewer_review_run(owner_repo, entry, pr)`** — the real work, off the request thread:
+   - `status, diff_text = _gitea_api_raw("GET", f"/repos/{owner_repo}/pulls/{pr['number']}.diff")`. Non-200 or empty → record failure (see below) and return.
+   - Truncate: `diff_truncated = len(diff_text.encode("utf-8")) > AI_REVIEWER_MAX_DIFF_BYTES`; if so, `diff_text = diff_text.encode("utf-8")[:AI_REVIEWER_MAX_DIFF_BYTES].decode("utf-8", errors="ignore")` (same encode-slice-decode pattern `build_digest()` already uses for its own hard cap).
+   - Resolve the roster entry: split `AI_REVIEWER_MODEL` on the first `:`, look it up in `teams.roster()` by `(kind, name)`. Not found/unset → record failure `"AI_REVIEWER_MODEL '...' not found in roster"` and return.
+   - `result = teams.review_pr_diff(model_entry, workdir=os.path.join(PROJECTS_DIR, entry["name"]), pr_title=pr.get("title", ""), pr_body=pr.get("body") or "", diff_text=diff_text, diff_truncated=diff_truncated)`.
+   - `result["ok"]` false → record failure (`result["error"]`) and return.
+   - Compose the comment body (see "Comment format" below) and `POST /repos/{owner_repo}/issues/{pr['number']}/comments` with `{"body": comment}`. Non-2xx → record failure. 2xx → record success: `{label_present: True, attempts: 0, reviewed_at: now, last_error: None}`.
+   - **Record failure** = re-read current state entry, `attempts += 1`, `last_error = <message>`, `label_present` left as `True` (already set synchronously in step 3 — never touched again on failure, so the "was already present" branch of step 3 is what drives the retry, not a re-trigger).
 
-### 6. Merged event feed: verb-specific rendering for board_write history
-`teamFeedEventKindClass()`/`teamFeedEventBody()` need two new, more
-specific branches, checked **before** the existing generic `tool_result`+
-`meta.resolved` → `'resolved'` branch (which would otherwise also match a
-`board_write_resolved` entry, since its `meta.resolved` is also `True` —
-see "Background"):
-- `tool_use` with `meta.verb !== undefined` → new class
-  `'board-write-proposal'` → body e.g. `'board_write (' + meta.verb + '):
-  ref #' + meta.ref + ' — ' + esc(e.text)` (reusing the transcript's own
-  `args_summary` text, already verb/ref-specific).
-- `tool_result` with `meta.approved !== undefined` (present on both
-  approve and reject outcomes, absent from `ask_user`'s own resolution
-  meta which only ever sets `resolved`) → new class
-  `'board-write-resolved'` → body distinguishes the three real outcomes by
-  parsing `e.text`'s known prefixes (`"rejected by human"`, `"approved and
-  applied"`, `"approved but Taiga rejected the write: ..."` — these are
-  `resolve_board_write()`'s own literal `outcome_summary`/
-  `full_result_text` strings, stable enough to branch on) rather than
-  reusing the generic `'Answer: ' + text` copy.
-- The existing `meta.resolved` → `'resolved'` branch is otherwise
-  unchanged and keeps matching `ask_user`'s own resolution entries exactly
-  as before (the new checks above are strictly narrower and only match
-  when `meta.verb`/`meta.approved` are present, which `ask_user`'s own
-  transcript entries never set).
+### `teams.review_pr_diff()` (new, in `app/teams.py`, next to `agent_run()`/`fact_check()`)
+```
+def review_pr_diff(model: dict, workdir: str, pr_title: str, pr_body: str,
+                   diff_text: str, diff_truncated: bool) -> dict:
+    """{"ok": True, "text": <review markdown>} or {"ok": False, "error": "..."}."""
+```
+- `digest = load_grounding(workdir)["digest"]` — `workdir` here is the project's REAL directory (`PROJECTS_DIR/<name>`), read via the existing read-only-guaranteed grounding path (6b's monkeypatch + AST scan already prove nothing under this call path can write). This is the concrete reuse of "6b's grounding... for consistent with the project's own documented conventions" the backlog asks for.
+- `prompt = _build_review_prompt(pr_title, pr_body, diff_text, diff_truncated, digest)` — new pure string-builder function (no I/O), unit-testable directly. Content: role framing ("You are reviewing a pull request for code consistency with this project's own documented conventions — not a general code review"), the grounding digest verbatim, the (possibly-truncated) diff, an explicit truncation notice when `diff_truncated`, and output-format instructions (short markdown review: a brief overall assessment plus specific, cited observations; explicitly told this is comment-only advisory feedback, never phrased as blocking).
+- `model["kind"] == "ollama"`: `payload, err = _tier1_call_with_retry(TEAM_LLM_BASE_URL, model["name"], system=<short reviewer system string>, user=prompt, tools=[], timeout=TEAM_LLM_TIMEOUT_SECONDS, retry_budget=TEAM_LLM_TRANSPORT_RETRY_BUDGET)`. `err` → `{"ok": False, "error": err}`. Else `{"ok": True, "text": _tier1_raw_text(payload)}`.
+- `model["kind"] == "engine"`: **never runs against `workdir` itself** — creates a throwaway scratch directory via `_run_run_user_command(["mkdir", "-p", scratch], cwd=TEAM_STATE_DIR)` (so it's `RUN_USER`-owned from creation, matching exactly how `_create_worktree()` already solves "a directory `agent_run()`'s `RUN_USER`-privileged tmux pane needs to read/write" — no chmod gymnastics, no new privilege path), under `TEAM_STATE_DIR/_ai_reviewer_scratch/<token_hex(8)>`, then `agent_run(model["name"], scratch, prompt, timeout=TEAM_HEADLESS_TIMEOUT_SECONDS)`, then **unconditionally** removes the scratch dir via `_run_run_user_command(["rm", "-rf", scratch], cwd=TEAM_STATE_DIR)` in a `finally`. `result["ok"]` false → `{"ok": False, "error": result.get("error") or "engine review failed"}`. Else `{"ok": True, "text": result["text"]}`.
+  - **This is the load-bearing safety property of this whole spec**, worth stating plainly: the reviewing engine is never given the project's real working copy, so even a rogue/over-eager headless invocation that ignores its instructions and tries to edit files can only ever touch a directory that's deleted seconds later — no worktree, no branch, no risk to the human's checkout. This goes beyond a prompt-level "don't edit files" instruction (which the diff+grounding-only prompt also says, for a well-behaved model) with an actual structural guarantee, matching this project's existing standard of pairing a permissive-sounding instruction with a real enforced boundary (6b's grounding guard is the direct precedent).
+
+### Comment format
+```
+**AI code review** (model: `{kind}:{name}`, via ai-dev-switchboard)
+
+{note if diff_truncated: "> Note: this diff was truncated to the first {N} bytes before review — some changes may not have been evaluated."}
+
+{review text from the model, verbatim}
+
+---
+_Comment-only — this review never blocks, approves, or merges this PR._
+```
 
 ## Affected areas
-- `app/app.py`:
-  - `/status` handler (`team_status` map, `waiting_on_you`, new
-    `escalation_kind` field) — §1.
-  - `_handle_team_inbox()` — new `blocked_board_write` branch, subject
-    enrichment via `app.taiga_board` — §2.
-  - New `POST /projects/<name>/team/board-resolve` route in `do_POST()` —
-    §3.
-  - `POST .../team/stop` route — one-tuple fix — §4.
-  - Frontend JS: `renderTeamStatusStrip()`, `renderEscalationPanel()`, new
-    `doTeamBoardResolve()`, `actionPath()`/`actionBody()`/
-    `handleActionResult()`, `teamFeedEventKindClass()`/
-    `teamFeedEventBody()` — §5, §6.
-- Not touched: `app/teams.py`, `app/taiga_board.py` (imported/called only,
-  not modified — the inbox route's subject-enrichment call in §2 is a new
-  **call site**, not a new function), `scripts/taiga_push_spec.py`.
-- New/extended tests:
-  - `tests/test_team_routes.py` — `/status`'s new `escalation_kind`
-    field and updated `team_status`/`waiting_on_you` for
-    `blocked_board_write`; `_handle_team_inbox()`'s new branch (including
-    the subject-enrichment success/degraded-failure cases); the new
-    `POST .../team/board-resolve` route (success, wrong status, invalid
-    action, missing/invalid `run_id`, TOTP gating, already-running-thread
-    defensive check); `POST .../team/stop`'s fix, mirroring the existing
-    `blocked_ask_user` stop test.
-  - `tests/test_team_frontend.js` — `renderEscalationPanel()`'s new
-    `board_write` branch for all three verbs plus the "already resolved"
-    race case (mirroring the existing `!cached.pending` test for
-    `ask_user`, per backlog item 12's precedent); `teamFeedEventKindClass()`/
-    `teamFeedEventBody()`'s two new branches, including a regression test
-    that a `board_write_resolved` entry no longer falls into the generic
-    `'resolved'`/`'Answer: ...'` branch.
+- `app/app.py`: new config reads (`AI_REVIEWER_*`), `_gitea_api_raw()`, state-file load/save + lock, per-PR lock dict, `_ai_reviewer_poll_repo()`/`_ai_reviewer_review_bg()`/`_ai_reviewer_review_run()`, one new call site inside the existing `_gitea_poll_if_due()` per-repo loop. No new routes, no new UI.
+- `app/teams.py`: one new public function `review_pr_diff()` plus a private `_build_review_prompt()` and the two `_run_run_user_command`-based scratch-dir helpers. No changes to `_LEAD_TOOL_NAMES`/`_lead_tools()`/any lead-loop state machine.
+- `scripts/gitea-configure-api.sh`: `--scopes` widened to add `read:issue,write:issue`.
+- `config/switchboard.env.example`: new `AI_REVIEWER_*` documented block, same style as the existing `GITEA_*`/`TEAM_LLM_*` blocks.
+- New test file `tests/test_ai_reviewer.py`, following `tests/test_gitea_poll.py`'s convention (monkeypatch `_gitea_api`/`_gitea_api_raw`/`subprocess.run`, no real Docker/network/Gitea calls) plus a focused set of `teams.review_pr_diff()`/`_build_review_prompt()` tests in the style of `tests/test_teams_headless.py`/`tests/test_teams_grounding.py` (monkeypatch `agent_run`/`_lead_tier1_call`, assert the grounding digest and diff text both land in the constructed prompt).
+- No data model / schema change beyond the two new flat JSON files (state file; no DB in this project).
+- No API/route changes — this is entirely a poll-side background feature plus one outbound Gitea write (the comment POST).
 
 ## Edge cases
-- **`inbox.json` missing/unreadable despite `status ==
-  "blocked_board_write"`** (crash between proposal and resolve, or a
-  corrupted write): mirrors the existing `ask_user` fallback — still
-  `"pending": True`, with `verb`/`ref`/`value` absent/`None` and a safe
-  placeholder the panel can render without crashing (e.g. "The team is
-  waiting on a board-write approval, but the details could not be read —
-  check `tmux attach` or use the CLI's `team-board-resolve` to
-  approve/reject blind"). Never a 500.
-- **Taiga unreachable when `/team/inbox` tries the subject-enrichment
-  read**: degrade to no `subject` field, every other field still present,
-  Approve/Reject remain fully functional (the actual apply-time fetch in
-  `resolve_board_write()` is independent and already handles this per
-  part 1).
-- **Two tabs, one already resolved the proposal**: the second tab's
-  cached `/team/inbox` response still says `pending: true`; clicking
-  Approve/Reject there hits the new route, which reloads state fresh and
-  gets `status != "blocked_board_write"` (already `"running"` again) →
-  400 → surfaced in the row's `team-msg` slot as an error (same
-  `handleActionResult()` 400-branch pattern `doTeamResolve()` already
-  uses) — no crash, no silent double-apply. Optionally (developer's call,
-  not required for acceptance): mirror the existing `!cached.pending`
-  "This question was already answered" render for the `board_write`
-  panel too, for the narrower case where a stale cached inbox itself
-  already reports resolution before the click — not load-bearing since
-  the 400 path alone is sufficient and already covered.
-- **Two genuinely concurrent Approve clicks (double-click, or two tabs
-  clicking within the same event loop tick)**: backend race safety is
-  already part 1's job (`os.replace()` as sole arbiter) — the UI's only
-  obligation is to not crash on the loser's 400 and to not double-count
-  it as a second real approval. No new backend work; verify the existing
-  race test's outcome (one winner, one clean 400) surfaces correctly
-  through the new route's error path.
-- **`append_comment`'s `current_value` is `{}`**: the panel must render
-  without a "current value" comparison for this verb specifically (by
-  design — a comment has no prior state to diff against), not show a
-  broken/empty comparison block.
-- **Very long `value`/`note`/`current_value.description` text** (server
-  caps `value` at `TEAM_BOARD_WRITE_VALUE_MAX_CHARS` = 8000 chars; `note`
-  and `current_value.description` are not separately capped by this
-  spec): the panel must not overflow the row — truncate/scroll, same
-  general long-text handling the existing grounding-file listing and
-  fact-check match snippets already use elsewhere in this file (200-char
-  truncation with an ellipsis is the existing precedent, e.g.
-  `teamFeedEventBody()`'s fact-check-result rendering) — exact truncation
-  length is a design detail, not an architecture decision.
-- **`ref` was deleted from Taiga between proposal and approval**: already
-  handled by the backend ("approved but Taiga rejected the write:
-  ..."`— §6 covers rendering that outcome legibly in the feed; no new
-  handling needed in the panel itself, since the panel's own job (submit
-  approve/reject) is already done by the time this surfaces.
-- **A run stopped (via the newly-fixed `/team/stop`) while a
-  `board_write` is pending**: `stop_team()`'s own existing generic
-  terminal-status handling applies unchanged (part 1/`docs/
-  implementation.md` already confirmed no `blocked_board_write`-specific
-  branch is needed there) — the pending proposal is simply abandoned
-  (never applied), same as stopping a run mid-`blocked_ask_user` today.
-- **A pre-existing client (a browser tab loaded before this change ships,
-  mid-poll)**: `/status`'s new `escalation_kind` field is additive; an old
-  cached JS bundle simply never reads it and continues rendering
-  `blocked_board_write` as generically "blocked" with no escalation panel
-  (today's actual behavior) until the page is reloaded — no crash, no
-  data loss, matches this project's existing "additive fields never break
-  an old client" discipline (see part 1's own `inbox.json` `kind` field
-  reasoning).
+- **Diff exceeds the model's context.** Settled: hard-truncate to `AI_REVIEWER_MAX_DIFF_BYTES`, note the truncation explicitly both in the prompt (so the model doesn't claim false completeness) and in the posted comment (so a human reader knows the review may be partial).
+- **PR closed/merged between label-add-detection and the background review actually running.** The `.diff` fetch or comment POST will simply 404/fail against Gitea — treated as an ordinary failure (`attempts += 1`, retried next poll up to `AI_REVIEWER_MAX_ATTEMPTS`, then given up on until the label cycles, which can't happen on a closed PR — a permanently-stuck-but-harmless state, not a crash).
+- **Label removed and re-added within the same poll interval** (faster than `GITEA_POLL_INTERVAL_SECONDS`) — indistinguishable from "never removed" at this poll's resolution; the next poll simply sees `label_present: True` again with no intervening `False` observed, so no new episode fires. Documented as the same "as soon as" == "within one poll interval" tradeoff item 2c/8 already accept.
+- **Same label name matched by exact string equality**, not a regex/substring — a project using a *different* label containing the configured word as a substring (e.g. "not ready for review") does not spuriously trigger.
+- **Empty diff** (e.g. a PR with no net changes against its base) — still reviewed; the model gets an empty diff and grounding digest and is free to say so; not treated as an error.
+- **`AI_REVIEWER_MODEL` unset while `AI_REVIEWER_ENABLED=1`** — per-repo no-op every poll pass, silent beyond the state file's `last_error`, never crashes the poll for other repos.
+- **Token scope insufficient** (403 from Gitea on the PR-list, diff, or comment call) — surfaces as an ordinary recorded failure via the same `attempts`/`last_error` path, not a crash; the fix (widen the token's scope, re-run `gitea-configure-api.sh`) is an operational step, not something this code needs to detect specially.
+- **Concurrent poll passes for the same PR** — closed by the synchronous `label_present: True` write in `_ai_reviewer_poll_repo()` (step 3 above) *before* any slow work starts, plus the per-PR non-blocking lock in `_ai_reviewer_review_bg()` as defense in depth against a still-in-flight retry attempt overlapping itself.
+- **Malformed/unexpected Gitea API response shape** (mid-restart, non-list `pulls` body, etc.) for one repo — caught by the existing outer `try/except Exception: pass` around the per-repo loop; other registered repos' polls are unaffected, matching the must-fix precedent from 2c part 1.
+- **State file missing or corrupt** — treated as `{}`, same tolerance as `_load_gitea_repo_map()`.
+- **A PR whose repo isn't in `GITEA_REPO_MAP_FILE`** — never inspected; out of scope by construction (the poll only iterates the repo map).
+- **Two roster entries with the same `name` but different `kind`** (e.g. an `engines.d` entry happens to share a name with the configured Ollama model) — `AI_REVIEWER_MODEL`'s `"kind:name"` format disambiguates explicitly; `roster()` lookup is keyed on `(kind, name)`, same as `validate_composition()` already does.
 
 ## Acceptance criteria
-- [ ] Given a run with `state["status"] == "blocked_board_write"`, `GET
-      /status` reports that project's `team.status === "blocked"`,
-      `team.waiting_on_you === true`, and `team.escalation_kind ===
-      "board_write"`.
-- [ ] Given a run with `state["status"] == "blocked_ask_user"`, `GET
-      /status` reports `team.escalation_kind === "ask_user"` (regression
-      check — must not change from today's behavior beyond the new field
-      itself).
-- [ ] Given a run that is `running`, `finished`, `error`, or has no run at
-      all, `team.escalation_kind` is `null`/absent.
-- [ ] Given a run blocked on `blocked_board_write`, `GET .../team/
-      inbox?run_id=<id>` returns `{"pending": true, "kind": "board_write",
-      "run_id", "verb", "ref", "value", "note", "current_value",
-      "proposed_at"}` matching `inbox.json`'s own content, plus `subject`
-      when the Taiga read succeeds.
-- [ ] Given the same run but Taiga unreachable for the subject-enrichment
-      read, `GET .../team/inbox` still returns `pending: true` with every
-      `inbox.json`-sourced field present and `subject` omitted — not a 500.
-- [ ] Given a run blocked on `blocked_ask_user`, `GET .../team/inbox`'s
-      response shape is byte-for-byte unchanged from today (regression).
-- [ ] Given a run blocked on `blocked_board_write`, `POST /projects/<name>/
-      team/board-resolve` with `{"run_id": id, "action": "approve", "code":
-      <valid TOTP>}` returns 200 `{"ok": true, "run_id": id}`, calls
-      `teams.resolve_board_write(run_id, "approve")` exactly once, and
-      starts the background driving thread (mirroring `/team/resolve`'s
-      own dispatch — verified via the same thread-registration check
-      `test_team_routes.py`'s existing `/team/resolve` tests use).
-- [ ] Same for `"action": "reject"`.
-- [ ] Given a run whose status is not `blocked_board_write` when `POST
-      .../team/board-resolve` is called, the route responds 400 with a
-      clear error, makes zero calls to `resolve_board_write()`, and starts
-      no thread.
-- [ ] Given `"action"` is neither `"approve"` nor `"reject"`, the route
-      responds 400 before calling `resolve_board_write()`.
-- [ ] Given a session that hasn't cleared the TOTP gate yet, `POST .../
-      team/board-resolve` (like every other mutating route) responds 428
-      with no `code`, and 403 with a wrong `code` — same shared gate,
-      verified once for this new route the same way `/team/resolve`'s own
-      TOTP tests are structured.
-- [ ] Given a run blocked on `blocked_board_write`, `POST .../team/stop`
-      now actually stops it: the project's cancel event (if a live thread
-      is registered) is set, `teams.stop_team()` is called, and the
-      response is `{"ok": true, "session_removed", "worktrees"}` — not the
-      former no-op `{"ok": true, "message": "no team currently running..."}`.
-      Existing `blocked_ask_user`/`running` stop behavior is unchanged
-      (regression check).
-- [ ] `renderEscalationPanel()`, given `team.escalation_kind ===
-      'board_write'` and a cached `set_status`/`amend_description`/
-      `append_comment` inbox response, renders a panel containing the
-      verb-appropriate current-vs-proposed content (or, for
-      `append_comment`, just the proposed comment text) and Approve/Reject
-      controls — no free-text field. Given `team.escalation_kind ===
-      'ask_user'`, `renderEscalationPanel()`'s output is unchanged from
-      today (regression).
-- [ ] `doTeamBoardResolve(name, 'approve')`/`doTeamBoardResolve(name,
-      'reject')` each dispatch a `POST .../team/board-resolve` with the
-      corresponding `action`, reusing the same TOTP-retry/code-overlay
-      flow `doTeamResolve()` already uses (verified via the same kind of
-      428-then-retry-with-code test `test_team_frontend.js` already has
-      for `team-resolve`/`team-start`).
-- [ ] `teamFeedEventKindClass()`, given a transcript event with `kind ===
-      'tool_use'` and `meta.verb` present, returns a distinct class (not
-      `'tool_use'`/generic fallback); given `kind === 'tool_result'` and
-      `meta.approved` present, returns a distinct class (not `'resolved'`)
-      — and a regression test confirms an `ask_user`-shaped `tool_result`
-      with only `meta.resolved` (no `meta.approved`) still returns
-      `'resolved'` exactly as before.
-- [ ] Full existing suite (`python3 -m unittest discover -s tests` plus
-      the JS test runner for `test_team_frontend.js`) remains green.
+- [ ] Given `AI_REVIEWER_ENABLED=0` (the default), when a registered project's open PR gets the configured label, then no PR-listing/diff/comment calls happen and no review is posted.
+- [ ] Given `AI_REVIEWER_ENABLED=1`, a valid `AI_REVIEWER_MODEL`, and a registered project's open PR whose label set changes from not containing `AI_REVIEWER_LABEL` to containing it, when the next due poll runs, then within that poll pass a comment is posted to that PR via `POST /repos/{owner}/{repo}/issues/{number}/comments`, and the state file records `label_present: true` for that PR.
+- [ ] Given the same PR polled again with the label still present (never removed in between), when polled repeatedly, then no second comment-post call happens.
+- [ ] Given the label is removed and then re-added on a previously-reviewed PR, when polled after the re-add, then exactly one new review-trigger fires (a second, independent episode).
+- [ ] Given a diff whose UTF-8 byte length exceeds `AI_REVIEWER_MAX_DIFF_BYTES`, when reviewed, then the text sent to the model is truncated to that many bytes and the posted comment contains an explicit truncation note.
+- [ ] Given `AI_REVIEWER_MODEL` names a roster entry that doesn't exist (unset, or removed from `engines.d` since configured), when a review would be triggered, then no exception propagates out of the poll pass, the repo's `last_error` is recorded, and other registered repos' polls in the same pass are unaffected.
+- [ ] Given a review-generation failure (model call error, diff-fetch failure, or comment-post failure), when it happens, then `attempts` increments and `label_present` stays `true` (no duplicate trigger from the add-edge), and after `AI_REVIEWER_MAX_ATTEMPTS` consecutive failures for one episode, no further attempts are made until the label is removed and re-added.
+- [ ] Given an `engine`-kind `AI_REVIEWER_MODEL`, when a review runs, then `agent_run()` is invoked with a freshly-created scratch directory (not `PROJECTS_DIR/<name>`) as its `workdir`, and that scratch directory no longer exists once the review call returns, regardless of success or failure.
+- [ ] Given an `ollama`-kind `AI_REVIEWER_MODEL`, when a review runs, then the call goes through `_tier1_call_with_retry()` with `tools=[]` (a plain completion, no tool-calling behavior).
+- [ ] Given a PR on a Gitea repo not present in `GITEA_REPO_MAP_FILE`, when polled, then it is never inspected for the review label.
+- [ ] Given a project with auto-discovered grounding docs, when a review is generated, then the constructed prompt contains the grounding digest text (verifiable directly against `teams.load_grounding()`'s output in a unit test, without needing a live model call).
+- [ ] No code path introduced by this feature calls any Gitea PR-approve, PR-merge, or repo-branch-write endpoint.
 
 ## Open questions
-- **Exact copy/iconography for the status strip and panel per verb.**
-  Deliberately left to the ux-designer (`docs/design.md`) — this spec
-  specifies the *information* each verb's panel must convey (current vs.
-  proposed value, or just proposed for `append_comment`; the lead's
-  `note`; the two action buttons) but not wording, layout, or color,
-  consistent with how 6f part 2's own spec left `ask_user`'s panel copy
-  to design.
-- **Whether `doTeamBoardResolve()`'s TOTP-retry plumbing needs `toggle()`
-  itself extended, or can piggyback entirely on the existing
-  `pendingToggle`/`actionBody()` mechanism.** Flagged in "Proposed
-  approach" §5 as a developer judgment call during implementation — the
-  existing `team-start` kind already threads an extra body field
-  (`task`/`lead`/`members`) through a 428 retry via a DOM/client-side-map
-  read rather than `toggle()`'s own call signature, and `action` should
-  follow whichever of those two patterns turns out simpler once the
-  developer is looking at the actual retry code path — not an
-  architecture decision that needs a human call first.
-- **Exact truncation length for long `value`/`note`/`description` text in
-  the panel.** Proposed default: reuse the existing 200-char precedent
-  from `teamFeedEventBody()`'s fact-check-match rendering, unless the
-  ux-designer has a reason to size it differently for a proposal panel
-  (which arguably deserves to show more context than a feed line, being a
-  one-at-a-time approval decision rather than a scrolling log). Not a
-  blocker either way.
+- **Token scope exact requirement** — proceeding under the assumption that Gitea's `issue` scope family (`read:issue`/`write:issue`) is what's needed for PR-label reads and PR-comment writes, alongside the existing `write:repository`. This is the one piece of the design most worth confirming live against the real Gitea 1.27.1 instance during the reviewer's testing pass (same live-verification precedent 2b/2c already established) — not a blocker, since a wrong scope surfaces cleanly as a recorded 403 failure per the edge cases above, not a crash or silent misbehavior.
+- **Whether a wrong scope should abort `gitea-configure-api.sh`'s existing run or just widen it going forward** — assumption: just widen the `--scopes` argument in place; the script is already documented as idempotent/re-runnable, so no new decision is needed there.
 
 ## Risk / rollback notes
-- Every backend change here is either purely additive (`escalation_kind`
-  field, new `blocked_board_write` branch in `_handle_team_inbox()`, new
-  `board-resolve` route) or a one-tuple extension to an existing status
-  check (`/team/stop`'s fix) — no existing `ask_user` code path is
-  modified except where explicitly noted (§6's event-feed classification
-  order, which only narrows two existing checks, never widens or removes
-  them).
-- The new Taiga read in `_handle_team_inbox()` (§2, subject enrichment)
-  is the one genuinely new network call this spec introduces on the web
-  side. It's read-only, best-effort, and failure-tolerant by design (see
-  "Edge cases") — worst case on a Taiga outage is a missing card title in
-  the panel, never a broken approval flow (approval itself doesn't depend
-  on this call at all — `resolve_board_write()` does its own fresh fetch
-  independently).
-- Rollback: revert the `app/app.py` diff. No data migration — `inbox.json`
-  and `run.json`'s `blocked_board_write` status already exist and are
-  already being written by part 1 regardless of whether this part ships;
-  reverting this part only removes the web-visible surface, not the
-  underlying capability (the CLI's `team-board-resolve` keeps working
-  either way, per part 1's own design).
+- **Off by default** (`AI_REVIEWER_ENABLED=0`) — zero behavior change for any existing install until an operator opts in.
+- **Worst case if something goes wrong**: a spurious or low-quality comment gets posted to a PR — reversible (delete the comment in Gitea's own UI) and never mixed with any write to code, branches, or PR state. No data-loss risk, no risk to the project's real working copy (see the scratch-directory design above).
+- **Rollback**: set `AI_REVIEWER_ENABLED=0` (or leave it unset); no schema/file needs cleanup — the state file and scratch directories are self-contained and harmless to leave in place or delete.
+- **Cost/rate risk** (noted for the future, not gated on here): reviewing every tagged PR against a hosted/paid model has a real per-review cost; the operator controls this entirely today via which roster model `AI_REVIEWER_MODEL` names (an Ollama/local model has none) — no rate limiting is added in this spec since Gitea is self-hosted with no external rate limit to respect, per the backlog's own "Scope is Gitea-only for now" framing.
