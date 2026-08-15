@@ -827,3 +827,268 @@ message. This cycle is confirmed genuinely inert in a running install (no
 route, no call sites, no template changes). One documentation-only nit
 (an extra, harmless sentence in the config comment) does not block
 approval.
+
+---
+
+# Test & Review: Backlog item 18 -- HTTP-level "Smoke check" button
+
+## Scope
+All 12 acceptance criteria in `docs/spec.md` for the HTTP-level smoke
+check: button visibility gated on `inst.url`, the GET-with-optional-
+substring-check contract (`smoke_check_run()`), the `POST
+/projects/<name>/smoke-check` route's 200/404/409 contract, timeout and
+connection-refused handling, per-project lock contention/independence,
+ephemeral (never-persisted) result rendering, no new `install.sh` step,
+and the `.smoke-btn` WCAG AA contrast claim. Branch:
+`backlog/gstack-capabilities-18`. Nothing committed by the developer;
+nothing committed by this review. Also independently investigates a
+regression the developer flagged in `docs/implementation.md` in
+`tests/test_deploy_frontend.js`, attributed to backlog item 13 and
+disclosed as pre-existing/unrelated to this cycle's own diff.
+
+## Test cases
+
+| # | Criterion / case | Method | Result | Evidence |
+|---|---|---|---|---|
+| 1 | Button renders when `inst.url` is non-null | automated | pass | `tests/test_smoke_check_frontend.js`: "project with a captured url renders a Smoke check button + input + empty message slot" |
+| 2 | Button does not render when `url` is null | automated | pass | `test_smoke_check_frontend.js`: "project without a captured url renders no Smoke check button at all" |
+| 3 | Empty field, 200 within timeout -> shows status code + elapsed ms, no content verdict | automated | pass | `test_smoke_check_frontend.js`: "a successful check with no expect_contains shows status + timing, no content verdict"; `tests/test_smoke_check.py::SmokeCheckRunTests::test_success_reports_status_code_and_elapsed_ms_no_content_check` |
+| 4 | Substring present -> positive content-match indication + status/timing | automated | pass | `test_smoke_check_frontend.js`: "...substring IS present shows a positive content match"; `test_smoke_check.py::test_expect_contains_present_reports_content_ok_true` |
+| 5 | Substring not present -> negative indication, status/timing still shown separately (not collapsed) | automated | pass | `test_smoke_check_frontend.js`: "...substring is NOT present still shows the real status/timing"; `test_smoke_check.py::test_expect_contains_absent_reports_content_ok_false_alongside_real_status` |
+| 6 | Target unreachable (connection refused) -> route responds HTTP 200, `ok: false`, human-readable error, never 500 | automated | pass | `test_smoke_check.py::SmokeCheckRunTests::test_connection_refused_returns_clean_failure_not_raise`, `SmokeCheckEndpointTests::test_smoke_check_post_target_side_failure_still_returns_http_200`; frontend "an unreachable target..." case |
+| 6b | Connection-refused path, independently reproduced (not just re-reading the dev's test) | manual, own script | pass | See "Independent timeout/connection-refused verification" below |
+| 7 | Target doesn't respond within `SMOKE_CHECK_TIMEOUT_SECONDS` -> returns within approx that bound, timeout error reported, thread not hung | automated | pass | `test_smoke_check.py::test_timeout_returns_within_roughly_the_configured_bound` (real listening socket, accepts but never writes) |
+| 7b | Timeout path, independently reproduced with my own raw socket (not the dev's test harness) | manual, own script | pass | See "Independent timeout/connection-refused verification" below |
+| 8 | Concurrent same-project clicks -> second gets 409 immediately, no second in-flight request | automated | pass | `test_smoke_check.py::SmokeCheckRunTests::test_concurrent_dispatch_for_same_project_reports_locked`, `SmokeCheckEndpointTests::test_smoke_check_post_lock_contention_surfaces_as_409` (asserts `"locked"` key never reaches the client payload); frontend "a second dispatch already in flight (409)..." |
+| 9 | Concurrent different-project clicks -> fully independent, no shared lock | automated | pass | `test_smoke_check.py::SmokeCheckRunTests::test_different_projects_do_not_block_each_other`, `SmokeCheckLockTests::test_different_projects_do_not_share_a_lock` |
+| 10 | Result is ephemeral -- gone on next page refresh / 4s poll re-render | structural + automated (partial) | pass | `smokeCheckRow()` unconditionally renders a fresh empty `.smoke-check-msg` div on every call (read directly, `app/app.py` diff); no persisted-state file added (`git diff --stat` confirms no new file). Not covered by a dedicated "fill message, call refresh(), assert cleared" test, but this exact gap exists identically in the precedent file `tests/test_deploy_frontend.js` for `.deploy-msg` -- consistent with established project convention, not a new gap this cycle introduces. See finding 3 below (nit). |
+| 11 | No new `apt-get`/Docker/binary-download step in `install.sh` | manual diff check | pass | `git diff --stat install.sh` -> no output (zero lines changed) |
+| 12 | `.smoke-btn` color pairing passes real WCAG AA contrast (>=4.5:1), independently computed | manual, own script | pass | See "Independent contrast recomputation" below -- **7.386:1**, matches the developer's claimed 7.39:1 |
+| 13 | Unknown project name in route path -> 404 | automated | pass | `test_smoke_check.py::SmokeCheckEndpointTests::test_smoke_check_post_unknown_project_returns_404` |
+| 14 | No captured URL -> clean `ok: false` dict, lock never touched, no 500 | automated | pass | `test_smoke_check.py::test_no_captured_url_returns_ok_false_without_touching_the_lock` |
+| 15 | Non-UTF-8 body decoded `errors="ignore"`, never raises | automated | pass | `test_smoke_check.py::test_non_utf8_body_does_not_raise_and_is_decoded_with_errors_ignored` |
+| 16 | Body capped at `SMOKE_CHECK_MAX_BODY_BYTES`; substring match past the cap correctly NOT found | automated | pass | `test_smoke_check.py::test_response_body_truncated_at_max_body_bytes_cap` |
+| 17 | Target 4xx/5xx is a completed check (real status code), not a mechanism failure | automated | pass | `test_smoke_check.py::test_target_http_error_status_is_a_completed_check_not_a_failure`, `test_target_5xx_is_also_a_completed_check` |
+| 18 | No `confirm()` dialog on smoke-check click (unlike Deploy) | automated | pass | `test_smoke_check_frontend.js`: "clicking Smoke check dispatches immediately with no confirm() dialog" |
+| 19 | `expect_contains` text survives a `refresh()` re-render | automated | pass | `test_smoke_check_frontend.js`: "typed expect_contains text survives a refresh() re-render" |
+| 20 | 428 mid-dispatch (TOTP code overlay) retried correctly through shared `toggle()`/`handleActionResult()` plumbing | automated | pass | `test_smoke_check_frontend.js`: "a 428 mid-dispatch shows the code overlay labeled for this smoke check, and a correct retry succeeds" |
+| 21 | SSRF: no user-supplied URL ever reaches the target -- only server-side `_session_urls[name]`, keyed by a validated project name | manual code read | pass | See "SSRF / read-only verification" below |
+| 22 | Smoke check is genuinely read-only against the target (GET, no body/method override) | manual code read | pass | Same section below |
+
+### Independent timeout/connection-refused verification
+Ran my own standalone script against the real `app.smoke_check_run()`
+(not the developer's test file/harness), using a raw listening socket
+that `accept()`s but never writes a byte back:
+```
+result: {'ok': False, 'status_code': None, 'elapsed_ms': 2024, 'error': 'timed out after 2s'}
+wall elapsed (s): 2.0245713079930283
+```
+with `SMOKE_CHECK_TIMEOUT_SECONDS` set to 2 -- the request returned in
+~2.02s, not hung, with the correct error message. Also independently
+reproduced the connection-refused path against a closed port
+(`http://127.0.0.1:1/`):
+```
+connection-refused result: {'ok': False, 'status_code': None, 'elapsed_ms': 0, 'error': 'connection refused'}
+```
+Both match the dict contract `docs/spec.md` specifies. This confirms the
+spec's own "Risk / rollback notes" concern (a swallowed timeout causing a
+hung request thread) does not manifest.
+
+### Independent contrast recomputation
+Given this project's history of a wrong contrast claim on the adjacent
+`.deploy-btn`/`.team-btn` pairing (backlog item 20), recomputed WCAG
+relative-luminance contrast from the literal hex values in the diff
+(`#4da6ff` background / `#111111` text) using the standard sRGB->linear
+formula, independently of the developer's own figure:
+```
+background: #4da6ff text: #111111 -> contrast ratio: 7.386
+```
+Matches the claimed **7.39:1** (rounding) and comfortably passes AA's
+4.5:1 minimum for normal text. `.smoke-btn` is confirmed as its own CSS
+class, not a reuse of the still-separately-tracked `.deploy-btn`/
+`.team-btn` pairing.
+
+### SSRF / read-only verification
+Read `smoke_check_run()` and the new route directly:
+- The route (`app/app.py`, new `elif parts[0] == "projects" ... parts[2]
+  == "smoke-check"` branch) passes only `name` (from the URL path,
+  validated against `instance_names()`) and `expect_contains` (from the
+  JSON body, used only for a substring check) into `smoke_check_run()`.
+  **No URL of any kind is ever accepted from the client.**
+- `smoke_check_run()` itself resolves the target exclusively via
+  `_session_urls.get(name)` -- the same server-populated map `/status`'s
+  own `url` field already reads (per `docs/spec.md` "Background"). A
+  malicious client cannot point a smoke check at an arbitrary external
+  host by any parameter this route accepts.
+- `urllib.request.urlopen(url, timeout=...)` is called with no `data=`
+  argument and no method override, so it is a plain GET; the response is
+  only read (`resp.read(...)`), never written to. Genuinely read-only
+  against the target.
+
+## Regression check
+Full targeted suite run as the developer's own "How to verify locally"
+section specifies, executed directly by this review (not re-read from the
+developer's report):
+```
+python3 -m unittest tests.test_smoke_check tests.test_deploy_dispatch tests.test_ai_reviewer tests.test_upload -v
+# Ran 180 tests ... OK
+python3 -m py_compile app/app.py
+# OK (no output)
+node tests/test_team_frontend.js               # ALL PASS (94/94)
+node tests/test_singleton_toggle_frontend.js    # ALL PASS (15/15)
+node tests/test_clone_frontend.js               # ALL PASS (8/8)
+node tests/test_upload_frontend.js              # ALL PASS (8/8)
+```
+This cycle's own new suites, run directly:
+```
+python3 -m unittest tests.test_smoke_check -v
+# Ran 25 tests ... OK
+node tests/test_smoke_check_frontend.js
+# ALL PASS (10/10)
+```
+All match the developer's claimed counts exactly.
+
+### Pre-existing `tests/test_deploy_frontend.js` regression -- independently confirmed pre-existing, not caused by this cycle
+Ran `node tests/test_deploy_frontend.js` against the working tree as-is:
+**4/9 FAIL** (the same four cases the developer's `docs/implementation.md`
+names: "clicking Deploy then cancelling the confirm() dialog...", "a
+quote-containing host/service value...", "confirmed deploy that
+succeeds...", "a 428 mid-dispatch..." -- all failing on an unexpected
+extra pending fetch, consistent with `renderTeamBranches()`'s
+unconditional `/projects/<name>/team/branches` call landing in backlog
+item 13).
+
+To verify this genuinely predates this cycle's diff rather than being
+caused or worsened by it: `git stash push -u` on every file this cycle
+touches or adds (`app/app.py`, `config/switchboard.env.example`,
+`docs/BACKLOG.md`, `docs/implementation.md`, `docs/spec.md`,
+`tests/test_smoke_check.py`, `tests/test_smoke_check_frontend.js`),
+leaving the tree at exactly the last committed state
+(`6008134`, "Implement item 17 part 1..." -- the tip of this branch
+before any of this cycle's changes), then re-ran
+`node tests/test_deploy_frontend.js` against that state: **identical 4/9
+failure**, same four test names, same assertion messages. Confirmed via
+`git diff app/app.py | grep -n "renderTeamBranches\|team/branches"` that
+this cycle's own diff touches neither `renderTeamBranches()` nor the
+`team/branches` route at all. Popped the stash back afterward (clean,
+`git status` verified). **This is genuinely pre-existing and unrelated to
+backlog item 18's diff** -- the developer's disclosure is accurate, not a
+convenient excuse.
+
+**Recommendation: file this as its own small, separate fix-and-PR, not
+bundled into item 18's commit.** Reasoning:
+- It is a different backlog item's bug (item 13, already shipped and
+  merged as PR #8) surfacing in a different feature's test file
+  (`test_deploy_frontend.js`, not `test_smoke_check_frontend.js`) --
+  fixing it inside item 18's diff would mix two unrelated features' fixes
+  into one commit/PR, working against this pipeline's own minimal-diff/
+  scope-discipline convention.
+- It is genuinely mechanical: either drain the `team/branches` fetch in
+  `test_deploy_frontend.js`'s own setup the same way this cycle's new
+  `test_smoke_check_frontend.js::setupCase()` already does (a technique
+  now proven twice), or gate `renderTeamBranches()`'s call behind
+  something the test can control. No design or product decision is
+  needed -- this can skip a full product-manager dispatch per this
+  project's own "mechanical repeats" token-efficiency rule and go
+  straight to a developer cycle with a minimal spec.
+- It should not block item 18's approval: item 18's own new frontend
+  suite (`test_smoke_check_frontend.js`) is unaffected (it drains the
+  fetch itself), and item 18 introduces zero lines touching
+  `renderTeamBranches()`/`team/branches`.
+- Concretely: open `backlog/deploy-frontend-test-regression-13b` (or
+  similar), spec = "drain `team/branches` in
+  `test_deploy_frontend.js`'s setup, matching
+  `test_smoke_check_frontend.js::setupCase()`'s already-proven technique,"
+  run the full suite, commit, done in one small cycle.
+
+No defects found in the testing pass -- proceeding to the review pass.
+
+## Spec coverage
+All 12 checkbox acceptance criteria in `docs/spec.md` are implemented and
+covered by an automated test, an independently-reproduced manual check,
+or both (see test-case table above; criteria 13-22 are this review's own
+additional verification of edge cases/non-goals/security properties
+beyond the spec's checkbox minimum). No gaps. The two disclosed
+deviations (internal `"locked"` dict key; `"<code> · <ms>ms"` display text
+omitting the literal word "OK") are both confirmed to still satisfy their
+mapped acceptance criteria exactly as written -- neither changes any
+client-visible dict-key contract or the underlying HTTP status-code
+mapping the spec requires, and the "OK" omission maps to a criterion
+("displays the status code and an elapsed time in milliseconds") that
+never requires the literal reason phrase.
+
+## Findings (most severe first)
+None must-fix. None should-fix (beyond the separately-tracked, pre-
+existing `test_deploy_frontend.js` regression above, which is correctly
+scoped as its own follow-up, not a finding against this cycle's diff).
+
+### 1. `.smoke-check-msg` "gone on refresh" has no dedicated regression test -- nit
+- File: `tests/test_smoke_check_frontend.js` (no test covers this
+  specific sequence: fill a result message in, call `refresh()`, assert
+  the message is cleared)
+- Issue: the behavior is structurally guaranteed (`smokeCheckRow()`
+  always emits a fresh empty `.smoke-check-msg` div on every render call,
+  confirmed by direct code read) but not exercised end-to-end by an
+  automated test the way most other acceptance criteria are.
+- Failure scenario: none currently -- this is a coverage gap, not a
+  behavioral bug. If a future change accidentally made the message slot
+  persist (e.g. conditionally preserving prior content), no test in this
+  file would catch the regression. Note: `tests/test_deploy_frontend.js`
+  has the identical gap for `.deploy-msg`, so this isn't a new lapse
+  introduced by this cycle -- it's consistent with (not worse than)
+  existing project convention. Not worth blocking on; a one-line addition
+  to either file's `test_*_frontend.js` in a future pass would close it.
+
+### 2. `expect_contains` has no server-side length cap -- nit
+- File: `app/app.py`, new `smoke_check_run()` (the
+  `expect_contains in body_text` substring check)
+- Issue: the client enforces `maxlength="500"` on the `<input>`, but the
+  server-side route only `.strip()`s `expect_contains` -- an operator (or
+  anyone with a valid session) bypassing the browser could POST an
+  arbitrarily large `expect_contains` string. `body_text` itself is
+  already bounded by `SMOKE_CHECK_MAX_BODY_BYTES` (65536), so the
+  substring search's cost is bounded on one side, and Python's `in`
+  operator uses an efficient substring-search algorithm in practice.
+- Failure scenario: not practically exploitable as a DoS given the
+  already-required session auth (TOTP-gated) and the small bound on the
+  other operand; flagged only because every other size-sensitive input in
+  this codebase (`UPLOAD_MAX_BYTES`, `AI_REVIEWER_MAX_DIFF_BYTES`) has an
+  explicit server-side cap and this one doesn't. Optional follow-up, not
+  required for approval.
+
+## Follow-ups (non-blocking)
+- File `backlog/deploy-frontend-test-regression-13b` (or similar) to fix
+  `tests/test_deploy_frontend.js`'s pre-existing 4/9 failure, using the
+  `setupCase()`-drains-the-extra-fetch technique this cycle's own
+  `test_smoke_check_frontend.js` already proves works. See "Pre-existing
+  `tests/test_deploy_frontend.js` regression" above for the full
+  recommendation and reasoning.
+- Optional: add a server-side cap on `expect_contains` length (finding 2)
+  and/or a dedicated "message clears on refresh" test (finding 1). Neither
+  blocks approval.
+
+## Overall verdict
+**Approve.** All 12 acceptance criteria in `docs/spec.md` are implemented
+and independently verified -- not just re-read from the developer's own
+report. This review's own hands-on checks (not delegated to the
+developer's test suite alone): the timeout path (a raw socket that
+accepts but never responds) and the connection-refused path were each
+reproduced from scratch against the real `smoke_check_run()`, confirming
+the request thread returns within the configured bound with the correct
+error rather than hanging; the `.smoke-btn` contrast ratio was
+recomputed from the literal hex values (7.386:1, matching the claimed
+7.39:1) given this project's prior history of a wrong contrast claim on
+the adjacent `.deploy-btn`/`.team-btn` pairing; and the SSRF-shaped
+concern the spec itself calls out was traced end-to-end through the route
+and `smoke_check_run()` -- no client-supplied value of any kind can reach
+the outbound URL, which is always the server's own trusted
+`_session_urls[name]`. The two disclosed deviations (internal `"locked"`
+marker; display text omitting the literal word "OK") are both confirmed
+cosmetic/mechanism-only and don't change any acceptance criterion's
+outcome. The pre-existing `tests/test_deploy_frontend.js` regression was
+independently confirmed (via `git stash` back to this branch's base
+commit) to genuinely predate this cycle's diff, not be caused or worsened
+by it -- recommended as its own small, separate fix-and-PR (see above),
+not bundled into this commit. Two nits (no dedicated "message clears on
+refresh" test; no server-side cap on `expect_contains` length) do not
+block approval.

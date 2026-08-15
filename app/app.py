@@ -227,6 +227,15 @@ AI_REVIEWER_MAX_ATTEMPTS = int(os.environ.get("AI_REVIEWER_MAX_ATTEMPTS", "3"))
 AI_REVIEWER_STATE_FILE = os.environ.get(
     "AI_REVIEWER_STATE_FILE", "/var/lib/ai-dev-switchboard/ai-reviewer-state.json")
 
+# HTTP-level smoke check (backlog item 18, docs/spec.md) -- a manual,
+# per-project "Smoke check" button that makes a single in-process GET
+# against that project's own already-captured _session_urls entry. Bounded
+# by construction: a request timeout and a capped response-body read, same
+# "never trust an outbound call to behave" discipline AI_REVIEWER_MAX_DIFF_
+# BYTES already established for a different bounded read.
+SMOKE_CHECK_TIMEOUT_SECONDS = int(os.environ.get("SMOKE_CHECK_TIMEOUT_SECONDS", "10"))
+SMOKE_CHECK_MAX_BODY_BYTES = int(os.environ.get("SMOKE_CHECK_MAX_BODY_BYTES", "65536"))
+
 # Team session lifecycle, part 2a (backlog item 6d, docs/spec.md §5) --
 # throttles _team_reap_if_due()'s own opportunistic sweep_dead_teams() call
 # inside _reap_dead_state(), same "not a background thread/timer, throttled
@@ -1649,6 +1658,103 @@ def deploy_run(name: str) -> tuple:
         lock.release()
 
 
+# Per-project non-blocking lock, identical shape to _deploy_locks/
+# _deploy_lock_for above -- a concurrent second smoke check for the same
+# project is dropped (the route maps this to 409), never queued.
+_smoke_check_locks_guard = threading.Lock()
+_smoke_check_locks = {}
+
+
+def _smoke_check_lock_for(name: str) -> threading.Lock:
+    with _smoke_check_locks_guard:
+        lock = _smoke_check_locks.get(name)
+        if lock is None:
+            lock = threading.Lock()
+            _smoke_check_locks[name] = lock
+        return lock
+
+
+def smoke_check_run(name: str, expect_contains: str) -> dict:
+    """Synchronous, request-thread dispatch -- same "manually clicked
+    one-shot action can and should just block the request" reasoning
+    deploy_run()'s own docstring gives. HTTP-level only (backlog item 18,
+    docs/spec.md): a single GET against _session_urls[name], the
+    switchboard's own trusted, server-derived URL for that project (never
+    an arbitrary client-supplied URL, so no SSRF-style concern). Never
+    raises -- every branch below returns a dict; on/OSError-shaped failures
+    from urlopen()/resp.read() are caught and turned into a clean
+    {"ok": False, ...} result instead.
+
+    Returns one of:
+    - {"ok": False, "error": "no captured URL for this project"} -- no
+      _session_urls entry for `name` (engine off, no url_regex, or hasn't
+      printed a matching URL yet). Returned immediately, before the lock is
+      even touched.
+    - {"ok": False, "error": <msg>, "locked": True} -- a check for this
+      project is already in flight. "locked" is an internal-only marker
+      the route below reads (and strips) to answer with HTTP 409, mirroring
+      deploy_run()'s own 409 contract -- never sent to the client verbatim.
+    - {"ok": False, "status_code": None, "elapsed_ms": int, "error": <msg>}
+      -- the request itself never completed (timeout, connection refused,
+      or any other transport-level failure).
+    - {"ok": True, "status_code": int, "elapsed_ms": int,
+       "content_ok": bool | None} -- a completed request, success or not:
+      a 404/500 from the target is a smoke-check RESULT, not a mechanism
+      failure, so it lands here with its real status_code, same as a 200.
+      content_ok is None (never False) when `expect_contains` was empty --
+      "not checked" must stay visibly distinct from "checked and failed".
+    """
+    url = _session_urls.get(name)
+    if url is None:
+        return {"ok": False, "error": "no captured URL for this project"}
+
+    lock = _smoke_check_lock_for(name)
+    if not lock.acquire(blocking=False):
+        return {"ok": False, "error": "a smoke check for this project is already in progress",
+                "locked": True}
+    try:
+        start = time.monotonic()
+        try:
+            with urllib.request.urlopen(url, timeout=SMOKE_CHECK_TIMEOUT_SECONDS) as resp:
+                status_code = resp.status
+                body = resp.read(SMOKE_CHECK_MAX_BODY_BYTES)
+        except urllib.error.HTTPError as e:
+            # Still a completed request -- a 4xx/5xx from the target is a
+            # smoke-check RESULT, not a mechanism failure.
+            status_code = e.code
+            body = e.read(SMOKE_CHECK_MAX_BODY_BYTES) or b""
+        except (urllib.error.URLError, TimeoutError, ConnectionRefusedError) as e:
+            # A bare TimeoutError/ConnectionRefusedError can surface here
+            # un-wrapped (e.g. resp.read() timing out on a stalled body
+            # AFTER urlopen() already returned headers successfully) as well
+            # as wrapped inside URLError.reason (e.g. a refused connection
+            # at connect time) -- unwrap either shape the same way.
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            reason = e.reason if isinstance(e, urllib.error.URLError) else e
+            if isinstance(reason, TimeoutError):
+                error = f"timed out after {SMOKE_CHECK_TIMEOUT_SECONDS}s"
+            elif isinstance(reason, ConnectionRefusedError):
+                error = "connection refused"
+            else:
+                error = str(reason) or "request failed"
+            return {"ok": False, "status_code": None, "elapsed_ms": elapsed_ms, "error": error}
+
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        content_ok = None
+        if expect_contains:
+            # errors="ignore" -- never raise on a non-UTF-8 body, same
+            # decode discipline AI_REVIEWER's own diff-decode already uses.
+            # The substring check only ever sees the (possibly truncated,
+            # per SMOKE_CHECK_MAX_BODY_BYTES) prefix read above -- a match
+            # past the cap is a documented, accepted limitation, not a bug.
+            body_text = body.decode("utf-8", errors="ignore")
+            content_ok = expect_contains in body_text
+        return {"ok": True, "status_code": status_code, "elapsed_ms": elapsed_ms,
+               "content_ok": content_ok}
+    finally:
+        lock.release()
+
+
 def create_project(name: str) -> tuple[bool, str]:
     if not NAME_RE.match(name or ""):
         return False, "Use letters, numbers, spaces, - or _ (must start with a letter/number)."
@@ -2461,6 +2567,24 @@ PAGE_TEMPLATE = """<!doctype html>
   .deploy-msg { font-size: 12px; color: #888; margin: 4px 0 0; min-height: 14px; word-break: break-all; }
   .deploy-msg.success { color: #34c759; }
   .deploy-msg.error { color: #ff6b6b; }
+  /* HTTP-level smoke check (backlog item 18, docs/spec.md) -- .smoke-btn is
+     its OWN class, deliberately NOT reusing .deploy-btn/.team-btn's shared
+     green (#34c759): backlog item 20 already fixed that pairing's text
+     color to #111 for the two existing call sites, but a brand-new control
+     shouldn't inherit any shared button rule's color sight-unseen. Instead
+     reuses #4da6ff/#111 -- the same pairing .pill.code-pill.active already
+     ships elsewhere on this page -- independently verified here (not
+     assumed) at 7.39:1 by WCAG relative luminance, comfortably passing
+     AA's 4.5:1 minimum (see docs/implementation.md for the computed
+     figures). */
+  .smoke-check-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+  .smoke-check-row input { flex: 1; min-width: 140px; font-size: 13px; padding: 8px 10px;
+                            border-radius: 8px; border: 1px solid #333; background: #1c1c1c; color: #eee; }
+  .smoke-btn { font-size: 14px; padding: 10px 16px; border-radius: 10px; border: none;
+               background: #4da6ff; color: #111; font-weight: 600; cursor: pointer; white-space: nowrap; }
+  .smoke-check-msg { font-size: 12px; color: #888; margin: 4px 0 0; min-height: 14px; word-break: break-all; }
+  .smoke-check-msg.success { color: #34c759; }
+  .smoke-check-msg.error { color: #ff6b6b; }
   /* Minimal per-project team control (backlog item 6d, part 2a --
      docs/design.md). Follows .deploy-row/.deploy-btn/.deploy-msg's own
      shape verbatim -- a single-purpose row, not the checkbox-toggle
@@ -2961,6 +3085,32 @@ function deployRow(name, deploy) {
   return '<div class="deploy-row"><button class="deploy-btn" onclick="doDeploy(' +
     "'" + name + "'" + ')">Deploy</button></div>' +
     '<div class="deploy-msg" id="deploy-msg-' + esc(name) + '"></div>';
+}
+// Per-project client state for the optional expect_contains text field
+// (backlog item 18, docs/spec.md) -- survives refresh()'s own full-row
+// re-render the same way teamTaskText already does below, since the input
+// would otherwise be wiped every 4-second poll while the operator is still
+// typing.
+let smokeCheckExpect = {};
+// HTTP-level smoke check (backlog item 18, docs/spec.md). Rendered only
+// when this project currently has a captured hosted URL (inst.url
+// non-null) -- mirrors deployRow()'s own "return '' if not present" shape
+// -- since a direct POST with no captured URL is still handled cleanly
+// server-side, but there is nothing useful to click otherwise. Reused-
+// message slot (.smoke-check-msg) is always rendered empty here;
+// doSmokeCheck() (via handleActionResult()'s own kind === 'smoke-check'
+// branch) fills it in after the POST resolves, and it's gone again on the
+// next refresh() (no persisted history — docs/spec.md non-goals).
+function smokeCheckRow(name, url) {
+  if (!url) return '';
+  const text = smokeCheckExpect[name] || '';
+  return '<div class="smoke-check-row">' +
+    '<input id="smoke-expect-' + esc(name) + '" maxlength="500" ' +
+    'placeholder="optional: text that should appear in the response" value="' + esc(text) + '" ' +
+    'oninput="smokeCheckExpect[' + "'" + name + "'" + '] = this.value">' +
+    '<button class="smoke-btn" onclick="doSmokeCheck(' + "'" + name + "'" + ')">Smoke check</button>' +
+    '</div>' +
+    '<div class="smoke-check-msg" id="smoke-check-msg-' + esc(name) + '"></div>';
 }
 // Per-project client state for the in-progress task text (backlog item 6d,
 // part 2a) -- survives refresh()'s own full-row re-render the same way
@@ -3850,6 +4000,7 @@ function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverr
     (desc ? '<div class="desc">' + esc(desc) + '</div>' : '') +
     '<div class="sub">' + sub + '</div>' +
     (kind === 'inst' ? codeRow(name, codeOn, codeUrl) : '') +
+    (kind === 'inst' ? smokeCheckRow(name, url) : '') +
     (kind === 'inst' ? deployRow(name, deploy) : '') +
     (kind === 'inst' ? teamRow(name, team) : '') +
     '</div>' +
@@ -3870,6 +4021,7 @@ function actionPath(kind, name, on) {
   if (kind === 'team-resolve') return '/projects/' + encodeURIComponent(name) + '/team/resolve';
   if (kind === 'team-board-resolve') return '/projects/' + encodeURIComponent(name) + '/team/board-resolve';
   if (kind === 'team-interject') return '/projects/' + encodeURIComponent(name) + '/team/interject';
+  if (kind === 'smoke-check') return '/projects/' + encodeURIComponent(name) + '/smoke-check';
   return '/instance/' + encodeURIComponent(name) + '/' + (on ? 'on' : 'off');
 }
 function actionBody(kind, name, on, code) {
@@ -3928,6 +4080,16 @@ function actionBody(kind, name, on, code) {
     const el = document.getElementById('interject-' + name);
     body.text = (el ? el.value : (teamInterjectText[name] || '')).trim();
   }
+  // HTTP-level smoke check (backlog item 18, docs/spec.md) -- reads the
+  // still-live input first, falls back to the smokeCheckExpect[] mirror,
+  // same "survives a mid-flow re-render/428 retry" reasoning team-start's
+  // own task-text field already relies on above. Always sent (possibly
+  // empty) -- an empty string is the documented "don't check content" case,
+  // not an omitted field.
+  if (kind === 'smoke-check') {
+    const el = document.getElementById('smoke-expect-' + name);
+    body.expect_contains = (el ? el.value : (smokeCheckExpect[name] || '')).trim();
+  }
   return body;
 }
 async function performAction(kind, name, on, code) {
@@ -3962,6 +4124,7 @@ async function handleActionResult(r, ctx) {
       kind === 'team-resolve' ? 'Submitting answer: ' + (name || 'this') :
       kind === 'team-board-resolve' ? 'Resolving board write: ' + (name || 'this') :
       kind === 'team-interject' ? 'Sending message: ' + (name || 'this') :
+      kind === 'smoke-check' ? 'Smoke checking: ' + (name || 'this') :
       kind === 'clone' ? 'Cloning from URL' :
       (on ? 'Turning on: ' : 'Turning off: ') + (name || 'this');
     document.getElementById('action-code').value = '';
@@ -4116,6 +4279,35 @@ async function handleActionResult(r, ctx) {
     }
     return;
   }
+  if (kind === 'smoke-check') {
+    // Its own inline result slot (docs/spec.md "Proposed approach") --
+    // never the generic setTimeout(refresh, 1500) below, same "persist
+    // until the next refresh() re-render, not wiped almost immediately"
+    // reasoning the deploy branch above already follows. Reads data.ok,
+    // NOT r.ok -- the route answers HTTP 200 for both a successful AND a
+    // target-side-failed completed check (docs/spec.md: "a completed
+    // check (success or target-side failure alike)... 200"); only a
+    // locked-out (409) or unknown-project (404) dispatch has r.ok false
+    // here, and those still carry a plain {ok: false, error} body this
+    // same branch renders correctly either way.
+    hideCodeOverlay();
+    const data = await r.json().catch(() => ({}));
+    const msgEl = document.getElementById('smoke-check-msg-' + name);
+    if (msgEl) {
+      if (data.ok) {
+        let text = data.status_code + ' · ' + data.elapsed_ms + 'ms';
+        if (data.content_ok !== null && data.content_ok !== undefined) {
+          text += data.content_ok ? ' · content: found' : ' · content: NOT found';
+        }
+        msgEl.textContent = text;
+        msgEl.className = 'smoke-check-msg success';
+      } else {
+        msgEl.textContent = data.error || 'Smoke check failed.';
+        msgEl.className = 'smoke-check-msg error';
+      }
+    }
+    return;
+  }
   if (kind === 'newproject') document.getElementById('new-project-name').value = '';
   hideCodeOverlay();
   setTimeout(refresh, 1500);
@@ -4169,6 +4361,18 @@ function doDeploy(name) {
   const msgEl = document.getElementById('deploy-msg-' + name);
   if (msgEl) { msgEl.textContent = 'Deploying…'; msgEl.className = 'deploy-msg'; }
   toggle('deploy', name, true, null);
+}
+// Manual, one-click HTTP-level smoke check (backlog item 18, docs/spec.md)
+// -- same toggle()/performAction()/handleActionResult() plumbing doDeploy()
+// above uses (including the shared TOTP code-overlay retry path), but with
+// NO confirm() dialog: unlike Deploy (mutates a remote target) or Stop team
+// (kills processes and removes worktrees), a GET request against the
+// project's own already-running dev server has no side effect worth a
+// confirmation interruption.
+function doSmokeCheck(name) {
+  const msgEl = document.getElementById('smoke-check-msg-' + name);
+  if (msgEl) { msgEl.textContent = 'Checking…'; msgEl.className = 'smoke-check-msg'; }
+  toggle('smoke-check', name, true, null);
 }
 // Minimal per-project team control (backlog item 6d, part 2a; extended with
 // a composition picker in 6e -- docs/design.md). Client-side validation
@@ -5858,6 +6062,31 @@ class Handler(BaseHTTPRequestHandler):
             if not result["ok"]:
                 return self._json({"error": result["error"]}, 400)
             self._json({"ok": True, "run_id": run_id})
+        elif (parts[0] == "projects" and len(parts) == 3 and parts[2] == "smoke-check"):
+            # HTTP-level smoke check (backlog item 18, docs/spec.md) -- new
+            # /projects/<name>/... sub-resource route (not the older
+            # /instance/<name>/deploy shape), reached through the same
+            # shared TOTP gate above. Body: {"expect_contains": "<string,
+            # may be empty>"}. 404 for an unknown project (checked here,
+            # same as every other per-project route); smoke_check_run()
+            # itself never 404s -- an unknown/URL-less project it can't
+            # reach still completes as a clean {"ok": False, ...} result,
+            # since _session_urls can change between page load and click.
+            name = parts[1]
+            if name not in instance_names():
+                return self._json({"error": "unknown project"}, 404)
+            raw_expect = body.get("expect_contains")
+            expect_contains = raw_expect.strip() if isinstance(raw_expect, str) else ""
+            result = smoke_check_run(name, expect_contains)
+            # "locked" is smoke_check_run()'s own internal-only marker for
+            # lock contention (see its docstring) -- popped here so it
+            # never reaches the client, and mapped to 409, mirroring
+            # deploy_run()'s own 409 contract. Every other completed check
+            # (success or target-side failure alike) is HTTP 200.
+            if result.pop("locked", False):
+                self._json(result, 409)
+            else:
+                self._json(result, 200)
         else:
             self.send_response(404)
             self.end_headers()
