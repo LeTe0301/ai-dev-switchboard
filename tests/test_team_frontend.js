@@ -153,6 +153,14 @@ function createCase() {
       `teamTaskText[${JSON.stringify(name)}] = ${JSON.stringify(text)};`, sandbox);
   }
 
+  // Same vm-lexical-scope reasoning as setTeamTaskText() above, for the
+  // chat-UI compose surface's own draft-text mirror (backlog item 19 part
+  // 2, docs/spec.md "Proposed approach" §1).
+  function setTeamInterjectText(name, text) {
+    vm.runInContext(
+      `teamInterjectText[${JSON.stringify(name)}] = ${JSON.stringify(text)};`, sandbox);
+  }
+
   // Scopes assertions to exactly one project's own <div class="row">...
   // </div> slice, anchored on its <div class="label">NAME</div> — same
   // slicing technique tests/test_deploy_frontend.js's own instanceRowHtml()
@@ -169,6 +177,7 @@ function createCase() {
 
   return {
     sandbox, elements, resolveFetch, call, rowsHtml, instanceRowHtml, setTeamTaskText,
+    setTeamInterjectText,
     pendingFetches,
     confirmCalls,
     setConfirmReturn(v) { confirmReturn = v; },
@@ -181,6 +190,9 @@ function createCase() {
     msgEl(name) { return sandbox.document.getElementById('team-msg-' + name); },
     taskEl(name) { return sandbox.document.getElementById('task-' + name); },
     startBtnEl(name) { return sandbox.document.getElementById('start-btn-' + name); },
+    interjectEl(name) { return sandbox.document.getElementById('interject-' + name); },
+    interjectSendBtnEl(name) { return sandbox.document.getElementById('interject-send-' + name); },
+    interjectCounterEl(name) { return sandbox.document.getElementById('interject-counter-' + name); },
   };
 }
 
@@ -1651,6 +1663,230 @@ test('a team stopping (going idle) clears its feed/escalation client state', asy
   // stay wherever it was left before going idle.
   const c2 = await setupCase([inst('proj', { status: 'running', run_id: 'run-clear-2' })]);
   assert.ok(c2.instanceRowHtml('proj').includes('Hide live feed'));
+});
+
+// ─── Chat-UI compose surface (backlog item 19 part 2, docs/spec.md /
+// docs/design.md) ─────────────────────────────────────────────────────────
+
+test('teamAcceptsInterject() matches exactly the statuses teams.interject() accepts server-side', async () => {
+  const c = await setupCase([inst('proj', null)]);
+  assert.strictEqual(c.call('teamAcceptsInterject', { status: 'running' }), true);
+  assert.strictEqual(c.call('teamAcceptsInterject', { status: 'blocked', waiting_on_you: true }), true);
+  assert.strictEqual(c.call('teamAcceptsInterject', { status: 'blocked', waiting_on_you: false }), false);
+  assert.strictEqual(c.call('teamAcceptsInterject', { status: 'idle' }), false);
+  assert.strictEqual(c.call('teamAcceptsInterject', { status: 'finished' }), false);
+  assert.strictEqual(c.call('teamAcceptsInterject', { status: 'error' }), false);
+  assert.strictEqual(c.call('teamAcceptsInterject', null), false);
+});
+
+test('running renders the compose box (textarea + Send button)', async () => {
+  const c = await setupCase([inst('proj', { status: 'running', run_id: 'run-ij1' })]);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('id="interject-proj"'), 'expected the compose textarea, got: ' + html);
+  assert.ok(html.includes('id="interject-send-proj"'), 'expected the Send button, got: ' + html);
+  assert.ok(html.includes('Send a message to the team…'), 'expected the neutral placeholder, got: ' + html);
+});
+
+test('blocked + waiting_on_you renders BOTH the escalation panel and the compose box, with the context-aware placeholder', async () => {
+  const c = await setupCase([inst('proj', { status: 'blocked', run_id: 'run-ij2', waiting_on_you: true })]);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('class="team-escalation"'), 'expected the escalation panel to still render, got: ' + html);
+  assert.ok(html.includes('id="interject-proj"'), 'expected the compose box to render alongside it, got: ' + html);
+  assert.ok(html.includes('this will not answer the pending question above'),
+    'expected the context-aware placeholder, got: ' + html);
+});
+
+test('idle, finished, error, and blocked-without-waiting_on_you each omit the compose box', async () => {
+  const cases = [
+    inst('proj', null),
+    inst('proj', { status: 'finished', run_id: 'run-1' }),
+    inst('proj', { status: 'error', run_id: 'run-2' }),
+    inst('proj', { status: 'blocked', run_id: 'run-3', waiting_on_you: false }),
+  ];
+  for (const one of cases) {
+    const c = await setupCase([one]);
+    const html = c.instanceRowHtml('proj');
+    assert.ok(!html.includes('id="interject-proj"'),
+      'expected no compose box for status=' + (one.team && one.team.status) + ', got: ' + html);
+  }
+});
+
+test('an empty or whitespace-only draft keeps Send disabled; an over-2000-char draft disables Send and marks the counter over-limit', async () => {
+  const c = await setupCase([inst('proj', { status: 'running', run_id: 'run-ij3' })]);
+  const html1 = c.instanceRowHtml('proj');
+  const sendHtml1 = html1.slice(html1.indexOf('id="interject-send-proj"'), html1.indexOf('</button>', html1.indexOf('id="interject-send-proj"')));
+  assert.ok(sendHtml1.includes('disabled'), 'expected Send disabled with an empty draft, got: ' + sendHtml1);
+
+  c.setTeamInterjectText('proj', 'x'.repeat(2001));
+  c.call('updateTeamInterjectControls', 'proj');
+  assert.strictEqual(c.interjectSendBtnEl('proj').disabled, true, 'expected Send disabled over the 2000-char limit');
+  assert.ok(c.interjectCounterEl('proj').className.includes('over-limit'),
+    'expected the counter to carry the over-limit class');
+
+  c.setTeamInterjectText('proj', '   ');
+  c.call('updateTeamInterjectControls', 'proj');
+  assert.strictEqual(c.interjectSendBtnEl('proj').disabled, true, 'expected Send disabled for a whitespace-only draft');
+
+  c.setTeamInterjectText('proj', 'a real message');
+  c.call('updateTeamInterjectControls', 'proj');
+  assert.strictEqual(c.interjectSendBtnEl('proj').disabled, false, 'expected Send enabled for a real, in-limit draft');
+});
+
+test('clicking Send dispatches POST /projects/<name>/team/interject with {text} and the 428 code-overlay label reads "Sending message: <name>"', async () => {
+  const c = await setupCase([inst('proj', { status: 'running', run_id: 'run-ij4' })]);
+  c.setTeamInterjectText('proj', '  please check the logs  ');
+  c.interjectEl('proj').value = '  please check the logs  ';
+  const p = c.call('doTeamInterject', 'proj');
+  await tick();
+  const f = c.pendingFetches.find((x) => x.url === '/projects/proj/team/interject');
+  assert.ok(f, 'expected a pending POST /projects/proj/team/interject, got: ' +
+    c.pendingFetches.map((x) => x.url).join(', '));
+  assert.strictEqual(f.opts.method, 'POST');
+  assert.strictEqual(JSON.parse(f.opts.body).text, 'please check the logs');
+  c.resolveFetch((x) => x.url === '/projects/proj/team/interject', 428, { error: 'totp_required' });
+  await p;
+  await tick();
+  const label = c.elements.get('code-overlay-label');
+  assert.strictEqual(label.textContent, 'Sending message: proj');
+  c.elements.get('action-code').value = '123456';
+  const p2 = c.call('submitActionCode');
+  await tick();
+  const retry = c.pendingFetches.find((x) => x.url === '/projects/proj/team/interject');
+  assert.ok(retry);
+  const body = JSON.parse(retry.opts.body);
+  assert.strictEqual(body.code, '123456');
+  assert.strictEqual(body.text, 'please check the logs', 'the retry must resend the (still-current) trimmed draft');
+  c.resolveFetch((x) => x.url === '/projects/proj/team/interject', 200, { ok: true, run_id: 'run-ij4' });
+  await p2;
+  await tick();
+});
+
+test('an empty/whitespace draft sends no request and shows a client-side error, mirroring doTeamResolve()', async () => {
+  const c = await setupCase([inst('proj', { status: 'running', run_id: 'run-ij5' })]);
+  c.setTeamInterjectText('proj', '   ');
+  c.call('doTeamInterject', 'proj');
+  await tick();
+  assert.ok(!c.pendingFetches.some((f) => f.url === '/projects/proj/team/interject'),
+    'no fetch should have been dispatched for an empty draft');
+  assert.ok(c.msgEl('proj').textContent.includes('Message must be non-empty'), 'got: ' + c.msgEl('proj').textContent);
+  assert.ok(c.msgEl('proj').className.includes('error'));
+});
+
+test('a successful send shows "Message sent", clears the textarea and the draft mirror, and re-disables Send', async () => {
+  const c = await setupCase([inst('proj', { status: 'running', run_id: 'run-ij6' })]);
+  c.setTeamInterjectText('proj', 'hello team');
+  c.interjectEl('proj').value = 'hello team';
+  c.call('updateTeamInterjectControls', 'proj');
+  const p = c.call('doTeamInterject', 'proj');
+  await tick();
+  c.resolveFetch((f) => f.url === '/projects/proj/team/interject', 200, { ok: true, run_id: 'run-ij6' });
+  await p;
+  await tick();
+  const msg = c.msgEl('proj');
+  assert.strictEqual(msg.textContent, '✓ Message sent');
+  assert.ok(msg.className.includes('success'));
+  assert.strictEqual(c.interjectEl('proj').value, '', 'expected the textarea to be cleared');
+  assert.strictEqual(c.interjectSendBtnEl('proj').disabled, true, 'expected Send to be disabled again after clearing');
+});
+
+test('a failed send preserves the draft text (textarea not cleared) and shows the server error', async () => {
+  const c = await setupCase([inst('proj', { status: 'running', run_id: 'run-ij7' })]);
+  c.setTeamInterjectText('proj', 'a message that will fail');
+  c.interjectEl('proj').value = 'a message that will fail';
+  const p = c.call('doTeamInterject', 'proj');
+  await tick();
+  c.resolveFetch((f) => f.url === '/projects/proj/team/interject', 400,
+    { error: 'run run-ij7 is not accepting messages (status=finished)' });
+  await p;
+  await tick();
+  const msg = c.msgEl('proj');
+  assert.strictEqual(msg.textContent, '✕ Error: run run-ij7 is not accepting messages (status=finished)');
+  assert.ok(msg.className.includes('error'));
+  assert.strictEqual(c.interjectEl('proj').value, 'a message that will fail',
+    'draft must be preserved on failure so the operator can retry without retyping');
+});
+
+test('a human-authored feed event classifies as human-message and renders with the kind-human-message row class', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-human1' })];
+  const c = await setupCase(instances);
+  const events = [
+    { ts: '2026-08-14T12:00:00Z', agent: 'human', seq: 1, kind: 'message', text: 'please verify the schema', meta: {} },
+  ];
+  assert.strictEqual(c.call('teamFeedEventKindClass', events[0], [], 'running'), 'human-message');
+  await openFeedAndDeliverEvents(c, 'proj', events);
+  await rerenderRow(c, instances);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('kind-human-message'), 'expected the kind-human-message row class, got: ' + html);
+  assert.ok(html.includes('please verify the schema'), 'expected the message text rendered, got: ' + html);
+});
+
+test('renderTeamFeed() lists filter pills in order All, lead, human, <member1>, ..., and clicking human filters via the existing generic filter', async () => {
+  const instances = [inst('proj', {
+    status: 'running', run_id: 'run-human2', composition: { lead: null, members: ['helper'] },
+  })];
+  const c = await setupCase(instances);
+  const events = [
+    { ts: '2026-08-14T12:00:00Z', agent: 'lead', seq: 1, kind: 'message', text: 'lead line', meta: {} },
+    { ts: '2026-08-14T12:00:01Z', agent: 'human', seq: 1, kind: 'message', text: 'human line', meta: {} },
+    { ts: '2026-08-14T12:00:02Z', agent: 'helper', seq: 1, kind: 'message', text: 'helper line', meta: {} },
+  ];
+  await openFeedAndDeliverEvents(c, 'proj', events);
+  await rerenderRow(c, instances);
+  let html = c.instanceRowHtml('proj');
+  const allIdx = html.indexOf('>All<');
+  const leadIdx = html.indexOf('>lead<');
+  const humanIdx = html.indexOf('>human<');
+  const helperIdx = html.indexOf('>helper<');
+  assert.ok(allIdx !== -1 && leadIdx !== -1 && humanIdx !== -1 && helperIdx !== -1,
+    'expected all four pills present, got: ' + html);
+  assert.ok(allIdx < leadIdx && leadIdx < humanIdx && humanIdx < helperIdx,
+    'expected pill order All, lead, human, helper, got: ' + html);
+
+  c.call('setTeamFeedFilter', 'proj', 'human');
+  await drainTriggeredRefresh(c, instances);
+  html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('human line') && !html.includes('lead line') && !html.includes('helper line'),
+    'expected only the human event via the existing generic agent filter, got: ' + html);
+});
+
+test('the human filter pill renders even before any interjection has been sent for a run (empty-state parity with other pills)', async () => {
+  const c = await setupCase([inst('proj', { status: 'running', run_id: 'run-human3' })]);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('>human<'), 'expected the human pill unconditionally present, got: ' + html);
+});
+
+test('an unsent draft is discarded once the status transitions to a compose-ineligible one on the next poll', async () => {
+  const running = [inst('proj', { status: 'running', run_id: 'run-ij8' })];
+  const c = await setupCase(running);
+  c.setTeamInterjectText('proj', 'an unsent draft');
+  const finished = [inst('proj', { status: 'finished', run_id: 'run-ij8' })];
+  await rerenderRow(c, finished);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(!html.includes('id="interject-proj"'), 'expected the compose box gone, got: ' + html);
+
+  // A brand-new run later starting for the same project must not resurrect
+  // the stale draft (docs/spec.md "Edge cases").
+  const c2 = await setupCase([inst('proj', { status: 'running', run_id: 'run-ij8-new' })]);
+  const html2 = c2.instanceRowHtml('proj');
+  assert.ok(html2.includes('id="interject-proj"'));
+  assert.ok(html2.includes('placeholder="Send a message to the team…"'),
+    'expected a fresh, empty compose box with no stale draft content, got: ' + html2);
+  assert.ok(!html2.includes('an unsent draft'), 'the stale draft must not reappear in the freshly rendered textarea');
+});
+
+test('a team stopping (going idle) clears the compose-box draft state', async () => {
+  const running = [inst('proj', { status: 'running', run_id: 'run-ij9' })];
+  const c = await setupCase(running);
+  c.setTeamInterjectText('proj', 'draft before stop');
+  const idle = [inst('proj', null)];
+  await rerenderRow(c, idle);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(!html.includes('id="interject-proj"'));
+  // Re-running the same project must not resurrect the stale draft.
+  const c2 = await setupCase([inst('proj', { status: 'running', run_id: 'run-ij9-new' })]);
+  const html2 = c2.instanceRowHtml('proj');
+  assert.ok(html2.includes('placeholder="Send a message to the team…"'),
+    'expected a fresh, empty compose box, got: ' + html2);
 });
 
 // ─── Past team branches panel (backlog item 13) ────────────────────────

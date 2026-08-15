@@ -959,3 +959,77 @@ product-manager pass:**
   agent, not agent → external system) and likely doesn't need the same
   caution, but state that explicitly in the eventual spec rather than
   assuming it transfers.
+
+**Status: shipped, in two parts (2026-08-14).** **Part 1** (backend +
+CLI): `teams.interject(run_id, message)` appends to a new per-run,
+append-only `human.jsonl` — never touches `run.json` directly, so it
+can't race the driving thread's own in-memory state / round-end
+`_persist()` overwrite. `team_step()` drains it via a persisted
+`human_cursor` at the top of its own round, folding messages into the
+lead's next round via a new `_INTERJECT_MITIGATION` prompt clause —
+delivery is at the next round boundary, not mid-in-flight-call (an
+explicit, reasoned non-goal). New `POST /team/interject` route +
+`team-interject` CLI subcommand, non-blocking (the team keeps running).
+`human.jsonl` merges into the existing event feed as
+`agent="human"`/`kind="message"`, reusing the existing envelope — no new
+shape, resolving the backlog's own third open question above. Lead-only,
+not addressable to a specific teammate, resolving the first open question
+above. Trust direction resolved (second-to-last open question above):
+human→agent injection has no external side effect, doesn't need items
+7/8's propose-then-approve caution. Reviewer independently verified the
+concurrency-safety design with real multi-threaded repro scripts (mid-
+round stall + concurrent interject; crash/restart cursor persistence),
+not just a design read. **Part 2** (chat UI): a compose box on the Teams
+page, visible whenever a team is `running` or `blocked` and
+`waiting_on_you` (exact mirror of what part 1 accepts server-side); a
+deliberate decision AGAINST a full chat-bubble redesign of the feed
+(reasoning: ~10 structurally different event kinds across more than two
+participants doesn't fit a two-party bubble layout, and a redesign risked
+breaking 6f part 2's `role="log"`/`aria-live="polite"` accessibility
+contract for no functional gain) — human messages instead get a new
+`.kind-human-message` row style within the existing log-list, plus a new
+`human` filter pill. Live character counter + proactively-disabled Send
+for the 2000-char limit. Both parts reviewer-approved with no must-fix
+findings.
+
+**Should-fix follow-up surfaced twice now, not yet fixed — see new item
+20 below**: `.team-btn`'s white-text-on-`#34c759`-green styling fails
+WCAG AA contrast (actual ~2.2:1, not the ~5:1 `docs/design.md` has
+claimed across at least two separate design-doc sections). Pre-existing,
+not introduced by either part of this item, but flagged again here since
+it's now been independently confirmed twice.
+
+---
+
+## 20. `.team-btn` fails WCAG AA contrast (white text on `#34c759` green)
+
+**Found independently by the reviewer twice** — first during item 16's
+review (`docs/test-review.md`), again during item 19 part 2's review —
+both times marked non-blocking since the styling is pre-existing and
+unmodified by the diff under review at the time. Recording as its own
+item now since two independent confirmations is enough to stop treating
+it as a footnote.
+
+**What's wrong:** `.team-btn`'s white (`#fff`) text on its green
+(`#34c759`) background computes to **≈2.2:1** contrast — well under
+WCAG AA's 4.5:1 minimum for normal text (3:1 even for large/bold text).
+`docs/design.md` has, across at least two separate sections written by
+two different ux-designer dispatches, claimed this pairing passes AA at
+figures like 5.05:1/9.15:1 — both wrong when recomputed from the actual
+hex values, and worth correcting in the doc alongside the real fix so a
+future design pass doesn't inherit the same wrong number a third time.
+
+**Shape of the fix:** darken the green (or lighten/bolden the text) until
+the pairing actually clears 4.5:1 — e.g. a darker `#1e7e34`-class green
+with white text typically clears AA; verify the actual chosen pair with a
+real contrast calculation, not a plausible-sounding guess, given this
+exact class of doc-vs-reality drift is what caused the problem twice
+already. `.team-btn` is used widely (team start/stop/resolve/board-
+resolve/interject, deploy) — a single shared CSS rule change fixes every
+call site at once, no per-button rework needed.
+
+**Open for the future session:** whether other button/control color
+pairings in `app/app.py` have the same undetected drift — a quick
+contrast audit of the page's full CSS palette might be worth doing in the
+same pass rather than fixing `.team-btn` in isolation and finding a third
+instance later.

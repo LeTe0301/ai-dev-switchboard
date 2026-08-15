@@ -165,3 +165,233 @@ against the actual test file and found accurate and reasonable. No
 security, correctness, or scope-creep issues found in the diff. One
 non-blocking nit/follow-up only (promoting the ad hoc concurrency repro
 into the committed suite) -- does not block this cycle.
+
+---
+
+# Test & Review: Backlog item 19 part 2 -- chat-UI compose surface for interjecting into a running team (frontend)
+
+## Scope
+Covers every acceptance criterion in `docs/spec.md` for this cycle (the
+compose box's visibility gate, coexistence with the escalation panel, the
+character counter/disabled-Send guard, the `team-interject` dispatch/
+428-retry/result-handling branch, the `human-message` feed classification +
+filter pill, and draft-discard-on-status-transition), plus independent
+verification of the developer's one disclosed deviation (no in-flight
+Send-disable) against both `docs/spec.md`'s "Non-goals" and the actual
+behavior of every sibling `team-*`/`deploy` action button. Branch:
+`backlog/team-chat-ui-19b`. Frontend-only per spec's own non-goal (no
+`app/teams.py`, route, or data-shape change) -- confirmed via `git diff
+--stat`. Nothing committed by the developer; nothing committed by this
+review.
+
+## Test cases
+
+| # | Criterion / case | Method | Result | Evidence |
+|---|---|---|---|---|
+| 1 | Visibility: `team.status === 'running'` renders the compose box (`#interject-<name>` + `#interject-send-<name>`) | automated | pass | `test_team_frontend.js`: "running renders the compose box (textarea + Send button)" |
+| 2 | Visibility: `team.status === 'blocked' && waiting_on_you === true` renders BOTH the escalation panel and the compose box, with the context-aware placeholder | automated | pass | "blocked + waiting_on_you renders BOTH the escalation panel and the compose box, with the context-aware placeholder" |
+| 3 | Visibility: `idle`, `finished`, `error`, and `blocked` w/ `waiting_on_you === false` (escalated_max_rounds) each individually omit the compose box | automated | pass | "idle, finished, error, and blocked-without-waiting_on_you each omit the compose box" (loops all 4 cases) |
+| 4 | `teamAcceptsInterject()` matches exactly the statuses `teams.interject()` accepts server-side | automated + manual code trace | pass | "teamAcceptsInterject() matches exactly the statuses teams.interject() accepts server-side"; independently traced `app/teams.py:4288-4291` (`interject()`'s own status check) and `app/app.py:5409` (route's own check) and `app/app.py:4930-4989` (status-collapse map + `waiting_on_you` definition) against the frontend predicate myself -- see "Deviation / cross-cutting check" below |
+| 5 | Empty/whitespace draft: Send disabled. Draft > 2000 chars: Send disabled, counter carries `over-limit` | automated | pass | "an empty or whitespace-only draft keeps Send disabled; an over-2000-char draft disables Send and marks the counter over-limit" |
+| 6 | Non-empty ≤2000-char Send click -> `doTeamInterject()` -> `toggle('team-interject', name, true, null)` -> POST `{text: <trimmed>}` [+ `code` on retry] to `/projects/<name>/team/interject`, 428-overlay label `"Sending message: <name>"`, retry resends the same trimmed text | automated | pass | "clicking Send dispatches POST ... and the 428 code-overlay label reads..." |
+| 7 | Empty/whitespace Send click: no request dispatched, client-side error shown | automated | pass | "an empty/whitespace draft sends no request and shows a client-side error, mirroring doTeamResolve()" |
+| 8 | `{"ok": true, ...}` response: `#team-msg-<name>` shows "✓ Message sent" (success), textarea + draft mirror cleared, Send re-disabled | automated | pass | "a successful send shows 'Message sent', clears the textarea and the draft mirror, and re-disables Send" |
+| 9 | `{"error": "..."}` 400 response: `#team-msg-<name>` shows "✕ Error: <server message>" (error), draft preserved (textarea NOT cleared) | automated | pass | "a failed send preserves the draft text (textarea not cleared) and shows the server error" |
+| 10 | A human feed event (`agent: "human"`, `kind: "message"`) -> `teamFeedEventKindClass()` returns `'human-message'`; rendered row carries `kind-human-message` | automated | pass | "a human-authored feed event classifies as human-message and renders with the kind-human-message row class" |
+| 11 | Filter-pill order `All, lead, human, <member1>, ...`; clicking `human` filters via the existing generic `agent === filter` logic, no new filter code path | automated | pass | "renderTeamFeed() lists filter pills in order All, lead, human, <member1>, ..." |
+| 12 | `human` pill renders unconditionally, even before any interjection has been sent | automated | pass | "the human filter pill renders even before any interjection has been sent for a run" |
+| 13 | Unsent draft discarded on transition to a compose-ineligible status; does not resurrect on a later run for the same project | automated | pass | "an unsent draft is discarded once the status transitions to a compose-ineligible one on the next poll" |
+| 14 | Draft discarded on the idle-transition path specifically (`clearTeamFeedState()`'s own new line) | automated | pass | "a team stopping (going idle) clears the compose-box draft state" |
+| 15 | `git diff` for this cycle touches only `app/app.py` (+ tests/docs) -- no `app/teams.py`, route, config, or data-shape change | automated (`git diff --stat`) | pass | `git diff --stat`: only `app/app.py`, `tests/test_team_frontend.js`, `docs/*.md` changed; zero hunks in `app/teams.py` |
+| 16 | `role="log"`/`aria-live="polite"` accessibility contract on the feed genuinely unchanged | manual diff-check (not accepted on the developer's own say-so) | pass | `git diff app/app.py \| grep 'role="log"\|aria-live'` returns **zero** hunks; the only two occurrences of the string in the file are both pre-existing, unmodified lines at `app/app.py:3285-3294` |
+| 17 | XSS: human message text escaped the same way as every other feed entry's text | manual code read | pass | `teamFeedEventBody()`'s generic `kind === 'message' \|\| kind === 'status'` branch (`app/app.py:3216`, unmodified by this diff) applies `esc(e.text \|\| '')`, the same `textContent`-based escaping (`app/app.py:2612-2614`) every other text-bearing branch uses; this branch is untouched code, not new for this cycle |
+| 18 | Client `TEAM_INTERJECT_MAX_CHARS_CLIENT` (2000) actually matches server `teams.TEAM_INTERJECT_MAX_CHARS` default | manual code read | pass (matches default; drift risk is disclosed, not silently missed) | `app/teams.py:199`: `TEAM_INTERJECT_MAX_CHARS = int(os.environ.get("TEAM_INTERJECT_MAX_CHARS", "2000"))` vs. `app/app.py`'s hardcoded `2000` -- see "Deviation / cross-cutting check" below for the drift-handling analysis |
+| 19 | In-flight Send-disable deviation: spec's "Non-goals" is unambiguous, and matches every sibling `team-*`/`deploy` button's actual behavior | manual code read across `doTeamStart`, `doTeamStop`, `doTeamResolve`, `doTeamBoardResolve`, `doDeploy`, and the shared `toggle()`/`performAction()` dispatcher | pass (deviation reasoning confirmed accurate) | See "Deviation / cross-cutting check" below |
+
+## Deviation / cross-cutting check
+
+**In-flight Send-disable (design doc's wireframe vs. spec's Non-goals).**
+Read both documents directly rather than trusting the developer's own
+framing in `docs/implementation.md`:
+- `docs/spec.md` "Non-goals": *"No double-submit / in-flight Send-disable
+  protection beyond what other actions in this app already have. No
+  existing action button (Submit answer, Approve/Reject, Stop team)
+  disables itself while its own POST is in flight ... not introducing a new
+  pattern for this one control alone."* This is unambiguous -- it doesn't
+  hedge or leave room for a UI-only exception.
+- `docs/design.md`'s "Compose box: Sending in Progress" wireframe does show
+  both the textarea and Send button as `[disabled]`, which is a real
+  conflict with the spec, not a developer misreading.
+- I independently read `doTeamStart()` (`app/app.py:3882-3899`),
+  `doTeamStop()` (`3905-3910`), `doTeamResolve()` (`3375-3387`),
+  `doTeamBoardResolve()` (`3395-3400`), `doDeploy()` (`3865-3874`), and the
+  shared `toggle()`/`performAction()` dispatcher (`3825-3855`) all of which
+  every `team-*` action (including the new `team-interject`) funnels
+  through. None of these `do*()` functions, nor `toggle()` itself, ever set
+  `.disabled` on any button or textarea keyed by `name`. The claim "matches
+  every other team-* action button" is accurate, not just plausible.
+- Per this pipeline's own convention (spec is authoritative for scope
+  questions the spec has already explicitly settled; design translates
+  spec into UI shape), implementing per the spec here is correct, and the
+  deviation was disclosed prominently rather than silently resolved. No
+  finding.
+
+**`TEAM_INTERJECT_MAX_CHARS_CLIENT` drift risk (explicitly asked to verify).**
+Confirmed the client hardcodes `2000` (`app/app.py:2716`) and the server
+defaults to the same value via `os.environ.get("TEAM_INTERJECT_MAX_CHARS",
+"2000")` (`app/teams.py:199`) -- they match today. If the env var is ever
+overridden away from `2000`, the two constants drift, and a message the
+client shows as "sendable" (under its own stale 2000-char guard) could still
+draw a late server-side 400. Checked what actually happens in that case: the
+route's own 400 (`app/app.py:5555-5558`) is caught by the *generic*
+`team-interject` branch in `handleActionResult()` (this diff, `app/app.py`
+~3748-3773), which renders `"✕ Error: <server message>"` in the existing
+`.team-msg` slot and preserves the draft for editing/retry -- test #9 above
+exercises this exact code path end-to-end (a 400 for a status-based
+rejection; a length-based 400 would hit the identical branch). This is not
+a crash, a silent failure, or data loss -- it degrades gracefully to the
+same inline-error UX every other action's server-side rejection already
+gets, and the drift is explicitly disclosed in both `docs/spec.md`
+("Non-goals"/"Open questions") and `docs/implementation.md` ("Known
+limitations"), consistent with the pre-existing pattern
+`TEAM_RESOLVE_MAX_CHARS`'s own hardcoded-2000 client guard
+(`doTeamResolve()`) already has. **Not a new should-fix** -- already
+adequately handled and already disclosed; no code or doc change needed.
+
+## Independently recomputed WCAG contrast claims (this cycle's `docs/design.md` section)
+Recomputed relative-luminance contrast from the literal hex values myself
+rather than trusting the stated ratios:
+- `#4da6ff` (new left-border accent) on `#1c1c1c`: **6.666:1** -- matches
+  the design doc's claimed "6.67:1", correctly passes the 3:1 graphical-
+  element threshold. Accurate.
+- `#888888` (counter text) on `#1c1c1c`: **4.808:1**, not the design doc's
+  claimed "6.14:1" (which is actually the `#ff6b6b` over-limit ratio,
+  apparently duplicated onto this line by copy/paste). The stated
+  conclusion ("passes WCAG AA", 4.5:1 threshold for normal text) still
+  holds since 4.808 ≥ 4.5 -- a documentation-accuracy nit, not a real
+  compliance failure.
+- `#ff6b6b` (over-limit counter text) on `#1c1c1c`: **6.141:1** -- matches
+  the design doc's claimed "6.14:1" (correctly stated on its own line, just
+  misapplied to the `#888` line above it too). Accurate.
+- **`#ffffff` Send button text on `#34c759` button background: 2.217:1,
+  not the design doc's claimed "5.05:1"** -- and 2.217:1 **fails WCAG AA**
+  outright (needs ≥4.5:1 at 14px; the button text isn't large enough to
+  qualify for the 3:1 large-text allowance either way). See "Findings"
+  below -- this is real, but pre-existing and out of scope for this cycle's
+  diff, not a new issue this cycle introduced.
+
+## Regression check
+`node tests/test_team_frontend.js` -> **ALL PASS (94/94)** -- 80
+pre-existing + 14 new, matching `docs/implementation.md`'s reported count
+exactly.
+
+Full existing suite: `python3 -m unittest discover -s tests` -> **Ran 1034
+tests in 145.054s -- OK** (zero failures; matches part 1's own baseline
+count exactly, consistent with this cycle being frontend-only and adding no
+new Python tests, as `docs/implementation.md` claims).
+
+`python3 -m py_compile app/app.py app/teams.py` -> clean, no syntax errors.
+
+No lint/type-check tooling exists in this project (no `Makefile`,
+`pyproject.toml`, `.flake8`, or CI config referencing one) -- not
+applicable, consistent with part 1's own review.
+
+## Defects found
+None. Testing pass is clean -- proceeding to the review pass.
+
+---
+
+## Spec coverage
+Every acceptance criterion in `docs/spec.md`'s "Acceptance criteria" list
+(11 items, all checkbox entries) maps to at least one automated test that
+was actually run this session and passed (see test-case table above,
+#1-#15). No criterion is implemented-but-untested or
+tested-but-not-actually-implemented.
+
+Edge cases from `docs/spec.md` not restated as acceptance criteria but
+independently checked: the client/server char-limit drift risk (verified
+above, degrades gracefully); the "no double-submit protection" claim
+(verified above, accurate and matches sibling buttons); the two-tabs-
+concurrent-interject edge case (backend-only, already proven safe in part
+1's own review, correctly not re-litigated here); the accessibility
+contract (`role="log"`/`aria-live="polite"`) genuinely untouched (diff-
+checked, not just claimed).
+
+## Findings (most severe first)
+
+### 1. `docs/design.md`'s Send-button contrast claim is wrong, and the actual pairing fails WCAG AA -- should-fix (follow-up, non-blocking for this cycle)
+- File: `docs/design.md:920` (this cycle's own "Accessibility & platform
+  notes" section; the same claim originates earlier at `docs/design.md:513`,
+  backlog item 16's design section, already merged)
+- Issue: the doc states *"Send button text (#fff) on button background
+  (#34c759): 5.05:1 (passes WCAG AA for large button text; existing token,
+  already audited elsewhere in this design)."* Recomputing WCAG relative
+  luminance from the literal hex values (`.team-btn`'s actual CSS,
+  `app/app.py:2160-2162`: `background: #34c759; color: #fff;`, 14px
+  font-weight 600) gives **2.217:1**, not 5.05:1 -- and 2.217:1 fails WCAG
+  AA outright (needs ≥4.5:1 for normal text; 14px doesn't meet the
+  ≥18.66px/14pt threshold to qualify for the more lenient 3:1 large-text
+  allowance even as bold).
+- Failure scenario: a low-vision or color-deficient operator using this
+  page's dark theme may struggle to read "Send" (and "Start", "Stop team",
+  "Approve"/"Reject", "Deploy", every other `.team-btn`/`.deploy-btn`) --
+  this is a real, currently-shipping accessibility gap across the whole
+  app, not a hypothetical.
+- Why this doesn't block this cycle: the color pairing itself is 100%
+  pre-existing and unmodified by this diff (`.team-btn`'s CSS is untouched;
+  the new Send button is a pure reuse per the spec's own explicit "No new
+  colors introduced" directive). The same wrong claim was already present,
+  unchallenged, in an earlier merged design doc (backlog item 16,
+  `docs/design.md:513`) -- this cycle only repeats/references it
+  ("already audited elsewhere"). Fixing `.team-btn`/`.deploy-btn`'s button
+  styling app-wide is a cross-cutting change well outside this narrow
+  frontend cycle's scope (and outside `docs/spec.md`'s own non-goals).
+- Recommendation: open a small, dedicated follow-up backlog item to fix
+  `.team-btn`/`.deploy-btn` text/background contrast app-wide (e.g. a
+  darker green or black button text), and correct the two now-known-wrong
+  contrast claims across `docs/design.md` while at it.
+
+### 2. Nit: `docs/design.md`'s `#888` counter-text contrast ratio is also mis-stated (copy/paste), though the conclusion happens to still be correct
+- File: `docs/design.md:921` (and the duplicate at `:970` "Accessibility
+  audit" list is not affected, only the numeric claim at the "Color
+  contrast" bullet)
+- Issue: states "Character counter text (#888) on row background (#1c1c1c):
+  6.14:1" -- recomputed actual value is 4.808:1 (the 6.14:1 figure is the
+  `#ff6b6b` over-limit variant's correct ratio, apparently duplicated onto
+  this line). 4.808 ≥ 4.5 so the stated conclusion ("passes WCAG AA")
+  still holds -- this is a documentation-accuracy nit only, not a
+  compliance failure.
+- Recommendation: fix alongside finding #1 if a doc-correction pass is
+  ever done; not worth a dedicated follow-up on its own.
+
+## Follow-ups (non-blocking)
+- Open a dedicated accessibility backlog item: fix `.team-btn`/
+  `.deploy-btn` white-on-`#34c759` button text contrast app-wide (currently
+  ~2.2:1, fails WCAG AA), and correct the two related mis-stated contrast
+  claims in `docs/design.md` (Send button 5.05:1 -> actual ~2.22:1; counter
+  text 6.14:1 -> actual ~4.81:1, conclusion unaffected).
+- Consider adding one explicit XSS-payload test (`<script>`/`<img onerror>`
+  in a human-authored message's text) to `tests/test_team_frontend.js` or
+  the broader feed-rendering suite -- today this is verified only by code
+  reading (the shared, unmodified `esc()`/`teamFeedEventBody()` path), not
+  by a dedicated regression test for any feed event kind, human or
+  otherwise. Not new to this cycle; a pre-existing gap in test coverage.
+
+## Overall verdict
+**Approve.** All 11 acceptance criteria in `docs/spec.md` are implemented
+and covered by automated tests I personally ran this session (94/94 new
+JS suite, 1034/1034 full Python suite, both clean). The compose box's
+visibility gate was independently traced against `teams.interject()`'s own
+status check and the `/status` collapse map, not just trusted to match; the
+`role="log"`/`aria-live="polite"` accessibility contract was diff-checked
+and confirmed genuinely untouched; human-message text escaping was
+confirmed to go through the same `esc()` path every other feed entry uses;
+and the developer's one disclosed deviation (no in-flight Send-disable) was
+independently confirmed accurate against both the spec's literal wording
+and every sibling button's actual code. One should-fix finding was
+surfaced -- `docs/design.md`'s Send-button WCAG contrast claim is wrong and
+the actual pairing fails WCAG AA -- but it is a pre-existing, cross-cutting,
+already-merged issue (inherited from backlog item 16's own design doc, not
+introduced by this diff, and out of scope for this cycle's own non-goals),
+so it is filed as a non-blocking follow-up rather than a blocker. No
+must-fix issues found.

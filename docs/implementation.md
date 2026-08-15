@@ -1608,3 +1608,169 @@ python3 -m unittest discover -s tests
 #   5. `python3 app/teams.py team-interject <run_id> "another message"` --
 #      prints "queued for run <run_id>", exits 0, does not block.
 ```
+
+# Implementation: Backlog item 19 part 2 -- chat-UI-facing surface for interjecting into a running team (frontend)
+
+## Summary
+The human-facing presentation layer on top of item 19 part 1's already-shipped
+backend (`teams.interject()`, `POST /projects/<name>/team/interject`,
+`human.jsonl` merged into `GET .../team/events`): a per-project compose box
+(textarea + Send) on the Teams row, visible exactly when
+`teams.interject()` would accept a message server-side (`running`,
+`blocked_ask_user`, `blocked_board_write` -- i.e. frontend
+`team.status === 'running' || (team.status === 'blocked' &&
+team.waiting_on_you)`), coexisting with the existing escalation panel via a
+context-aware placeholder, a new `.kind-human-message` left-border-accent
+row class + `human` filter pill in the existing merged event feed, and a
+client-side 2000-char counter/guard mirroring `TEAM_INTERJECT_MAX_CHARS`.
+Frontend-only, entirely within `app/app.py`'s inline `<style>`/`<script>`
+blocks -- no `app/teams.py`, route, or data-shape change, per docs/spec.md's
+own explicit non-goal.
+
+## Changes by file
+- `app/app.py`:
+  - New CSS (near the existing `.team-escalation-*`/`.team-feed-*` rules):
+    `.team-interject` (wrapper, reuses `.team-escalation`'s own
+    padding/border/background shape), `.team-interject-row`,
+    `.team-interject-textarea` (byte-for-byte `.team-textarea`'s shape,
+    `flex: 1` added so it shares the row with the Send button),
+    `.team-interject-counter` (+ `.over-limit` modifier, reusing the
+    existing `#ff6b6b` error token), `.team-feed-event.kind-human-message`
+    (`border-left: 3px solid #4da6ff; padding-left: 12px`).
+  - New JS state: `teamInterjectText` (name -> draft string, same
+    survives-a-refresh()/428-retry idiom as `teamTaskText`),
+    `TEAM_INTERJECT_MAX_CHARS_CLIENT = 2000` (hardcoded, mirroring
+    `doTeamResolve()`'s own existing hardcoded-2000 precedent -- see
+    "Deviations from spec" below, none needed here, this is spec-directed).
+  - New JS functions: `teamAcceptsInterject(team)` (single shared visibility
+    predicate), `renderTeamInterjectBox(name, team)`,
+    `updateTeamInterjectControls(name)` (narrow direct-DOM update on
+    `oninput`, matching `updateTeamStartButton()`'s own idiom -- no
+    `refresh()` call, so typing never loses focus/cursor position),
+    `doTeamInterject(name)` (client-side validation, then
+    `toggle('team-interject', name, true, null)`).
+  - `teamFeedEventKindClass()`: one new early-return branch,
+    `if (e.kind === 'message' && e.agent === 'human') return
+    'human-message';`, placed right after the existing `kind === 'error'`
+    check. `teamFeedEventBody()` needed no change -- its existing
+    `message`/`status` catch-all already rendered a human message's text
+    correctly (part 1's own "renders generically even before part 2's
+    styling lands" property).
+  - `renderTeamFeed()`: filter-pill agent list extended from `['lead']` to
+    `['lead', 'human']`.
+  - `actionPath()`: one new `kind === 'team-interject'` branch, POSTs to the
+    already-shipped `/projects/<name>/team/interject`.
+  - `actionBody()`: one new `kind === 'team-interject'` branch, reads the
+    live textarea first, falls back to the `teamInterjectText[]` mirror
+    (same "survives a 428 retry" discipline `team-start`'s own task-text
+    field uses).
+  - `handleActionResult()`: one new 428-label switch entry (`'Sending
+    message: ' + (name || 'this')`) and one new `kind === 'team-interject'`
+    branch, placed before the generic-400 fallback, mirroring
+    `team-resolve`'s own branch shape (success clears the textarea and
+    draft mirror and re-disables Send; failure preserves the draft).
+  - `clearTeamFeedState(name)`: one new line, `delete
+    teamInterjectText[name];`.
+  - `teamRow(name, team)`: one new `interjectBox` variable
+    (`renderTeamInterjectBox(name, team)`), inserted into the non-idle
+    render order between `escalationPanel` and `feedToggle`.
+- `tests/test_team_frontend.js`:
+  - Two new `createCase()` helpers: `setTeamInterjectText(name, text)`
+    (same vm-lexical-scope reasoning as the existing `setTeamTaskText()`)
+    and three new element accessors (`interjectEl`, `interjectSendBtnEl`,
+    `interjectCounterEl`), mirroring `taskEl`/`startBtnEl`.
+  - A new "Chat-UI compose surface" test section (14 new tests), placed
+    right before the existing "Past team branches panel" section (i.e.
+    after the rest of the live-event-feed coverage): visibility across all
+    of `running` / `blocked+waiting_on_you` (coexisting with the escalation
+    panel) / the four ineligible statuses; empty/whitespace/over-limit
+    disabled-Send + `over-limit` counter class; the POST dispatch shape and
+    428-retry label/resend; client-side-rejected empty send; success
+    (clears textarea + draft, re-disables Send) and failure (preserves
+    draft) result rendering; `teamFeedEventKindClass()` returning
+    `'human-message'` and the rendered row carrying
+    `kind-human-message`; the filter-pill order (`All, lead, human,
+    <members...>`) and that clicking `human` filters via the existing
+    generic agent filter; the `human` pill's unconditional presence; and
+    that an unsent draft is discarded on a status transition away from
+    compose-eligible (and does not resurrect for a later run on the same
+    project, or on the project going idle).
+
+## Key decisions / tradeoffs
+- **No disabling of the textarea/Send button while the POST is in flight.**
+  docs/design.md's own wireframe for the "Sending in Progress" state shows
+  both disabled, but docs/spec.md's "Non-goals" explicitly rules this out
+  ("No double-submit / in-flight Send-disable protection beyond what other
+  actions in this app already have... not introducing a new pattern for
+  this one control alone") and no other action button in this app
+  (`team-start`, `team-stop`, `team-resolve`, `team-board-resolve`) disables
+  itself mid-flight either. Implemented per the spec (authoritative over
+  the design doc's own wireframe detail) -- see "Deviations from spec /
+  design" below.
+- **`renderTeamInterjectBox()` proactively deletes a stale draft the moment
+  `teamAcceptsInterject()` returns false**, rather than leaving the delete
+  only to `clearTeamFeedState()`'s idle-transition case -- this is what
+  makes the "running -> finished" acceptance criterion self-contained: the
+  draft is gone the very next time the row renders in a non-idle,
+  non-eligible status (e.g. `finished`/`error`), not only when it falls all
+  the way back to `idle`. `clearTeamFeedState()`'s own added line remains
+  necessary for the idle-transition case specifically, since
+  `renderTeamInterjectBox()` is never called at all once `teamRow()` takes
+  its idle branch.
+- **`teamFeedEventBody()` left untouched**, exactly as docs/spec.md's
+  "Proposed approach" §2 specified -- the existing generic `kind ===
+  'message' || kind === 'status'` catch-all already renders a human
+  message's text correctly; only the CSS *classification* needed a new
+  branch.
+
+## Deviations from spec / design
+- **In-flight disabling (design doc says disabled, spec's "Non-goals" says
+  not to add new disable protection)**: implemented per the spec, which is
+  authoritative for scope decisions per this pipeline's own convention
+  (design translates spec into UI shape; where the two conflict on a scope
+  question the spec already explicitly settled, the spec wins). Flagged
+  here rather than silently resolved, since a reviewer reading only
+  docs/design.md's wireframe could otherwise expect disabled controls
+  during the POST that this implementation does not provide.
+- Everything else implemented per docs/spec.md's own literal
+  pseudocode/DOM-ID shapes ("Proposed approach" §§1-4) and docs/design.md's
+  copy/styling choices (placeholder text, `#4da6ff` left-border accent,
+  `.team-interject-*` class names) -- no other functional deviation.
+
+## Known limitations
+Every "Non-goal"/"Edge case" docs/spec.md already documents as an accepted,
+narrow tradeoff is carried forward unchanged (not re-litigated here):
+`TEAM_INTERJECT_MAX_CHARS_CLIENT` hardcoded to 2000 (drifts silently if the
+server env var is ever overridden -- server-side validation remains
+authoritative regardless), no UI surface for
+`TEAM_HUMAN_MSG_MAX_BYTES_PER_ROUND`, no Enter-to-send, no double-submit
+protection, no messaging a specific teammate directly, no
+edit/withdraw of an already-sent message. No new limitation was introduced
+beyond what docs/spec.md already scoped.
+
+## How to verify locally
+```
+# This cycle's new frontend tests, plus the full existing frontend suite
+# (both run from the real, rendered <script> extracted from
+# app.render_page(), same technique as every other test in this file):
+node tests/test_team_frontend.js
+# ALL PASS (94/94) -- 80 pre-existing + 14 new
+
+# Backend route tests (untouched by this cycle, confirmed unaffected --
+# frontend-only change, no app/teams.py or route edit):
+python3 -m unittest tests.test_team_routes -v
+# Ran 111 tests ... OK
+
+# Full existing suite:
+python3 -m unittest discover -s tests
+# Ran 1034 tests in 145.7s ... OK (unchanged from part 1's own baseline --
+# this cycle is frontend-only and adds no new Python tests)
+
+python3 -m py_compile app/app.py   # syntax check on the modified file -- OK
+```
+
+`git diff --stat` for this cycle: `app/app.py` (+159/-0-ish, additive) and
+`tests/test_team_frontend.js` (+236 new tests/helpers) are the only files
+this developer cycle touched; `docs/spec.md`/`docs/design.md` were already
+written by product-manager/ux-designer before this cycle started, per the
+task brief.
