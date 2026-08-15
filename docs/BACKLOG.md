@@ -717,6 +717,13 @@ restart a running session) is in `docs/spec.md`.
 
 ## 15. Install wizard UI
 
+**Status: shipped in full (2026-08-15), parts 1-3 covering all six shaped
+pieces below (5: part 1; 1: part 2; 2-4: part 3; 6 stays an explicit
+non-goal).** `ct/create.sh`'s Advanced branch now has an optional-feature
+checklist, a Default/Advanced entry fork, live storage/bridge enumeration,
+and hard-block CTID/hostname validation — reviewer should confirm before
+this is treated as fully closed, per the normal approval gate.
+
 **Added 2026-08-14**, user-requested: "install should be an install wizard
 like this picture" — the referenced image was not attached at the time.
 **Reference supplied 2026-08-15**: screenshots + a blog post
@@ -873,13 +880,19 @@ machine actually needs them.
   INSTALL_FLAGS="$INSTALL_FLAGS --with-git-hosting"`) — one conditional
   append per checked item, no new dispatch mechanism needed.
 
-**Open for the future session:** whether step 1 (Default/Advanced fork)
+~~**Open for the future session:** whether step 1 (Default/Advanced fork)
 alone satisfies "install wizard" well enough to ship alone, or whether the
 user wants storage/bridge live-enumeration (steps 2–3) and the checklist
 (step 5) in the same pass; whether validation (step 4) should hard-block
 on failure or just warn and let `pct create`'s own error surface,
 consistent with this project's existing preference for real errors over
-guessed validation.
+guessed validation.~~ **Resolved (2026-08-15, part 3):** all of steps 1-3/5
+shipped together across parts 1-3, not step 1 alone; validation (step 4)
+is a hard block with no "continue anyway" escape hatch, per part 1's own
+settled reasoning (checking CTID/hostname before `pct create` surfaces the
+same rule `pct create` would enforce anyway, just earlier and more
+clearly). Reviewer-confirmed during part 3's test-review pass — see
+`docs/test-review.md` for that cycle.
 
 ---
 

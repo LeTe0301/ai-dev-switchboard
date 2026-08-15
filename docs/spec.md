@@ -1,401 +1,449 @@
-# Spec: Install wizard UI — part 2: Default/Advanced entry fork (BACKLOG item 15, piece 1)
+# Spec: Install wizard UI — part 3: live storage/bridge enumeration + CTID/hostname hard-block validation (BACKLOG item 15, pieces 2-4)
 
 ## Summary
-Add a `whiptail --menu` entry fork ("Default Install" / "Advanced Install")
-at the very start of `ct/create.sh`'s prompt sequence, mirroring
-community-scripts/ProxmoxVE's `install_script()` menu: **Advanced** walks
-the exact prompt sequence `ct/create.sh` already has today, completely
-unchanged (including part 1's optional-feature checklist and its
-taiga/ollama follow-ups); **Default** skips every prompt that already has
-a sensible built-in default, enables zero optional features, and lands the
-operator at one final confirmation screen before `pct create` runs.
+Inside `ct/create.sh`'s Advanced branch only, replace the free-text
+storage-pool and network-bridge `ask()` prompts with live-enumerated
+`whiptail --menu` pickers (`pvesm status -content rootdir` for storage;
+kernel bridges + SDN vnets for network bridges), and add hard-block,
+loop-until-valid CTID/hostname validation before `pct create` is ever
+attempted — closing out BACKLOG item 15 (pieces 2, 3, and 4; piece 1
+shipped in PR #21, piece 5 shipped in PR #20).
 
 ## Routing note
 Workflow: `workflows/feature.md`. Single file (`ct/create.sh`), single
-architectural layer (the `whiptail` TUI prompt sequence) — no schema, API,
-or web-UI layer involved, matching part 1's own routing reasoning. Routes
-through **ux-designer** first for the same reason part 1 did: not for
-visual design (`ui-ux-pro-max`'s normal tooling doesn't apply to a TUI),
-but for entry-menu copy, the two option descriptions, and the exact wording
-of the new Default-path confirmation `msgbox` — refining what's drafted
-below, not inventing new visual design.
+architectural layer (the `whiptail` TUI prompt sequence inside the
+already-existing Advanced branch) — no schema, API, or web-UI layer
+involved, matching parts 1 and 2's own routing reasoning. All three pieces
+(storage enumeration, bridge enumeration, CTID/hostname validation) are
+independent, non-overlapping edits to three different existing `ask()`
+call sites in the same branch of the same file, with no shared state
+beyond variables that already exist — this does not meet the
+load-balanced-decomposition bar for splitting into sub-specs (that bar is
+about work spanning multiple architectural layers — e.g. schema + API +
+UI — not about a file having three independent edit sites in one layer).
+Routes through **ux-designer** first, same reason parts 1/2 did: not for
+visual design, but for the wording of the new menu row descriptions and
+the new hard-block error `msgbox` text.
+
+**This is the last scoped piece of BACKLOG item 15.** After this cycle,
+items 1-5 of the "Shape of the work" list in `docs/BACKLOG.md`'s item 15
+entry are all shipped (1: part 2, 2-4: this part, 5: part 1) and item 6 is
+a standing non-goal. No part 4 is anticipated; item 15 should be marked
+shipped/closed in `docs/BACKLOG.md` once this cycle is reviewer-approved.
 
 ## Goals
-- New `whiptail --menu` shown immediately after the existing intro `msg()`
-  call (today's `ct/create.sh:32`), before what's currently the CTID
-  `ask()` at line 34: two options, `default` and `advanced`, each with a
-  short one-line description (see "Proposed approach" for draft copy;
-  ux-designer owns final wording).
-- **Advanced** path: today's existing flow, unchanged in prompt text,
-  order, and default values — every `ask`/`menu`/`whiptail --checklist`
-  call between today's lines 34-158 (CTID through the optional-feature
-  checklist, taiga/ollama follow-ups, and `PUBLISH_MODE`/`BASE_URL`) keeps
-  running exactly as it does today. This is the "don't regress the
-  existing flow" anchor — Advanced is the pre-existing code path relocated
-  behind a menu choice, not a rewrite.
-- **Default** path: a new branch that, with zero additional dialogs beyond
-  one final confirmation screen:
-  - Resolves `CTID` via the same `pvesh get /cluster/nextid` (fallback
-    `900`) logic the CTID prompt already uses today — computed, not
-    asked, since it's inherently host-specific/dynamic and can't be a
-    static literal the way the other fields below are.
-  - Uses the exact literal default value each other currently-`ask()`ed
-    field already has today: hostname `ai-dev-switchboard`, storage
-    `local-lvm`, disk `8`, cores `2`, memory `2048`, bridge `vmbr0`,
-    ipconfig `dhcp`, template storage `local`, run-user `dev`.
-  - Sets `AUTH_MODE=pve` (checks the switchboard web UI login against this
-    Proxmox host's own real PVE credentials — an already-shipped auth mode,
-    just selected without asking) rather than `simple`, so no
-    username/password needs to be collected or generated for this path at
-    all. See "Open questions" #1 for the reasoning and the alternative
-    considered.
-  - Sets `PUBLISH_MODE=none` / `BASE_URL=""` — matches the existing menu's
-    own first-listed, zero-follow-up option.
-  - Skips part 1's optional-feature checklist entirely: all four
-    `WITH_GIT_HOSTING`/`WITH_CODE_SERVER`/`WITH_TAIGA`/`WITH_OLLAMA` stay
-    `0`, no taiga or ollama follow-up screens are shown. See "Open
-    questions" #2 for why this is gated behind Default/Advanced rather
-    than shown unconditionally — grounded in how community-scripts'
-    own `build.func` treats per-app feature toggles (folded into
-    `advanced_settings()`'s own step walk; Default mode shows zero of
-    them and silently uses whatever's absent-means-off).
-  - Shows exactly one `whiptail --msgbox` immediately before container
-    creation, summarizing every resolved value, so the operator gets one
-    last look before anything is created (mirrors community-scripts' own
-    `echo_default` pre-build summary).
-- Extract the field literals used above into named `DEFAULT_*` constants
-  (`DEFAULT_CT_HOSTNAME`, `DEFAULT_STORAGE`, `DEFAULT_DISK_GB`,
-  `DEFAULT_CORES`, `DEFAULT_MEM_MB`, `DEFAULT_BRIDGE`, `DEFAULT_IPCONFIG`,
-  `DEFAULT_TEMPLATE_STORAGE`, `DEFAULT_RUN_USER`) read by *both* paths —
-  Advanced's `ask()` calls pass `"$DEFAULT_*"` as their pre-fill instead of
-  a repeated literal, and Default's branch assigns from the same variable
-  directly. This is the mechanical device that keeps the two paths from
-  silently drifting apart if one is edited later without the other.
-- A shared `default_ctid()` function (today's
-  `pvesh get /cluster/nextid 2>/dev/null || echo 900` one-liner, extracted)
-  used by both the Advanced CTID prompt's pre-fill and the Default path's
-  silent resolution — same reasoning as the `DEFAULT_*` constants above.
+- **Piece 2 — storage-pool enumeration.** Replace
+  `STORAGE=$(ask "Storage pool for the container's root disk:"
+  "$DEFAULT_STORAGE")` (current `ct/create.sh:84`) with: run `pvesm status
+  -content rootdir`, filter to rows whose `Status` column is `active`,
+  and if one or more remain, present them as a `whiptail --menu` (each row
+  labelled with its storage type and free space, e.g.
+  `local-lvm   lvmthin, 362GiB free`); the operator's selection becomes
+  `STORAGE`. If enumeration yields zero usable pools, fall back to
+  exactly today's free-text `ask()` behavior (see Edge cases).
+- **Piece 3 — network-bridge enumeration.** Replace
+  `BRIDGE=$(ask "Network bridge:" "$DEFAULT_BRIDGE")` (current
+  `ct/create.sh:88`) with: enumerate live kernel bridges (`ip -o link show
+  type bridge`) plus any Proxmox SDN vnets (`/etc/pve/sdn/vnets.cfg`, same
+  file community-scripts' own `_detect_bridges()` reads), and if one or
+  more are found, present them as a `whiptail --menu`; the operator's
+  selection becomes `BRIDGE` (SDN entries are shown prefixed `sdn:` in the
+  menu label for clarity but the prefix is stripped before being used as
+  the actual `-net0 bridge=...` value). If enumeration yields zero
+  results, fall back to exactly today's free-text `ask()` behavior (see
+  Edge cases).
+- **Piece 4 — CTID/hostname hard-block validation.** Wrap both
+  `CTID=$(ask "Container ID (must be free):" "$(default_ctid)")` and
+  `CT_HOSTNAME=$(ask "Hostname:" "$DEFAULT_CT_HOSTNAME")` (current
+  `ct/create.sh:82-83`) each in their own loop-until-valid retry (same
+  interaction shape as the existing ollama endpoint retry loop,
+  `ct/create.sh:158-196`): on invalid input, show a `msgbox` explaining
+  exactly what's wrong and re-show the same `ask()` prompt; on valid
+  input, proceed. This is a **hard block** — there is no "continue
+  anyway" escape hatch, per the reasoning already settled in part 1's
+  spec's "Deferred to a later part" section (preserved below verbatim
+  since part 1's spec.md has since been overwritten by parts 2 and this
+  one):
+
+  > CTID uniqueness (checkable exactly via `pct status "$CTID"`/`pvesh get
+  > /cluster/resources`) and RFC1123 hostname syntax are exact rules `pct
+  > create` itself enforces, not guesses — checking them before `pct
+  > create` and giving a clear whiptail error is strictly better than
+  > surfacing the same rule as a raw `pct create` stack trace later, and
+  > loops the operator back to re-enter the field rather than aborting the
+  > whole run.
+
+  CTID validation: numeric, and in Proxmox's actual valid VMID range
+  (100-999999999 — 1-99 are reserved), and not already in use on this
+  node (`pct status "$CTID"` exits 0 iff a container/VM with that ID
+  already exists locally). Hostname validation: RFC1123 basic shape only
+  — each dot-separated label is 1-63 characters, alphanumeric plus
+  hyphen, must not start or end with a hyphen; overall length <= 253.
+  This is a narrow, mechanical regex/exit-code check, not a
+  reimplementation of Proxmox's full hostname/VMID validation.
+- Default path is completely untouched by all three pieces — it never
+  shows a storage/bridge prompt or a CTID/hostname field to validate in
+  the first place (it uses `DEFAULT_STORAGE`/`DEFAULT_BRIDGE` and
+  `default_ctid()`/`DEFAULT_CT_HOSTNAME` directly, with no validation, by
+  existing intentional design — confirmed not to be touched by this spec).
 
 ## Non-goals
-- **Pieces 2-4 of BACKLOG item 15 are explicitly deferred to a later
-  part**: live storage-pool enumeration (piece 2), live network-bridge
-  enumeration (piece 3), CTID/hostname pre-validation before `pct create`
-  (piece 4). See "Deferred to a later part" below for why this cycle does
-  not bundle them in.
-- Any change to the Advanced path's actual prompt sequence, wording, field
-  ordering, or default values beyond sourcing them from the new
-  `DEFAULT_*` constants — Advanced is a relocation of existing code, not a
-  redesign.
-- Any change to `install.sh`, `app/`, or any web UI code.
-- App-defaults save/reuse file, a "User Defaults" / "Settings" menu entry
-  — community-scripts' own entry menu has these; item 15's backlog entry
-  already excludes them explicitly ("Explicitly out of scope for this
-  item"), unchanged by this spec. The entry menu here has exactly two
-  options: Default, Advanced.
-- Auto-generating a `SIMPLE_PASSWORD` for the Default path (considered and
-  rejected — see "Open questions" #1). `AUTH_MODE=pve` is used instead,
-  which needs no generated secret at all.
-- Building or fixing the "non-interactive... CT_* / SWB_* env vars... see
-  the 'non-interactive' block near the bottom" feature the file's own
-  header comment (`ct/create.sh:13-16`) currently promises but which does
-  not exist anywhere in the file today (verified: no `CT_*`/`SWB_*` env
-  var is read anywhere in the current 240-line file beyond `REPO_URL`/
-  `REPO_BRANCH`). This is a pre-existing inconsistency, not introduced by
-  this change or by part 1 — flagged under "Open questions" #3, not fixed
-  here; a real env-var-driven non-interactive mode is a materially
-  different feature from this spec's whiptail-based Default/Advanced fork
-  and deserves its own scoping pass if pursued.
-
-## Deferred to a later part
-Pieces 2 (live storage-pool enumeration), 3 (live network-bridge
-enumeration), and 4 (CTID/hostname pre-validation, hard-block per part 1's
-already-settled reasoning) are **not** built in this cycle.
-
-This cycle's own open question was whether piece 1 has enough of a
-structural dependency on 2-4 that it needs to bundle them in, or risks
-being a hollow shell without them. Resolved: **no bundling needed.**
-Piece 1's Default path proves out a real, non-hollow behavioral difference
-using only today's *already-existing* static defaults (zero-prompt vs. a
-full walk) — it does not need pieces 2-4 to exist to be meaningful. The
-dependency actually runs the other way: pieces 2-4 are enhancements that
-only make sense *inside* the Advanced branch this spec establishes (Default
-never shows a storage/bridge prompt to enumerate, or a CTID/hostname field
-to validate, in the first place — those prompts simply don't run under
-Default). So piece 1 first, then 2-4 layered into the now-existing Advanced
-branch, is the correct build order, not the reverse. A future
-product-manager pass picks up pieces 2-4 as **part 3** once this part 2 has
-shipped and been reviewed.
+- Extending storage enumeration to `TEMPLATE_STORAGE` (current
+  `ct/create.sh:90`, the OS-template storage prompt). BACKLOG item 15's
+  piece 2 is scoped specifically to `pvesm status -content rootdir` (the
+  root-disk storage prompt); `TEMPLATE_STORAGE` needs `-content vztmpl`
+  instead and was not named in piece 2's scope. The same helper/menu
+  pattern this spec introduces would extend to it cheaply as a fast
+  follow, but adding it here without it being asked for is scope creep —
+  flagged under Open questions instead of silently included.
+- CTID/hostname validation beyond RFC1123 shape and local-node uniqueness
+  — no reachability/DNS checks, no cluster-wide VMID check via `pvesh get
+  /cluster/resources` (local `pct status` is sufficient for this script's
+  existing single-node assumption — `default_ctid()` above it already
+  only calls `pvesh get /cluster/nextid`, which is cluster-aware, but this
+  script otherwise operates against `pct` locally throughout).
+- Storage-space validation (community-scripts' `validate_storage_space()`
+  — checking the chosen pool has enough free space for `DISK_GB`). Not
+  named in item 15's scoped pieces; a plausible future enhancement, not
+  built here.
+- Any step-back/step-state-machine navigation, app-defaults save/reuse,
+  IPv6/MTU/VLAN fields — all already excluded by item 15's backlog entry
+  ("Explicitly out of scope for this item"), unchanged here.
+- Any change to the Default path, to `install.sh`, to `app/`, or to any
+  web UI code.
+- Any change to `DISK_GB`/`CORES`/`MEM_MB`/`IPCONFIG` prompts — untouched,
+  still free-text `ask()` exactly as today.
 
 ## Background / current state
-`ct/create.sh` (240 lines after part 1) is a flat `whiptail`-based TUI: one
-intro `msg()`, then a strictly sequential run of `ask`/`menu`/
-`whiptail --checklist` calls with no branching — CTID, hostname, storage,
-disk, cores, memory, bridge, ipconfig, template storage, run-user
-(`ct/create.sh:34-44`); auth mode + credentials (`46-55`); the
-part-1-shipped optional-feature checklist plus taiga/ollama follow-ups
-(`57-149`); publish mode (`151-158`); then TOTP secret generation, template
-resolution, `pct create`/`pct start`, in-container bootstrap, and the final
-`SUMMARY` msgbox (`160-239`), none of which is touched by this spec — the
-fork only spans lines 34-158, everything from `TOTP_SECRET=...` (line 160)
-onward is shared, unchanged code regardless of which path was taken.
+`ct/create.sh` (288 lines, after parts 1 and 2) has an `if [ "$INSTALL_MODE"
+= "default" ]; then ... else ... fi` fork (`ct/create.sh:54-207`). The
+`else` (Advanced) branch, lines 82-207, is the exact pre-part-2 prompt
+sequence, unchanged by part 2 apart from being relocated inside the
+`else`. The three prompts this spec touches, at their current exact line
+numbers:
 
-Item 15's backlog entry (`docs/BACKLOG.md`, "## 15. Install wizard UI")
-documents, from a direct read of community-scripts/ProxmoxVE's actual
-`misc/build.func` source, that its `install_script()` shows a
-`whiptail --menu` with **Default Install / Advanced Install / User
-Defaults / App Defaults (if saved) / Settings**: Default calls
-`base_settings()` and proceeds immediately with zero further prompts;
-Advanced additionally walks `advanced_settings()`, an explicit step
-state-machine covering every container-spec field. This spec adopts the
-Default/Advanced fork itself (piece 1), not the state-machine/step-back
-navigation (that's a separate, larger piece of the researched pattern,
-not part of item 15's scoped pieces 1-5) or the User-Defaults/App-Defaults
-entries (explicitly excluded, see "Non-goals").
+```
+82  CTID=$(ask "Container ID (must be free):" "$(default_ctid)")
+83  CT_HOSTNAME=$(ask "Hostname:" "$DEFAULT_CT_HOSTNAME")
+84  STORAGE=$(ask "Storage pool for the container's root disk:" "$DEFAULT_STORAGE")
+...
+88  BRIDGE=$(ask "Network bridge:" "$DEFAULT_BRIDGE")
+```
 
-Re-checked directly against `misc/build.func` this session (not assumed
-from memory) for how community-scripts itself handles the specific
-question this cycle needed answered — is a feature-toggle checklist a
-separate concept from the Default/Advanced container-spec fork, or does
-everything go through the one fork: their `default_var_settings()` shows
-**no** interactive prompts of any kind, loading everything (including
-optional per-app toggles like `var_fuse`/`var_tun`/`var_gpu`) from
-`ENV var_* > default.vars > built-ins` — absent means off. There is **no
-dedicated checklist UI** for feature toggles in their framework; toggles
-that do get asked interactively are folded into `advanced_settings()`'s
-own step walk (individual yes/no prompts among its other steps), gated
-behind Advanced exactly the same as every container-spec field. This
-directly answers this cycle's second open question (see Goals, and "Open
-questions" #2): the precedent is to gate optional-feature prompting behind
-Default/Advanced, not to treat it as orthogonal.
+`default_ctid()` (`ct/create.sh:50-52`) already calls `pvesh get
+/cluster/nextid`, so a fresh CTID suggestion is already collision-free by
+construction — validation only matters when the operator *overrides* the
+suggested default with something else, which `ask()` always allows.
+
+Re-checked `misc/build.func` (community-scripts/ProxmoxVE) directly this
+session for the bridge-enumeration mechanism, per this cycle's
+instructions, rather than guessing: its `_detect_bridges()` helper (inside
+`advanced_settings()`) parses `/etc/network/interfaces` and
+`/etc/network/interfaces.d/*` line-by-line for `iface`/`bridge-ports`/
+`bridge_vlan-aware`/`ovs_type OVSBridge` keywords to build `BRIDGES`, then
+separately reads Proxmox SDN vnets via `awk '/^vnet:/{print $2}'
+/etc/pve/sdn/vnets.cfg`, prefixing SDN entries `sdn:` in the resulting
+`BRIDGE_MENU_OPTIONS`.
+
+**Deliberate deviation, flagged explicitly:** this spec does not port
+`_detect_bridges()`'s text-parsing of `/etc/network/interfaces` verbatim.
+Per item 15's own backlog guidance ("borrow the *pattern*, not the
+*code*") and this project's "no shared framework, just pct and whiptail"
+design constraint, this spec instead uses `ip -o link show type bridge`
+to read live kernel bridge state directly via `iproute2` (already present
+on every Debian/Proxmox host, no config-file parsing/regex fragility) —
+functionally equivalent for this script's purpose (every bridge a
+container could actually attach to is, by definition, an up kernel
+bridge), simpler, and more robust than re-parsing ifupdown config syntax
+in bash. The SDN-vnet half (`/etc/pve/sdn/vnets.cfg` via the same `awk`
+one-liner) is kept as-is since it is already exactly this simple. This is
+called out here per skill 5's "flag deliberate deviations" rule, not
+silently substituted.
+
+`pvesm status -content rootdir` output (confirmed via Proxmox
+documentation/forum references, columns are header + one row per storage):
+```
+Name             Type     Status           Total            Used       Available        %
+local            dir      active        101584140        13735316        82694508  13.52%
+local-lvm        lvmthin  active        380526592               0       380526592   0.00%
+```
+Column 1 = name, column 2 = type, column 3 = status, column 6 = available
+(KiB). Rows with `Status != active` (e.g. a misconfigured/unreachable NFS
+mount showing `unknown`) are excluded from the menu — an inactive pool
+would fail `pct create` immediately anyway, so offering it in the picker
+would just relocate the same failure one step later.
 
 ## Proposed approach
 
-### 1. Entry menu (new, inserted after today's `ct/create.sh:32`)
+### Shared helpers (added near the existing `msg`/`ask`/`askpw`/`yesno`/
+`menu` block, `ct/create.sh:26-30`)
 ```bash
-INSTALL_MODE=$(whiptail --title "ai-dev-switchboard" --menu \
-    "How do you want to configure this container?" 15 74 2 \
-    "default"  "Recommended settings, zero extra prompts" \
-    "advanced" "Walk every setting yourself (container specs + optional features)" \
-    3>&1 1>&2 2>&3)
-```
-(ux-designer to refine the two description strings and title/box sizing;
-draft copy above conveys the mechanism only.)
+_valid_hostname() {
+    local _h="$1" _label
+    [ -n "$_h" ] && [ "${#_h}" -le 253 ] || return 1
+    local _old_ifs=$IFS
+    IFS='.'
+    for _label in $_h; do
+        IFS=$_old_ifs
+        [[ "$_label" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || return 1
+        IFS='.'
+    done
+    IFS=$_old_ifs
+    return 0
+}
 
-### 2. Shared defaults (new, above the fork)
-```bash
-DEFAULT_CT_HOSTNAME="ai-dev-switchboard"
-DEFAULT_STORAGE="local-lvm"
-DEFAULT_DISK_GB="8"
-DEFAULT_CORES="2"
-DEFAULT_MEM_MB="2048"
-DEFAULT_BRIDGE="vmbr0"
-DEFAULT_IPCONFIG="dhcp"
-DEFAULT_TEMPLATE_STORAGE="local"
-DEFAULT_RUN_USER="dev"
+_enumerate_storage() {
+    STORAGE_MENU_OPTS=()
+    local _line _name _type _status _avail _desc
+    while IFS= read -r _line; do
+        _name=$(awk '{print $1}' <<<"$_line")
+        _type=$(awk '{print $2}' <<<"$_line")
+        _status=$(awk '{print $3}' <<<"$_line")
+        _avail=$(awk '{print $6}' <<<"$_line")
+        [ "$_status" = "active" ] || continue
+        if command -v numfmt >/dev/null 2>&1 && [[ "$_avail" =~ ^[0-9]+$ ]]; then
+            _desc="${_type}, $(numfmt --to=iec --suffix=B $((_avail * 1024)) 2>/dev/null) free"
+        else
+            _desc="$_type"
+        fi
+        STORAGE_MENU_OPTS+=("$_name" "$_desc")
+    done < <(pvesm status -content rootdir 2>/dev/null | tail -n +2)
+}
 
-default_ctid() {
-    pvesh get /cluster/nextid 2>/dev/null || echo 900
+_enumerate_bridges() {
+    BRIDGE_MENU_OPTS=()
+    local _br _vnet
+    while IFS= read -r _br; do
+        [ -n "$_br" ] && BRIDGE_MENU_OPTS+=("$_br" "kernel bridge")
+    done < <(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1)
+    if [ -f /etc/pve/sdn/vnets.cfg ]; then
+        while IFS= read -r _vnet; do
+            [ -n "$_vnet" ] && BRIDGE_MENU_OPTS+=("sdn:${_vnet}" "SDN vnet")
+        done < <(awk '/^vnet:/{print $2}' /etc/pve/sdn/vnets.cfg 2>/dev/null)
+    fi
 }
 ```
+(`numfmt`'s bytes conversion multiplies by 1024 because `pvesm status`'s
+`Available` column is in KiB, per the sample output above; if `numfmt` is
+unavailable — unlikely on Debian, but not assumed — the description just
+omits the free-space figure rather than failing.)
 
-### 3. The fork itself (replaces today's `ct/create.sh:34-158`)
+### Piece 4 — replace `ct/create.sh:82-83`
 ```bash
-if [ "$INSTALL_MODE" = "default" ]; then
-    CTID=$(default_ctid)
-    CT_HOSTNAME="$DEFAULT_CT_HOSTNAME"
-    STORAGE="$DEFAULT_STORAGE"
-    DISK_GB="$DEFAULT_DISK_GB"
-    CORES="$DEFAULT_CORES"
-    MEM_MB="$DEFAULT_MEM_MB"
-    BRIDGE="$DEFAULT_BRIDGE"
-    IPCONFIG="$DEFAULT_IPCONFIG"
-    TEMPLATE_STORAGE="$DEFAULT_TEMPLATE_STORAGE"
-    RUN_USER="$DEFAULT_RUN_USER"
-
-    AUTH_MODE="pve"
-    SIMPLE_USERNAME=""
-    SIMPLE_PASSWORD=""
-
-    WITH_GIT_HOSTING=0
-    WITH_CODE_SERVER=0
-    WITH_TAIGA=0
-    WITH_OLLAMA=0
-    OLLAMA_BASE_URL_NORM=""
-    OLLAMA_MODEL_INPUT=""
-
-    PUBLISH_MODE="none"
-    BASE_URL=""
-
-    whiptail --title "ai-dev-switchboard" --msgbox "About to create:\n\n  CTID: ${CTID}\n  Hostname: ${CT_HOSTNAME}\n  Storage: ${STORAGE} (${DISK_GB}G disk)\n  CPU / RAM: ${CORES} cores / ${MEM_MB}MB\n  Network: bridge ${BRIDGE}, ${IPCONFIG}\n  Run-as user: ${RUN_USER}\n  Login: your Proxmox VE credentials\n  Optional features: none enabled\n  Terminal publishing: loopback only\n\nPress Enter to create it, or Cancel to abort." 20 74
-else
+while :; do
     CTID=$(ask "Container ID (must be free):" "$(default_ctid)")
+    if ! [[ "$CTID" =~ ^[0-9]+$ ]] || [ "$CTID" -lt 100 ] || [ "$CTID" -gt 999999999 ]; then
+        msg "Container ID must be a number between 100 and 999999999 (got '$CTID')."
+        continue
+    fi
+    if pct status "$CTID" >/dev/null 2>&1; then
+        msg "Container ID $CTID is already in use on this host. Choose a different one."
+        continue
+    fi
+    break
+done
+
+while :; do
     CT_HOSTNAME=$(ask "Hostname:" "$DEFAULT_CT_HOSTNAME")
+    if ! _valid_hostname "$CT_HOSTNAME"; then
+        msg "'$CT_HOSTNAME' is not a valid hostname (letters, digits, hyphens; each dot-separated label 1-63 characters; can't start or end with a hyphen)."
+        continue
+    fi
+    break
+done
+```
+Whiptail Cancel inside either `ask()` call still aborts the whole run
+immediately (pre-existing `set -euo pipefail` behavior identical to every
+other `ask()` in the file — not a new edge case introduced by the retry
+loop, which only re-prompts on *validation failure*, not on Cancel).
+
+### Piece 2 — replace `ct/create.sh:84`
+```bash
+_enumerate_storage
+if [ "${#STORAGE_MENU_OPTS[@]}" -eq 0 ]; then
     STORAGE=$(ask "Storage pool for the container's root disk:" "$DEFAULT_STORAGE")
-    DISK_GB=$(ask "Disk size (GB):" "$DEFAULT_DISK_GB")
-    CORES=$(ask "CPU cores:" "$DEFAULT_CORES")
-    MEM_MB=$(ask "Memory (MB):" "$DEFAULT_MEM_MB")
-    BRIDGE=$(ask "Network bridge:" "$DEFAULT_BRIDGE")
-    IPCONFIG=$(ask "IP config (dhcp, or e.g. 192.168.1.50/24,gw=192.168.1.1):" "$DEFAULT_IPCONFIG")
-    TEMPLATE_STORAGE=$(ask "Storage where the Debian 12 container template lives/downloads to:" "$DEFAULT_TEMPLATE_STORAGE")
-    RUN_USER=$(ask "Unprivileged user to run coding sessions as (created inside the container):" "$DEFAULT_RUN_USER")
-
-    AUTH_MODE=$(menu "How should the web UI authenticate you?" \
-        "simple" "A single username + password you set now" \
-        "pve"    "Real Proxmox VE credentials (checked against this host's API)")
-
-    SIMPLE_USERNAME=""
-    SIMPLE_PASSWORD=""
-    if [ "$AUTH_MODE" = "simple" ]; then
-        SIMPLE_USERNAME=$(ask "Web UI username:" "admin")
-        SIMPLE_PASSWORD=$(askpw "Web UI password:")
-    fi
-
-    # ...today's existing checklist block (ct/create.sh:57-78), taiga
-    # follow-up (80-82), and ollama follow-up (84-149) — unchanged, moved
-    # verbatim into this branch...
-
-    PUBLISH_MODE=$(menu "How should per-project ttyd/VS Code terminals be published beyond this container?" \
-        "none"      "Loopback only — you handle exposing them yourself" \
-        "tailscale" "Publish via 'tailscale serve --set-path' (requires tailscale installed+logged in later)")
-
-    BASE_URL=""
-    if [ "$PUBLISH_MODE" = "tailscale" ]; then
-        BASE_URL=$(ask "Tailnet hostname per-project terminals get published under (see 'tailscale status' inside the container later — leave blank to fill in afterward):" "")
-    fi
+else
+    _storage_rows=$(( ${#STORAGE_MENU_OPTS[@]} / 2 ))
+    _storage_listheight=$(( _storage_rows < 8 ? _storage_rows : 8 ))
+    STORAGE=$(whiptail --title "ai-dev-switchboard" --menu \
+        "Storage pool for the container's root disk:" \
+        "$(( _storage_listheight + 9 ))" 78 "$_storage_listheight" \
+        "${STORAGE_MENU_OPTS[@]}" 3>&1 1>&2 2>&3)
 fi
 ```
-Everything from today's `TOTP_SECRET=...` (`ct/create.sh:160`) onward is
-untouched, outside this `if`/`else`, and runs identically regardless of
-which branch executed.
+
+### Piece 3 — replace `ct/create.sh:88`
+```bash
+_enumerate_bridges
+if [ "${#BRIDGE_MENU_OPTS[@]}" -eq 0 ]; then
+    BRIDGE=$(ask "Network bridge:" "$DEFAULT_BRIDGE")
+else
+    _bridge_rows=$(( ${#BRIDGE_MENU_OPTS[@]} / 2 ))
+    _bridge_listheight=$(( _bridge_rows < 8 ? _bridge_rows : 8 ))
+    BRIDGE=$(whiptail --title "ai-dev-switchboard" --menu \
+        "Network bridge:" \
+        "$(( _bridge_listheight + 9 ))" 78 "$_bridge_listheight" \
+        "${BRIDGE_MENU_OPTS[@]}" 3>&1 1>&2 2>&3)
+    BRIDGE="${BRIDGE#sdn:}"
+fi
+```
+
+All four blocks stay inside the existing `else` (Advanced) branch,
+between the current `else` (line 81) and the existing `DISK_GB=$(ask
+...)` line — insertion order (CTID/hostname validation first, then
+storage, unchanged disk/cores/mem, then bridge, unchanged ipconfig/
+template-storage/run-user) matches the file's existing field order
+exactly; no field is reordered.
 
 ## Affected areas
-- `ct/create.sh` only — single file, the prompt-sequence section
-  (`ct/create.sh:32-158` today). No schema, API, or web UI code involved.
-- No changes to `install.sh`, `app/`, or `config/`.
+- `ct/create.sh` only — the four helper functions (added near the
+  existing helper block) plus the four `ask()` call sites inside the
+  Advanced branch (`ct/create.sh:82-83-84-88` at current line numbers;
+  will shift once the CTID/hostname loops are inserted, since they add
+  lines above the storage prompt — developer should re-read the file
+  after each edit rather than trusting these line numbers past the first
+  change). No other file changes.
 
 ## Edge cases
-- **Cancel/Esc at the new entry menu itself**: `whiptail --menu`'s Cancel
-  exit code makes the `INSTALL_MODE=$(...)` assignment fail under
-  `set -euo pipefail`, aborting the whole run before anything else runs —
-  consistent with every other dialog's existing Cancel-aborts behavior in
-  this file.
-- **Default path, `pvesh get /cluster/nextid` fails** (host not clustered,
-  API transiently unreachable): falls back to `900`, identical to today's
-  existing CTID-prompt fallback — no new failure mode.
-- **Default path, resolved CTID collides with an existing container**
-  (race, stale `nextid`, or simply already in use): `pct create` fails
-  with Proxmox's own real error — identical to today's unvalidated-CTID
-  behavior in the existing flow; catching this ahead of time is
-  explicitly piece 4's job (deferred, see "Deferred to a later part").
-- **Default path, `local-lvm`/`local` don't actually exist on this
-  particular host**: `pveam`/`pct create` fail with Proxmox's own real
-  error — identical to today's unvalidated-storage behavior; catching this
-  ahead of time is explicitly piece 2's job (deferred).
-- **Default path final confirmation msgbox, Cancel pressed**: aborts the
-  whole run, no container created — same Cancel-aborts precedent as every
-  other dialog in the file, including the pre-existing one (see part 1's
-  own reviewer finding) that whiptail's Cancel and "No" are
-  indistinguishable inside an `if whiptail --yesno; then...else...fi`
-  idiom; this new confirmation uses a plain `--msgbox` (informational,
-  single dismiss button) so no such ambiguity applies here.
-- **Advanced path chosen**: zero behavior change versus pre-change
-  `ct/create.sh` — a diff of the Advanced branch's body against the
-  pre-change file (outside the `if`/`else` wrapper and the
-  literal-to-`$DEFAULT_*`-variable substitutions) should show no
-  structural change: same prompts, same order, same resolved default
-  values.
-- **No live switching between Default and Advanced mid-run**: once a path
-  is chosen and begins, there is no back-navigation to the entry menu —
-  consistent with this file's existing lack of step-back navigation
-  elsewhere (noted as a known gap in the backlog's own research, not
-  something this piece adds or removes).
+- **Zero active storage pools found by `pvesm status -content rootdir`**
+  (e.g. a fresh host with only backup/ISO storage, no rootdir-capable
+  pool visible) — falls back to today's free-text `ask()` with
+  `DEFAULT_STORAGE` as the shown default, identical to pre-this-spec
+  behavior. Explicit decision, not an oversight (per Goals/Proposed
+  approach above).
+- **Zero bridges found** (no kernel bridge up, no SDN vnets configured —
+  practically rare since `vmbr0` normally exists on any real PVE host,
+  but possible on a minimal/testing host) — same fallback to free-text
+  `ask()` with `DEFAULT_BRIDGE`.
+- **Exactly one storage pool / one bridge found** — still shown as a
+  one-row `whiptail --menu`, not auto-selected. (community-scripts
+  auto-picks silently when there's exactly one pool; this spec
+  deliberately keeps the operator's explicit confirmation step even for a
+  single option, consistent with this project's existing "no silent
+  skip once you're in Advanced" posture — Advanced means every field is
+  shown. Flagged here as a deliberate, minor deviation from the
+  researched pattern rather than left implicit.)
+- **CTID re-entered identical to a rejected value** — loop re-validates
+  identically each pass; no infinite-loop risk beyond the operator simply
+  retyping the same bad value forever, same as the existing ollama retry
+  loop's behavior.
+- **Hostname containing uppercase letters** — RFC1123 technically permits
+  them in the syntax sense though DNS resolution normalizes to lowercase;
+  `_valid_hostname`'s regex accepts uppercase (matches
+  `[a-zA-Z0-9]`), consistent with `validate_hostname`-style checks being
+  about *shape*, not about forcing case normalization the operator didn't
+  ask for.
+- **`pct status "$CTID"` exit code when CTID belongs to a VM, not a
+  container** — `pct status` still exits 0 for a VMID that's a QEMU VM
+  (Proxmox VMIDs are shared across the whole `pct`/`qm` namespace, and
+  `pct status` on a VM's ID errors with a message but the important part
+  — the ID being taken — is what matters here); either way a non-zero
+  exit means the ID is genuinely free, a zero exit means it is not,
+  regardless of which resource type owns it — correct behavior either
+  way for this check's purpose (must the ID be free), no special-casing
+  needed.
+- **`numfmt` unavailable** — storage menu descriptions omit the free-space
+  figure and show just the storage type; does not block the picker itself
+  from working.
+- **Non-Proxmox test environment (no `pct`/`pvesm`/`ip -o link show type
+  bridge` returning real data)** — same preflight as today
+  (`ct/create.sh:22`, `command -v pct` already hard-required at the top
+  of the file); this spec does not change that requirement, and the
+  reviewer's testing pass should mock/stub `pvesm status`/`pct
+  status`/`ip -o link show` output rather than requiring a live Proxmox
+  host, matching how prior parts' shell-level logic was already
+  reviewer-tested by argument/output stubbing rather than requiring real
+  infrastructure.
 
 ## Acceptance criteria
-- [ ] Given the operator selects "Default Install", when the script
-      proceeds, then no `ask`/`menu`/`whiptail --checklist` dialog is shown
-      for CTID, hostname, storage, disk, cores, memory, bridge, ipconfig,
-      template storage, run-user, auth mode, optional features, or publish
-      mode — only the entry menu itself and the one final confirmation
-      `msgbox` are shown.
-- [ ] Given "Default Install", when the script proceeds, then
-      `AUTH_MODE=pve`, all four `WITH_*` flags are `0`,
-      `OLLAMA_BASE_URL_NORM`/`OLLAMA_MODEL_INPUT` are empty,
-      `PUBLISH_MODE=none`, `BASE_URL=""`, `RUN_USER=dev`, and every other
-      field equals its corresponding `DEFAULT_*` constant (hostname
-      `ai-dev-switchboard`, storage `local-lvm`, disk `8`, cores `2`,
-      memory `2048`, bridge `vmbr0`, ipconfig `dhcp`, template storage
-      `local`), verifiable by extracting the Default branch into a
-      standalone harness with `ask`/`menu`/`whiptail` stubbed out (same
-      technique part 1's reviewer used) and asserting on the resulting
-      variable values.
-- [ ] Given "Advanced Install", when the script proceeds, then every
-      dialog from today's existing flow (CTID through the ollama
-      follow-up through publish mode) is shown, in the same order, with
-      the same prompt text and the same default value as before this
-      change — confirmed by diffing the Advanced branch's body against
-      pre-change `ct/create.sh:34-158`.
-- [ ] Given either path, when it completes, then both converge on the
-      identical set of variable names and both leave every one of them
-      set to a defined (possibly empty-string) value before reaching
-      today's unchanged `TOTP_SECRET=...` line — no variable is
-      conditionally undefined depending on which path ran.
-- [ ] Given "Default Install", when the final confirmation `msgbox` is
-      shown, then it lists the resolved CTID, hostname, storage+disk,
-      cores+memory, bridge+ipconfig, run-user, "your Proxmox VE
-      credentials" for login, "none enabled" for optional features, and
-      "loopback only" for publishing — before any `pct create` call is
-      reached in the script.
-- [ ] `bash -n ct/create.sh` and `shellcheck ct/create.sh` both pass with
-      zero errors and no new warnings versus the pre-change file, matching
-      part 1's own testing bar.
+- [ ] Given the Advanced path and `pvesm status -content rootdir`
+      returning two or more `active` rows, when the storage step is
+      reached, then a `whiptail --menu` is shown listing each active
+      pool's name with a type+free-space description, and the operator's
+      selection is used as `STORAGE`.
+- [ ] Given the Advanced path and `pvesm status -content rootdir`
+      returning zero `active` rows, when the storage step is reached,
+      then the original free-text `ask()` prompt (with `DEFAULT_STORAGE`
+      as its shown default) is shown instead, unchanged from pre-this-spec
+      behavior.
+- [ ] Given the Advanced path and one or more kernel bridges (`ip -o link
+      show type bridge`) and/or SDN vnets present, when the bridge step is
+      reached, then a `whiptail --menu` is shown listing them, an SDN
+      entry's `sdn:` label prefix is stripped before being assigned to
+      `BRIDGE`, and the operator's selection becomes `BRIDGE`.
+- [ ] Given the Advanced path and zero bridges/vnets found, when the
+      bridge step is reached, then the original free-text `ask()` prompt
+      (with `DEFAULT_BRIDGE` as its shown default) is shown instead.
+- [ ] Given the Advanced path and a non-numeric or out-of-range
+      (<100 or >999999999) CTID entered, when the CTID step's `ask()`
+      returns, then a `msgbox` explains the problem and the same `ask()`
+      prompt is re-shown (the run does not proceed to the hostname step
+      or abort).
+- [ ] Given the Advanced path and a CTID that `pct status` reports as
+      already in use, when the CTID step's `ask()` returns, then a
+      `msgbox` explains the collision and the same `ask()` prompt is
+      re-shown.
+- [ ] Given the Advanced path and a numeric, unused CTID, when the CTID
+      step's `ask()` returns, then the run proceeds immediately to the
+      hostname step with no extra prompt or delay.
+- [ ] Given the Advanced path and a hostname violating RFC1123 shape
+      (e.g. starts with a hyphen, contains an underscore or space, an
+      empty label between two dots), when the hostname step's `ask()`
+      returns, then a `msgbox` explains the problem and the same `ask()`
+      prompt is re-shown.
+- [ ] Given the Advanced path and a valid RFC1123 hostname, when the
+      hostname step's `ask()` returns, then the run proceeds immediately
+      to the storage step with no extra prompt or delay.
+- [ ] Given the Default path, when `ct/create.sh` runs end to end, then
+      no storage/bridge menu and no CTID/hostname validation loop is ever
+      shown — behavior is byte-for-byte identical to before this spec
+      (Default remains completely untouched).
+- [ ] `shellcheck ct/create.sh` (or the project's existing lint step, if
+      any is already run on this file — check how parts 1/2 were verified
+      and match it) passes with no new warnings introduced by this
+      spec's additions.
 
 ## Open questions
-1. **Default path's `AUTH_MODE`: `pve` vs. auto-generated `simple`
-   credentials.** Assumption this spec proceeds under: `AUTH_MODE=pve`.
-   Considered and rejected: defaulting to `simple` with an auto-generated
-   password (mirroring the existing `TOTP_SECRET` auto-generation
-   precedent at `ct/create.sh:160`) — rejected because it adds a new
-   secret-generation code path and a new "write this down, it's shown only
-   once" burden for zero benefit over `pve`, which needs no new secret at
-   all: the operator already has Proxmox VE credentials for this host (a
-   precondition for running the wizard in the first place), so reusing
-   them is strictly less friction. If the user disagrees at review time,
-   this is a small, isolated change (swap the three `AUTH_MODE`/
-   `SIMPLE_USERNAME`/`SIMPLE_PASSWORD` lines in the Default branch).
-2. **Gating the part-1 optional-feature checklist behind Default/Advanced,
-   vs. showing it unconditionally regardless of mode.** Resolved, not
-   left open: gated (Default = skip entirely, matches every flag's
-   existing off-by-default posture; Advanced = shown exactly as today).
-   Grounded in a direct re-check of community-scripts' own `build.func`
-   this session (see "Background / current state") — their own framework
-   treats per-app optional-feature toggles as folded into the
-   Default/Advanced fork, not orthogonal to it, and Default mode shows
-   zero of them. Recorded here so a future pass doesn't need to
-   re-research this.
-3. **Stale header comment referencing a non-existent "non-interactive...
-   CT_*/SWB_* env vars" block.** Discovered while reading the current
-   file (`ct/create.sh:13-16` promises a block that doesn't exist anywhere
-   in the 240-line file). Not fixed in this spec — a real env-var-driven
-   non-interactive mode is a different, larger feature than this spec's
-   whiptail Default/Advanced fork. Flagging for a future bugfix/feature
-   pass to either build that block or correct the comment; either is a
-   reasonable fix, but picking one is a product decision outside this
-   spec's scope.
-4. **Exact copy for the entry menu's two option descriptions and the
-   Default-path confirmation `msgbox`.** Left to ux-designer per this
-   item's own established routing pattern (part 1 routed dialog-flow/copy
-   decisions to ux-designer the same way); draft copy above is a
-   placeholder conveying mechanism, not finalized wording.
+1. Should `TEMPLATE_STORAGE` (`ct/create.sh:90`, `-content vztmpl`) get
+   the same live-enumeration treatment as `STORAGE` in this same cycle,
+   since the helper pattern is identical and the marginal cost is low?
+   **Assumption proceeding under: no** — piece 2 as scoped in
+   `docs/BACKLOG.md` names `-content rootdir` specifically and does not
+   mention `TEMPLATE_STORAGE`; flagged here rather than silently bundled
+   in, per scope discipline. Easy fast-follow if wanted.
+2. Should the storage/bridge menu's box height be dynamically sized (as
+   proposed: `min(rows, 8)` visible rows, box height `rows+9`) or fixed
+   like the existing checklist's `18 78 4`? **Assumption proceeding
+   under: dynamic**, since storage-pool/bridge counts genuinely vary
+   host-to-host (unlike the checklist's fixed 4 always-present feature
+   toggles) and a fixed height would either waste space (few pools) or
+   clip the list (many pools, e.g. a host with 10 ZFS datasets each
+   exposed as separate storage). ux-designer should confirm or adjust the
+   exact sizing constants during its pass, not re-litigate whether dynamic
+   sizing is the right call.
+3. Is `pct status "$CTID"` (local-node-only) sufficient for CTID
+   collision checking, or should this also check
+   `pvesh get /cluster/resources --type vmid` for cluster-wide safety on
+   a clustered Proxmox setup? **Assumption proceeding under: local-node
+   only (`pct status`) is sufficient** — this script already only ever
+   creates the container on the node it's run on via local `pct`/`pveam`
+   calls throughout (no cluster-target selection exists anywhere in the
+   file), so cluster-wide uniqueness is outside this script's existing
+   scope; `default_ctid()`'s own `pvesh get /cluster/nextid` call already
+   provides cluster-safe suggestions for the common "just press Enter"
+   case, which is the practical mitigation that matters most.
 
 ## Risk / rollback notes
-Single-file change to a script with no persisted state of its own (it only
-writes into the container it creates) and no CI dependency on it (part 1's
-own test-review confirmed `tests/` has no reference to `create.sh`).
-Rollback is a plain `git revert`/checkout of `ct/create.sh` to its
-pre-change version — no data migration, no downstream code depends on the
-new `INSTALL_MODE` variable or the `DEFAULT_*` constants existing. The
-main risk is the Advanced branch silently drifting from today's exact
-behavior during the literal-to-`$DEFAULT_*`-variable refactor described in
-"Proposed approach" #3 — mitigated by the diff-based acceptance criterion
-above, which the reviewer can check mechanically against pre-change
-`ct/create.sh`.
+Purely additive changes to three existing `ask()` call sites plus four new
+helper functions, all confined to `ct/create.sh`'s Advanced branch; the
+Default branch and every other part of the file (template resolution,
+`pct create`/`pct start`, in-container bootstrap, summary box) are
+byte-for-byte unchanged. Worst-case failure mode is a whiptail menu
+showing unexpected/garbled entries if `pvesm status`/`ip -o link show
+type bridge` output ever changes format on a future Proxmox/iproute2
+version — degrades to a confusing menu, not a script crash (the parsing
+is defensive: non-matching rows are simply skipped via the `active`
+status filter and empty-line guards). Rollback is a straight `git revert`
+of this cycle's commit; no data migration, no state left behind by a
+partial run beyond what already happens today if `pct create` fails
+partway (unchanged, pre-existing behavior).

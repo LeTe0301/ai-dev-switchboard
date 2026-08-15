@@ -29,6 +29,51 @@ askpw() { whiptail --title "ai-dev-switchboard" --passwordbox "$1" 10 74 3>&1 1>
 yesno() { whiptail --title "ai-dev-switchboard" --yesno "$1" 10 74; }
 menu()  { whiptail --title "ai-dev-switchboard" --menu "$1" 15 74 3 "${@:2}" 3>&1 1>&2 2>&3; }
 
+_valid_hostname() {
+    local _h="$1" _label
+    [ -n "$_h" ] && [ "${#_h}" -le 253 ] || return 1
+    local _old_ifs=$IFS
+    IFS='.'
+    for _label in $_h; do
+        IFS=$_old_ifs
+        [[ "$_label" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || return 1
+        IFS='.'
+    done
+    IFS=$_old_ifs
+    return 0
+}
+
+_enumerate_storage() {
+    STORAGE_MENU_OPTS=()
+    local _line _name _type _status _avail _desc
+    while IFS= read -r _line; do
+        _name=$(awk '{print $1}' <<<"$_line")
+        _type=$(awk '{print $2}' <<<"$_line")
+        _status=$(awk '{print $3}' <<<"$_line")
+        _avail=$(awk '{print $6}' <<<"$_line")
+        [ "$_status" = "active" ] || continue
+        if command -v numfmt >/dev/null 2>&1 && [[ "$_avail" =~ ^[0-9]+$ ]]; then
+            _desc="${_type}, $(numfmt --to=iec-i --suffix=B $((_avail * 1024)) 2>/dev/null) free"
+        else
+            _desc="$_type"
+        fi
+        STORAGE_MENU_OPTS+=("$_name" "$_desc")
+    done < <(pvesm status -content rootdir 2>/dev/null | tail -n +2)
+}
+
+_enumerate_bridges() {
+    BRIDGE_MENU_OPTS=()
+    local _br _vnet
+    while IFS= read -r _br; do
+        [ -n "$_br" ] && BRIDGE_MENU_OPTS+=("$_br" "kernel bridge")
+    done < <(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1)
+    if [ -f /etc/pve/sdn/vnets.cfg ]; then
+        while IFS= read -r _vnet; do
+            [ -n "$_vnet" ] && BRIDGE_MENU_OPTS+=("sdn:${_vnet}" "SDN vnet")
+        done < <(awk '/^vnet:/{print $2}' /etc/pve/sdn/vnets.cfg 2>/dev/null)
+    fi
+}
+
 msg "This creates a new LXC container running ai-dev-switchboard: a web UI that starts/stops Claude Code, aider, Codex, or any CLI coding agent per project, from a phone or laptop.\n\nEach next step has a sensible default — press Enter (or Tab, Enter) to accept it."
 
 INSTALL_MODE=$(whiptail --title "ai-dev-switchboard" --menu \
@@ -79,13 +124,54 @@ if [ "$INSTALL_MODE" = "default" ]; then
 
     whiptail --title "ai-dev-switchboard" --msgbox "About to create:\n\n  CTID: ${CTID}\n  Hostname: ${CT_HOSTNAME}\n  Storage: ${STORAGE} (${DISK_GB}G disk)\n  CPU / RAM: ${CORES} cores / ${MEM_MB}MB\n  Network: bridge ${BRIDGE}, ${IPCONFIG}\n  Run-as user: ${RUN_USER}\n  Web UI login: your existing Proxmox VE credentials\n  Optional features: none enabled\n  Terminal publishing: loopback only\n\nPress Enter to create it, or Cancel to abort." 20 74
 else
-    CTID=$(ask "Container ID (must be free):" "$(default_ctid)")
-    CT_HOSTNAME=$(ask "Hostname:" "$DEFAULT_CT_HOSTNAME")
-    STORAGE=$(ask "Storage pool for the container's root disk:" "$DEFAULT_STORAGE")
+    while :; do
+        CTID=$(ask "Container ID (must be free):" "$(default_ctid)")
+        if ! [[ "$CTID" =~ ^[0-9]+$ ]] || [ "$CTID" -lt 100 ] || [ "$CTID" -gt 999999999 ]; then
+            msg "Container ID must be a number between 100 and 999999999 (got '$CTID')."
+            continue
+        fi
+        if pct status "$CTID" >/dev/null 2>&1; then
+            msg "Container ID $CTID is already in use on this host. Choose a different one."
+            continue
+        fi
+        break
+    done
+
+    while :; do
+        CT_HOSTNAME=$(ask "Hostname:" "$DEFAULT_CT_HOSTNAME")
+        if ! _valid_hostname "$CT_HOSTNAME"; then
+            msg "'$CT_HOSTNAME' is not a valid hostname. Use letters, digits, hyphens; each dot-separated label 1-63 characters; can't start or end with a hyphen."
+            continue
+        fi
+        break
+    done
+
+    _enumerate_storage
+    if [ "${#STORAGE_MENU_OPTS[@]}" -eq 0 ]; then
+        STORAGE=$(ask "Storage pool for the container's root disk:" "$DEFAULT_STORAGE")
+    else
+        _storage_rows=$(( ${#STORAGE_MENU_OPTS[@]} / 2 ))
+        _storage_listheight=$(( _storage_rows < 8 ? _storage_rows : 8 ))
+        STORAGE=$(whiptail --title "ai-dev-switchboard" --menu \
+            "Storage pool for the container's root disk:" \
+            "$(( _storage_listheight + 9 ))" 78 "$_storage_listheight" \
+            "${STORAGE_MENU_OPTS[@]}" 3>&1 1>&2 2>&3)
+    fi
     DISK_GB=$(ask "Disk size (GB):" "$DEFAULT_DISK_GB")
     CORES=$(ask "CPU cores:" "$DEFAULT_CORES")
     MEM_MB=$(ask "Memory (MB):" "$DEFAULT_MEM_MB")
-    BRIDGE=$(ask "Network bridge:" "$DEFAULT_BRIDGE")
+    _enumerate_bridges
+    if [ "${#BRIDGE_MENU_OPTS[@]}" -eq 0 ]; then
+        BRIDGE=$(ask "Network bridge:" "$DEFAULT_BRIDGE")
+    else
+        _bridge_rows=$(( ${#BRIDGE_MENU_OPTS[@]} / 2 ))
+        _bridge_listheight=$(( _bridge_rows < 8 ? _bridge_rows : 8 ))
+        BRIDGE=$(whiptail --title "ai-dev-switchboard" --menu \
+            "Network bridge:" \
+            "$(( _bridge_listheight + 9 ))" 78 "$_bridge_listheight" \
+            "${BRIDGE_MENU_OPTS[@]}" 3>&1 1>&2 2>&3)
+        BRIDGE="${BRIDGE#sdn:}"
+    fi
     IPCONFIG=$(ask "IP config (dhcp, or e.g. 192.168.1.50/24,gw=192.168.1.1):" "$DEFAULT_IPCONFIG")
     TEMPLATE_STORAGE=$(ask "Storage where the Debian 12 container template lives/downloads to:" "$DEFAULT_TEMPLATE_STORAGE")
 

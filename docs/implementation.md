@@ -1130,3 +1130,203 @@ cycle:
    real `pvesh get /cluster/nextid` round-trip on an actual clustered
    Proxmox host (only its documented fallback-to-900 behavior was
    exercised, via the stubbed `pvesh` returning nonzero).
+
+# Implementation: BACKLOG item 15 part 3, pieces 2-4 -- live storage/bridge enumeration + CTID/hostname hard-block validation in `ct/create.sh`
+
+## Summary
+Inside `ct/create.sh`'s Advanced branch only (untouched Default branch),
+replaced the three remaining free-text `ask()` prompts with:
+- **Storage** (piece 2): `_enumerate_storage()` runs `pvesm status
+  -content rootdir`, filters to `active`-status rows, and if one or more
+  remain, shows a `whiptail --menu` (each row: pool name + "type, size
+  free" description); falls back to the original free-text `ask()` if
+  zero active pools are found.
+- **Bridge** (piece 3): `_enumerate_bridges()` reads live kernel bridges
+  via `ip -o link show type bridge` plus Proxmox SDN vnets via
+  `/etc/pve/sdn/vnets.cfg`'s `awk '/^vnet:/{print $2}'`, and if one or
+  more are found, shows a `whiptail --menu` (SDN entries labelled
+  `sdn:name` / "SDN vnet"); the `sdn:` prefix is stripped
+  (`BRIDGE="${BRIDGE#sdn:}"`) after selection, before assignment; falls
+  back to the original free-text `ask()` if zero bridges/vnets are found.
+- **CTID/hostname** (piece 4): both `ask()` calls are now wrapped in
+  `while :; do ... done` hard-block retry loops (same shape as the
+  existing ollama endpoint retry loop) — CTID must be numeric, in
+  100-999999999, and not already in use per `pct status "$CTID"`;
+  hostname must pass `_valid_hostname()`'s RFC1123-shape check (each
+  dot-separated label 1-63 chars, alphanumeric + hyphen, no
+  leading/trailing hyphen, total <=253 chars). On failure, a `msgbox`
+  explains the specific problem and the same prompt re-shows; there is no
+  "continue anyway" escape hatch.
+
+This is the last scoped piece of BACKLOG item 15 (pieces 1-5 all shipped
+across parts 1/2/this part; item 15 marked shipped in `docs/BACKLOG.md`,
+see below).
+
+## Changes by file
+- `ct/create.sh`:
+  - Added three helper functions (`_valid_hostname()`,
+    `_enumerate_storage()`, `_enumerate_bridges()`) immediately after the
+    existing `msg`/`ask`/`askpw`/`yesno`/`menu` block (before the intro
+    `msg` call) — `docs/spec.md`'s "Proposed approach" code, inserted
+    near-verbatim (see "Deviations from spec" for the one intentional
+    change).
+  - Replaced `ct/create.sh`'s (pre-change) `CTID=$(ask ...)` /
+    `CT_HOSTNAME=$(ask ...)` lines with `while :; do ... done`
+    loop-until-valid blocks per spec's Piece 4 code, using
+    `docs/design.md`'s finalized `msgbox` copy for both failure messages
+    (identical to spec's own draft copy in this case — spec and design
+    agreed verbatim on all four pieces' copy, so no wording conflict
+    arose to resolve in design's favor).
+  - Replaced the `STORAGE=$(ask ...)` line with the enumerate-then-menu-
+    or-fallback block per spec's Piece 2 code (dynamic `whiptail --menu`
+    listheight, `min(rows, 8)`, box height `listheight + 9`, width 78).
+  - Replaced the `BRIDGE=$(ask ...)` line with the enumerate-then-menu-
+    or-fallback block per spec's Piece 3 code, including the
+    `BRIDGE="${BRIDGE#sdn:}"` prefix strip after selection.
+  - Insertion order unchanged from the pre-change file: CTID validation
+    loop, then hostname validation loop, then storage menu/fallback, then
+    the untouched `DISK_GB`/`CORES`/`MEM_MB` prompts, then bridge
+    menu/fallback, then the untouched `IPCONFIG`/`TEMPLATE_STORAGE`/
+    `RUN_USER` prompts onward — no field reordered.
+  - Default branch (`ct/create.sh`'s `if [ "$INSTALL_MODE" = "default" ]`
+    block) is byte-for-byte unchanged.
+- `docs/BACKLOG.md`: marked item 15 shipped (see "Known limitations" /
+  closing note below for the exact wording used).
+
+## Key decisions / tradeoffs
+- **`numfmt --to=iec-i` instead of spec's `--to=iec`.** Spec's own
+  "Proposed approach" code block used `numfmt --to=iec --suffix=B`, which
+  produces decimal-letter suffixes on binary-computed values (e.g. `363GB`
+  for a value GNU `numfmt` computed via powers of 1024) — but
+  `docs/design.md`'s row-format table and character-width-verification
+  table both give the expected output as `362GiB free` (binary-suffix
+  notation), and its own "Rationale" bullet explicitly says "human-
+  readable size" using the `GiB` unit. Verified directly
+  (`numfmt --to=iec --suffix=B $((380526592*1024))` → `363GB`;
+  `numfmt --to=iec-i --suffix=B $((380526592*1024))` → `363GiB`) — `--to=
+  iec-i` is the flag that actually produces design's documented `GiB`-
+  style output; `--to=iec` does not. Per this task's explicit instruction
+  to use design.md's wording over spec's draft wherever they differ, and
+  since this is the one place the two genuinely disagree (a numfmt flag
+  that changes the literal string shown to the operator, not just
+  narrative description), swapped to `--to=iec-i`. Flagged here rather
+  than silently applied — this is the only place I deviated from spec's
+  literal "Proposed approach" bash.
+- **Storage/bridge menu dimensions kept exactly as spec proposed**
+  (`"$(( listheight + 9 ))" 78 "$listheight"`, `min(rows, 8)` visible
+  rows). `docs/design.md`'s own "Implementation notes for developer"
+  section describes the array-length fallback check and ordering but does
+  not supply different numeric constants, and spec's open question #2 was
+  explicitly left for ux-designer to "confirm or adjust". Design's
+  mockups/tables use these same numbers implicitly (no contradicting
+  value appears anywhere in design.md), so treated as confirmed-as-is
+  rather than silently changed.
+- **Test harness technique**: rather than declaring the enumeration/
+  validation logic untestable (no real Proxmox host available), extracted
+  the three helper functions verbatim (`sed -n '32,75p' ct/create.sh`)
+  into a standalone sourced file and exercised them with mocked `pvesm`,
+  `ip`, and `pct` shell functions substituted ahead of the real binaries
+  (functions, not `PATH` shims, since a `source`d function calls whatever
+  `pvesm`/`ip`/`pct` resolve to at call time — a shell function of the
+  same name shadows the real command). This is the same technique part
+  1's implementation used for `INSTALL_FLAGS` composition and the ollama
+  model-check script — extended here to the three new pieces. See "How
+  to verify locally" for the full harness and results.
+
+## Deviations from spec
+- **`numfmt --to=iec` → `--to=iec-i`** — see "Key decisions" above. This
+  is the only code-level deviation from spec's provided "Proposed
+  approach" bash; every other block (`_valid_hostname()`,
+  `_enumerate_storage()`'s enumeration/filtering logic,
+  `_enumerate_bridges()`, both validation loops, both menu blocks) was
+  inserted verbatim.
+- No deviations from design.md — spec and design agreed on every piece
+  of copy (menu titles, fallback prompts, both CTID error messages, the
+  hostname error message) verbatim, so there was no wording conflict to
+  resolve in design's favor beyond the `numfmt` output-format point
+  above, which is a mechanism choice implied by design's documented
+  example output rather than a copy string design explicitly wrote.
+
+## Known limitations
+- Same constraint as parts 1 and 2: not exercised against a real Proxmox
+  host / real `whiptail` TTY — there is no CI harness for `ct/create.sh`
+  and none was added. What was actually run this cycle is listed below.
+- Per spec's non-goals: `TEMPLATE_STORAGE` (the OS-template storage
+  prompt, `-content vztmpl`) still uses free-text `ask()`, unchanged —
+  not in this piece's scope (spec's Open question #1, left unresolved by
+  design, assumption-proceeding-under-no per spec). Storage-space
+  validation (`DISK_GB` vs. chosen pool's free space) is not built, per
+  spec's non-goals. CTID/hostname validation is local-node-only (`pct
+  status`, not cluster-wide `pvesh get /cluster/resources`), per spec's
+  Open question #3's stated assumption.
+- **`docs/BACKLOG.md` item 15 marked shipped in this cycle** — per spec's
+  own explicit framing ("This is the last scoped piece of BACKLOG item
+  15... item 15 should be marked shipped/closed in `docs/BACKLOG.md` once
+  this cycle is reviewer-approved"). Marked here at implementation time
+  rather than withheld for a separate cycle since the spec states this
+  unambiguously as the closing condition and there's no remaining piece
+  of item 15's "Shape of the work" list left unshipped after this change;
+  reviewer should confirm before treating item 15 as fully closed, per
+  the spec's own "once this cycle is reviewer-approved" qualifier — the
+  BACKLOG.md note added here says "shipped" but the reviewer pass is what
+  actually finalizes that per the pipeline's normal approval gate.
+
+## How to verify locally
+This script only runs interactively on a real Proxmox VE host (`pct`,
+`pvesm`, `ip`, `whiptail` in a real TTY) — there is no CI harness for it
+and none was added, matching parts 1/2's own testing bar. What was
+actually run this cycle:
+
+1. **Syntax check**: `bash -n ct/create.sh` → passed (no output, exit 0).
+2. **Full-file shellcheck**: `shellcheck ct/create.sh` → zero
+   warnings/errors anywhere in the file (not just the diff).
+3. **Standalone harness exercising the three new helper functions plus
+   the CTID/hostname validation logic**, extracted verbatim from the file
+   (`sed -n '32,75p' ct/create.sh` for the three helpers) and run against
+   mocked `pvesm`/`ip`/`pct` shell functions (33 assertions, all passing):
+   - `_valid_hostname()`: plain hostname, multi-label FQDN, leading-hyphen
+     reject, trailing-hyphen reject, underscore reject, space reject,
+     empty-label-between-dots reject, empty-string reject, uppercase
+     accept (shape-only), 64-char label reject (over the 63 limit),
+     63-char label accept (at the limit) — 11/11 passed.
+   - CTID range check (spec's verbatim condition): 99 rejected, 100
+     accepted (lower bound), 999999999 accepted (upper bound),
+     1000000000 rejected (over range), non-numeric (`abc`, `12ab`)
+     rejected, empty string rejected — 7/7 passed. CTID collision check
+     against a mocked `pct status` (reports CTID 150 as taken, everything
+     else free): 150 → collision, 151 → free — 2/2 passed.
+   - `_enumerate_storage()` against a sample `pvesm status -content
+     rootdir` output matching spec's documented column layout (two
+     `active` rows + one `unknown`-status row): produces a 4-element
+     `STORAGE_MENU_OPTS` array (2 pools x tag+desc), correct tags
+     (`local`, `local-lvm`), the `unknown`-status row excluded, and (with
+     `numfmt` present in this sandbox) a human-readable free-space
+     description (`dir, 79GiB free`, confirming the `--to=iec-i` swap
+     above actually produces `GiB`-suffixed output). Zero-`active`-rows
+     input produces an empty array (confirming the fallback-to-`ask()`
+     trigger condition) — 5/5 passed.
+   - `_enumerate_bridges()` against sample `ip -o link show type bridge`
+     output (two bridges, one with an `@vmbr0` VLAN-parent suffix):
+     produces a 4-element `BRIDGE_MENU_OPTS` array, correctly stripped
+     tags (`vmbr0`, `vmbr1` — the `@vmbr0` suffix removed), and
+     `"kernel bridge"` descriptions. The SDN-vnet `awk` one-liner was
+     exercised directly against a sample `vnets.cfg` (two `vnet:` lines),
+     confirming both vnet names are extracted correctly. Zero-bridges
+     input (with no `/etc/pve/sdn/vnets.cfg` present, true of this
+     sandbox) produces an empty array (confirming the fallback trigger)
+     — 6/6 passed. The `BRIDGE="${BRIDGE#sdn:}"` prefix-strip logic was
+     exercised directly (`sdn:guest` → `guest`, `vmbr0` unaffected) —
+     2/2 passed.
+   - Full harness output: `=== Summary: 33 passed, 0 failed ===`.
+4. **Not checked** (genuinely requires the real environment): an actual
+   `whiptail --menu`/retry-loop render/keystroke sequence in a TTY, a
+   real `pvesm status -content rootdir` / `ip -o link show type bridge` /
+   `pct status` round-trip against live Proxmox/kernel state, and a real
+   `/etc/pve/sdn/vnets.cfg` on an SDN-enabled host (the file's presence
+   check and its `awk` extraction were both exercised directly against a
+   sample file instead, since `_enumerate_bridges()`'s `[ -f
+   /etc/pve/sdn/vnets.cfg ]` check reads a hardcoded absolute path that
+   can't be redirected without root in this sandbox — traced by hand
+   against the acceptance criteria instead: the `if`/`while` structure is
+   identical to the already-exercised kernel-bridge loop, and the `awk`
+   command itself was verified correct against the sample file).

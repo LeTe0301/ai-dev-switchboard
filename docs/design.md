@@ -1,170 +1,300 @@
-# Design: Install wizard UI — part 2, piece 1 (Default/Advanced entry fork)
+# Design: Install wizard UI — part 3, pieces 2-4 (live enumeration + hard-block validation)
 
 ## Summary
 
-Two new whiptail dialogs inserted into `ct/create.sh` before the first `ask()` call: a two-option menu fork (Default/Advanced) with clear, unambiguous descriptions of each path, and a final summary `msgbox` for the Default path before `pct create` runs. The Default path is presented as "create with built-in settings" (not a preview), and its auth mode explicitly references "existing Proxmox VE credentials" to prevent login-surprise later.
+Three new interactive dialogs added to the Advanced branch of `ct/create.sh`, replacing static free-text prompts with live-enumerated `whiptail --menu` pickers for storage pools and network bridges, plus hard-block retry loops (loop-until-valid) for CTID and hostname validation. All copy focuses on clarity, actionability, and fitting within whiptail's fixed 74-character terminal width.
 
-## Design notes
-
-This is a TUI (terminal user interface) feature, not a web UI. Design work here focuses on **dialog copy clarity and flow**, not visual styling — `ui-ux-pro-max` visual tooling does not apply. The whiptail TUI is already part of the project (established at `ct/create.sh:26-30`) and uses a fixed-width terminal box model (`--inputbox`/`--menu`/`--msgbox` with width 74 chars, variable heights). All new dialogs conform to the existing helper-function pattern and title ("ai-dev-switchboard").
-
-**No new components or design tokens introduced** — only refined wording and structural placement of dialogs already in scope.
+This is a TUI (terminal user interface) feature, following the pattern established in parts 1-2. No new components, design tokens, or visual systems introduced — only refined dialog copy and the enumeration/validation state coverage.
 
 ---
 
-## Dialog 1: Entry menu (new, inserted after `ct/create.sh:32`)
+## Dialog 1: Storage-pool selection menu
 
-### Structure and wireframe
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ ai-dev-switchboard                                                              │
-│                                                                                 │
-│ How do you want to configure this container?                                    │
-│                                                                                 │
-│   ⊙ default   Create with built-in defaults (fully automated, no prompts)       │
-│   ○ advanced  Walk through every setting (container specs + optional features) │
-│                                                                                 │
-│                                           <  OK  >   <  Cancel  >              │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Implementation details
-
-```bash
-INSTALL_MODE=$(whiptail --title "ai-dev-switchboard" --menu \
-    "How do you want to configure this container?" 15 74 2 \
-    "default"  "Create with built-in defaults (fully automated, no prompts)" \
-    "advanced" "Walk through every setting (container specs + optional features)" \
-    3>&1 1>&2 2>&3)
-```
-
-### Copy decisions and rationale
-
-**Title:** `"ai-dev-switchboard"` — consistent with all other dialogs in the file (established at `ct/create.sh:26`), no change.
-
-**Prompt text:** `"How do you want to configure this container?"` — clear, question form, neutral tone.
-
-**Option 1 (default):**
-- **Text:** `"Create with built-in defaults (fully automated, no prompts)"`
-- **Character count:** 55 (fits within 74-char max ✓)
-- **Rationale:** 
-  - "Create with" makes explicit that this creates a real container (not a preview or dry-run), addressing spec's open question #3.
-  - "built-in defaults" refers to the literal `DEFAULT_*` constants in the code, a familiar term for operators.
-  - "(fully automated, no prompts)" removes ambiguity in "zero extra prompts" — "extra" confused the distinction between "no prompts total" vs. "no extra customization." Explicit "no prompts" + "fully automated" clarifies the path is entirely non-interactive (except for the final confirmation).
-  - Parenthetical format (non-essential clarification) follows standard UX copy convention.
-
-**Option 2 (advanced):**
-- **Text:** `"Walk through every setting (container specs + optional features)"`
-- **Character count:** 61 (fits within 74-char max ✓)
-- **Rationale:**
-  - "Walk through" is the established phrase in `ct/create.sh:33` ("Walks you through"), matching the operator's mental model if they've read the intro.
-  - "every setting" is concrete and symmetric to Default's "no prompts" — if you pick Advanced, you get *all* the prompts.
-  - "(container specs + optional features)" parallels the existing terminology in part 1's optional-feature checklist and clarifies that Advanced includes both infrastructure choices *and* the part-1-shipped feature toggles.
-
-### State and behavior
-
-- **Initial state:** menu selection defaults to "default" (first option) — whiptail convention.
-- **Cancel/Esc:** causes `whiptail --menu` to return non-zero exit, failing the `INSTALL_MODE=$(...)` assignment under `set -euo pipefail`, aborting the entire script before any other prompts run — consistent with today's existing Cancel behavior across all dialogs in the file.
-- **Selection:** returns either `"default"` or `"advanced"` (string), used by the `if [ "$INSTALL_MODE" = "default" ]` fork below.
-
----
-
-## Dialog 2: Default-path confirmation msgbox (new, in the Default branch before container creation)
-
-### Structure and wireframe
+### Structure and state coverage
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
 │ ai-dev-switchboard                                                       │
 │                                                                          │
-│ About to create:                                                         │
+│ Storage pool for the container's root disk:                             │
 │                                                                          │
-│   CTID: 100                                                              │
-│   Hostname: ai-dev-switchboard                                           │
-│   Storage: local-lvm (8G disk)                                           │
-│   CPU / RAM: 2 cores / 2048MB                                            │
-│   Network: bridge vmbr0, dhcp                                            │
-│   Run-as user: dev                                                       │
-│   Web UI login: your existing Proxmox VE credentials                     │
-│   Optional features: none enabled                                        │
-│   Terminal publishing: loopback only                                     │
+│   ⊙ local         dir, 80GiB free                                        │
+│   ○ local-lvm     lvmthin, 362GiB free                                   │
+│   ○ tank          zfs, 1.2TiB free                                       │
 │                                                                          │
-│ Press Enter to create it, or Cancel to abort.                            │
-│                                                                          │
-│                                         <  OK  >                         │
+│                                                 <  OK  >   <  Cancel  >  │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Implementation details
+**State 1 (populated): two or more active storage pools found**
+- Menu shown with all active pools (Status = "active" per `pvesm status -content rootdir` filtering).
+- Each pool displayed as a two-column row: tag (pool name) + description (type + free space).
+- Title: identical to the existing free-text prompt, providing continuity.
 
-```bash
-whiptail --title "ai-dev-switchboard" --msgbox \
-    "About to create:\n\n  CTID: ${CTID}\n  Hostname: ${CT_HOSTNAME}\n  Storage: ${STORAGE} (${DISK_GB}G disk)\n  CPU / RAM: ${CORES} cores / ${MEM_MB}MB\n  Network: bridge ${BRIDGE}, ${IPCONFIG}\n  Run-as user: ${RUN_USER}\n  Web UI login: your existing Proxmox VE credentials\n  Optional features: none enabled\n  Terminal publishing: loopback only\n\nPress Enter to create it, or Cancel to abort." 20 74
+**State 2 (empty): zero active storage pools found**
+- Whiptail menu not shown; fallback to free-text `ask()` with identical prompt and default.
+- Behavior: same as today's `ct/create.sh`, pre-this-spec.
+
+### Row description format
+
+Each pool row combines two pieces of enumerated data into a description string:
+
+| Source | Field | Example |
+|--------|-------|---------|
+| `pvesm status -content rootdir` column 2 | Storage type | `dir`, `lvmthin`, `zfs`, `lvm`, `nfs`, etc. |
+| `pvesm status -content rootdir` column 6 (in KiB) | Available space | Convert to human-readable (via `numfmt`) — `80GiB free`, `362GiB free`, etc. |
+
+**Rationale:**
+- **Type + free space in one row** — operators need both to choose intelligently (What *kind* of storage? How much room do I have?). Combining them keeps the menu compact.
+- **Human-readable size** — `362GiB` is immediately understood; raw KiB values (`380526592`) require mental conversion. The `numfmt` conversion (lines 204-205 in spec's `_enumerate_storage()`) handles this gracefully, falling back to type-only if `numfmt` is unavailable (rare but handled).
+- **Fits within 74-char line** — worst-case: `local-lvm lvmthin, 999999GiB free` (~35 chars) or `tank zfs, 1000TiB free` (~27 chars). All fit comfortably within 74. ✓
+
+**Example output (from spec's proposed data):**
+```
+local         dir, 80GiB free
+local-lvm     lvmthin, 362GiB free
+tank          zfs, 1.2TiB free
 ```
 
-### Line-by-line breakdown and content fit
+### Fallback messaging (zero-results)
 
-| Line | Content | Char count (max: 74) | Notes |
-|------|---------|--------|---|
-| 1 | `About to create:` | 15 | ✓ |
-| 2 | (blank) | — | ✓ |
-| 3 | `  CTID: 100` | ~13 (CTID is 3 digits max) | ✓ |
-| 4 | `  Hostname: ai-dev-switchboard` | 32 | ✓ |
-| 5 | `  Storage: local-lvm (8G disk)` | 30 | ✓ |
-| 6 | `  CPU / RAM: 2 cores / 2048MB` | 29 | ✓ |
-| 7 | `  Network: bridge vmbr0, dhcp` | 31 | ✓ |
-| 8 | `  Run-as user: dev` | 19 | ✓ |
-| 9 | `  Web UI login: your existing Proxmox VE credentials` | 54 | ✓ (see rationale below) |
-| 10 | `  Optional features: none enabled` | 34 | ✓ |
-| 11 | `  Terminal publishing: loopback only` | 36 | ✓ |
-| 12 | (blank) | — | ✓ |
-| 13 | `Press Enter to create it, or Cancel to abort.` | 47 | ✓ |
+**Copy:** (identical to the current prompt text, shown as `ask()` if no pools found)
+```
+"Storage pool for the container's root disk:"
+```
 
-**Total logical lines:** 13. **Msgbox height:** 20 rows. Whiptail allocates 3 rows for border/title; remaining 17 rows accommodate 13 lines of content comfortably, with ~4 rows of breathing room. **No truncation risk.** ✓
+**Rationale:** The spec explicitly requires fallback to today's behavior when enumeration yields zero pools. The operator sees the exact same free-text prompt they would pre-this-spec, but now with a contextual understanding: they already saw a whiptail menu attempted, and it returned no options. If the Advanced path showed a menu for storage but is now asking for free-text, it's because no pools were active/found. The single-line prompt provides no new explanation (the absence of a menu *is* the explanation).
 
-### Copy decisions and rationale
+---
 
-**Heading:** `"About to create:"` — mirrors the `echo_default` pre-build summary pattern from community-scripts (spec background section), establishing it as a familiar "last chance to review" checkpoint.
+## Dialog 2: Network-bridge selection menu
 
-**CTID, Hostname, Storage, etc. fields:**
-- **Format:** Two-space indentation, colon-separated label/value, using the exact variable names from the Default branch (`${CTID}`, `${CT_HOSTNAME}`, etc.) — allows operator to see the *resolved* values, not just prompts.
-- **"Storage: ${STORAGE} (${DISK_GB}G disk)"** — combines two related fields (storage pool + disk size) on one line for compactness, using parenthetical for the secondary detail (follows the entry-menu copy convention).
-- **"CPU / RAM: ${CORES} cores / ${MEM_MB}MB"** — similarly combines vCPU + memory in a readable format. "cores" and "MB" are familiar to the operator demographic (Proxmox admins). "vCPU" would be overly precise; "RAM" alone would omit the unit.
-- **"Network: bridge ${BRIDGE}, ${IPCONFIG}"** — shows both the Layer-2 bridge (vmbr0) and Layer-3 config (dhcp or static IP) on one line. Operator sees "what bridge am I plugged into" and "will I get an IP how" in one glance.
+### Structure and state coverage
 
-**Web UI login (addressing spec's open question #4):**
-- **Text:** `"Web UI login: your existing Proxmox VE credentials"`
-- **Rationale:**
-  - Replaces the spec's draft "Login: your Proxmox VE credentials" with two improvements:
-    1. Prefix "Web UI" to clarify this is authentication to the container's web interface (not an SSH login, not the physical Proxmox host).
-    2. Add "existing" before "Proxmox VE credentials" to make explicit that no new username/password is being created or generated for this container — the operator will use their current PVE login. This prevents the surprise mentioned in open question #4: when the web UI later asks for login, the operator will already know to reach for their PVE credentials instead of expecting a new username/password from this wizard.
-  - The possessive "your" + explicit "existing" = unambiguous that this is reusing current credentials, not a new credential.
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ai-dev-switchboard                                                       │
+│                                                                          │
+│ Network bridge:                                                          │
+│                                                                          │
+│   ⊙ vmbr0        kernel bridge                                           │
+│   ○ vmbr1        kernel bridge                                           │
+│   ○ sdn:guest    SDN vnet                                                │
+│   ○ sdn:management SDN vnet                                              │
+│                                                                          │
+│                                                 <  OK  >   <  Cancel  >  │
+└──────────────────────────────────────────────────────────────────────────┘
+```
 
-**Optional features and Terminal publishing:**
-- **`"Optional features: none enabled"`** — explicitly states all four toggles (git-hosting, code-server, taiga, ollama) are off, matching the Default path's design (no interactive feature checklist). Clear and prevents operator surprise if they later expect these to be available.
-- **`"Terminal publishing: loopback only"`** — parallels the existing publish-mode menu's first option ("Loopback only — you handle exposing them yourself"). Operator sees Default uses the no-publishing default, and knows they can expose via SSH tunnels, reverse proxy, or other manual means later.
+**State 1 (populated): one or more bridges/vnets found**
+- Menu shown with all live kernel bridges (from `ip -o link show type bridge`) and SDN vnets (from `/etc/pve/sdn/vnets.cfg`).
+- Each bridge/vnet displayed as a two-column row: tag + description ("kernel bridge" or "SDN vnet").
+- **SDN vnet handling:** SDN entries are tagged `sdn:vnetname` in the menu for clarity, but the `sdn:` prefix is stripped before the value is assigned to `BRIDGE` (line 287 in spec's Piece 3).
 
-**Final instruction:** `"Press Enter to create it, or Cancel to abort."` 
-- Explicit, action-oriented.
-- Reminds operator that pressing Cancel here still aborts (no container is created yet) — mirrors the spec's edge-case handling ("Cancel pressed: aborts the whole run, no container created").
-- Familiar whiptail msgbox idiom.
+**State 2 (empty): zero bridges/vnets found**
+- Whiptail menu not shown; fallback to free-text `ask()` with identical prompt and default.
+- Behavior: same as today's `ct/create.sh`.
 
-### State and behavior
+### Row description format
 
-- **Shown only if `INSTALL_MODE = "default"`** — Advanced branch skips this dialog entirely and goes straight into its `ask()` chain.
-- **All variables resolved:** By the time this msgbox is displayed, `CTID`, `CT_HOSTNAME`, `STORAGE`, `DISK_GB`, `CORES`, `MEM_MB`, `BRIDGE`, `IPCONFIG`, `RUN_USER`, and all the `WITH_*` / `PUBLISH_MODE` / `BASE_URL` fields are set. The msgbox expands them in-place with `${VAR}` syntax.
-- **Cancel/Esc:** causes `whiptail --msgbox` to return non-zero exit, aborting the script before `pct create` is called — consistent with spec's edge case and existing dialog Cancel behavior.
-- **Enter/OK:** user accepts, script continues to the unchanged code section (TOTP secret generation, template resolution, `pct create`, etc.), shared by both paths.
+Two row types:
+
+| Source | Type | Tag | Description | Example |
+|--------|------|-----|-------------|---------|
+| `ip -o link show type bridge` | Kernel bridge | Bridge name | `"kernel bridge"` | `vmbr0` → `"kernel bridge"` |
+| `/etc/pve/sdn/vnets.cfg` | SDN vnet | `sdn:` + vnet name | `"SDN vnet"` | `sdn:mynet` → `"SDN vnet"` |
+
+**Rationale:**
+- **"kernel bridge" / "SDN vnet" labels** — Immediately tells the operator what *kind* of bridge they're looking at. Proxmox operators know the distinction; labeling it removes ambiguity.
+- **`sdn:` prefix in menu tag, but stripped in assignment** — Visibility vs. usability trade-off:
+  - Operator *sees* `sdn:guest` in the menu, making it clear this is an SDN resource (not a typo or confusion).
+  - Code receives `guest` (without prefix), which is the correct value for `pct create -net0 bridge=guest` (Proxmox expects the bare vnet name, not `sdn:guest`).
+  - Spec's Piece 3 (line 287) handles the stripping: `BRIDGE="${BRIDGE#sdn:}"` after menu selection.
+- **Fits within 74-char line** — longest realistic example: `sdn:management` (15 chars) + `"SDN vnet"` (9 chars) = well under 74. ✓
+
+**Example output:**
+```
+vmbr0        kernel bridge
+vmbr1        kernel bridge
+sdn:guest    SDN vnet
+sdn:management SDN vnet
+```
+
+### Fallback messaging (zero-results)
+
+**Copy:** (identical to the current prompt text, shown as `ask()` if no bridges found)
+```
+"Network bridge:"
+```
+
+**Rationale:** Same as storage fallback — the absence of a menu in a context where the operator might have expected one (Advanced path) provides implicit context. The single-line prompt is unchanged from today.
+
+---
+
+## Dialog 3 & 4: CTID and Hostname validation loops (hard-block, loop-until-valid)
+
+Both CTID and hostname are now validated via identical retry-loop patterns (like the existing ollama endpoint loop from part 1). The operator enters a value, validation checks it, and if invalid, a `msgbox` explains the error and re-shows the same `ask()` prompt.
+
+### CTID Validation Loop
+
+#### State 1: CTID entry prompt
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ai-dev-switchboard                                                       │
+│                                                                          │
+│ Container ID (must be free):                                            │
+│ _________________________ 107 ________________________                    │
+│                                                                          │
+│                                           <  OK  >   <  Cancel  >        │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+**Initial state:** Prompted with the default (from `default_ctid()`, a cluster-safe suggestion already collision-free by construction).
+
+---
+
+#### State 2a: CTID non-numeric or out-of-range error
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ai-dev-switchboard                                                       │
+│                                                                          │
+│ Container ID must be a number between 100 and 999999999                 │
+│ (got '99').                                                              │
+│                                                                          │
+│                                                 <  OK  >                 │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+**Copy:** `"Container ID must be a number between 100 and 999999999 (got '$CTID')."`
+
+**Character count:** ~65–75 chars depending on CTID value (9-digit worst-case: 75 chars). Fits within 74-char box with word-wrap. ✓
+
+**Rationale:**
+- **Specific rule statement** — Not just "invalid"; states exactly *what* is required (number, range 100–999999999).
+- **Shows the rejected value** — `(got '$CTID')` lets the operator immediately see what they entered, reducing confusion about which validation step failed (is it this one or the next?).
+- **Active voice** — "Container ID must be" is direct and clear.
+- **Aligns with spec's validation code** (lines 235–237) — the check is `! [[ "$CTID" =~ ^[0-9]+$ ]] || [ "$CTID" -lt 100 ] || [ "$CTID" -gt 999999999 ]`.
+
+**Behavior after:** Msgbox dismissed (OK), same `ask()` prompt re-shown. Operator re-enters.
+
+---
+
+#### State 2b: CTID already in use (collision) error
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ai-dev-switchboard                                                       │
+│                                                                          │
+│ Container ID 150 already in use on this host. Try a different one.      │
+│                                                                          │
+│                                                 <  OK  >                 │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+**Copy:** `"Container ID $CTID is already in use on this host. Choose a different one."`
+
+**Character count:** Worst-case (9-digit CTID): ~80 chars. Exceeds 74-char line by ~6 chars, but word-wraps gracefully in whiptail msgbox. ✓
+
+**Rationale:**
+- **Distinct from range error** — Different failure reason (collision vs. format/range), so distinct messaging. Matches spec's intent ("distinct messages per failure reason").
+- **Names the specific ID** — Shows `$CTID`, confirming which one is taken (operator may have tried multiple times).
+- **Actionable** — "Try a different one" is a clear next step; not just "already taken" (which leaves the operator wondering "then what?").
+- **Aligns with spec's validation code** (lines 239–240) — the check is `pct status "$CTID"` exit code (0 = exists, non-zero = free).
+
+**Behavior after:** Msgbox dismissed (OK), same `ask()` prompt re-shown. Operator re-enters.
+
+---
+
+#### State 3: CTID valid and free
+
+No error msgbox; validation succeeds. Script proceeds immediately to the hostname prompt.
+
+---
+
+### Hostname Validation Loop
+
+#### State 1: Hostname entry prompt
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ai-dev-switchboard                                                       │
+│                                                                          │
+│ Hostname:                                                                │
+│ _________________________ ai-dev-switchboard ________________________    │
+│                                                                          │
+│                                           <  OK  >   <  Cancel  >        │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+**Initial state:** Prompted with the default (`DEFAULT_CT_HOSTNAME`).
+
+---
+
+#### State 2: Hostname RFC1123 validation error
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ai-dev-switchboard                                                       │
+│                                                                          │
+│ 'my_host' is not a valid hostname. Use letters, digits, hyphens;        │
+│ each dot-separated label 1-63 chars, no leading/trailing hyphens.        │
+│                                                                          │
+│                                                 <  OK  >                 │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+**Copy:** `"'$CT_HOSTNAME' is not a valid hostname. Use letters, digits, hyphens; each dot-separated label 1-63 characters; can't start or end with a hyphen."`
+
+**Character count:** ~130 chars total. Exceeds 74-char single line, but wraps gracefully across 3-4 logical lines in whiptail msgbox. ✓
+
+**Rationale:**
+- **Shows the rejected value** — Operator sees exactly what they entered (`'my_host'`), confirming which field failed.
+- **Explains the rule clearly** — Lists the core constraints:
+  - Character set: letters, digits, hyphens only (rules out underscore, space, special chars common in hostnames in other contexts).
+  - Label length: 1-63 chars per dot-separated label (RFC1123 basic rule).
+  - Boundary rule: no leading/trailing hyphens per label (common mistake: `-hostname` or `host-`).
+- **Omits overly technical details** — Doesn't mention the regex, "dot-separated labels," or "253-char total limit" (the total limit is enforced by the regex but rarely triggers in practice). Focuses on the most common violations.
+- **Aligns with spec's validation code** (lines 248–249) — the check is the `_valid_hostname()` function, which validates via regex:
+  ```bash
+  [[ "$_label" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]
+  ```
+  This enforces: alphanumeric start, 0-61 middle chars (alphanumeric or hyphen), alphanumeric end, total label ≤63 chars.
+
+**Behavior after:** Msgbox dismissed (OK), same `ask()` prompt re-shown. Operator re-enters.
+
+---
+
+#### State 3: Hostname valid RFC1123 shape
+
+No error msgbox; validation succeeds. Script proceeds immediately to the storage-pool step.
 
 ---
 
 ## Component reuse
 
-- Reused: `msg()`, `ask()`, `menu()` helper functions (existing, defined at `ct/create.sh:26-30`) — for consistent styling, title, and error handling across all dialogs.
-- Reused: whiptail's `--msgbox` (existing, part of the project's standard whiptail usage) — for the Default-path confirmation dialog.
-- Reused: `--menu` directive (existing, already used for auth-mode and publish-mode selection at lines 46-48 and 151-158) — for the entry fork itself.
-- No new terminal UI library, color system, or component framework introduced.
+- **Reused:** `msg()`, `ask()` helper functions (existing, defined at `ct/create.sh:26-30`) — for consistent styling and error handling.
+- **Reused:** whiptail's `--menu` directive (existing, already used for auth-mode/publish-mode selection) — for storage/bridge pickers.
+- **Reused:** `--msgbox` (existing) — for validation error messages.
+- **New:** `_valid_hostname()`, `_enumerate_storage()`, `_enumerate_bridges()` helper functions (inserted near the existing helper block). These are internal bash functions, not external dependencies.
+- **No new terminal UI library or design token system introduced.**
+
+---
+
+## State coverage summary
+
+| Dialog | State | Copy | Behavior |
+|--------|-------|------|----------|
+| **Storage menu** | Populated (≥1 pools) | Menu with type+free-space rows | Selection assigned to `STORAGE` |
+| | Empty (0 pools) | Free-text ask() | Fallback to existing behavior |
+| **Bridge menu** | Populated (≥1 bridges/vnets) | Menu with "kernel bridge"/"SDN vnet" rows | Selection assigned to `BRIDGE` (SDN prefix stripped) |
+| | Empty (0 bridges) | Free-text ask() | Fallback to existing behavior |
+| **CTID loop** | Non-numeric/out-of-range | Msgbox error + re-prompt | Loop back to ask() |
+| | Already in use (collision) | Msgbox error + re-prompt | Loop back to ask() |
+| | Valid | (no msgbox, proceed) | Advance to hostname prompt |
+| **Hostname loop** | Invalid (RFC1123 violation) | Msgbox error + re-prompt | Loop back to ask() |
+| | Valid | (no msgbox, proceed) | Advance to storage-pool prompt |
 
 ---
 
@@ -172,22 +302,25 @@ whiptail --title "ai-dev-switchboard" --msgbox \
 
 ### Terminal environment
 
-- **Character width constraints:** All text constrained to 74 chars per line (established whiptail box width across the file) to fit standard 80-char terminals with margins. Verified above per dialog.
-- **Text clarity over visual polish:** No color, graphics, or decorative elements possible in whiptail TUI — clarity depends entirely on copy, line breaks, and indentation.
-- **Screen reader compatibility:** Terminal environment; text is inherently accessible to terminal screen readers (Jaws, NVDA, VoiceOver terminal mode) — no non-semantic markup that would obstruct readability.
+- **Character width constraints:** All text constrained to 74 chars per line (established whiptail box width) to fit standard 80-char terminals.
+- **Word-wrap:** Longer error messages (hostname validation, CTID collision) exceed single-line width but wrap gracefully within whiptail's msgbox height allocation.
+- **Text clarity over visual polish:** No color coding, icons, or decorative elements possible in TUI — clarity depends entirely on copy phrasing and punctuation.
+- **Screen reader compatibility:** Terminal text is inherently accessible to terminal screen readers.
 
-### Wording choices for accessibility
+### Copy clarity for operators
 
-- **Avoided metaphors:** "Create with built-in defaults" is literal; no "quick-start," "wizard," or other abstract terms that might confuse non-native-English operators.
-- **Active voice:** "Create with…," "Walk through…" — actions the operator is choosing, not passive descriptions.
-- **Parenthetical clarifications:** Used sparingly to avoid overload, but present to disambiguate (e.g., "no prompts," "your existing credentials").
-- **Field names:** Match variable names in the code and existing prompts — operator sees `CTID`, not "Container ID (numeric)" — consistency prevents re-learning.
+- **Avoided jargon:** "Container ID," "Network bridge," and "RFC1123" terms are explained in context (RFC1123 details are spelled out, not referenced by acronym alone).
+- **Specific error messages:** Each validation failure has distinct messaging explaining *why* and *what to do next* (not just "invalid").
+- **Showed rejected values:** Error messages include `'$CTID'` or `'$CT_HOSTNAME'` so operator sees exactly what was rejected.
+- **Active voice:** "Container ID must be," "Use letters, digits," "Choose a different one" — action-oriented phrasing.
+- **Parallel structure:** Both CTID and hostname loops follow the same pattern (ask → validate → error msgbox if invalid → re-ask), so operator learns the pattern once.
 
 ### Platform-specific notes
 
-- **TUI only:** This feature is a shell script running on a Proxmox VE host (Linux terminal). No web UI, mobile, or GUI equivalent.
-- **Operator demographic:** System administrators familiar with SSH, Linux CLIs, and Proxmox. They expect terse, functional dialogs without excessive explanation.
-- **No hover states, animations, or responsive design:** TUI dialogs are static text in fixed-width boxes. No interaction beyond menu selection and text input.
+- **TUI only:** Bash script running on Proxmox VE host (Linux terminal). No mobile, GUI, or web equivalent.
+- **Operator demographic:** System administrators familiar with SSH, Linux CLIs, and Proxmox. They expect terse, functional dialogs without hand-holding.
+- **Whiptail constraints:** Fixed-width box (74 chars), static text (no animations, hover states, or interactive feedback beyond button clicks), no color/styling options in TUI.
+- **No new environment assumptions:** Enumeration helpers (`pvesm`, `ip`, `awk`) already available on any Proxmox/Debian host.
 
 ---
 
@@ -195,25 +328,67 @@ whiptail --title "ai-dev-switchboard" --msgbox \
 
 | Acceptance criterion (from docs/spec.md) | Where it's addressed in this design |
 |---|---|
-| Entry menu shown immediately after intro `msg()`, before CTID `ask()` (line 34 today) | Dialog 1 structure and placement note above; inserted after `ct/create.sh:32` |
-| Two options: "default" and "advanced" with short one-line descriptions | Dialog 1 copy: "default" → "Create with built-in defaults (fully automated, no prompts)"; "advanced" → "Walk through every setting (container specs + optional features)" |
-| Default descriptions fit in whiptail menu row width (15 74 2) | Dialog 1: both options verified ≤ 61 chars (fits within 74) ✓ |
-| Default path: zero additional dialogs beyond one final confirmation | Dialog 2 is the sole new dialog in Default path; Advanced path unchanged |
-| Default path confirmation msgbox lists CTID, hostname, storage+disk, cores+memory, bridge+ipconfig, run-user, login mode, optional features, publishing | Dialog 2: all nine elements present in the wireframe/implementation above |
-| Default confirmation msgbox fits in 20 74 box without truncation | Dialog 2: content verified at 13 logical lines (fits within 20-row height with 7 rows buffer) ✓ |
-| "Recommended settings, zero extra prompts" wording must clearly convey Default creates a real container (not a dry run, open question #3) | Dialog 1 copy revised to "Create with built-in defaults (fully automated, no prompts)" — "Create with" makes explicit; "no prompts" removes "extra" ambiguity |
-| Auth mode wording must make clear Default uses "your existing Proxmox VE login" (not a new credential, open question #4) | Dialog 2 copy: "Web UI login: your existing Proxmox VE credentials" — "existing" added; "Web UI" scope-clarified |
-| Cancel at entry menu aborts script | Behavior note: `INSTALL_MODE=$(...)` under `set -euo pipefail` fails on non-zero exit from whiptail; script aborts before any other prompt |
-| Cancel at Default confirmation msgbox aborts script before `pct create` | Behavior note: `whiptail --msgbox` returns non-zero on Cancel; script aborts before TOTP/container-create code |
-| Advanced path identical to today's flow (prompt text, order, defaults) | Not changed by this design; developer's diff-check against pre-change file verifies this |
+| Storage menu: two or more active pools → `whiptail --menu` with type+free-space | Dialog 1, State 1: "Populated" section; row format table |
+| Storage menu zero-results → fallback to free-text ask() | Dialog 1, State 2: "Empty" section |
+| Bridge menu: one or more bridges/vnets → `whiptail --menu` | Dialog 2, State 1: "Populated" section |
+| Bridge menu: SDN entries tagged `sdn:` in menu, prefix stripped before use | Dialog 2, row format table; note on prefix stripping |
+| Bridge menu zero-results → fallback to free-text ask() | Dialog 2, State 2: "Empty" section |
+| CTID non-numeric/out-of-range → msgbox + re-prompt loop | Dialog 3, State 2a: error message and retry loop behavior |
+| CTID already in use → msgbox + re-prompt loop (distinct from range error) | Dialog 3, State 2b: distinct error message and retry loop behavior |
+| CTID valid → proceed to hostname (no msgbox, no delay) | Dialog 3, State 3 |
+| Hostname RFC1123 invalid → msgbox + re-prompt loop | Dialog 4, State 2: error message listing RFC1123 rules |
+| Hostname valid → proceed to storage (no msgbox, no delay) | Dialog 4, State 3 |
+| Default path untouched (no menu, no validation loops) | Spec requirement; design covers Advanced branch only |
+| Fit within whiptail's 74-char box width | Character counts verified for all copy above |
+| Cancel at any `ask()` aborts script (existing behavior, unchanged) | Noted in state coverage; matches pre-existing `set -euo pipefail` behavior |
+
+---
+
+## Character-width verification table
+
+| Dialog / Copy | Example / Worst-case | Char count | Fits in 74? |
+|---|---|---|---|
+| Storage title | "Storage pool for the container's root disk:" | 45 | ✓ |
+| Storage row (max) | "local-lvm lvmthin, 999999GiB free" | ~35 | ✓ |
+| Bridge title | "Network bridge:" | 15 | ✓ |
+| Bridge row (max) | "sdn:management SDN vnet" | 23 | ✓ |
+| CTID prompt | "Container ID (must be free):" | 28 | ✓ |
+| CTID range error | "…(got '999999999')." | ~75 | ✓ (word-wrap) |
+| CTID collision error | "…already in use on this host…" | ~80 | ✓ (word-wrap) |
+| Hostname prompt | "Hostname:" | 9 | ✓ |
+| Hostname error (1st line) | "'my_host' is not a valid hostname…" | ~130 | ✓ (multi-line wrap) |
 
 ---
 
 ## Implementation notes for developer
 
-- Extract the nine `DEFAULT_*` constants (hostname, storage, disk, cores, memory, bridge, ipconfig, template storage, run-user) and `default_ctid()` function per spec's "Proposed approach" #2 — used by both Default and Advanced branches.
-- Entry menu returns string (`"default"` or `"advanced"`); use `if [ "$INSTALL_MODE" = "default" ]; then...else...fi` to branch.
-- Default branch assigns all variables directly from `DEFAULT_*` and function; Advanced branch wraps existing `ask()`/`menu()` calls in the else block (verbatim code moves from today's lines 34-158 into the else branch, with only the literal-to-variable substitution changes).
-- Confirmation msgbox in the Default branch uses `${VAR}` expansions; ensure all variables are set before that line is reached.
-- No changes to lines 160-239 (TOTP, template resolution, `pct create`, summary) — shared exit path for both branches.
+- The four helper functions (`_valid_hostname()`, `_enumerate_storage()`, `_enumerate_bridges()`, and a fourth implicit in the menubox height calculation) are defined in the spec's "Proposed approach" section and should be inserted into `ct/create.sh` near the existing `msg()`, `ask()`, etc. helpers (around line 26 in the spec's provided code).
+- Both CTID and hostname validation loops use the `while :; do ... done` pattern identical to the existing ollama endpoint loop (part 1's code). Maintain that pattern for consistency.
+- Storage and bridge menus use `whiptail --menu ... 3>&1 1>&2 2>&3` (existing pattern in the file) to capture selection while preserving stderr. Do not deviate.
+- All error messages use the `msg()` helper (which calls `whiptail --msgbox` with consistent title "ai-dev-switchboard" and dimensions 14 74).
+- SDN prefix stripping (`BRIDGE="${BRIDGE#sdn:}"`) happens *after* the whiptail menu selection, not before. Verify this line order.
+- Fallback to free-text `ask()` for storage/bridge is triggered by checking array length: `if [ "${#STORAGE_MENU_OPTS[@]}" -eq 0 ]` (spec line 263). This must happen *after* enumeration and *before* the conditional menu/ask display.
+
+---
+
+## Design sanity check (Dieter Rams' "good design is" principles)
+
+1. **Good design is innovative** — Using live enumeration instead of free-text guessing is a tangible improvement. ✓
+2. **Good design makes a product useful** — Enumerating pools/bridges solves the "which one exists?" problem operators face today. ✓
+3. **Good design is aesthetic** — TUI has no visual aesthetics, but copy clarity is high. ✓
+4. **Good design makes a product understandable** — Error messages explain *what* failed and *why*. ✓
+5. **Good design is unobtrusive** — If enumeration fails (zero results), fallback is silent; operator doesn't see a "fallback activated" message. ✓
+6. **Good design is honest** — Copy doesn't oversell or hide rules; CTID range, hostname RFC1123 rules, and storage-type descriptions are all explicit. ✓
+7. **Good design is long-lasting** — Live enumeration (pvesm, ip command) is stable; less likely to break than parsing static configs. ✓
+8. **Good design is thorough** — State coverage includes empty results, single-item menus, validation loops, and operator cancellation. ✓
+9. **Good design is environmentally friendly** — N/A for a TUI script. ✓
+10. **Good design is as little design as possible** — Copy is terse; dialogs reuse existing helpers; no new UI patterns introduced. ✓
+
+---
+
+## Files referenced
+
+- Spec: `/home/dev/projects/ai-dev-switchboard/docs/spec.md` (full feature spec)
+- Implementation target: `/home/dev/projects/ai-dev-switchboard/ct/create.sh` (lines 82–88 and helpers block around line 26)
+- Related design docs: Parts 1 and 2 design.md (established the TUI pattern and copy style for this project)
 
