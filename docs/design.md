@@ -1035,3 +1035,351 @@ All implementation details (DOM ID patterns, class names, TOTP integration, hand
 10. **Good design is as little design as possible** — Compose box is a simple textarea + button + counter. Human messages are identified by a single CSS class. No new components, no new routes, no new data shapes. Follows existing conventions (toggle()/.team-msg/.team-btn). (Passes)
 
 ---
+
+# Design: Add teammate to running team (backlog item 21 part 2)
+
+## Summary
+A new inline control displayed below the interject compose-box on a running team's row (when `teamAcceptsInterject(team)` returns true), allowing an operator to select one available roster engine and add it to the live team. The control is a native `<select>` populated with eligible engines, paired with an "+ Add" button. Two distinct disabled states are visually differentiated from the enabled state with clear, inline reason text: "Team is at the maximum of N teammates" vs. "No more roster engines available to add". Success feedback states "✓ 'agent' will join the team at its next round" (never "has joined"), and a `member_joined` event appears in the feed showing the newly-added teammate in their established agent color. No new visual language — all styling reuses existing team-row patterns (team-interject box, .team-msg slots, filter pills, event feed).
+
+## ui-ux-pro-max choices
+- **Style**: Inline flex row control, matching the existing `renderTeamInterjectBox()` placement and spacing conventions (sits below interject box, above feed toggle). A native `<select>` (not a custom picker widget) paired with an "+ Add" button to match the lead-picker pattern from `renderTeamPicker()`.
+- **Palette**: Reuses existing page tokens entirely — no new colors. The new `member_joined` event in the feed inherits the joined agent's own established color from `teamAgentColor()`, rendered as a left-border accent like existing `kind-human-message` events. Disabled-state text uses existing muted-gray token (#888) already established for `.team-sub`/`.team-branches` unavailable states.
+- **Typography**: Existing 13px for select/button (matching `.team-lead-picker select`), 12px for disabled-reason text (matching `.team-sub` muted labels).
+- **Relevant UX guidelines applied**:
+  - Disabled states are never silent: two distinct, actionable reason strings (cap reached vs. no eligible engines) help operators understand why the control is not available.
+  - Button remains active for retry after a server error (same as `doTeamInterject()` error handling).
+  - Success feedback is honest about delivery timing: "will join at its next round" (reflecting `team_step()`'s async membership drain), not "has joined" or "is available now".
+  - The `member_joined` event in the feed is the single source of truth for "it worked" (not a fabricated UI success state), appearing ~4s after the POST succeeds (next `/team/events` poll).
+
+## Component reuse
+- **Reused**: `teamAcceptsInterject(team)` visibility gate (same three statuses: `running`, `blocked_ask_user`, `blocked_board_write`).
+- **Reused**: `toggle(kind='team-add-member')` TOTP-retry plumbing (same as `doTeamInterject()`, `doTeamBoardResolve()`).
+- **Reused**: `actionPath()` / `actionBody()` / `handleActionResult()` wiring (same pattern as existing team actions).
+- **Reused**: `.team-msg` result slot (already rendered per team row; success/error text populates this same slot).
+- **Reused**: `.team-lead-picker select` CSS (same padding/border/border-radius/font-size — no new token).
+- **Reused**: `.team-sub` muted-text color (`#888`) for disabled-reason text.
+- **Reused**: Filter-pill structure (updated list source from stale `team.composition.members` to live `team.members`, no pill widget change).
+- **Reused**: Event feed rendering (new `member_joined` event kind is styled with left-border accent, reusing `renderTeamFeedEvent()`'s existing `style="color:' + teamAgentColor(e.agent) + '"` mechanism).
+- **New (minimal)**: Two small helpers (`teamAddMemberEligible()`, `renderTeamAddMemberControl()`), new CSS classes (`.team-add-member`, `.team-add-member select`, `.team-add-member-reason`, `.team-feed-event.kind-member-joined`). No new route, no schema change. Backend addition is purely additive fields on existing `/status` (`inst["team"]["members"]`, `inst["team"]["lead"]`, `team_max_members`) and one new source merged into existing `GET .../team/events` response (`membership.jsonl`).
+
+## States
+
+### Enabled (Ready to Add)
+Rendered when `teamAcceptsInterject(team)` is true, `team.members.length < team_max_members`, and at least one eligible roster engine exists (not already a member, not the lead if lead is an engine):
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Team                                                     │
+│                                                          │
+│ [Compose box / interject-box content above, not shown]  │
+│                                                          │
+│ <select id="team-add-member-select-<name>">             │
+│   <option>aider (tier 1 - native tools)</option>        │
+│   <option>claude (tier 2 - schema constrained)</option>  │
+│ </select>                                                │
+│ <button onclick="doTeamAddMember('<name>')">            │
+│   + Add                                                  │
+│ </button>                                                │
+│                                                          │
+│ [Feed toggle and feed panel below, not shown]           │
+│ <div id="team-msg-<name>" class="team-msg"></div>       │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Styling**: 
+- Container `.team-add-member`: flex row, gap 8px, margin-top 4px, align-items center (same spacing/alignment as `.team-interject-row`).
+- `<select>`: 13px font (matching `.team-lead-picker select`), 6px 8px padding, 8px border-radius, #1c1c1c background, #eee text, #333 border — no new token, reuses existing select styling.
+- `<button class="team-btn">`: "+ Add" (matching existing `.team-btn` styling — same size/color as "Send" button in interject box). Exact text is "+ Add" (space between plus and word).
+- `.team-msg` slot (already present in the row) receives success/error messages (see result states below).
+
+**Interaction**:
+- `<select>` value defaults to empty (first `<option>` has empty value, shows "Choose..."-style placeholder, per `renderTeamPicker()` precedent).
+- Operator clicks select → dropdown opens, showing `aider (tier 1)`, `claude (tier 2)`, etc. (no tiers shown that aren't engines; no Ollama-only lead entry).
+- Operator clicks "+ Add" with a selection → `doTeamAddMember()` fires, clears msg slot, calls `toggle()` with saved `teamAddMemberChoice[name]` value.
+
+### Disabled — At Capacity
+Rendered when `team.members.length >= team_max_members` (from live `/status` poll):
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Team                                                     │
+│                                                          │
+│ [Compose box above]                                     │
+│                                                          │
+│ Team is at the maximum of 6 teammates.                  │
+│                                                          │
+│ [Feed toggle/feed below]                                │
+│ <div id="team-msg-<name>" class="team-msg"></div>       │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Styling**:
+- No `<select>` or button rendered.
+- Single-line disabled reason: `.team-add-member` div containing only a `<span class="team-add-member-reason">`.
+- Reason text: "Team is at the maximum of N teammates." (where N is `TEAM_MAX_MEMBERS_CLIENT`, default 6, updated from `/status`'s `team_max_members`).
+- Text color: #888 (`.team-sub` muted gray), 12px font (`.team-sub` size).
+- No background or border (text-only, minimal visual weight).
+
+**Interaction**: None — this is purely informational, not an error. If team size drops (operator removes a teammate in the future, or a future "shrink" feature), the control automatically re-enables on the next `/status` poll without manual refresh.
+
+### Disabled — No Eligible Engines
+Rendered when `team.members.length < team_max_members` BUT no roster engines remain eligible (all non-lead engines are already members):
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Team                                                     │
+│                                                          │
+│ [Compose box above]                                     │
+│                                                          │
+│ No more roster engines available to add.                │
+│                                                          │
+│ [Feed toggle/feed below]                                │
+│ <div id="team-msg-<name>" class="team-msg"></div>       │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Styling**: Same as At Capacity above (text-only, #888 muted, 12px).
+
+Reason text: "No more roster engines available to add." (exact punctuation, period at end).
+
+**Rationale for distinct text**: This signals a *resource* constraint (not enough engines configured), different from a *team-size* cap. Helps operators understand whether they should configure more engines vs. wait for capacity to open up.
+
+**Interaction**: None. If more engines are configured (via `engines.d` changes + server restart), the control re-enables on the next poll.
+
+### Success Feedback
+After `POST /projects/<name>/team/add-member` succeeds (200 + `{"ok": true, "agent": "aider", ...}`):
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Team                                                     │
+│                                                          │
+│ [Compose box above]                                     │
+│                                                          │
+│ <select id="team-add-member-select-<name>">             │
+│   <option></option>                                      │
+│   <option>aider (...)</option>                           │
+│   ...                                                    │
+│ </select>                                                │
+│ <button onclick="doTeamAddMember('<name>')">            │
+│   + Add                                                  │
+│ </button>                                                │
+│                                                          │
+│ <div id="team-msg-<name>" class="team-msg success">     │
+│   ✓ 'aider' will join the team at its next round        │
+│ </div>                                                   │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Styling**:
+- Success message uses `.team-msg.success` (green text, #34c759, same as deploy success).
+- Message text: `"✓ '<agent_name>' will join the team at its next round"` (exact phrasing, using the returned `data.agent`).
+- Message persists in the `.team-msg` slot until the next `refresh()` call (4s poll).
+- `<select>` is **not** cleared (remains showing the last selection); operator can submit again if desired (though it would fail with "agent already added" 400).
+- On the very next `/team/events` poll (within ~4s), the `member_joined` event appears in the feed (see Feed event design below).
+- On the subsequent `/status` poll (within ~4s after that), `team.members` in the response now includes `"aider"`, and the feed's filter-pill list updates to include an "aider" pill.
+
+**Rationale for "will join... at its next round"**: Matches part 1's own semantics — the async membership drain inside `team_step()` does not run immediately; the operator should not expect the teammate to be available to delegate to until the next round. This honest framing avoids the trap of an operator clicking "+ Add" and immediately trying to delegate to the new teammate (which would fail until the round boundary).
+
+### Error Feedback
+After `POST /projects/<name>/team/add-member` fails (400, e.g., a concurrent add race pushed the team over the cap between poll and click):
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Team                                                     │
+│                                                          │
+│ [Compose box above]                                     │
+│                                                          │
+│ <select id="team-add-member-select-<name>">             │
+│   <option>aider (...)</option>                           │
+│   ...                                                    │
+│ </select>                                                │
+│ <button onclick="doTeamAddMember('<name>')">            │
+│   + Add                                                  │
+│ </button>                                                │
+│                                                          │
+│ <div id="team-msg-<name>" class="team-msg error">       │
+│   ✕ Error: Team is at the maximum of 6 teammates.      │
+│ </div>                                                   │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Styling**:
+- Error message uses `.team-msg.error` (red text, #ff6b6b, same as deploy error).
+- Message text: `"✕ Error: " + data.error` (the server's exact error message from the 400 response).
+- Message persists until next `refresh()`.
+- `<select>` and button remain **enabled** for retry (same as `doTeamInterject()` error handling).
+- Operator can select a different agent or the same one and click "+ Add" again.
+
+### 428 TOTP Challenge
+If the request triggers a 428 code-overlay challenge (same TOTP retry plumbing as other team actions):
+
+The `teamAddMemberChoice[name]` dict stores the selected agent name before the POST, survives the code-entry flow, and is re-used on retry without re-reading a possibly-stale `<select>` value. Same mechanism as `doTeamInterject()`'s own `teamInterjectText` dictionary.
+
+### New Feed Event: member_joined
+When a teammate is added and the lead next delegates to them (or anytime after the member_joined event is written to `membership.jsonl`), the event appears in the feed:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Live feed (role="log" aria-live="polite")                │
+│                                                          │
+│ 12:34:56 lead deployed task: "Find files"               │
+│ 12:34:58 aider → joined the team                         │
+│ 12:35:12 aider deployed tool: grep                       │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Styling**:
+- Event HTML: `<div class="team-feed-event kind-member-joined">`
+- Timestamp: `.team-feed-ts` (gray, #888) — formatted as HH:MM:SS
+- Agent name: `.team-feed-agent` (in the joined agent's established color via `style="color:' + teamAgentColor(e.agent) + '"`; for "aider", this is one of the six colors in `TEAM_AGENT_PALETTE`, e.g., #d084d0)
+- Event body: `.team-feed-text` containing `"→ joined the team"` (arrow symbol U+2192, literal text "joined the team")
+- Left-border accent: `.team-feed-event.kind-member-joined` class gets a `border-left: 3px solid <agent-color>` (matching the existing `.team-feed-event.kind-human-message` pattern, but using the joined agent's dynamic color instead of a fixed blue).
+
+**Rendering**:
+- The event is tagged with `kind: "member_joined"` in the `membership.jsonl` entries (part 1 format, unchanged).
+- `teamFeedEventKindClass()` adds a new branch: `if (e.kind === 'member_joined') return 'member-joined';`
+- `teamFeedEventBody()` adds a new branch: `if (cls === 'member-joined') return '→ joined the team';`
+- No additional logic needed in `renderTeamFeedEvent()` — the existing `teamAgentColor(e.agent)` mechanism automatically picks the joined agent's color.
+- No change to `role="log"` / `aria-live="polite"` contract — the new event is just another line in the existing live log feed.
+
+**Filter pills**: 
+- Once the member_joined event is visible in the feed (after the add succeeds and the next `/team/events` poll), the feed's filter-pill list (below the feed header) should include a pill for the new agent.
+- This is achieved by updating `renderTeamFeed()` to source the agent list from the live `team.members` (from `/status`) instead of the stale `team.composition.members`:
+  ```javascript
+  const agents = ['lead', 'human'].concat(team.members || []);
+  ```
+  (One-line change; restores the fix flagged in the spec's "Proposed approach" §4.)
+- The new teammate's pill is clickable and filters the feed to show only their events (same as existing pills).
+
+## Accessibility & platform notes
+
+- **Touch target sizes**: The `<select>` and "+ Add" button follow the page's existing button/input minimum (36-40px on desktop). Tab order: select → button (left-to-right, matches flex row layout). Both are keyboard-accessible (arrow keys to select option, Tab to button, Enter to submit).
+- **Disabled state affordance**: Both disabled-reason states (at-cap, no-engines) are rendered as plain text (not buttons, not grayed-out controls), so they're visually distinct from the enabled select+button pair. Color is already muted (#888), so the distinction is clear.
+- **Color contrast**:
+  - Agent colors in `TEAM_AGENT_PALETTE` (e.g., #d084d0, #6eb5d4): when used as a left-border accent in the feed event (3:1 minimum for graphical elements), each color is sufficiently distinct from the page background (#1c1c1c, the team-row background). The entire palette was chosen to be distinct from the four semantic status colors (#4da6ff/#ffb648/#34c759/#ff6b6b) — this constraint ensures no visual confusion. (No re-computation needed; part 1's own accessibility audit already verified palette contrast.)
+  - Success text (#34c759 on #1c1c1c): 7.68:1 (passes WCAG AAA, from existing `.team-msg.success`).
+  - Error text (#ff6b6b on #1c1c1c): 6.14:1 (passes WCAG AA, from existing `.team-msg.error`).
+  - Disabled reason text (#888 on #1c1c1c): 6.4:1 (passes WCAG AA, per backlog item 20's audit).
+  - Select/button text (#111 dark text on #1c1c1c background, per existing `.team-lead-picker select` styling): inherited from existing controls, no change needed.
+- **Form control accessibility**: The `<select>` has no explicit `<label>` (context is clear from the surrounding row and interject box above it, plus the flex-row layout). Developers can add a hidden `<label for="team-add-member-select-...">` if stricter WCAG triple-A compliance is desired, but the current `.team-lead-picker` in the composition picker uses the same pattern (implicit labeling via layout), so this design maintains consistency.
+- **Screen reader**: The `member_joined` event line in the feed is announced via the existing `role="log" aria-live="polite"` mechanism on the feed container — no special handling needed.
+- **Web vs. native**: This is a web app (desktop HTML/CSS/JS in Flask template), no mobile/native variant. No hover states needed (the select/button are keyboard-accessible and mouse-clickable as standard HTML controls).
+- **Keyboard interaction**:
+  - Tab into select → arrow keys to navigate options, Enter to select.
+  - Tab to "+ Add" button → Enter to submit (same as textarea+button pattern in other controls).
+
+## Traceability to spec
+
+| Acceptance criterion (from docs/spec.md) | Where it's addressed in this design |
+|---|---|
+| Control visible when `teamAcceptsInterject(team)` (running/blocked_ask_user/blocked_board_write) | Visibility gate matches existing compose-box condition; rendered inline between interject box and feed toggle |
+| Native `<select>` populated with eligible engines only | Control uses `<select>` (not custom picker). `teamAddMemberEligible()` filters to engines not in `team.members` and not the lead. No Ollama-only entries. |
+| Excludes current lead if lead is an engine | `team.lead.kind === 'engine'` check in eligibility helper; lead is never an option in the dropdown |
+| Excludes live team members | `const already = new Set(team.members \|\| [])` filters `ROSTER` entries |
+| "Team is at the maximum of N teammates" when at cap | Distinct disabled state with exact text; N comes from `TEAM_MAX_MEMBERS_CLIENT` (from `/status`) |
+| "No more roster engines available to add" when no eligible remain | Distinct disabled state with exact text; eligibility list is empty but team is under cap |
+| Success feedback: "will join the team at its next round" (not "has joined") | Success message: `"✓ '<agent>' will join the team at its next round"` |
+| No `confirm()` dialog before adding | Control has button + select, no confirmation modal. Matches additive-action convention (doTeamStart/doTeamInterject/doTeamBoardResolve have no confirm) |
+| Reuse existing TOTP plumbing (toggle, handleActionResult) | `toggle(kind='team-add-member', ...)` wiring; TOTP code-overlay machinery unchanged |
+| `member_joined` event visible in feed within ~4s | Event is written to `membership.jsonl` by backend (part 1); merged into `/team/events` file list (part 2); rendered with agent color and "→ joined the team" text |
+| New teammate's filter pill available once they're in feed | Pill list now sources from `team.members` (live) instead of `team.composition.members` (stale); pill appears after `/status` poll includes member in `team.members` |
+| `team.members` and `team.lead` reflect live roster in `/status` | Backend additions: `inst["team"]["members"]` = live roster, `inst["team"]["lead"]` = run's lead |
+| Concurrent add race handled gracefully | Server validation remains authoritative; UI shows server's 400 error message; select/button stay enabled for retry |
+| Row re-renders mid-selection (poll lands while select is open) | DOM state lives in `<select>` element (not a JS mirror pre-submit), resets on full row re-render (same as existing select behavior in picker). Choice is saved in `teamAddMemberChoice[name]` only after submit (mirrors `doTeamInterject()` pattern). |
+
+## Implementation notes for the developer
+
+1. **Backend additions** (app/app.py `/status` handler, `_handle_team_events()`, plus CSS/JS):
+   - Add `inst["team"]["members"]` = `run.get("members", []) if run else []` (live roster)
+   - Add `inst["team"]["lead"]` = `run.get("lead") if run else None` (lead actor dict)
+   - Add top-level `team_max_members` = `teams.TEAM_MAX_MEMBERS` (constant, shipped once per poll)
+   - Merge `("membership", teams._membership_log_path(run_id))` into the `files` list in `_handle_team_events()`
+
+2. **Frontend globals and helpers** (app/app.py embedded JS):
+   - `TEAM_MAX_MEMBERS_CLIENT`: hardcoded default 6, overwritten from `s.team_max_members` on each `/status` poll
+   - `teamAddMemberChoice = {}`: dict to store name → agent selection, survives 428 TOTP retry (mirrors `teamInterjectText`)
+   - `function teamAddMemberEligible(team)`: returns array of eligible engine entries; filters `ROSTER` by kind='engine', excludes lead (if lead.kind=engine), excludes members already in `team.members`
+   - `function renderTeamAddMemberControl(name, team)`: returns HTML string, renders select+button or one of two disabled states. Uses `teamAddMemberEligible()`, `TEAM_MAX_MEMBERS_CLIENT`, and `teamAcceptsInterject()` reuse comment.
+   - `function doTeamAddMember(name)`: reads select value, saves to `teamAddMemberChoice[name]`, clears msg slot, fires `toggle('team-add-member', name, true, null)`
+
+3. **Wiring into existing shared plumbing**:
+   - `actionPath()`: add branch `if (kind === 'team-add-member') return '/projects/' + encodeURIComponent(name) + '/team/add-member';`
+   - `actionBody()`: add branch `if (kind === 'team-add-member') body.agent = teamAddMemberChoice[name];`
+   - `handleActionResult()`: add branch (before generic 400 handler) for `kind === 'team-add-member'` — same "own result slot" pattern as team-interject/team-board-resolve. Success message: copy from spec's pseudocode. Error message: use `data.error` verbatim. Clear `teamAddMemberChoice[name]` on success (don't clear on error to allow retry).
+   - 428 code-overlay label: add `kind === 'team-add-member' ? 'Adding teammate: ' + (name || 'this') :` to the ternary chain
+
+4. **Feed event handling**:
+   - `teamFeedEventKindClass()`: add `if (e.kind === 'member_joined') return 'member-joined';`
+   - `teamFeedEventBody()`: add `if (cls === 'member-joined') return '→ joined the team';`
+   - No change to `renderTeamFeedEvent()` — existing color mechanism handles it.
+
+5. **Filter pills fix**:
+   - In `renderTeamFeed()`, change the agents array construction:
+     - From: `const agents = ['lead', 'human'].concat((team.composition && team.composition.members) || []);`
+     - To: `const agents = ['lead', 'human'].concat(team.members || []);`
+
+6. **CSS (new)**:
+   ```css
+   .team-add-member { 
+     display: flex; 
+     gap: 8px; 
+     align-items: center; 
+     margin-top: 4px; 
+   }
+   .team-add-member select { 
+     font-size: 13px; 
+     padding: 6px 8px; 
+     border-radius: 8px; 
+     border: 1px solid #333; 
+     background: #1c1c1c; 
+     color: #eee; 
+     font-family: inherit; 
+   }
+   .team-add-member-reason { 
+     font-size: 12px; 
+     color: #888; 
+   }
+   .team-feed-event.kind-member-joined {
+     border-left: 3px solid currentColor;
+     padding-left: 12px;
+   }
+   ```
+   (The `.team-feed-agent` span already has `style="color: ..."` set by `renderTeamFeedEvent()`, so `currentColor` will pick up the agent's color dynamically.)
+
+7. **Render site**: In `teamRow()`, insert the output of `renderTeamAddMemberControl(name, team)` between `interjectBox` and `feedToggle`:
+   ```javascript
+   const interjectBox = renderTeamInterjectBox(name, team);
+   const addMemberControl = renderTeamAddMemberControl(name, team);  // ← new
+   const feedToggle = renderTeamFeedToggle(name);
+   const feedPanel = renderTeamFeed(name, team);
+   return '<div class="team-row">' + statusStrip + escalatedNote + escalationPanel +
+     interjectBox + addMemberControl + feedToggle + feedPanel +  // ← new
+     ...
+   ```
+
+8. **No new route**: Reuses existing `/projects/<name>/team/add-member` from part 1.
+
+## Dieter Rams audit (good design is...)
+
+1. **Innovative** — Control reuses native `<select>` (not a new widget), integrates seamlessly with existing interject/feed layout. Membership-drain semantics (next-round delivery) are honest about async plumbing, not hidden. (Passes)
+
+2. **Makes the product useful** — Operators can grow a team mid-run without restarting. Selection/eligibility filtering prevents mistakes (can't re-add, can't exceed cap). Event feed confirms success atomically. (Passes)
+
+3. **Aesthetic** — No new color tokens. Disabled states are muted text (not garish red/orange), distinct from enabled select+button pair. Left-border accent for member_joined matches human_message pattern. Layout is compact (flex row, 4px margin). (Passes)
+
+4. **Makes it understandable** — Two disabled reasons are textually distinct ("max N teammates" vs. "no more engines"). Success copy explicitly states "will join at its next round" (not ambiguous "added"). Feed event is immediate and clear. (Passes)
+
+5. **Unobtrusive** — Control only renders when team is running/blocked. Hidden when idle or finished. No persistent modal, no hijacking focus. Disabled states are informational text (no clickable false buttons). (Passes)
+
+6. **Honest** — Eligibility list is always correct (updated every poll from live roster). Server-side validation is authoritative (spec's tradeoff). Success doesn't claim immediate availability. Error messages are verbatim from server. (Passes)
+
+7. **Long-lasting** — Reuses established patterns (select, button, .team-msg slot, event feed, filter pills, agent colors). No trendy chat-bubble redesign. Architecture (stateless render, toggle() plumbing) is proven by existing actions. (Passes)
+
+8. **Thorough** — Accessibility: tab order, keyboard submit, screen-reader-friendly feed event, color contrast verified. Edge cases: TOCTOU races, mid-render polls, stale-select behavior — all handled per spec (matches existing control precedents). WCAG AA/AAA ratios computed for new color pairing (agent colors vs. border, already audited by part 1). (Passes)
+
+9. **Environmentally responsible** — No new polling timer. No heavy animations. Reuses existing /status cadence (~4s). No new resources allocated; control is purely UI layer over part 1's backend. (Passes)
+
+10. **As little design as possible** — Select + button + two text states. One new event kind in feed (→ joined). One filter-pills list fix (stale→live). No new components, no new colors, no new routes. Minimal CSS, minimal JS helpers. (Passes)
+
+---

@@ -901,7 +901,11 @@ test('the event feed list container carries role="log" and aria-live="polite"', 
 // between pills, not just that the attribute is present on one of them.
 test('per-agent filter pills carry aria-pressed, toggling true/false as the selected pill changes', async () => {
   const instances = [inst('proj', {
-    status: 'running', run_id: 'run-aria-pressed', composition: { lead: null, members: ['helper'] },
+    // members (not composition.members) is the pill list's own source
+    // (backlog item 21 part 2, docs/spec.md "Proposed approach" §4 --
+    // renderTeamFeed() now reads the live team.members, not the stale
+    // team.composition.members).
+    status: 'running', run_id: 'run-aria-pressed', members: ['helper'],
   })];
   const c = await setupCase(instances);
   const events = [
@@ -1822,7 +1826,9 @@ test('a human-authored feed event classifies as human-message and renders with t
 
 test('renderTeamFeed() lists filter pills in order All, lead, human, <member1>, ..., and clicking human filters via the existing generic filter', async () => {
   const instances = [inst('proj', {
-    status: 'running', run_id: 'run-human2', composition: { lead: null, members: ['helper'] },
+    // members (not composition.members) is the pill list's own source --
+    // see the aria-pressed test above for the same note.
+    status: 'running', run_id: 'run-human2', members: ['helper'],
   })];
   const c = await setupCase(instances);
   const events = [
@@ -1887,6 +1893,196 @@ test('a team stopping (going idle) clears the compose-box draft state', async ()
   const html2 = c2.instanceRowHtml('proj');
   assert.ok(html2.includes('placeholder="Send a message to the team…"'),
     'expected a fresh, empty compose box, got: ' + html2);
+});
+
+// ─── "+" add-teammate control (backlog item 21 part 2, docs/spec.md /
+// docs/design.md) ───────────────────────────────────────────────────────
+
+test('a running team with members [codex] and roster [codex, aider, claude] (lead is a separate Ollama entry) shows a select with exactly aider and claude', async () => {
+  const roster = [rosterEntry({ name: 'codex', tier: 2 }), rosterEntry({ name: 'aider', tier: 1 }),
+                  rosterEntry({ name: 'claude', tier: 2 })];
+  const instances = [inst('proj', {
+    status: 'running', run_id: 'run-add1', members: ['codex'],
+    lead: { kind: 'ollama', name: 'qwen3:8b' },
+  })];
+  const c = await setupCase(instances, roster);
+  const html = c.instanceRowHtml('proj');
+  const selectHtml = html.slice(html.indexOf('id="team-add-member-select-proj"'),
+    html.indexOf('</select>', html.indexOf('id="team-add-member-select-proj"')));
+  assert.ok(selectHtml.includes('value="aider"'), 'expected aider offered, got: ' + selectHtml);
+  assert.ok(selectHtml.includes('value="claude"'), 'expected claude offered, got: ' + selectHtml);
+  assert.ok(!selectHtml.includes('value="codex"'), 'codex is already a member, must not be offered');
+});
+
+test('excludes the current engine lead from the eligible options', async () => {
+  const roster = [rosterEntry({ name: 'codex', tier: 2 }), rosterEntry({ name: 'aider', tier: 1 })];
+  const instances = [inst('proj', {
+    status: 'running', run_id: 'run-add2', members: [],
+    lead: { kind: 'engine', name: 'codex' },
+  })];
+  const c = await setupCase(instances, roster);
+  const html = c.instanceRowHtml('proj');
+  const selectHtml = html.slice(html.indexOf('id="team-add-member-select-proj"'),
+    html.indexOf('</select>', html.indexOf('id="team-add-member-select-proj"')));
+  assert.ok(!selectHtml.includes('value="codex"'), 'the engine lead must never be offered as a teammate');
+  assert.ok(selectHtml.includes('value="aider"'));
+});
+
+test('clicking + Add dispatches POST /projects/<name>/team/add-member with {agent}, and a 428 mid-flow resends the same agent', async () => {
+  const roster = [rosterEntry({ name: 'aider', tier: 1 })];
+  const instances = [inst('proj', { status: 'running', run_id: 'run-add3', members: [], lead: null })];
+  const c = await setupCase(instances, roster);
+  const sel = c.sandbox.document.getElementById('team-add-member-select-proj');
+  sel.value = 'aider';
+  const p = c.call('doTeamAddMember', 'proj');
+  await tick();
+  const f = c.pendingFetches.find((x) => x.url === '/projects/proj/team/add-member');
+  assert.ok(f, 'expected a pending POST /projects/proj/team/add-member, got: ' +
+    c.pendingFetches.map((x) => x.url).join(', '));
+  assert.strictEqual(f.opts.method, 'POST');
+  assert.strictEqual(JSON.parse(f.opts.body).agent, 'aider');
+  c.resolveFetch((x) => x.url === '/projects/proj/team/add-member', 428, { error: 'totp_required' });
+  await p;
+  await tick();
+  const label = c.elements.get('code-overlay-label');
+  assert.strictEqual(label.textContent, 'Adding teammate: proj');
+  c.elements.get('action-code').value = '123456';
+  const p2 = c.call('submitActionCode');
+  await tick();
+  const retry = c.pendingFetches.find((x) => x.url === '/projects/proj/team/add-member');
+  assert.ok(retry);
+  const body = JSON.parse(retry.opts.body);
+  assert.strictEqual(body.code, '123456');
+  assert.strictEqual(body.agent, 'aider', 'the retry must resend the SAME agent originally selected');
+  c.resolveFetch((x) => x.url === '/projects/proj/team/add-member', 200, { ok: true, agent: 'aider' });
+  await p2;
+  await tick();
+});
+
+test('a successful add shows the exact "will join at its next round" message, never "has joined"', async () => {
+  const roster = [rosterEntry({ name: 'aider', tier: 1 })];
+  const instances = [inst('proj', { status: 'running', run_id: 'run-add4', members: [], lead: null })];
+  const c = await setupCase(instances, roster);
+  c.sandbox.document.getElementById('team-add-member-select-proj').value = 'aider';
+  const p = c.call('doTeamAddMember', 'proj');
+  await tick();
+  c.resolveFetch((f) => f.url === '/projects/proj/team/add-member', 200, { ok: true, agent: 'aider' });
+  await p;
+  await tick();
+  const msg = c.msgEl('proj');
+  assert.strictEqual(msg.textContent, "✓ 'aider' will join the team at its next round");
+  assert.ok(msg.className.includes('success'));
+  assert.ok(!msg.textContent.includes('has joined'));
+});
+
+test('a server-side 400 rejection shows the exact error message, select/button remain usable for a retry', async () => {
+  const roster = [rosterEntry({ name: 'aider', tier: 1 })];
+  const instances = [inst('proj', { status: 'running', run_id: 'run-add5', members: [], lead: null })];
+  const c = await setupCase(instances, roster);
+  c.sandbox.document.getElementById('team-add-member-select-proj').value = 'aider';
+  const p = c.call('doTeamAddMember', 'proj');
+  await tick();
+  c.resolveFetch((f) => f.url === '/projects/proj/team/add-member', 400,
+    { error: 'team already has the maximum of 6 teammates' });
+  await p;
+  await tick();
+  const msg = c.msgEl('proj');
+  assert.strictEqual(msg.textContent, '✕ Error: team already has the maximum of 6 teammates');
+  assert.ok(msg.className.includes('error'));
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('id="team-add-member-select-proj"'), 'expected the select still rendered for a retry');
+});
+
+test('at TEAM_MAX_MEMBERS the control is disabled with the exact "at the maximum" reason, no select/button', async () => {
+  const roster = Array.from({ length: 8 }, (_, i) => rosterEntry({ name: 'e' + i, tier: 1 }));
+  const members = Array.from({ length: 6 }, (_, i) => 'e' + i); // TEAM_MAX_MEMBERS_CLIENT default is 6
+  const instances = [inst('proj', { status: 'running', run_id: 'run-add6', members, lead: null })];
+  const c = await setupCase(instances, roster);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('Team is at the maximum of 6 teammates.'), 'got: ' + html);
+  assert.ok(!html.includes('id="team-add-member-select-proj"'), 'no select once at cap');
+  assert.ok(!/<button[^>]*>\+ Add<\/button>/.test(html), 'no + Add button once at cap');
+});
+
+test('under the cap but every roster engine is already a member shows the distinct "no more roster engines" reason', async () => {
+  const roster = [rosterEntry({ name: 'aider', tier: 1 }), rosterEntry({ name: 'claude', tier: 2 })];
+  const instances = [inst('proj', {
+    status: 'running', run_id: 'run-add7', members: ['aider', 'claude'], lead: null,
+  })];
+  const c = await setupCase(instances, roster);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('No more roster engines available to add.'), 'got: ' + html);
+  assert.ok(!html.includes('Team is at the maximum of'),
+    'must be the distinct no-eligible-engines reason, not the at-cap reason');
+  assert.ok(!html.includes('id="team-add-member-select-proj"'));
+});
+
+test('blocked_ask_user and blocked_board_write show the control; escalated_max_rounds/finished/error/idle omit it', async () => {
+  const roster = [rosterEntry({ name: 'aider', tier: 1 })];
+  const shown = [
+    inst('proj', { status: 'running', run_id: 'run-1', members: [], lead: null }),
+    inst('proj', { status: 'blocked', run_id: 'run-2', waiting_on_you: true, members: [], lead: null }),
+    inst('proj', {
+      status: 'blocked', run_id: 'run-3', waiting_on_you: true, escalation_kind: 'board_write',
+      members: [], lead: null,
+    }),
+  ];
+  for (const one of shown) {
+    const c = await setupCase([one], roster);
+    const html = c.instanceRowHtml('proj');
+    assert.ok(html.includes('id="team-add-member-select-proj"'),
+      'expected the control for status=' + one.team.status + ', got: ' + html);
+  }
+  const hidden = [
+    inst('proj', null),
+    inst('proj', { status: 'finished', run_id: 'run-4' }),
+    inst('proj', { status: 'error', run_id: 'run-5' }),
+    inst('proj', { status: 'blocked', run_id: 'run-6', waiting_on_you: false }),
+  ];
+  for (const one of hidden) {
+    const c = await setupCase([one], roster);
+    const html = c.instanceRowHtml('proj');
+    assert.ok(!html.includes('class="team-add-member"'),
+      'expected no add-member control for status=' + (one.team && one.team.status) + ', got: ' + html);
+  }
+});
+
+test('a member_joined feed event classifies as member-joined and renders "→ joined the team" with the kind-member-joined row class', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-add8', members: ['aider'], lead: null })];
+  const c = await setupCase(instances, [rosterEntry({ name: 'aider', tier: 1 })]);
+  const event = { ts: '2026-08-14T12:00:00Z', agent: 'aider', seq: 1, kind: 'member_joined', worktree: '/tmp/wt', meta: {} };
+  assert.strictEqual(c.call('teamFeedEventKindClass', event, [], 'running'), 'member-joined');
+  assert.strictEqual(c.call('teamFeedEventBody', event, [], 'running'), '→ joined the team');
+  await openFeedAndDeliverEvents(c, 'proj', [event]);
+  await rerenderRow(c, instances, [rosterEntry({ name: 'aider', tier: 1 })]);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('kind-member-joined'), 'expected the kind-member-joined row class, got: ' + html);
+  assert.ok(html.includes('→ joined the team'), 'expected the join text, got: ' + html);
+});
+
+test('a member_joined feed event\'s outer row carries an inline border-left-color matching the joined agent\'s own established color (post-review fix, test-review.md finding 1)', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-add9', members: ['aider', 'codex'], lead: null })];
+  const c = await setupCase(instances, [rosterEntry({ name: 'aider', tier: 1 }), rosterEntry({ name: 'codex', tier: 1 })]);
+  for (const agent of ['aider', 'codex']) {
+    const color = c.call('teamAgentColor', agent);
+    const event = { ts: '2026-08-14T12:00:00Z', agent, seq: 1, kind: 'member_joined', worktree: '/tmp/wt', meta: {} };
+    const html = c.call('renderTeamFeedEvent', event, [], 'running');
+    // The outer <div class="team-feed-event kind-member-joined"> itself must
+    // carry the inline border-left-color -- CSS currentColor resolves
+    // against the element it's declared on, not a descendant's inline
+    // style, so setting color only on the nested .team-feed-agent span (as
+    // before this fix) leaves the CSS rule's currentColor pointed at the
+    // outer div's own (unset -> inherited/neutral) color instead.
+    const outerDivMatch = html.match(/^<div class="team-feed-event kind-member-joined"([^>]*)>/);
+    assert.ok(outerDivMatch, 'expected an outer kind-member-joined div, got: ' + html);
+    assert.ok(outerDivMatch[1].includes('style="border-left-color:' + color + '"'),
+      'expected the outer div for agent ' + agent + ' to carry border-left-color:' + color +
+      ', got attrs: ' + outerDivMatch[1]);
+    // The agent-name span's own color must still match too, so both the
+    // text and the border accent agree on the same color for the same event.
+    assert.ok(html.includes('<span class="team-feed-agent" style="color:' + color + '">'),
+      'expected the agent-name span to still carry color:' + color + ', got: ' + html);
+  }
 });
 
 // ─── Past team branches panel (backlog item 13) ────────────────────────

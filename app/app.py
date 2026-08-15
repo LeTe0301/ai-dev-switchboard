@@ -2867,6 +2867,15 @@ PAGE_TEMPLATE = """<!doctype html>
   .team-interject-counter { font-size: 12px; color: #888; text-align: left; }
   .team-interject-counter.over-limit { color: #ff6b6b; }
   .team-feed-event.kind-human-message { border-left: 3px solid #4da6ff; padding-left: 12px; }
+  /* "+" add-teammate control (backlog item 21 part 2, docs/design.md) --
+     reuses .team-lead-picker select's own declaration block verbatim for
+     the <select>, and .team-sub's own muted-informational-text token
+     (#888/12px) for the two disabled-reason strings. No new color tokens. */
+  .team-add-member { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
+  .team-add-member select { font-size: 13px; padding: 6px 8px; border-radius: 8px;
+                              border: 1px solid #333; background: #1c1c1c; color: #eee; font-family: inherit; }
+  .team-add-member-reason { font-size: 12px; color: #888; }
+  .team-feed-event.kind-member-joined { border-left: 3px solid currentColor; padding-left: 12px; }
   .new-project-row { display: flex; gap: 8px; padding: 4px 0 16px; }
   .new-project-row input { flex: 1; font-size: 14px; padding: 10px 12px; border-radius: 10px;
                             border: 1px solid #333; background: #1c1c1c; color: #eee; }
@@ -3156,6 +3165,9 @@ async function refresh() {
   const s = await r.json();
   ENGINE_LABELS = s.engines || {};
   ROSTER = s.roster || [];
+  // "+" add-teammate control (backlog item 21 part 2) -- live override of
+  // the hardcoded default, same idiom as ROSTER itself above.
+  if (s.team_max_members) TEAM_MAX_MEMBERS_CLIENT = s.team_max_members;
   DEPLOY_TARGETS = {};
   TEAM_BY_NAME = {};
   let html = '';
@@ -3322,6 +3334,20 @@ let teamBoardResolveAction = {};
 // the env var is ever overridden.
 let teamInterjectText = {};  // name -> string draft
 const TEAM_INTERJECT_MAX_CHARS_CLIENT = 2000;
+
+// "+" add-teammate control (backlog item 21 part 2, docs/spec.md "Proposed
+// approach" §5) -- teamAddMemberChoice mirrors teamInterjectText's own
+// "survives a mid-flow re-render/428 retry" idiom: the selected agent name
+// is saved BEFORE toggle()'s POST fires, so a 428-then-retry resends the
+// SAME agent rather than re-reading a possibly-already-redrawn <select>.
+// TEAM_MAX_MEMBERS_CLIENT is a `let` (not `const`, unlike
+// TEAM_INTERJECT_MAX_CHARS_CLIENT above) -- hardcoded default matching the
+// server's own default, but overwritten from s.team_max_members on every
+// /status poll (refresh()), since this cap is cheap to fetch live and
+// unlike the interject char limit is directly gating a control's disabled
+// state, not just advisory copy.
+let teamAddMemberChoice = {};  // name -> agent name
+let TEAM_MAX_MEMBERS_CLIENT = 6;
 
 // Agent-identity colour palette (docs/design.md "ui-ux-pro-max choices") --
 // deliberately distinct from the four semantic status colors
@@ -3769,6 +3795,12 @@ function teamFeedEventKindClass(e, leadEvents, status) {
   // kind==='message' never matches any of the other branches below, so
   // this is safe placed early, before the final `return e.kind;` fallback.
   if (e.kind === 'message' && e.agent === 'human') return 'human-message';
+  // "+" add-teammate control (backlog item 21 part 2, docs/spec.md
+  // "Proposed approach" §3) -- kind==='member_joined' is structurally
+  // disjoint from every other branch here (none of them check that kind
+  // value), so placement doesn't matter beyond being before the final
+  // `return e.kind;` fallback.
+  if (e.kind === 'member_joined') return 'member-joined';
   // Board-write proposal/resolution (backlog item 7 part 2, docs/spec.md
   // §6 / docs/design.md) -- checked BEFORE the generic 'tool_result' +
   // meta.resolved -> 'resolved' branch below, since a board_write_resolved
@@ -3807,6 +3839,10 @@ function teamFeedEventKindClass(e, leadEvents, status) {
 function teamFeedEventBody(e, leadEvents, status) {
   const meta = e.meta || {};
   const cls = teamFeedEventKindClass(e, leadEvents, status);
+  // "+" add-teammate control (backlog item 21 part 2) -- the agent name
+  // itself is already rendered by renderTeamFeedEvent()'s own existing
+  // <span class="team-feed-agent">, no need to repeat it in the body text.
+  if (cls === 'member-joined') return '→ joined the team';
   if (cls === 'board-write-proposal') {
     return 'board_write (' + esc(meta.verb || '') + '): ref #' + esc(meta.ref || '') + ' — ' + esc(e.text || '');
   }
@@ -3860,7 +3896,18 @@ function renderTeamFeedEvent(e, leadEvents, status) {
   const ts = (e.ts || '').length >= 19 ? e.ts.slice(11, 19) : (e.ts || '');
   const kindClass = teamFeedEventKindClass(e, leadEvents, status);
   const body = teamFeedEventBody(e, leadEvents, status);
-  return '<div class="team-feed-event kind-' + esc(kindClass) + '">' +
+  // kind-member-joined's CSS border-left uses `currentColor` (docs/design.md
+  // "the joined agent's own color"), which resolves against the element the
+  // rule is DECLARED on -- the outer div below -- not a descendant's inline
+  // style. Setting color only on the .team-feed-agent span (as this row
+  // already does, for the name text) leaves the outer div's own color
+  // unset/inherited, so the border renders neutral instead of per-agent
+  // (docs/test-review.md, BACKLOG item 21 part 2 review, finding 1). Set the
+  // inline style on the outer div itself for this one kind only -- every
+  // other kind is untouched, matching kind-human-message's own hardcoded
+  // (not currentColor-based) border color, which never had this problem.
+  const borderStyle = kindClass === 'member-joined' ? ' style="border-left-color:' + color + '"' : '';
+  return '<div class="team-feed-event kind-' + esc(kindClass) + '"' + borderStyle + '>' +
     '<span class="team-feed-ts">' + esc(ts) + '</span> ' +
     '<span class="team-feed-agent" style="color:' + color + '">' + esc(e.agent) + '</span> ' +
     '<span class="team-feed-text">' + body + '</span></div>';
@@ -3874,7 +3921,12 @@ function renderTeamFeed(name, team) {
   // "always present" behavior -- no filtering code change needed, the
   // existing generic filter below already isolates human.jsonl's own
   // events once selected.
-  const agents = ['lead', 'human'].concat((team.composition && team.composition.members) || []);
+  // Backlog item 21 part 2, docs/spec.md "Proposed approach" §4 -- sourced
+  // from the LIVE roster (team.members, /status's own live field) instead
+  // of the stale team.composition.members (a saved/default PICKER
+  // preference, never updated by add_team_member()); without this a newly
+  // -added teammate never gets its own clickable filter pill.
+  const agents = ['lead', 'human'].concat(team.members || []);
   const pills = ['all'].concat(agents).map(a => {
     const label = a === 'all' ? 'All' : a;
     const isActive = filter === a;
@@ -4074,6 +4126,52 @@ function doTeamInterject(name) {
   }
   toggle('team-interject', name, true, null);
 }
+// "+" add-teammate control (backlog item 21 part 2, docs/spec.md "Proposed
+// approach" §5) -- pure, no I/O. `e.kind === 'engine'` mirrors
+// add_team_member()'s own server-side rejection of the Ollama lead-only
+// roster entry -- same rule, restated client-side for fast feedback, same
+// "client mirrors server, server stays authoritative" discipline
+// teamCompositionError() already documents for the Start-time picker.
+function teamAddMemberEligible(team) {
+  const already = new Set((team && team.members) || []);
+  const leadName = team && team.lead && team.lead.kind === 'engine' ? team.lead.name : null;
+  return ROSTER.filter(e => e.kind === 'engine' && e.name !== leadName && !already.has(e.name));
+}
+// Visibility gate reuses teamAcceptsInterject(team) as-is (docs/spec.md
+// "Background": interject() and add_team_member() were both built to
+// accept the identical status set -- running/blocked_ask_user/
+// blocked_board_write) -- intentional reuse, not incidental.
+function renderTeamAddMemberControl(name, team) {
+  if (!teamAcceptsInterject(team)) return '';
+  const members = (team && team.members) || [];
+  const atCap = members.length >= (TEAM_MAX_MEMBERS_CLIENT || 6);
+  if (atCap) {
+    return '<div class="team-add-member"><span class="team-add-member-reason">' +
+      'Team is at the maximum of ' + (TEAM_MAX_MEMBERS_CLIENT || 6) + ' teammates.</span></div>';
+  }
+  const eligible = teamAddMemberEligible(team);
+  if (eligible.length === 0) {
+    return '<div class="team-add-member"><span class="team-add-member-reason">' +
+      'No more roster engines available to add.</span></div>';
+  }
+  const options = eligible.map(e =>
+    '<option value="' + esc(e.name) + '">' + esc(e.name) + ' (' + tierLabel(e.tier) + ')</option>').join('');
+  return '<div class="team-add-member">' +
+    '<select id="team-add-member-select-' + esc(name) + '">' + options + '</select>' +
+    '<button class="team-btn" onclick="doTeamAddMember(' + "'" + name + "'" + ')">+ Add</button></div>';
+}
+// Reuses toggle()'s TOTP-retry/code-overlay plumbing exactly like every
+// other team-* action above -- teamAddMemberChoice[name] is set BEFORE
+// toggle() fires so a 428-then-retry resends the same agent (docs/spec.md
+// "Proposed approach" §5).
+function doTeamAddMember(name) {
+  const sel = document.getElementById('team-add-member-select-' + name);
+  if (!sel || !sel.value) return;
+  teamAddMemberChoice[name] = sel.value;
+  const msgEl = document.getElementById('team-msg-' + name);
+  if (msgEl) { msgEl.textContent = ''; msgEl.className = 'team-msg'; }
+  toggle('team-add-member', name, true, null);
+}
 function teamRow(name, team) {
   const msgSlot = '<div class="team-msg" id="team-msg-' + esc(name) + '"></div>';
   if (!team || team.status === 'idle') {
@@ -4131,10 +4229,15 @@ function teamRow(name, team) {
   // channel sits directly below it; both sit above the passive, scrollable
   // log feed.
   const interjectBox = renderTeamInterjectBox(name, team);
+  // "+" add-teammate control (backlog item 21 part 2, docs/spec.md
+  // "Proposed approach" §5) -- its own visual block, between the compose
+  // box and the feed toggle (not inside .team-actions, which stays
+  // reserved for the single "Stop team" button per existing convention).
+  const addMemberControl = renderTeamAddMemberControl(name, team);
   const feedToggle = renderTeamFeedToggle(name);
   const feedPanel = renderTeamFeed(name, team);
   return '<div class="team-row">' + statusStrip + escalatedNote + escalationPanel +
-    interjectBox + feedToggle + feedPanel +
+    interjectBox + addMemberControl + feedToggle + feedPanel +
     '<div class="team-actions"><button class="team-btn" onclick="doTeamStop(' +
     "'" + name + "'" + ')">Stop team</button></div>' +
     msgSlot + renderTeamBranches(name) + '</div>';
@@ -4177,6 +4280,7 @@ function actionPath(kind, name, on) {
   if (kind === 'team-resolve') return '/projects/' + encodeURIComponent(name) + '/team/resolve';
   if (kind === 'team-board-resolve') return '/projects/' + encodeURIComponent(name) + '/team/board-resolve';
   if (kind === 'team-interject') return '/projects/' + encodeURIComponent(name) + '/team/interject';
+  if (kind === 'team-add-member') return '/projects/' + encodeURIComponent(name) + '/team/add-member';
   if (kind === 'smoke-check') return '/projects/' + encodeURIComponent(name) + '/smoke-check';
   return '/instance/' + encodeURIComponent(name) + '/' + (on ? 'on' : 'off');
 }
@@ -4236,6 +4340,12 @@ function actionBody(kind, name, on, code) {
     const el = document.getElementById('interject-' + name);
     body.text = (el ? el.value : (teamInterjectText[name] || '')).trim();
   }
+  // "+" add-teammate control (backlog item 21 part 2, docs/spec.md
+  // "Proposed approach" §5) -- sourced from the client-side map
+  // doTeamAddMember() populates BEFORE dispatching (same "survives a TOTP
+  // retry" discipline team-board-resolve's own action field already relies
+  // on above), never a re-read of the (possibly-already-redrawn) <select>.
+  if (kind === 'team-add-member') body.agent = teamAddMemberChoice[name];
   // HTTP-level smoke check (backlog item 18, docs/spec.md) -- reads the
   // still-live input first, falls back to the smokeCheckExpect[] mirror,
   // same "survives a mid-flow re-render/428 retry" reasoning team-start's
@@ -4280,6 +4390,7 @@ async function handleActionResult(r, ctx) {
       kind === 'team-resolve' ? 'Submitting answer: ' + (name || 'this') :
       kind === 'team-board-resolve' ? 'Resolving board write: ' + (name || 'this') :
       kind === 'team-interject' ? 'Sending message: ' + (name || 'this') :
+      kind === 'team-add-member' ? 'Adding teammate: ' + (name || 'this') :
       kind === 'smoke-check' ? 'Smoke checking: ' + (name || 'this') :
       kind === 'clone' ? 'Cloning from URL' :
       (on ? 'Turning on: ' : 'Turning off: ') + (name || 'this');
@@ -4386,6 +4497,31 @@ async function handleActionResult(r, ctx) {
         // Draft text is deliberately NOT cleared on failure -- the operator
         // can fix and resend without retyping.
         msgEl.textContent = '✕ Error: ' + (data.error || 'could not send message');
+        msgEl.className = 'team-msg error';
+      }
+    }
+    return;
+  }
+  if (kind === 'team-add-member') {
+    // Its own inline result slot (docs/design.md "Success Feedback" /
+    // "Error Feedback"), same pattern as team-interject above -- handled
+    // before the generic 400 branch below for the same reason (a
+    // cap-reached/already-a-member/race 400 belongs in THIS row's own
+    // team-msg slot, not the new-project error field). Deliberately says
+    // "will join... at its next round," never "has joined" -- the new
+    // teammate isn't actually reachable until team_step()'s own membership
+    // drain runs at the run's next round boundary (docs/spec.md's own
+    // "accurate, non-oversold feedback" goal).
+    hideCodeOverlay();
+    const data = await r.json().catch(() => ({}));
+    const msgEl = document.getElementById('team-msg-' + name);
+    if (msgEl) {
+      if (r.ok && data.ok) {
+        msgEl.textContent = '✓ \\'' + esc(data.agent) + '\\' will join the team at its next round';
+        msgEl.className = 'team-msg success';
+        delete teamAddMemberChoice[name];
+      } else {
+        msgEl.textContent = '✕ Error: ' + (data.error || 'could not add teammate');
         msgEl.className = 'team-msg error';
       }
     }
@@ -5663,7 +5799,20 @@ class Handler(BaseHTTPRequestHandler):
                     None)
                 inst["team"] = {"status": team_status, "run_id": run["run_id"] if run else None,
                                 "composition": composition, "waiting_on_you": waiting_on_you,
-                                "escalation_kind": escalation_kind}
+                                "escalation_kind": escalation_kind,
+                                # Backlog item 21 part 2, docs/spec.md
+                                # "Proposed approach" §1 -- the run's LIVE
+                                # roster/lead, read directly off the
+                                # persisted state dict rather than
+                                # re-derived from `composition` above
+                                # (a saved/default PICKER preference, never
+                                # updated by add_team_member()). Grows the
+                                # moment team_step()'s membership drain
+                                # runs, never earlier -- matching part 1's
+                                # own "next round boundary" delivery
+                                # semantics.
+                                "members": run.get("members", []) if run is not None else [],
+                                "lead": run.get("lead") if run is not None else None}
                 sync_entry = gitea_sync_by_name.get(n)
                 if sync_entry is not None:
                     inst["gitea_sync"] = {"state": sync_entry.get("sync_state"),
@@ -5681,6 +5830,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"instances": instances,
                        "engines": {name: e.label for name, e in engines.items()},
                        "roster": roster,
+                       # Backlog item 21 part 2, docs/spec.md "Proposed
+                       # approach" §1 -- a single process-wide constant, not
+                       # per-project, same "computed once, shipped once per
+                       # /status call" treatment `roster` itself gets above.
+                       "team_max_members": teams.TEAM_MAX_MEMBERS,
                        "host_enabled": HOST_CONTROL_ENABLED, "host_label": HOST_LABEL,
                        "host": host_on, "host_url": host_url,
                        "taiga_enabled": TAIGA_ENABLED, "taiga_label": TAIGA_LABEL,
@@ -5780,7 +5934,16 @@ class Handler(BaseHTTPRequestHandler):
         # own log -- no other change to this function, the existing
         # per-file cursor/byte-cap/truncation-flag/chronological-merge-sort
         # logic below is already generic over the file list.
-        files = [("lead", teams._transcript_path(run_id)), ("human", teams._human_log_path(run_id))]
+        # "membership" (backlog item 21 part 2, docs/spec.md "Proposed
+        # approach" §2) -- merges add_team_member()'s own member_joined
+        # envelopes in. The "membership" label here is only used for the
+        # malformed-line fallback and this file's own cursors-dict key; it
+        # does NOT override the `agent` field already embedded in each
+        # membership.jsonl line (the newly-joined agent's own name), so a
+        # member_joined event surfaces tagged with that agent's name/color,
+        # not a generic "membership" pseudo-agent.
+        files = [("lead", teams._transcript_path(run_id)), ("human", teams._human_log_path(run_id)),
+                 ("membership", teams._membership_log_path(run_id))]
         files += [(m, teams._agent_log_path(run_id, m)) for m in state.get("members", [])]
         all_events = []
         cursors = {}

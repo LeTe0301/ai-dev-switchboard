@@ -1,536 +1,500 @@
-# Spec: Item 21 part 1 — grow a running team with an added teammate (backend)
+# Spec: Item 21 part 2 — the "+" button UI for growing a running team
 
 ## Summary
-Resolve backlog item 21's shape ambiguity as **"grow a running team"**: add
-`teams.add_team_member()` (+ a `POST /projects/<name>/team/add-member` route
-and a `team-add-member` CLI subcommand) that adds one more teammate engine to
-an already-launched, still-live team run — new git worktree, new tmux
-dashboard window, and a queued announcement the lead picks up at its next
-round boundary — plus a new `TEAM_MAX_MEMBERS` cap enforced both here and at
-initial team-start. This is backend-only (no "+" button yet); the UI is a
-separate part 2.
-
-## Decision: shape (1), "grow a running team" — not shape (2)
-
-Backlog item 21 named two candidate shapes. Picking shape (1), for reasons
-that follow directly from reading the actual code (`app/app.py`, `app/teams.py`):
-
-- **A project is genuinely capped at one non-team engine session today** —
-  confirmed directly: `instance_start()` (`app/app.py:2513`) refuses outright
-  if `active_engine(name) is not None`, and `_session_urls` (`app/app.py:2483`)
-  is keyed by project name alone, one entry per project, full stop. Shape (2)
-  ("independent parallel non-team instances") would have to invent a wholly
-  new N-sessions-per-project addressing scheme from scratch — a new key shape
-  for `_session_urls`-equivalent state, new per-instance tmux session naming,
-  a new UI list-of-sessions-per-project (today's UI assumes exactly one
-  engine row per project) — none of which exists anywhere in this codebase
-  today, for team sessions or otherwise.
-- **Team sessions already generalized past one-session-per-project in the
-  one specific way shape (1) needs, and no further**: `docs/ARCHITECTURE.md`
-  and item 6d's own history describe a team as one tmux session per project
-  with **N windows**, one per member, reusing the single-engine
-  `engines.d/*.engine` startup/URL machinery per window. That generalization
-  is already built, reviewed, and live (`_create_team_session()`,
-  `app/teams.py:3693`). Adding one more member to a *running* team is adding
-  one more window to an *already-multi-window* session — the natural next
-  increment of a pattern that already exists — not a new pattern.
-- **The roster the lead can `delegate` to is already re-read fresh from
-  `state["members"]` every single round, not snapshotted once at launch.**
-  Verified directly: `_call_lead()` (`app/teams.py:2917`) builds `_lead_tools`
-  from `state["members"]` on every call, `_system_framing()`
-  (`app/teams.py:2322`, called from `team_step()` at `app/teams.py:3024`) does
-  the same, and `_validate_lead_action()`'s `agent_not_on_team` check
-  (`app/teams.py:3048`) reads `state["members"]` fresh too. This means the
-  lead-loop's own core logic needs **zero changes** to support a grown
-  roster — it was already written to tolerate `state["members"]` changing
-  between rounds; only appending to that list (safely, off the driving
-  thread — see below) and standing up the new teammate's window/worktree is
-  new work. This is a materially smaller, lower-risk change than shape (2).
-- **Item 19 part 1's `human.jsonl` mechanism is directly reusable machinery**
-  for the one real hazard here: a request thread (handling the "+" click)
-  must never touch `run.json` directly, because the driving thread's own
-  end-of-round `_persist(state)` last-writer-wins overwrite would race it
-  (`interject()`'s docstring, `app/teams.py:4241`, documents this exact
-  hazard and its fix). The same append-only-side-file + drain-at-round-
-  boundary pattern item 19 part 1 built for human messages is the correct,
-  already-proven fix for "tell the lead a new teammate joined" too (see
-  "Proposed approach" below) — this directly answers the backlog's own
-  first open question under item 21.
-
-Shape (2) is not being built, now or as a future part of this item — it
-would require a fundamentally different, currently-nonexistent
-multi-session-per-project architecture with no team/lead framework wrapped
-around it at all, at genuinely higher implementation and review cost than
-shape (1), for a request ("spawn any amount of AI instances... in the
-repos") that reads at least as naturally as "grow the team working on this
-repo" as it does "open N unrelated terminals against the same repo."
+Ship the actual "+"-button UI backlog item 21's original request asked for,
+on top of part 1's already-merged backend (`teams.add_team_member()`,
+`POST /projects/<name>/team/add-member`, `team-add-member` CLI, the
+`TEAM_MAX_MEMBERS` cap). A new inline control on an already-running team's
+row lets a human pick one roster engine (via a native `<select>`, mirroring
+the existing lead-picker's own control) and add it to the live team, reusing
+`toggle()`'s existing TOTP-retry plumbing exactly like every other team
+action. This also requires two small, necessary backend additions
+`docs/spec.md` (part 1) explicitly deferred/left open: exposing the run's
+*live* roster (`state["members"]`/`state["lead"]`) via `/status`, and
+merging `membership.jsonl` into `GET .../team/events` so a `member_joined`
+event is actually visible in the feed — without both, the UI this part adds
+would have no correct data source to build the picker from, and no feed
+evidence the add succeeded.
 
 ## Goals
-- A human can add one more teammate engine to an **already-running** team
-  (status `running`, `blocked_ask_user`, or `blocked_board_write` — the same
-  three non-terminal statuses `interject()` already accepts) without
-  stopping and restarting the run.
-- The new teammate gets its own git worktree (mirrors `launch_team()`'s
-  per-member worktree, item 6d part 1's precedent) and its own tmux
-  dashboard window in the already-live `team-<project>` session (mirrors
-  `_create_team_session()`'s per-member window loop), so it is observable
-  and delegate-able exactly the same way an original teammate is.
-- The lead is told, at its next round boundary, that a new teammate is
-  available — delivered via a new dedicated append-only side-channel file
-  (NOT `human.jsonl` — see "Proposed approach" §3 for why these stay
-  separate), drained by `team_step()` the same way `human.jsonl` already is.
-- A real, configurable ceiling on team size: new `TEAM_MAX_MEMBERS` env var
-  (default `6`), enforced both here (growing a running team) and at initial
-  team-start (`validate_composition()` for an explicit picker composition;
-  `default_team_composition()` truncates its own auto-picked list to the
-  cap deterministically rather than refusing) — closing the backlog's own
-  "any real ceiling on 'any amount'" open question for the whole feature,
-  not just the new growth path.
-- CLI parity (`team-add-member`), following every other team mutation's
-  existing CLI-first precedent (`team-interject`, `team-resolve`, etc.), so
-  this is independently testable/scriptable without any UI.
+- A "+"-style control on a `running`/`blocked_ask_user`/`blocked_board_write`
+  team's row (the exact three statuses `add_team_member()` already accepts
+  server-side — no new status set to invent) that lets a human pick ONE
+  roster engine not already on the team and add it.
+- The picker is a native `<select>`, populated only with eligible
+  candidates (roster engines, excluding the current lead if the lead is an
+  engine, excluding anyone already in the live roster) — mirrors the
+  existing composition picker's lead-`<select>` exactly, not a new picker
+  widget.
+- When `TEAM_MAX_MEMBERS` is reached (or no eligible roster engine remains
+  for a smaller reason), the control is disabled with an explicit, distinct
+  reason shown inline — never hidden outright, and never a silent failed
+  click.
+- Accurate, non-oversold feedback: a successful add shows a message that
+  states the new teammate will join **at the next round boundary** (part
+  1's own delivery semantics), not that it is immediately available to
+  delegate to. The `membership.jsonl` `member_joined` event becomes visible
+  in the merged event feed on the very next `/team/events` poll (same ~4s
+  cadence as everything else in that feed) — this is the honest "how do I
+  know it worked" signal, not a fabricated instant-success UI state.
+- The event feed's per-agent filter pills and the newly-added teammate's own
+  events become reachable once the lead actually delegates to them, without
+  requiring a full page reload.
 
 ## Non-goals
-- **The "+" button UI itself** — this part ships no new button, no picker,
-  no Teams-page change at all. That is part 2 (needs `ux-designer`; see
-  "Open questions").
-- **Shape (2) (independent, non-team, human-driven parallel instances)** —
-  explicitly rejected above, not deferred, not a "part 3."
-- **Removing a teammate from a running team** ("shrink," the inverse of this
-  feature) — not asked for by the backlog item, not built here.
-- **Concurrent/parallel delegation to multiple teammates at once** — unrelated
-  to this item; the lead already delegates to one agent per round today, and
-  that is completely unchanged by growing the roster it can choose from.
-- **Retroactively capping an already-running team that was started before
-  `TEAM_MAX_MEMBERS` existed** — the cap is enforced only at team-start
-  (already covers unbounded initial composition) and at each individual
-  add-member call (covers growth); no migration/trim of any pre-existing
-  persisted run.
-- **Telling the lead a teammate joined mid-in-flight-tool-call** — same
-  non-goal item 19 part 1 already accepted for human interjects: delivery is
-  at the next round boundary only, never mid-call.
+- **Removing/shrinking a team** — unrelated, not part of this backlog item.
+- **A live terminal/window view of any teammate (original or newly added)**
+  in the web UI — no such view exists for ANY teammate today (only the
+  merged transcript-style event feed does); out of scope for this part,
+  which only needs to reuse that existing feed, not build a new observation
+  surface.
+- **A confirm() dialog before adding.** This project's own established
+  convention (`doDeploy()`'s and `doTeamStop()`'s comments, `app/app.py`)
+  reserves `confirm()` for actions that mutate a remote target or kill/
+  destroy in-flight work. Adding a teammate is additive and has no such
+  effect — `doTeamStart()`/`doTeamInterject()`/`doTeamBoardResolve()` (the
+  closest precedents) have no `confirm()` either.
+- **Multi-select / adding more than one teammate per click** — the backlog
+  item's own open question already framed this as "pick WHICH agent," not
+  "pick several"; one `<select>` + one action, matching `add_team_member()`'s
+  own single-`agent`-argument contract.
+- **Renaming/relabeling `membership.jsonl`'s already-shipped envelope
+  shape.** Part 1 persisted `{"agent": <joined-agent-name>, ...}` (the
+  literal spec text it implemented), not `agent: "system"` — part 1's own
+  "Open questions" floated `agent="system"` as a *possible* future
+  rendering choice, not a commitment. This part reuses the already-shipped
+  shape as-is (see "Proposed approach" §3 for why that's actually the
+  better choice, not a compromise).
+- **A client-side or server-side warning about resource cost beyond the
+  existing `TEAM_MAX_MEMBERS` cap.** Part 1 already settled that; this part
+  only surfaces the cap in the UI, it doesn't re-litigate its value.
+- **Retrofitting `renderTeamFeed()`'s filter-pill list is broader than just
+  this feature would need** — see "Proposed approach" §4: the fix (switch
+  from the stale `team.composition.members` to the new live `team.members`)
+  is scoped narrowly to what's needed for a newly-added teammate to get a
+  filter pill at all; no other filter/feed behavior changes.
 
 ## Background / current state
-- `app/app.py`'s `_session_urls` (`app/app.py:2483`) and `instance_start()`
-  (`app/app.py:2513`)/`instance_stop()` (`app/app.py:2539`) implement the
-  plain, non-team, one-engine-per-project session — confirmed capped at one
-  by `active_engine(name) is not None` in `instance_start()`. Not touched by
-  this spec at all; team sessions are a fully separate code path.
-- `app/teams.py`'s team machinery (item 6/6c/6d/6f/19): `roster()`
-  (`app/teams.py:1946`) lists every headless-eligible `engines.d` entry plus
-  the configured Ollama tier-1 model; `default_team_composition()`
-  (`app/teams.py:1978`) picks a deterministic default lead+members;
-  `validate_composition()` (`app/teams.py:2045`) validates an explicit
-  picker-supplied lead+members pair; `launch_team()` (`app/teams.py:3829`)
-  creates per-member worktrees, persists a fresh `run.json`
-  (`_new_state()`, `app/teams.py:2732`), then creates the tmux session +
-  one window per member (`_create_team_session()`, `app/teams.py:3693`).
-  `team_step()` (`app/teams.py:2978`) drives one round: first drains
-  `human.jsonl` (item 19 part 1) into a non-lead-calling history round if
-  anything is queued, else calls the lead via `_call_lead()`
-  (`app/teams.py:2917`), which rebuilds tool schema/system framing from
-  `state["members"]` fresh every call.
-- **No cap exists anywhere today** on team size — `default_team_composition()`
-  includes every eligible engine as a member with no limit;
-  `validate_composition()` accepts any non-empty, non-duplicate member list.
-  This is the backlog's own flagged open question, unresolved until now.
-- `docs/ARCHITECTURE.md` documents the "per-project engine session"/"every
-  team session" model; team sessions are the one place this project already
-  generalized past strictly one-session-per-project, via windows, not via
-  additional sessions.
+- Part 1 (merged into this branch) shipped `teams.add_team_member(run_id,
+  agent)`, `POST /projects/<name>/team/add-member` (`app/app.py`, right
+  after `/team/interject`), and `team-add-member <run_id> <agent>` (CLI).
+  Accepts exactly the same three statuses `interject()` does: `running`,
+  `blocked_ask_user`, `blocked_board_write`. Returns `{"ok": true, "agent":
+  ..., "worktree": ...}` / `{"error": ...}` (400) — confirmed directly from
+  `docs/implementation.md`'s "item 21 part 1" section and the route code
+  (`app/app.py`, `/team/add-member` branch).
+- `TEAM_MAX_MEMBERS` (`app/teams.py`, default `6`) is enforced in
+  `add_team_member()` itself — the route surfaces its rejection message
+  verbatim as a 400, no separate check needed at the route or UI layer for
+  correctness (the UI's own cap-awareness below is purely a UX
+  convenience/reason-surfacing layer, not a second source of truth).
+- **`/status`'s `inst["team"]` object does NOT currently expose the run's
+  live roster.** Confirmed by reading `app/app.py`'s `/status` handler
+  directly (~line 5600-5666): `composition` is read from
+  `teams.load_compositions()` (a per-project *saved picker preference*,
+  used to pre-fill the Start-time picker) — it is computed and returned
+  unconditionally, including for an already-running team, but it is
+  **never updated by `add_team_member()`** (which deliberately never
+  touches `run.json`/`state["members"]` directly — see part 1's own "Key
+  decisions"). For a grown team, `team.composition.members` is therefore
+  stale the moment a teammate is added. `run` (the value
+  `teams.latest_run_for_project()` returns) IS the full persisted state
+  dict and already has `run["members"]`/`run["lead"]` — just not currently
+  copied into the JSON response.
+- **`renderTeamFeed()`'s per-agent filter-pill list is built from
+  `team.composition.members`** (`app/app.py`, ~line 3877:
+  `const agents = ['lead', 'human'].concat((team.composition &&
+  team.composition.members) || []);`), the same stale field. A newly-added
+  teammate's events would already appear in the merged feed under `filter
+  === 'all'` once the lead delegates to them (their own `<agent>.jsonl` is
+  already included via `state.get("members", [])` inside
+  `_handle_team_events()`, which itself IS live/fresh every poll — only the
+  *pill list* is stale), but they would have no dedicated filter pill to
+  click, and would never appear in the pill list at all if the operator
+  never happens to see one of their `all`-filtered events go by.
+- **`GET .../team/events` (`_handle_team_events()`, `app/app.py` ~line
+  5763) does not merge `membership.jsonl` into its file list today** — only
+  `transcript.jsonl` ("lead"), `human.jsonl` ("human"), and one file per
+  `state.get("members", [])`. This means the one durable, already-persisted
+  record that an add succeeded (`membership.jsonl`'s `member_joined`
+  envelope, written synchronously inside `add_team_member()`) is currently
+  invisible in the web UI's own event feed — part 1's own "Open questions"
+  flagged this exact gap and deferred it here.
+- The composition picker (`renderTeamPicker()`, `app/app.py` ~line 3495) is
+  this project's own established "pick one engine via native `<select>`"
+  precedent — its lead-`<select>` is the direct model for this part's new
+  control (one dropdown, `ROSTER` entries as `<option>`s, `tierLabel()` for
+  the visible label). Item 19 part 2's compose box
+  (`renderTeamInterjectBox()`, `app/app.py` ~line 4039) is the direct model
+  for "a new control that posts to a team-scoped route, visible under the
+  same status conditions `add_team_member()` itself accepts" — in fact its
+  own `teamAcceptsInterject(team)` helper computes EXACTLY the visibility
+  condition this part needs too (same three statuses), since `interject()`
+  and `add_team_member()` were both built to accept the identical status
+  set.
 
 ## Proposed approach
 
-### 1. `teams.add_team_member(run_id, agent)` — the core function
-New function, `app/teams.py`, placed near `launch_team()`/`stop_team()`.
-`{"ok": True, "agent": ..., "worktree": ...}` or `{"ok": False, "error": ...}`,
-matching every other team-mutation function's return shape.
+### 1. `/status` gains the live roster (`app/app.py`, `/status` handler)
+Add two fields:
+- `inst["team"]["members"]`: `run.get("members", []) if run is not None else
+  []` — the live, currently-drained roster (grows the moment `team_step()`'s
+  membership drain runs, i.e. one round-poll after `add_team_member()`
+  succeeds — never earlier, matching part 1's own delivery semantics).
+- `inst["team"]["lead"]`: `run.get("lead") if run is not None else None` —
+  the run's actual lead (`{"kind", "name"}` or `None`), read directly from
+  the live state rather than re-deriving it from the picker's saved/default
+  `composition.lead`, which could in principle differ if an operator saved a
+  new preference after this run's own team-start.
 
-Steps, all synchronous on the calling (request) thread — mirrors
-`launch_team()`'s own synchronous worktree+window setup, never touches the
-driving thread:
+Also add one new top-level field, alongside the existing `"roster": roster`:
+`"team_max_members": teams.TEAM_MAX_MEMBERS` — a single global constant,
+same "computed once, shipped once per `/status` call" treatment `roster`
+itself already gets (not per-project, since the cap is one process-wide
+config value).
 
-1. Load state (`_load_state(run_id)`; `FileNotFoundError` → `{"ok": False,
-   "error": f"no such run_id: {run_id}"}`).
-2. Status check: reject (same message shape as `interject()`) unless status
-   is one of `"running"`, `"blocked_ask_user"`, `"blocked_board_write"`.
-3. Roster/validity checks, reusing `roster()` the same way
-   `validate_composition()` already does — reject with a clear message if:
-   - `agent` is not a `kind="engine"` roster entry (rejects unknown names
-     and rejects the Ollama lead entry the same way `validate_composition()`
-     already excludes it — an engine's `delegate_capable` is always `True`
-     by construction, so no separate check needed there).
-   - `agent == state["lead"]["name"]` and `state["lead"]["kind"] ==
-     "engine"` ("lead cannot also be a teammate", mirrors
-     `validate_composition()`'s identical check).
-   - `agent in state["members"]` ("already a teammate on this team").
-   - `len(state["members"]) >= TEAM_MAX_MEMBERS` — reject with
-     `f"team already has the maximum of {TEAM_MAX_MEMBERS} teammates"`.
-4. `_create_worktree(state["workdir"], agent, run_id)` (existing function,
-   unchanged) — same rollback-free single-item semantics `launch_team()`'s
-   own per-member loop already has; on failure, return its error verbatim
-   (nothing to roll back yet — no window, no queued event created).
-5. Pre-touch + chmod the new agent's log file exactly like `launch_team()`
-   does for its own initial members (`app/teams.py:3896-3899`):
-   `open(_agent_log_path(run_id, agent), "a").close()`, `os.chmod(..., 0o644)`.
-   Done **before** the window is created, same ordering reason
-   `launch_team()`'s own comment gives (no `tail -F` may ever race file
-   creation).
-6. Create the new tmux window in the **already-live** session:
-   `subprocess.run(TMUX + ["new-window", "-t", _team_session_name(state["project_name"]),
-   "-n", agent, "bash", "-lc", f"tail -n +1 -F {shlex.quote(log_path)} || sleep infinity"])`
-   — byte-for-byte the same per-member window command
-   `_create_team_session()`'s own loop already uses
-   (`app/teams.py:3822-3825`). If `tmux new-window` fails (session gone —
-   team died between the status check and here), call
-   `_remove_worktree(state["workdir"], path)` to undo step 4 and return
-   `{"ok": False, "error": "team session is no longer running"}`.
-7. Append one envelope to a **new** `_membership_log_path(run_id)` file
-   (see §3 below) — `{"ts": ..., "agent": agent, "seq": ...,
-   "kind": "member_joined", "worktree": path}` — the only thing this
-   function ever writes to persisted run state. Never touches `run.json`.
-8. Return `{"ok": True, "agent": agent, "worktree": path}`.
+Both additions are purely additive to the JSON shape — no existing field
+changes meaning, no existing test asserting exact-dict-equality on `/status`
+should need more than adding the two new keys to its expected shape (per
+this codebase's own established "additive JSON field" precedent, e.g. how
+`escalation_kind` was added in item 7 part 2).
 
-Note step 4-6 leave a worktree+window "ahead of" `run.json` for at most one
-round (until `team_step()`'s drain picks it up) — this is intentional and
-safe: the worktree and window are inert until the lead actually delegates to
-this agent, and `state["members"]` (the ONLY thing `_validate_lead_action()`
-checks before allowing a `delegate` call to this agent) isn't updated until
-the drain runs, so the lead genuinely cannot reach the new agent one instant
-early. No race with the driving thread's own in-flight round is possible
-either: the driving thread only ever reads `state["members"]` at the top of
-each round build, never mid-round.
-
-### 2. `team_step()`'s new drain step
-Add a second drain, structured identically to the existing `human.jsonl`
-drain at the top of `team_step()` (`app/teams.py:3006-3020`), reusing
-`tail_jsonl_events()` unchanged. Order: **membership drain runs before the
-human drain** (arbitrary but deterministic — new teammates becoming
-available is the more "structural" change of the two to surface first if
-both happen to be queued in the same round-poll). Each drained
-`member_joined` event becomes its own history round (consistent with
-"several queued human messages, several history rounds" — this item's own
-open question about round-budget cost is being answered the same way
-item 19 part 1 already answered it for human messages: yes, it costs one
-`TEAM_MAX_ROUNDS` slot, an accepted, already-precedented tradeoff, not a new
-one):
-
+### 2. `GET .../team/events` merges `membership.jsonl` too (`app/app.py`,
+`_handle_team_events()`)
+One new line in the `files` list, alongside the existing three sources:
 ```python
-new_member_events, new_membership_cursor, _ = tail_jsonl_events(
-    _membership_log_path(state["run_id"]), state.get("membership_cursor", 0),
-    TEAM_HUMAN_MSG_MAX_BYTES_PER_ROUND, agent="system")
-if new_member_events:
-    for ev in new_member_events:
-        agent = ev.get("agent")
-        if agent and agent not in state["members"]:
-            state["members"].append(agent)
-            if ev.get("worktree"):
-                state.setdefault("worktrees", {})[agent] = ev["worktree"]
-            drain_round_n = len(state["history"]) + 1
-            _append_history(state, drain_round_n, tool="team_member_joined",
-                            args_summary=f'team_member_joined("{agent}")',
-                            outcome_summary=f"'{agent}' joined the team and is now available to delegate to",
-                            full_result_text=f"New teammate '{agent}' joined the team.",
-                            log_path=None, transcript_entries=[])
-    state["membership_cursor"] = new_membership_cursor
-    _persist(state)
-    return state
+files = [("lead", teams._transcript_path(run_id)), ("human", teams._human_log_path(run_id)),
+         ("membership", teams._membership_log_path(run_id))]
+files += [(m, teams._agent_log_path(run_id, m)) for m in state.get("members", [])]
 ```
-(then the existing `human.jsonl` drain block, unchanged, runs next). The
-`agent not in state["members"]` guard makes this idempotent against a
-theoretical double-drain (crash/resume replaying from a stale
-`membership_cursor` — same defensive shape `_recover_in_progress()`
-elsewhere in this module already favors).
+The `agent` label passed to `tail_jsonl_events()` here (`"membership"`) is
+only used for the malformed-line fallback and the `cursors` dict's own key
+— it does NOT override the `agent` field already embedded in each
+`membership.jsonl` line by `add_team_member()` (`{"agent": <joined-agent-
+name>, ...}`, part 1's own shipped shape — `tail_jsonl_events()` only
+substitutes its own `agent` label when a line fails to parse as JSON at
+all). So a `member_joined` event surfaces in the merged feed tagged with the
+NEWLY-JOINED agent's own name (e.g. `"aider"`), not a generic `"system"`
+pseudo-agent.
 
-`_new_state()` (`app/teams.py:2732`) gets one new additive field:
-`"membership_cursor": 0` — same "missing key defaults to 0" precedent
-`human_cursor` itself established when it was added; every existing
-persisted `run.json` and every existing test reading `state.get(
-"membership_cursor", 0)` is unaffected.
+**This is a deliberate choice, not an oversight** (see "Non-goals" above):
+tagging the event with the joined agent's own name means it renders in that
+agent's own established color (`teamAgentColor()`), visually tying "this is
+the moment this color/agent became available" together — arguably more
+useful than a flat gray system line, and it requires zero change to
+`_handle_team_events()`'s per-file `agent` parameter contract or to
+`tail_jsonl_events()` itself. `cursors["membership"]` is a new key in the
+response; the frontend's cursor-merge logic (`app/app.py`, the
+`pollTeamFeed()`-equivalent client function) already treats `cursors` as an
+open dict keyed by whatever agent labels the server returns (proven by how
+it already handles `"human"` today, added by item 19 part 1 with zero
+frontend cursor-logic change) — no frontend cursor-handling change needed
+beyond what "Proposed approach" §5 below already describes for rendering.
 
-### 3. New side-channel file, deliberately separate from `human.jsonl`
-New `_membership_log_path(run_id)` → `<rundir>/membership.jsonl`, alongside
-`_human_log_path()`/`_transcript_path()`/`_inbox_path()`. **Not** written
-into `human.jsonl` itself, even though the drain mechanics are identical,
-because:
-- Every event source in this module already gets its own file
-  (`transcript.jsonl` for the lead, one `<agent>.jsonl` per teammate,
-  `human.jsonl` for human chat) — conflating a system-generated
-  "roster changed" event into the human-authored file would be the one
-  exception to that convention, not a reuse of it.
-- `GET .../team/events`'s merged feed (item 6f) renders `human.jsonl`
-  entries as `agent="human"`; item 19 part 2's UI gives "human" its own
-  filter pill and `.kind-human-message` row style specifically for
-  free-text human chat. A `member_joined` event is a different kind of
-  thing (system-generated, not human-authored) and should get its own
-  `agent="system"` / `kind="member_joined"` envelope shape so a future
-  UI pass (part 2 or later) can render/filter it distinctly, not lumped in
-  with human chat bubbles.
-- The failure mode of conflating them is real, not hypothetical: item 19
-  part 2 was built understanding "human filter pill = human.jsonl", and
-  silently adding non-human entries to that same file/agent value would be
-  a foot-gun for that already-shipped UI.
+### 3. New frontend event classification for `member_joined`
+(`app/app.py`, `teamFeedEventKindClass()`/`teamFeedEventBody()`)
 
-### 4. `TEAM_MAX_MEMBERS` cap — resolves the backlog's ceiling question
-New env var, same declaration style as every other `TEAM_MAX_*`/`TEAM_*`
-constant (`app/teams.py`, near `TEAM_MAX_ROUNDS` at line 106):
-```python
-TEAM_MAX_MEMBERS = int(os.environ.get("TEAM_MAX_MEMBERS", "6"))
+One new branch in `teamFeedEventKindClass()`, placed alongside the other
+`kind`-based checks (order doesn't matter here — `kind === 'member_joined'`
+is structurally disjoint from every existing branch, none of which check
+that `kind` value):
+```javascript
+if (e.kind === 'member_joined') return 'member-joined';
 ```
-Document in `config/switchboard.env.example` alongside the existing
-commented-out `#TEAM_MAX_ROUNDS=8` line (same section, same `#KEY=default`
-commented style), e.g. `#TEAM_MAX_MEMBERS=6`.
-
-Enforced in **three** places, closing the gap for both growth and initial
-start, not just the new path:
-- `add_team_member()` (§1 above): reject if already at the cap.
-- `validate_composition()` (`app/teams.py:2045`, the explicit-picker path):
-  add `if len(names) > TEAM_MAX_MEMBERS: return f"too many teammates: {len(names)} "
-  f"exceeds the configured maximum of {TEAM_MAX_MEMBERS}"` — a human who
-  explicitly picked an oversized roster gets a clear rejection, not a
-  silent truncation of their own explicit choice.
-- `default_team_composition()` (`app/teams.py:1978`): the auto-picked
-  `members` list is **deterministically truncated** to the first
-  `TEAM_MAX_MEMBERS` entries (already sorted by name via `roster()`), not
-  refused — consistent with this function's own existing character (a
-  best-effort deterministic default, never a hard refusal for a situation
-  the human didn't explicitly create). Note this in the function's
-  docstring so a future reader isn't surprised a large `engines.d` doesn't
-  make every engine a default teammate.
-
-Default `6`: a running team's real per-teammate cost is one persistent
-`tail -F` tmux window (cheap) plus one git worktree checkout (cheap, disk
-only — delegated work is still strictly sequential, one `agent_run()` call
-per round, never N teammates running concurrently) plus one more tool
-choice + one more line of `_tool_prose()` in the lead's own system prompt
-per round (the real, less-cheap cost: context budget). 6 is comfortably
-above any realistic current `engines.d` roster size in this project while
-still being a real, configured ceiling rather than "any amount."
-
-### 5. `POST /projects/<name>/team/add-member` route
-New branch in `app/app.py`'s POST dispatch, alongside `/team/interject`
-(`app/app.py:6186-6226`), same shape/order (unknown-project 404 → run_id
-resolution via `run_id` in body or `latest_run_for_project()` → status
-check delegated to `add_team_member()` itself, not duplicated at the route
-layer, since unlike `/team/resolve`'s status check the allowed-status set
-here is identical to `interject()`'s own and is more naturally owned by the
-one function both entry points call):
-```python
-elif (parts[0] == "projects" and len(parts) == 4 and parts[2] == "team"
-      and parts[3] == "add-member"):
-    name = parts[1]
-    if name not in instance_names():
-        return self._json({"error": "unknown project"}, 404)
-    run_id = (body.get("run_id") or "").strip() or None
-    if run_id:
-        if not teams._RUN_ID_RE.match(run_id):
-            return self._json({"error": "no run found for this project"}, 400)
-        try:
-            state = teams._load_state(run_id)
-        except (OSError, ValueError):
-            return self._json({"error": "no run found for this project"}, 400)
-        if state.get("project_name") != name:
-            return self._json({"error": "this run belongs to a different project"}, 400)
-    else:
-        state = teams.latest_run_for_project(name)
-        if state is None:
-            return self._json({"error": "no run found for this project"}, 400)
-        run_id = state["run_id"]
-    agent = (body.get("agent") or "").strip()
-    if not agent:
-        return self._json({"error": "agent is required"}, 400)
-    result = teams.add_team_member(run_id, agent)
-    if not result["ok"]:
-        return self._json({"error": result["error"]}, 400)
-    self._json({"ok": True, "run_id": run_id, "agent": agent})
+One new branch in `teamFeedEventBody()`:
+```javascript
+if (cls === 'member-joined') return '→ joined the team';
 ```
-No background thread spun up here (unlike `/team/resolve`/`/team/board-
-resolve`) — same reasoning `/team/interject` already documents: this never
-resumes a stopped loop, so there is nothing to (re-)drive. Reached through
-the same shared TOTP gate every other `/team/*` route already sits behind
-— no new gating code.
+(The agent name itself is already rendered by `renderTeamFeedEvent()`'s
+existing `<span class="team-feed-agent">` — no need to repeat it in the
+body text.) New CSS: `.team-feed-event.kind-member-joined` — a left-border
+accent using that event's own agent color inline style already applied via
+`renderTeamFeedEvent()`'s existing `style="color:' + color + '"` mechanism;
+no new color token needed, reuses `TEAM_AGENT_PALETTE`.
 
-### 6. CLI: `team-add-member <run_id> <agent>`
-Thin wrapper mirroring `_cli_team_interject()` exactly (`app/teams.py:4697`)
-— queues/executes and returns, does **not** call `_drive_and_report()`
-(same reasoning: there may already be a live driver elsewhere, and
-double-driving one `run_id` is the bug class `/team/resolve`'s own
-`_team_threads_get` check exists to prevent):
-```python
-def _cli_team_add_member(args: argparse.Namespace) -> int:
-    result = add_team_member(args.run_id, args.agent)
-    if not result["ok"]:
-        print(f"error: {result['error']}", file=sys.stderr)
-        return 1
-    print(f"added '{result['agent']}' to run {args.run_id} (worktree: {result['worktree']})")
-    return 0
+### 4. Filter-pill list now reads the live roster, not the stale composition
+(`app/app.py`, `renderTeamFeed()`, ~line 3877)
+```javascript
+const agents = ['lead', 'human'].concat(team.members || []);
 ```
-New `argparse` subparser next to `p_team_interject`
-(`app/teams.py:4855-4859`):
-```python
-p_team_add_member = sub.add_parser("team-add-member", help="Add one more "
-                                   "teammate engine to an already-running "
-                                   "team (backlog item 21 part 1).")
-p_team_add_member.add_argument("run_id")
-p_team_add_member.add_argument("agent", help="engines.d engine name to add as a new teammate.")
+replacing `(team.composition && team.composition.members) || []`. This is
+the one necessary correction identified in "Background" above — without it,
+a newly-added teammate's events are reachable under the `all` filter (their
+own log file was already merged by `_handle_team_events()` before this
+part) but never get their own clickable pill. `team.members` is the new
+`/status` field from §1; every existing caller of `renderTeamFeed()` already
+receives the full `team` object, so no signature change.
+
+### 5. The "+" control itself (`app/app.py`, new functions alongside
+`renderTeamInterjectBox()`/`doTeamInterject()`)
+
+**Eligibility helper**, pure, no I/O:
+```javascript
+function teamAddMemberEligible(team) {
+  const already = new Set(team.members || []);
+  const leadName = team.lead && team.lead.kind === 'engine' ? team.lead.name : null;
+  return ROSTER.filter(e => e.kind === 'engine' && e.name !== leadName && !already.has(e.name));
+}
 ```
-Wired into `main()`'s dispatch (`app/teams.py:4896` region) the same way
-every other `team-*` subcommand already is.
+(`e.kind === 'engine'` mirrors `add_team_member()`'s own server-side
+rejection of the Ollama lead-only roster entry — same rule, restated
+client-side for fast feedback, exactly the same "client mirrors server,
+server stays authoritative" discipline `teamCompositionError()` already
+documents for the Start-time picker.)
+
+**Visibility gate**: reuse `teamAcceptsInterject(team)` as-is (see
+"Background" — the status set is identical by construction). No rename;
+add a one-line comment at the new call site noting the reuse is
+intentional, not incidental.
+
+**Render function**, placed directly below `renderTeamInterjectBox()` in
+`teamRow()`'s non-idle branch (own visual block, between the interject box
+and the feed toggle — matches "coexists with other controls" without
+crowding the `.team-actions` row, which stays reserved for the single
+"Stop team" button per existing convention):
+```javascript
+function renderTeamAddMemberControl(name, team) {
+  if (!teamAcceptsInterject(team)) return '';
+  const members = team.members || [];
+  const atCap = members.length >= (TEAM_MAX_MEMBERS_CLIENT || 6);
+  const eligible = teamAddMemberEligible(team);
+  if (atCap) {
+    return '<div class="team-add-member"><span class="team-add-member-reason">' +
+      'Team is at the maximum of ' + (TEAM_MAX_MEMBERS_CLIENT || 6) + ' teammates.</span></div>';
+  }
+  if (eligible.length === 0) {
+    return '<div class="team-add-member"><span class="team-add-member-reason">' +
+      'No more roster engines available to add.</span></div>';
+  }
+  const options = eligible.map(e =>
+    '<option value="' + esc(e.name) + '">' + esc(e.name) + ' (' + tierLabel(e.tier) + ')</option>').join('');
+  return '<div class="team-add-member">' +
+    '<select id="team-add-member-select-' + esc(name) + '">' + options + '</select>' +
+    '<button class="team-btn" onclick="doTeamAddMember(' + "'" + name + "'" + ')">+ Add</button></div>';
+}
+```
+`TEAM_MAX_MEMBERS_CLIENT`: a new client-side global, hardcoded default `6`
+(matching the server default), overwritten from `s.team_max_members` on
+every `/status` poll — exact same "hardcoded default + live override"
+precedent `TEAM_INTERJECT_MAX_CHARS_CLIENT` already establishes (item 19
+part 2), not a new pattern.
+
+**Dispatch function**, mirrors `doTeamInterject()`'s shape:
+```javascript
+let teamAddMemberChoice = {};  // name -> agent name, set before toggle() fires (survives a 428 retry)
+function doTeamAddMember(name) {
+  const sel = document.getElementById('team-add-member-select-' + name);
+  if (!sel || !sel.value) return;
+  teamAddMemberChoice[name] = sel.value;
+  const msgEl = document.getElementById('team-msg-' + name);
+  if (msgEl) { msgEl.textContent = ''; msgEl.className = 'team-msg'; }
+  toggle('team-add-member', name, true, null);
+}
+```
+
+**Wiring into the existing shared plumbing** (`app/app.py`):
+- `actionPath()`: `if (kind === 'team-add-member') return '/projects/' +
+  encodeURIComponent(name) + '/team/add-member';`
+- `actionBody()`: `if (kind === 'team-add-member') body.agent =
+  teamAddMemberChoice[name];`
+- `handleActionResult()`: new branch, same "own inline result slot, handled
+  before the generic 400 branch" pattern `team-interject`/
+  `team-board-resolve` already use:
+  ```javascript
+  if (kind === 'team-add-member') {
+    hideCodeOverlay();
+    const data = await r.json().catch(() => ({}));
+    const msgEl = document.getElementById('team-msg-' + name);
+    if (msgEl) {
+      if (r.ok && data.ok) {
+        msgEl.textContent = '✓ \'' + esc(data.agent) + '\' will join the team at its next round';
+        msgEl.className = 'team-msg success';
+        delete teamAddMemberChoice[name];
+      } else {
+        msgEl.textContent = '✕ Error: ' + (data.error || 'could not add teammate');
+        msgEl.className = 'team-msg error';
+      }
+    }
+    return;
+  }
+  ```
+  (Deliberately says "will join... at its next round," never "has joined" —
+  directly satisfies this spec's own "accurate, non-oversold feedback"
+  goal.)
+- The 428 code-overlay label ternary (`handleActionResult()`, the existing
+  chain of `kind === '...' ? '...' :`) gains: `kind === 'team-add-member' ?
+  'Adding teammate: ' + (name || 'this') :`.
+- `teamRow()`'s non-idle branch: insert
+  `renderTeamAddMemberControl(name, team)` between `interjectBox` and
+  `feedToggle`.
+
+**New CSS**: `.team-add-member { display: flex; gap: 8px; align-items:
+center; margin-top: 4px; }`, `.team-add-member select { font-size: 13px;
+padding: 6px 8px; border-radius: 8px; ... }` (reusing
+`.team-lead-picker select`'s existing declaration block's values, not
+inventing new tokens), `.team-add-member-reason { font-size: 12px; color:
+#888; }` (same muted-informational-text token `.team-branches` already
+uses for its own "unavailable"/"none" states).
 
 ## Affected areas
-- `app/teams.py`: new `TEAM_MAX_MEMBERS` constant; new
-  `_membership_log_path()`; new `add_team_member()`; new drain block in
-  `team_step()`; new `"membership_cursor": 0` field in `_new_state()`;
-  `TEAM_MAX_MEMBERS` check added to `validate_composition()`; truncation
-  added to `default_team_composition()` (+ docstring update); new
-  `_cli_team_add_member()` + argparse subparser + `main()` dispatch line.
-- `app/app.py`: new `POST /projects/<name>/team/add-member` route branch.
-- `config/switchboard.env.example`: new commented `#TEAM_MAX_MEMBERS=6`
-  line next to `#TEAM_MAX_ROUNDS=8`.
-- No data model changes to `run.json`'s existing fields — one new additive
-  key (`membership_cursor`), same pattern `human_cursor`/`worktrees`/
-  `project_name` already established as safe/backward-compatible additions.
-- No changes to `app/app.py`'s frontend JS, `_session_urls`, or the plain
-  non-team engine session path — entirely untouched by this spec.
+- `app/app.py`:
+  - `/status` handler: two new fields on `inst["team"]` (`members`, `lead`),
+    one new top-level field (`team_max_members`).
+  - `_handle_team_events()`: `membership.jsonl` added to the merged file
+    list.
+  - Frontend JS: `teamAddMemberEligible()`, `renderTeamAddMemberControl()`,
+    `doTeamAddMember()`, `teamAddMemberChoice` (new); `actionPath()`/
+    `actionBody()`/`handleActionResult()` gain `'team-add-member'` branches;
+    `teamFeedEventKindClass()`/`teamFeedEventBody()` gain the
+    `member_joined` branch; `renderTeamFeed()`'s `agents` line changed to
+    read `team.members`; `teamRow()` gains one new call; new
+    `TEAM_MAX_MEMBERS_CLIENT` global, updated from `/status`.
+  - New CSS: `.team-add-member`/`.team-add-member select`/
+    `.team-add-member-reason`; `.team-feed-event.kind-member-joined`.
+- No `app/teams.py` change — part 1's backend is reused entirely as-is; no
+  new function, no new route beyond what part 1 already shipped, no schema
+  change to `run.json`/`membership.jsonl`.
+- No new route. `/status` and `GET .../team/events` are both existing
+  routes gaining additive fields/merged sources, not new endpoints.
 
 ## Edge cases
-- **No team running for this project at all** — `latest_run_for_project()`
-  returns `None` → `400 "no run found for this project"`, same as
-  `/team/resolve`.
-- **Team just finished/errored/stopped between page load and the add-member
-  click** — `add_team_member()`'s own status check catches this
-  (`finished`/`error`/`stopped`/`escalated_max_rounds` all rejected), same
-  set `interject()` already rejects, same error-message shape.
-- **Requested agent is already a teammate** — rejected with a specific
-  message, not a silent no-op or a duplicate window.
-- **Requested agent is the current lead** — rejected (mirrors
-  `validate_composition()`'s "lead cannot also be a teammate").
-- **Requested agent doesn't exist in `engines.d` at all, or is the Ollama
-  entry** — rejected via the `roster()` lookup, same message style
-  `validate_composition()`'s "Unknown teammate" already uses.
-- **At the `TEAM_MAX_MEMBERS` cap already** — rejected with the count and
-  configured max named explicitly.
-- **Stale worktree leftover at the target path from a previous run** —
-  `_create_worktree()`'s own existing "still has uncommitted changes"
-  message surfaces unchanged; no new handling needed, this function already
-  has it.
-- **tmux session died between the status check and the `new-window` call**
-  (team crashed/was killed out-of-band mid-request) — worktree created in
-  step 4 is rolled back via `_remove_worktree()` before returning the error,
-  so no orphaned worktree is left behind for this failure path.
-- **Two concurrent add-member calls for the same run** — each independently
-  validates against its own freshly-loaded `state["members"]` snapshot; the
-  worst case is two different, valid new agents both getting worktrees/
-  windows/queued events (no conflict — different worktree paths, different
-  window names, independent envelope appends to `membership.jsonl`, same
-  "one independent bounded `open(...,'a')` + `write()` under `PIPE_BUF`"
-  safety `interject()`'s own docstring already establishes for concurrent
-  writers to one append-only file). The narrow exception: two concurrent
-  calls for the **same** requested `agent` name — the second one's
-  `_create_worktree()` call will see the first's now-existing path and
-  return its normal "still has uncommitted changes"-shaped error (a false
-  positive in this specific race, since the first call is legitimate, not a
-  leftover) — acceptable: the human retries, sees one teammate already
-  added, and doesn't re-request the same name. Not fixed further here (same
-  narrowness judgment call this project already made for comparable
-  first-mover races, e.g. `_create_team_session()`'s own documented
-  session-name race).
-- **Run is `blocked_ask_user`/`blocked_board_write` when add-member is
-  called** — allowed (matches `interject()`'s own accepted statuses); the
-  worktree/window are created immediately, but the `membership_cursor`
-  drain (and thus the lead actually learning about it) only happens once
-  the run resumes and `team_step()` runs again — same "sits queued until
-  resumed" behavior `interject()`'s own docstring already documents for a
-  human message posted while blocked.
+- **Team at `TEAM_MAX_MEMBERS` already** — control renders disabled with
+  the "Team is at the maximum of N teammates" reason, computed from the
+  live `team.members.length` (not a snapshot) every `/status` poll, so it
+  flips to enabled again automatically if the operator (or a future
+  "shrink" feature, not built here) ever reduces the count — no manual
+  refresh needed.
+- **Fewer roster engines configured than `TEAM_MAX_MEMBERS`, and every one
+  is already on the team** — distinct reason text ("No more roster engines
+  available to add") from the at-cap case, so an operator isn't told to
+  wait for a cap that was never actually the blocker.
+- **Server rejects anyway despite client-side eligibility passing** (a race:
+  another operator/tab added the same or a different teammate between this
+  tab's last `/status` poll and this click, pushing the count to the cap in
+  between) — the existing generic 400-handling path in `handleActionResult()`
+  surfaces `data.error` verbatim in the row's `team-msg` slot; the server
+  (`add_team_member()`) remains the sole source of truth, exactly as every
+  other client-side-mirrored validation in this codebase already documents
+  (`teamCompositionError()`'s own comment).
+- **Team transitions out of an accepted status between render and click**
+  (e.g. it finishes or errors while the control is visible) — `toggle()`'s
+  own existing POST still fires; `add_team_member()`'s own status check
+  rejects with a clear error, surfaced the same way as any other race here
+  — no new handling needed, same class of race `doTeamInterject()` already
+  accepts unhandled-beyond-the-server-check.
+- **Row re-renders mid-selection** (a `/status` poll lands while the
+  `<select>` is open) — `refresh()`'s existing full-row re-render already
+  resets any unsubmitted, unmirrored `<select>` choice on every poll for
+  every kind of control in this codebase that isn't backed by a client-side
+  text mirror (e.g. the lead-picker's own `<select>` IS mirrored via
+  `teamPickerLead`/survives redraws; this new `<select>`'s value is NOT
+  separately mirrored client-side pre-submit, matching `team-mate` checkbox
+  behavior's own precedent of "state lives in the DOM until submitted, not
+  a JS mirror" — acceptable because, unlike the interject textarea, there's
+  no risk of losing meaningful typed text here, only a re-picked dropdown
+  selection, which is cheap to redo).
+- **`membership.jsonl` doesn't exist yet for a run that predates part 1**
+  (impossible in practice on this branch, since part 1 is already merged
+  and no run persists across a deploy that removed the feature, but as a
+  defensive matter) — `tail_jsonl_events()` already returns `([], offset,
+  False)` on `FileNotFoundError`, so this degrades to "no membership events
+  ever appear," not an error.
+- **Two operators in two browser tabs both add a teammate concurrently** —
+  covered entirely by part 1's own already-documented concurrent
+  `add_team_member()` race handling (independent worktree/window/queued
+  envelope per distinct agent; a narrow, accepted false-positive "still has
+  uncommitted changes" error only for the exact-same-agent-name race). No
+  new handling needed at the UI layer beyond surfacing whatever error the
+  server returns.
 
 ## Acceptance criteria
-- [ ] Given a running team (status `running`) for project P with members
-      `["codex"]`, when `add_team_member(run_id, "aider")` is called, then
-      the call returns `{"ok": True, "agent": "aider", "worktree": <path>}`,
-      a new git worktree exists at `<P>.teams/aider`, and a new tmux window
-      named `aider` exists in the `team-P` session.
-- [ ] Given the same call above, when the run's next `team_step()` round
-      runs, then `state["members"]` includes `"aider"`, `state["worktrees"]`
-      includes an `"aider"` entry, `state["membership_cursor"]` has advanced
-      past the queued event, and one new history entry with
-      `tool="team_member_joined"` was appended — and the lead was NOT called
-      that round (mirrors `human.jsonl`'s own "drain-only round" behavior).
-- [ ] Given the round after that, when the lead is called, then its tool
-      schema/system framing include `aider` as a valid `delegate` target
-      (verified via `_lead_tools(state["members"])`/`_validate_lead_action()`
-      both now accepting `agent="aider"`), with no code change required in
-      either of those two functions.
-- [ ] Given a team already at `TEAM_MAX_MEMBERS` teammates, when
-      `add_team_member()` is called with a new, otherwise-valid agent name,
-      then it returns `{"ok": False, "error": ...}` naming the configured
-      max, and no worktree/window/queued-event is created.
-- [ ] Given an explicit picker composition (`validate_composition()`) with
-      more than `TEAM_MAX_MEMBERS` teammate names, when team-start is
-      attempted, then it is rejected with a clear "too many teammates"
-      message before any worktree is created.
-- [ ] Given `engines.d` configured with more than `TEAM_MAX_MEMBERS`
-      headless-eligible engines and no explicit picker composition, when
-      `default_team_composition()` is called, then its `members` list is
-      truncated to exactly `TEAM_MAX_MEMBERS` entries, deterministically
-      (same set every call, given the same `engines.d`).
-- [ ] Given a team NOT currently running for project P (no run at all, or
-      the latest run is terminal), when `POST /projects/P/team/add-member`
-      is called, then it returns HTTP 400 with a clear "no run found"/status
-      error and no side effects.
-- [ ] Given a run in status `blocked_ask_user`, when `add_team_member()` is
-      called with a valid new agent, then it succeeds (worktree + window
-      created immediately) and the queued `member_joined` event is only
-      drained once the run is later resumed (via `/team/resolve` or
-      `team-resume`), not before.
-- [ ] `team-add-member <run_id> <agent>` (CLI) produces the same effect and
-      the same success/failure text conventions as the HTTP route, without
-      needing any web server running.
-- [ ] All existing team tests (6c/6d/6f/19/7/8's own suites) continue to
-      pass unmodified — `membership_cursor`'s additive default (`0`) and the
-      unchanged shape of every pre-existing `run.json` field mean no
-      existing persisted-state fixture needs updating.
+- [ ] Given a `running` team with members `["codex"]` and roster
+      `["codex", "aider", "claude"]` (lead = a separate Ollama entry), when
+      the row renders, then the "+" control shows a `<select>` with exactly
+      `aider` and `claude` as options (not `codex`, already a member; not
+      the Ollama lead entry).
+- [ ] Given the same team, when `aider` is selected and "+ Add" is clicked,
+      then `POST /projects/<name>/team/add-member` is sent with
+      `{"agent": "aider"}`, and on success the row's message slot shows
+      "✓ 'aider' will join the team at its next round" (not "has joined" /
+      "is now available").
+- [ ] Given the add above succeeded, when the next `/team/events` poll
+      lands, then a `member_joined`-kind event tagged `agent: "aider"`
+      appears in the merged feed (rendered as "→ joined the team" in
+      `aider`'s own established color), even before the lead's next round
+      has run.
+- [ ] Given the same add, when the run's next `team_step()` round runs (a
+      subsequent `/status` poll after that), then `team.members` in the
+      `/status` response includes `"aider"`, and the feed's filter pills now
+      include an `aider` pill.
+- [ ] Given a team already at `TEAM_MAX_MEMBERS` (`team.members.length ===
+      team_max_members` from `/status`), when the row renders, then the "+"
+      control is disabled/replaced with "Team is at the maximum of N
+      teammates." and no `<select>`/button is clickable.
+- [ ] Given a team with every roster engine already a member (but under the
+      numeric cap), when the row renders, then the control shows "No more
+      roster engines available to add." — distinct text from the at-cap
+      case.
+- [ ] Given a team in `blocked_ask_user` or `blocked_board_write`, when the
+      row renders, then the "+" control is visible and enabled (same
+      condition `teamAcceptsInterject()` already computes for the compose
+      box) — and given a team in `escalated_max_rounds`/`finished`/`error`/
+      `idle`, then it is not rendered at all.
+- [ ] Given a server-side rejection (e.g. a genuine concurrent-add race
+      pushing the team over the cap between poll and click), when the POST
+      returns 400, then the row's message slot shows "✕ Error: <the
+      server's exact message>", and the `<select>`/button remain usable for
+      a retry.
+- [ ] Given a 428 TOTP challenge mid-flow, when the code is submitted, then
+      the retry resends the SAME `agent` value originally selected (via
+      `teamAddMemberChoice[name]`, not a re-read of a possibly-already-
+      cleared `<select>`).
+- [ ] All existing frontend tests (`tests/test_team_frontend.js`) and
+      backend team-route tests continue to pass with the two new additive
+      `/status`/`/team/events` fields — no existing exact-dict-equality test
+      should need more than adding the new keys to its expected shape.
 
 ## Open questions
-- **Part 2 (the actual "+" button UI) is not scoped here at all** — a
-  separate `docs/spec.md` pass, once this part is built and reviewed, will
-  cover: where the "+" lives on the Teams page (most likely inside the
-  existing non-idle `teamRow()` render, near the "Stop team" action), how
-  the target engine is picked (a small dropdown of `roster()` engine
-  entries not already on the team, reusing 6e's picker-list rendering
-  conventions rather than inventing a new picker), visibility rules (shown
-  only when `team.status` is `running`/`blocked_ask_user`/
-  `blocked_board_write`, hidden once at `TEAM_MAX_MEMBERS`), and how a
-  `member_joined` event renders in the existing merged event feed (its own
-  `agent="system"`/`kind="member_joined"` row style, distinct from both
-  lead and human rows). **Assumption proceeding under**: this part ships
-  with zero UI, verified via the CLI/route directly — flag if a UI
-  affordance is actually wanted in the same cycle instead of split.
-- **`TEAM_MAX_MEMBERS` default of 6`** is a judgment call, not a measured
-  number (no host resource benchmarking was run) — reasonable given the
-  per-teammate cost analysis in "Proposed approach" §4, but callable out
-  as adjustable if a real deployment finds it too tight or too loose.
-- **Whether a grown team's new teammate should get any different framing in
-  its own dashboard window's very first log lines** (e.g., a short
-  "you were just added mid-run" banner) — no such banner is added; the
-  window behaves identically to an original teammate's from the moment
-  it's created. Flagging in case product intent differs, but the backlog
-  item's own text doesn't ask for this and there's no signal it's wanted.
+- **`ux-designer` IS needed this cycle.** This is a genuinely new UI
+  control (not a copy of an existing one wired to a new endpoint) —
+  reviewing/refining the exact placement (between interject box and feed
+  toggle vs. inside `.team-actions`), spacing, and the two distinct
+  disabled-reason copy strings against `docs/design.md`'s own established
+  visual language (status-strip colors, `.team-escalation`/`.team-interject`
+  spacing tokens) is real design work, not a mechanical extension. Unlike
+  item 13's "Past team branches" panel (which the product-manager judged
+  didn't need a design pass, being a plain read-only list with an obvious
+  single layout), this control has real states (enabled / two distinct
+  disabled reasons / mid-request) worth a design pass. **Assumption
+  proceeding under**: `ux-designer` runs next, using this spec's "Proposed
+  approach" as its functional baseline — the exact CSS values above are a
+  developer-ready starting point, not a locked-in final design.
+- **Whether `member_joined`'s feed row should additionally trigger any kind
+  of transient visual highlight** (e.g. briefly flashing the new filter
+  pill) — no such affordance is specced here; flagging in case product
+  intent wants stronger immediate feedback than a feed line + message-slot
+  text. Assumption: not needed: the existing feed's own scroll/append
+  behavior is already the established "something happened" signal for
+  every other event kind.
+- **Whether the CLI (`team-add-member`) should also gain a `--roster` /
+  list-eligible-first convenience flag** now that a UI exists to browse the
+  roster visually — out of scope here (this part is UI-only, no CLI
+  change); flagging as a possible small follow-up, not blocking.
 
 ## Risk / rollback notes
-- Fully additive: no existing function's signature changes in a
-  backward-incompatible way (`validate_composition()`/
-  `default_team_composition()` gain new internal checks, not new required
-  parameters; `_new_state()` gains one new dict key with a safe default).
-  Reverting is a straightforward revert of this commit — no data migration
-  needed since `membership_cursor` is read with `.get(..., 0)` and no
-  existing `run.json` on disk needs it.
-- Worst-case failure mode if `TEAM_MAX_MEMBERS` is misconfigured to `0` or a
-  negative number: every add-member call (and possibly every team-start,
-  once `validate_composition()`'s check applies) is rejected — a loud,
-  immediate error, not a silent bypass; no separate guard needed against a
-  pathological config value beyond the existing `int(os.environ.get(...))`
-  parse (a non-numeric value already raises at import time, matching every
-  other `TEAM_*` int env var's existing behavior in this file).
-- The one genuinely new failure surface is the tmux `new-window` call
-  against a session that might have just died — handled explicitly (§1 step
-  6's rollback), not left as an unhandled exception path.
+- Fully additive on both the backend-field and frontend-control level: no
+  existing `/status`/`/team/events` field is removed or reinterpreted, no
+  existing route's request/response shape for any OTHER action changes. A
+  revert of this commit removes the control and the two additive fields
+  with zero data-model migration (nothing new is persisted server-side by
+  this part at all — `membership.jsonl`'s shape and write path are entirely
+  part 1's, untouched here).
+- Worst-case failure mode if the `/status`/`/team/events` additions are
+  buggy: the "+" control renders with an empty/wrong option list, or the
+  feed misses/misrenders a `member_joined` line — cosmetic degradation, not
+  a functional regression, since `add_team_member()`'s own server-side
+  validation (unchanged, part 1) remains the sole correctness gate no
+  matter what the UI shows or omits.
+- No new privileged code path, no new sudoers entry, no new tmux/subprocess
+  call anywhere in this part — every mutation still flows through part 1's
+  already-reviewed `add_team_member()`.
