@@ -144,6 +144,23 @@ class AiReviewerStateFileTests(unittest.TestCase):
         self.assertEqual(set(s.keys()), {"admin/one#1", "admin/two#2"})
 
 
+class AiReviewerPrKeyTests(unittest.TestCase):
+    """_ai_reviewer_pr_key() -- backlog item 17 part 2: Gitea's key format is
+    unchanged, GitHub's gets a collision-proof "github:" prefix."""
+
+    def test_gitea_key_is_unprefixed_owner_repo_hash_number(self):
+        self.assertEqual(appmod._ai_reviewer_pr_key("gitea", "admin/proj", 1), "admin/proj#1")
+
+    def test_github_key_is_prefixed(self):
+        self.assertEqual(
+            appmod._ai_reviewer_pr_key("github", "acme/widget", 7), "github:acme/widget#7")
+
+    def test_gitea_and_github_keys_for_the_same_owner_repo_number_never_collide(self):
+        gitea_key = appmod._ai_reviewer_pr_key("gitea", "acme/widget", 7)
+        github_key = appmod._ai_reviewer_pr_key("github", "acme/widget", 7)
+        self.assertNotEqual(gitea_key, github_key)
+
+
 class AiReviewerPollRepoTests(unittest.TestCase):
     """_ai_reviewer_poll_repo() -- label-edge detection + dispatch gating.
     _ai_reviewer_review_bg is mocked out entirely (a separate class below
@@ -186,21 +203,22 @@ class AiReviewerPollRepoTests(unittest.TestCase):
         appmod.AI_REVIEWER_ENABLED = False
         calls = []
         appmod._gitea_api = lambda method, path, body=None: calls.append(path) or (200, [])
-        appmod._ai_reviewer_poll_repo("admin/proj", {"name": "proj"})
+        appmod._ai_reviewer_poll_repo("gitea", "admin/proj", {"name": "proj"})
         self.assertEqual(calls, [])
 
     def test_unseen_pr_without_label_records_absent_no_dispatch(self):
         self._fake_pulls([self._pr(1)])
-        appmod._ai_reviewer_poll_repo("admin/proj", {"name": "proj"})
+        appmod._ai_reviewer_poll_repo("gitea", "admin/proj", {"name": "proj"})
         self.assertEqual(self.bg_calls, [])
         s = appmod._load_ai_reviewer_state()
         self.assertEqual(s["admin/proj#1"]["label_present"], False)
 
     def test_label_add_edge_triggers_dispatch_and_synchronous_state_write(self):
         self._fake_pulls([self._pr(1, labels=["ready for review"])])
-        appmod._ai_reviewer_poll_repo("admin/proj", {"name": "proj"})
+        appmod._ai_reviewer_poll_repo("gitea", "admin/proj", {"name": "proj"})
         self.assertEqual(len(self.bg_calls), 1)
-        owner_repo, entry, pr = self.bg_calls[0]
+        host, owner_repo, entry, pr = self.bg_calls[0]
+        self.assertEqual(host, "gitea")
         self.assertEqual(owner_repo, "admin/proj")
         self.assertEqual(pr["number"], 1)
         s = appmod._load_ai_reviewer_state()
@@ -215,7 +233,7 @@ class AiReviewerPollRepoTests(unittest.TestCase):
             "admin/proj#1", label_present=True, attempts=0,
             reviewed_at="2026-01-01T00:00:00Z", last_error=None)
         self._fake_pulls([self._pr(1, labels=["ready for review"])])
-        appmod._ai_reviewer_poll_repo("admin/proj", {"name": "proj"})
+        appmod._ai_reviewer_poll_repo("gitea", "admin/proj", {"name": "proj"})
         self.assertEqual(self.bg_calls, [])
 
     def test_label_still_present_after_a_failed_attempt_redispatches(self):
@@ -223,7 +241,7 @@ class AiReviewerPollRepoTests(unittest.TestCase):
             "admin/proj#1", label_present=True, attempts=1,
             reviewed_at=None, last_error="diff fetch failed (status 500)")
         self._fake_pulls([self._pr(1, labels=["ready for review"])])
-        appmod._ai_reviewer_poll_repo("admin/proj", {"name": "proj"})
+        appmod._ai_reviewer_poll_repo("gitea", "admin/proj", {"name": "proj"})
         self.assertEqual(len(self.bg_calls), 1)
 
     def test_attempts_exhausted_gives_up_silently(self):
@@ -231,14 +249,14 @@ class AiReviewerPollRepoTests(unittest.TestCase):
             "admin/proj#1", label_present=True, attempts=3,
             reviewed_at=None, last_error="still failing")
         self._fake_pulls([self._pr(1, labels=["ready for review"])])
-        appmod._ai_reviewer_poll_repo("admin/proj", {"name": "proj"})
+        appmod._ai_reviewer_poll_repo("gitea", "admin/proj", {"name": "proj"})
         self.assertEqual(self.bg_calls, [])
 
     def test_label_removed_then_readded_is_exactly_one_new_episode(self):
         # Poll 1: label present -> fresh trigger, then simulate a completed
         # success (attempts reset to 0, last_error None).
         self._fake_pulls([self._pr(1, labels=["ready for review"])])
-        appmod._ai_reviewer_poll_repo("admin/proj", {"name": "proj"})
+        appmod._ai_reviewer_poll_repo("gitea", "admin/proj", {"name": "proj"})
         appmod._save_ai_reviewer_state_entry(
             "admin/proj#1", label_present=True, attempts=0,
             reviewed_at="2026-01-01T00:00:00Z", last_error=None)
@@ -246,7 +264,7 @@ class AiReviewerPollRepoTests(unittest.TestCase):
 
         # Poll 2: label removed.
         self._fake_pulls([self._pr(1, labels=[])])
-        appmod._ai_reviewer_poll_repo("admin/proj", {"name": "proj"})
+        appmod._ai_reviewer_poll_repo("gitea", "admin/proj", {"name": "proj"})
         self.assertEqual(self.bg_calls, [])
         s = appmod._load_ai_reviewer_state()
         self.assertEqual(s["admin/proj#1"]["label_present"], False)
@@ -254,29 +272,111 @@ class AiReviewerPollRepoTests(unittest.TestCase):
 
         # Poll 3: label re-added -> exactly one new trigger.
         self._fake_pulls([self._pr(1, labels=["ready for review"])])
-        appmod._ai_reviewer_poll_repo("admin/proj", {"name": "proj"})
+        appmod._ai_reviewer_poll_repo("gitea", "admin/proj", {"name": "proj"})
         self.assertEqual(len(self.bg_calls), 1)
 
     def test_label_matched_by_exact_equality_not_substring(self):
         self._fake_pulls([self._pr(1, labels=["not ready for review"])])
-        appmod._ai_reviewer_poll_repo("admin/proj", {"name": "proj"})
+        appmod._ai_reviewer_poll_repo("gitea", "admin/proj", {"name": "proj"})
         self.assertEqual(self.bg_calls, [])
 
     def test_non_200_status_skipped_without_raising(self):
         appmod._gitea_api = lambda method, path, body=None: (500, {})
-        appmod._ai_reviewer_poll_repo("admin/proj", {"name": "proj"})  # must not raise
+        appmod._ai_reviewer_poll_repo("gitea", "admin/proj", {"name": "proj"})  # must not raise
         self.assertEqual(self.bg_calls, [])
 
     def test_non_list_response_skipped_without_raising(self):
         appmod._gitea_api = lambda method, path, body=None: (200, {"not": "a list"})
-        appmod._ai_reviewer_poll_repo("admin/proj", {"name": "proj"})  # must not raise
+        appmod._ai_reviewer_poll_repo("gitea", "admin/proj", {"name": "proj"})  # must not raise
         self.assertEqual(self.bg_calls, [])
 
     def test_malformed_pr_entry_in_list_is_skipped_not_fatal(self):
         self._fake_pulls(["not-a-dict", self._pr(2, labels=["ready for review"])])
-        appmod._ai_reviewer_poll_repo("admin/proj", {"name": "proj"})  # must not raise
+        appmod._ai_reviewer_poll_repo("gitea", "admin/proj", {"name": "proj"})  # must not raise
         self.assertEqual(len(self.bg_calls), 1)
-        self.assertEqual(self.bg_calls[0][2]["number"], 2)
+        self.assertEqual(self.bg_calls[0][3]["number"], 2)
+
+
+class AiReviewerPollRepoGithubTests(unittest.TestCase):
+    """_ai_reviewer_poll_repo("github", ...) -- same label-edge-detection/
+    dispatch-gating logic as AiReviewerPollRepoTests above, proven identical
+    for the GitHub path; only the PR-list-fetch call (github_list_open_prs
+    instead of _gitea_api) and the pr_key prefix differ."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="switchboard-ai-reviewer-poll-gh-")
+        self._orig_state_file = appmod.AI_REVIEWER_STATE_FILE
+        self._orig_enabled = appmod.AI_REVIEWER_ENABLED
+        self._orig_label = appmod.AI_REVIEWER_LABEL
+        self._orig_token = appmod.GITHUB_TOKEN
+        self._orig_list_prs = appmod.github_list_open_prs
+        self._orig_bg = appmod._ai_reviewer_review_bg
+        appmod.AI_REVIEWER_STATE_FILE = os.path.join(self.tmp, "state.json")
+        appmod.AI_REVIEWER_ENABLED = True
+        appmod.AI_REVIEWER_LABEL = "ready for review"
+        appmod.GITHUB_TOKEN = "test-gh-token"
+        self.bg_calls = []
+        appmod._ai_reviewer_review_bg = lambda *a: self.bg_calls.append(a)
+
+    def tearDown(self):
+        appmod.AI_REVIEWER_STATE_FILE = self._orig_state_file
+        appmod.AI_REVIEWER_ENABLED = self._orig_enabled
+        appmod.AI_REVIEWER_LABEL = self._orig_label
+        appmod.GITHUB_TOKEN = self._orig_token
+        appmod.github_list_open_prs = self._orig_list_prs
+        appmod._ai_reviewer_review_bg = self._orig_bg
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _fake_pulls(self, prs):
+        appmod.github_list_open_prs = lambda owner, repo: {"ok": True, "prs": prs}
+
+    def _pr(self, number, labels=()):
+        return {"number": number, "title": "t", "body": "b",
+                "labels": [{"name": n} for n in labels]}
+
+    def test_missing_token_makes_no_calls(self):
+        appmod.GITHUB_TOKEN = ""
+        calls = []
+        appmod.github_list_open_prs = lambda owner, repo: calls.append((owner, repo)) or \
+            {"ok": True, "prs": []}
+        appmod._ai_reviewer_poll_repo("github", "acme/widget", {"name": "widget"})
+        self.assertEqual(calls, [])
+
+    def test_label_add_edge_triggers_dispatch_with_github_prefixed_state_key(self):
+        self._fake_pulls([self._pr(1, labels=["ready for review"])])
+        appmod._ai_reviewer_poll_repo("github", "acme/widget", {"name": "widget"})
+        self.assertEqual(len(self.bg_calls), 1)
+        host, owner_repo, entry, pr = self.bg_calls[0]
+        self.assertEqual(host, "github")
+        self.assertEqual(owner_repo, "acme/widget")
+        self.assertEqual(pr["number"], 1)
+        s = appmod._load_ai_reviewer_state()
+        self.assertIn("github:acme/widget#1", s)
+        self.assertNotIn("acme/widget#1", s)
+
+    def test_label_still_present_after_success_does_not_redispatch(self):
+        appmod._save_ai_reviewer_state_entry(
+            "github:acme/widget#1", label_present=True, attempts=0,
+            reviewed_at="2026-01-01T00:00:00Z", last_error=None)
+        self._fake_pulls([self._pr(1, labels=["ready for review"])])
+        appmod._ai_reviewer_poll_repo("github", "acme/widget", {"name": "widget"})
+        self.assertEqual(self.bg_calls, [])
+
+    def test_result_not_ok_skipped_without_raising(self):
+        appmod.github_list_open_prs = lambda owner, repo: {"ok": False, "error": "boom"}
+        appmod._ai_reviewer_poll_repo("github", "acme/widget", {"name": "widget"})  # must not raise
+        self.assertEqual(self.bg_calls, [])
+
+    def test_allowlist_gating_is_not_this_functions_job(self):
+        # _ai_reviewer_poll_repo() itself has no allowlist concept -- that
+        # gate lives entirely in _github_poll_if_due() (below), which never
+        # even calls this function for a non-allowlisted repo. Directly
+        # calling this function bypasses that gate by design (mirrors how
+        # _ai_reviewer_poll_repo("gitea", ...) has no GITEA_REPO_MAP_FILE
+        # membership check of its own either -- the caller already filtered).
+        self._fake_pulls([self._pr(1, labels=["ready for review"])])
+        appmod._ai_reviewer_poll_repo("github", "not-allowlisted/repo", {"name": "x"})
+        self.assertEqual(len(self.bg_calls), 1)
 
 
 class AiReviewerReviewRunTests(unittest.TestCase):
@@ -328,7 +428,7 @@ class AiReviewerReviewRunTests(unittest.TestCase):
         appmod._gitea_api_raw = lambda method, path: (404, "")
         comment_calls = []
         appmod._gitea_api = lambda method, path, body=None: comment_calls.append(path) or (200, {})
-        appmod._ai_reviewer_review_run("admin/proj", {"name": "proj"}, self._pr())
+        appmod._ai_reviewer_review_run("gitea", "admin/proj", {"name": "proj"}, self._pr())
         self.assertEqual(comment_calls, [])
         s = appmod._load_ai_reviewer_state()
         self.assertEqual(s["admin/proj#1"]["attempts"], 1)
@@ -339,7 +439,7 @@ class AiReviewerReviewRunTests(unittest.TestCase):
         def raise_conn(method, path):
             raise ConnectionError("gitea unreachable")
         appmod._gitea_api_raw = raise_conn
-        appmod._ai_reviewer_review_run("admin/proj", {"name": "proj"}, self._pr())  # must not raise
+        appmod._ai_reviewer_review_run("gitea", "admin/proj", {"name": "proj"}, self._pr())  # must not raise
         s = appmod._load_ai_reviewer_state()
         self.assertEqual(s["admin/proj#1"]["attempts"], 1)
 
@@ -348,7 +448,7 @@ class AiReviewerReviewRunTests(unittest.TestCase):
         posted = {}
         appmod._gitea_api = lambda method, path, body=None: posted.update(
             path=path, body=body) or (201, {})
-        appmod._ai_reviewer_review_run("admin/proj", {"name": "proj"}, self._pr())
+        appmod._ai_reviewer_review_run("gitea", "admin/proj", {"name": "proj"}, self._pr())
         self.assertEqual(len(self.review_calls), 1)
         self.assertEqual(self.review_calls[0][4], "")  # diff_text
         self.assertEqual(posted["path"], "/repos/admin/proj/issues/1/comments")
@@ -362,7 +462,7 @@ class AiReviewerReviewRunTests(unittest.TestCase):
         posted = {}
         appmod._gitea_api = lambda method, path, body=None: posted.update(
             path=path, body=body) or (200, {})
-        appmod._ai_reviewer_review_run("admin/proj", {"name": "proj"}, self._pr())
+        appmod._ai_reviewer_review_run("gitea", "admin/proj", {"name": "proj"}, self._pr())
         sent_diff = self.review_calls[0][4]
         self.assertEqual(len(sent_diff.encode("utf-8")), 10)
         self.assertTrue(self.review_calls[0][5])  # diff_truncated
@@ -374,7 +474,7 @@ class AiReviewerReviewRunTests(unittest.TestCase):
         posted = {}
         appmod._gitea_api = lambda method, path, body=None: posted.update(
             path=path, body=body) or (200, {})
-        appmod._ai_reviewer_review_run("admin/proj", {"name": "proj"}, self._pr())
+        appmod._ai_reviewer_review_run("gitea", "admin/proj", {"name": "proj"}, self._pr())
         self.assertFalse(self.review_calls[0][5])
         self.assertNotIn("truncated", posted["body"]["body"])
 
@@ -382,7 +482,7 @@ class AiReviewerReviewRunTests(unittest.TestCase):
         appmod.AI_REVIEWER_MODEL = "ollama:does-not-exist"
         diff_calls = []
         appmod._gitea_api_raw = lambda method, path: diff_calls.append(path) or (200, "diff")
-        appmod._ai_reviewer_review_run("admin/proj", {"name": "proj"}, self._pr())
+        appmod._ai_reviewer_review_run("gitea", "admin/proj", {"name": "proj"}, self._pr())
         s = appmod._load_ai_reviewer_state()
         self.assertIn("not found in roster", s["admin/proj#1"]["last_error"])
         self.assertEqual(s["admin/proj#1"]["attempts"], 1)
@@ -390,7 +490,7 @@ class AiReviewerReviewRunTests(unittest.TestCase):
     def test_model_unset_records_failure(self):
         appmod.AI_REVIEWER_MODEL = ""
         appmod._gitea_api_raw = lambda method, path: (200, "diff")
-        appmod._ai_reviewer_review_run("admin/proj", {"name": "proj"}, self._pr())
+        appmod._ai_reviewer_review_run("gitea", "admin/proj", {"name": "proj"}, self._pr())
         s = appmod._load_ai_reviewer_state()
         self.assertEqual(s["admin/proj#1"]["attempts"], 1)
 
@@ -398,7 +498,7 @@ class AiReviewerReviewRunTests(unittest.TestCase):
         appmod.AI_REVIEWER_MODEL = "ollama:qwen3:8b"
         appmod._gitea_api_raw = lambda method, path: (200, "diff")
         appmod._gitea_api = lambda method, path, body=None: (200, {})
-        appmod._ai_reviewer_review_run("admin/proj", {"name": "proj"}, self._pr())
+        appmod._ai_reviewer_review_run("gitea", "admin/proj", {"name": "proj"}, self._pr())
         model_used = self.review_calls[0][0]
         self.assertEqual(model_used["kind"], "ollama")
         self.assertEqual(model_used["name"], "qwen3:8b")
@@ -413,7 +513,7 @@ class AiReviewerReviewRunTests(unittest.TestCase):
         appmod.AI_REVIEWER_MODEL = "ollama:shared-name"
         appmod._gitea_api_raw = lambda method, path: (200, "diff")
         appmod._gitea_api = lambda method, path, body=None: (200, {})
-        appmod._ai_reviewer_review_run("admin/proj", {"name": "proj"}, self._pr())
+        appmod._ai_reviewer_review_run("gitea", "admin/proj", {"name": "proj"}, self._pr())
         self.assertEqual(self.review_calls[0][0]["kind"], "ollama")
 
     def test_review_generation_failure_records_error_no_comment_post(self):
@@ -425,7 +525,7 @@ class AiReviewerReviewRunTests(unittest.TestCase):
         def fake_review(model, workdir, pr_title, pr_body, diff_text, diff_truncated):
             return {"ok": False, "error": "model unreachable"}
         appmod.teams.review_pr_diff = fake_review
-        appmod._ai_reviewer_review_run("admin/proj", {"name": "proj"}, self._pr())
+        appmod._ai_reviewer_review_run("gitea", "admin/proj", {"name": "proj"}, self._pr())
         self.assertEqual(comment_calls, [])
         s = appmod._load_ai_reviewer_state()
         self.assertEqual(s["admin/proj#1"]["last_error"], "model unreachable")
@@ -434,7 +534,7 @@ class AiReviewerReviewRunTests(unittest.TestCase):
     def test_comment_post_non_2xx_records_failure(self):
         appmod._gitea_api_raw = lambda method, path: (200, "diff")
         appmod._gitea_api = lambda method, path, body=None: (403, {})
-        appmod._ai_reviewer_review_run("admin/proj", {"name": "proj"}, self._pr())
+        appmod._ai_reviewer_review_run("gitea", "admin/proj", {"name": "proj"}, self._pr())
         s = appmod._load_ai_reviewer_state()
         self.assertEqual(s["admin/proj#1"]["attempts"], 1)
         self.assertIn("403", s["admin/proj#1"]["last_error"])
@@ -445,7 +545,7 @@ class AiReviewerReviewRunTests(unittest.TestCase):
         def raise_conn(method, path, body=None):
             raise ConnectionError("gitea unreachable")
         appmod._gitea_api = raise_conn
-        appmod._ai_reviewer_review_run("admin/proj", {"name": "proj"}, self._pr())  # must not raise
+        appmod._ai_reviewer_review_run("gitea", "admin/proj", {"name": "proj"}, self._pr())  # must not raise
         s = appmod._load_ai_reviewer_state()
         self.assertEqual(s["admin/proj#1"]["attempts"], 1)
 
@@ -455,7 +555,7 @@ class AiReviewerReviewRunTests(unittest.TestCase):
             last_error="prior failure")
         appmod._gitea_api_raw = lambda method, path: (200, "diff")
         appmod._gitea_api = lambda method, path, body=None: (200, {})
-        appmod._ai_reviewer_review_run("admin/proj", {"name": "proj"}, self._pr())
+        appmod._ai_reviewer_review_run("gitea", "admin/proj", {"name": "proj"}, self._pr())
         s = appmod._load_ai_reviewer_state()
         self.assertEqual(s["admin/proj#1"]["attempts"], 0)
         self.assertIsNone(s["admin/proj#1"]["last_error"])
@@ -467,7 +567,7 @@ class AiReviewerReviewRunTests(unittest.TestCase):
         posted = {}
         appmod._gitea_api = lambda method, path, body=None: posted.update(
             path=path, body=body) or (200, {})
-        appmod._ai_reviewer_review_run("admin/proj", {"name": "proj"}, self._pr())
+        appmod._ai_reviewer_review_run("gitea", "admin/proj", {"name": "proj"}, self._pr())
         body = posted["body"]["body"]
         self.assertIn("ollama:qwen3:8b", body)
         self.assertIn("Looks fine.", body)
@@ -481,11 +581,114 @@ class AiReviewerReviewRunTests(unittest.TestCase):
             calls.append((method, path))
             return (200, {})
         appmod._gitea_api = spy_api
-        appmod._ai_reviewer_review_run("admin/proj", {"name": "proj"}, self._pr())
+        appmod._ai_reviewer_review_run("gitea", "admin/proj", {"name": "proj"}, self._pr())
         for method, path in calls:
             self.assertNotIn("merge", path)
             self.assertNotIn("approve", path)
             self.assertNotIn("/branches/", path)
+
+
+class AiReviewerReviewRunGithubTests(unittest.TestCase):
+    """_ai_reviewer_review_run("github", ...) -- same pipeline as
+    AiReviewerReviewRunTests above, proven identical for the GitHub path;
+    only the diff-fetch (github_pr_diff) and comment-post
+    (github_post_pr_comment) calls, and the "github:"-prefixed pr_key,
+    differ."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="switchboard-ai-reviewer-run-gh-")
+        self._orig_state_file = appmod.AI_REVIEWER_STATE_FILE
+        self._orig_max_diff = appmod.AI_REVIEWER_MAX_DIFF_BYTES
+        self._orig_model = appmod.AI_REVIEWER_MODEL
+        self._orig_pr_diff = appmod.github_pr_diff
+        self._orig_post_comment = appmod.github_post_pr_comment
+        self._orig_roster = appmod.teams.roster
+        self._orig_review = appmod.teams.review_pr_diff
+        appmod.AI_REVIEWER_STATE_FILE = os.path.join(self.tmp, "state.json")
+        appmod.AI_REVIEWER_MAX_DIFF_BYTES = 40000
+        appmod.AI_REVIEWER_MODEL = "ollama:qwen3:8b"
+        appmod.teams.roster = lambda: [
+            {"name": "qwen3:8b", "kind": "ollama", "label": "qwen3:8b", "tier": 1,
+             "delegate_capable": False}]
+        self.review_calls = []
+
+        def fake_review(model, workdir, pr_title, pr_body, diff_text, diff_truncated):
+            self.review_calls.append((model, workdir, pr_title, pr_body, diff_text, diff_truncated))
+            return {"ok": True, "text": "Looks fine."}
+        appmod.teams.review_pr_diff = fake_review
+
+        appmod._save_ai_reviewer_state_entry(
+            "github:acme/widget#1", label_present=True, attempts=0,
+            reviewed_at=None, last_error=None)
+
+    def tearDown(self):
+        appmod.AI_REVIEWER_STATE_FILE = self._orig_state_file
+        appmod.AI_REVIEWER_MAX_DIFF_BYTES = self._orig_max_diff
+        appmod.AI_REVIEWER_MODEL = self._orig_model
+        appmod.github_pr_diff = self._orig_pr_diff
+        appmod.github_post_pr_comment = self._orig_post_comment
+        appmod.teams.roster = self._orig_roster
+        appmod.teams.review_pr_diff = self._orig_review
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _pr(self, number=1, title="add feature", body="does a thing"):
+        return {"number": number, "title": title, "body": body}
+
+    def test_diff_fetch_failure_records_failure_and_posts_no_comment(self):
+        appmod.github_pr_diff = lambda owner, repo, number: {
+            "ok": False, "error": "diff fetch failed (status 404)"}
+        comment_calls = []
+        appmod.github_post_pr_comment = lambda owner, repo, number, body: \
+            comment_calls.append((owner, repo, number, body)) or {"ok": True}
+        appmod._ai_reviewer_review_run("github", "acme/widget", {"name": "widget"}, self._pr())
+        self.assertEqual(comment_calls, [])
+        s = appmod._load_ai_reviewer_state()
+        self.assertEqual(s["github:acme/widget#1"]["attempts"], 1)
+        self.assertIn("404", s["github:acme/widget#1"]["last_error"])
+        self.assertTrue(s["github:acme/widget#1"]["label_present"])
+
+    def test_success_posts_comment_and_resets_state(self):
+        appmod.github_pr_diff = lambda owner, repo, number: {"ok": True, "diff": "diff text"}
+        posted = {}
+
+        def fake_post(owner, repo, number, body):
+            posted.update(owner=owner, repo=repo, number=number, body=body)
+            return {"ok": True}
+        appmod.github_post_pr_comment = fake_post
+        appmod._ai_reviewer_review_run("github", "acme/widget", {"name": "widget"}, self._pr())
+        self.assertEqual(posted["owner"], "acme")
+        self.assertEqual(posted["repo"], "widget")
+        self.assertEqual(posted["number"], 1)
+        self.assertIn("Looks fine.", posted["body"])
+        s = appmod._load_ai_reviewer_state()
+        self.assertEqual(s["github:acme/widget#1"]["attempts"], 0)
+        self.assertIsNone(s["github:acme/widget#1"]["last_error"])
+        self.assertIsNotNone(s["github:acme/widget#1"]["reviewed_at"])
+
+    def test_comment_post_failure_records_failure(self):
+        appmod.github_pr_diff = lambda owner, repo, number: {"ok": True, "diff": "diff text"}
+        appmod.github_post_pr_comment = lambda owner, repo, number, body: \
+            {"ok": False, "error": "comment post failed (status 403)"}
+        appmod._ai_reviewer_review_run("github", "acme/widget", {"name": "widget"}, self._pr())
+        s = appmod._load_ai_reviewer_state()
+        self.assertEqual(s["github:acme/widget#1"]["attempts"], 1)
+        self.assertIn("403", s["github:acme/widget#1"]["last_error"])
+
+    def test_diff_exceeding_cap_is_truncated_and_comment_notes_it(self):
+        appmod.AI_REVIEWER_MAX_DIFF_BYTES = 10
+        appmod.github_pr_diff = lambda owner, repo, number: {
+            "ok": True, "diff": "0123456789ABCDEF"}
+        posted = {}
+
+        def fake_post(owner, repo, number, body):
+            posted["body"] = body
+            return {"ok": True}
+        appmod.github_post_pr_comment = fake_post
+        appmod._ai_reviewer_review_run("github", "acme/widget", {"name": "widget"}, self._pr())
+        sent_diff = self.review_calls[0][4]
+        self.assertEqual(len(sent_diff.encode("utf-8")), 10)
+        self.assertTrue(self.review_calls[0][5])  # diff_truncated
+        self.assertIn("truncated", posted["body"])
 
 
 class AiReviewerReviewBgConcurrencyTests(unittest.TestCase):
@@ -502,7 +705,8 @@ class AiReviewerReviewBgConcurrencyTests(unittest.TestCase):
             calls = []
             appmod._ai_reviewer_review_run = lambda *a: calls.append(a)
             try:
-                appmod._ai_reviewer_review_bg("admin/lockedproj", {"name": "p"}, {"number": 7})
+                appmod._ai_reviewer_review_bg(
+                    "gitea", "admin/lockedproj", {"name": "p"}, {"number": 7})
                 time.sleep(0.05)
                 self.assertEqual(calls, [])
             finally:
@@ -516,7 +720,7 @@ class AiReviewerReviewBgConcurrencyTests(unittest.TestCase):
         calls = []
         appmod._ai_reviewer_review_run = lambda *a: calls.append(a)
         try:
-            appmod._ai_reviewer_review_bg("admin/freeproj", {"name": "p"}, {"number": 9})
+            appmod._ai_reviewer_review_bg("gitea", "admin/freeproj", {"name": "p"}, {"number": 9})
             for _ in range(50):
                 if appmod._ai_reviewer_pr_lock_for(pr_key).acquire(blocking=False):
                     appmod._ai_reviewer_pr_lock_for(pr_key).release()
@@ -525,6 +729,351 @@ class AiReviewerReviewBgConcurrencyTests(unittest.TestCase):
             self.assertEqual(len(calls), 1)
         finally:
             appmod._ai_reviewer_review_run = orig
+
+    def test_github_and_gitea_dispatch_for_same_owner_repo_use_different_locks(self):
+        # host-prefixed pr_key (_ai_reviewer_pr_key) means a Gitea and a
+        # GitHub dispatch for the numerically-identical owner/repo#number
+        # never contend on the same lock (docs/spec.md item 17 part 2).
+        gitea_key = appmod._ai_reviewer_pr_key("gitea", "acme/widget", 3)
+        github_key = appmod._ai_reviewer_pr_key("github", "acme/widget", 3)
+        self.assertNotEqual(gitea_key, github_key)
+        gitea_lock = appmod._ai_reviewer_pr_lock_for(gitea_key)
+        github_lock = appmod._ai_reviewer_pr_lock_for(github_key)
+        self.assertIsNot(gitea_lock, github_lock)
+
+
+class AiReviewerGithubReposAllowlistTests(unittest.TestCase):
+    """_load_ai_reviewer_github_repos() -- hand-edited JSON array loader,
+    same never-crash contract as _load_deploy_map()/_load_gitea_repo_map()."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="switchboard-ai-reviewer-gh-repos-")
+        self._orig = appmod.AI_REVIEWER_GITHUB_REPOS_FILE
+        appmod.AI_REVIEWER_GITHUB_REPOS_FILE = os.path.join(self.tmp, "repos.json")
+
+    def tearDown(self):
+        appmod.AI_REVIEWER_GITHUB_REPOS_FILE = self._orig
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_missing_file_returns_empty_set(self):
+        self.assertEqual(appmod._load_ai_reviewer_github_repos(), set())
+
+    def test_valid_array_returns_set_of_strings(self):
+        with open(appmod.AI_REVIEWER_GITHUB_REPOS_FILE, "w") as f:
+            json.dump(["acme/widget", "acme/gizmo"], f)
+        self.assertEqual(appmod._load_ai_reviewer_github_repos(), {"acme/widget", "acme/gizmo"})
+
+    def test_malformed_json_returns_empty_set_not_raise(self):
+        with open(appmod.AI_REVIEWER_GITHUB_REPOS_FILE, "w") as f:
+            f.write("not json{{{")
+        self.assertEqual(appmod._load_ai_reviewer_github_repos(), set())
+
+    def test_not_a_list_returns_empty_set(self):
+        with open(appmod.AI_REVIEWER_GITHUB_REPOS_FILE, "w") as f:
+            json.dump({"acme/widget": True}, f)
+        self.assertEqual(appmod._load_ai_reviewer_github_repos(), set())
+
+    def test_non_string_entries_are_dropped(self):
+        with open(appmod.AI_REVIEWER_GITHUB_REPOS_FILE, "w") as f:
+            json.dump(["acme/widget", 42, "", None, ["nested"]], f)
+        self.assertEqual(appmod._load_ai_reviewer_github_repos(), {"acme/widget"})
+
+    def test_empty_array_returns_empty_set(self):
+        with open(appmod.AI_REVIEWER_GITHUB_REPOS_FILE, "w") as f:
+            json.dump([], f)
+        self.assertEqual(appmod._load_ai_reviewer_github_repos(), set())
+
+
+class GithubPollIfDueTests(unittest.TestCase):
+    """_github_poll_if_due() -- throttle/lock shape mirroring
+    tests/test_gitea_poll.py's GiteaPollIfDueTests, plus the allowlist/
+    token/enabled gating specific to this poll (docs/spec.md "Proposed
+    approach" #3)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="switchboard-github-poll-due-")
+        self._orig_enabled = appmod.AI_REVIEWER_ENABLED
+        self._orig_token = appmod.GITHUB_TOKEN
+        self._orig_last_at = appmod._github_poll_last_at
+        self._orig_repos_file = appmod.AI_REVIEWER_GITHUB_REPOS_FILE
+        self._orig_instance_names = appmod.instance_names
+        self._orig_detect_origin = appmod.detect_project_origin
+        self._orig_poll_repo = appmod._ai_reviewer_poll_repo
+        appmod.AI_REVIEWER_GITHUB_REPOS_FILE = os.path.join(self.tmp, "repos.json")
+        appmod.AI_REVIEWER_ENABLED = True
+        appmod.GITHUB_TOKEN = "test-gh-token"
+        appmod._github_poll_last_at = 0.0
+        self.poll_calls = []
+        appmod._ai_reviewer_poll_repo = lambda *a: self.poll_calls.append(a)
+
+    def tearDown(self):
+        appmod.AI_REVIEWER_ENABLED = self._orig_enabled
+        appmod.GITHUB_TOKEN = self._orig_token
+        appmod._github_poll_last_at = self._orig_last_at
+        appmod.AI_REVIEWER_GITHUB_REPOS_FILE = self._orig_repos_file
+        appmod.instance_names = self._orig_instance_names
+        appmod.detect_project_origin = self._orig_detect_origin
+        appmod._ai_reviewer_poll_repo = self._orig_poll_repo
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_allowlist(self, repos):
+        with open(appmod.AI_REVIEWER_GITHUB_REPOS_FILE, "w") as f:
+            json.dump(repos, f)
+
+    def test_ai_reviewer_disabled_makes_no_calls(self):
+        appmod.AI_REVIEWER_ENABLED = False
+        self._write_allowlist(["acme/widget"])
+        appmod.instance_names = lambda: ["widget"]
+        appmod.detect_project_origin = lambda name: {
+            "kind": "github", "owner": "acme", "repo": "widget"}
+        appmod._github_poll_if_due()
+        self.assertEqual(self.poll_calls, [])
+
+    def test_missing_github_token_makes_no_calls(self):
+        appmod.GITHUB_TOKEN = ""
+        self._write_allowlist(["acme/widget"])
+        appmod.instance_names = lambda: ["widget"]
+        appmod._github_poll_if_due()
+        self.assertEqual(self.poll_calls, [])
+
+    def test_empty_allowlist_makes_no_calls_and_skips_instance_walk(self):
+        walked = []
+        appmod.instance_names = lambda: walked.append(1) or ["widget"]
+        appmod._github_poll_if_due()
+        self.assertEqual(self.poll_calls, [])
+        self.assertEqual(walked, [])  # short-circuits before even listing projects
+
+    def test_allowlisted_github_origin_project_is_polled(self):
+        self._write_allowlist(["acme/widget"])
+        appmod.instance_names = lambda: ["widget"]
+        appmod.detect_project_origin = lambda name: {
+            "kind": "github", "owner": "acme", "repo": "widget"}
+        appmod._github_poll_if_due()
+        self.assertEqual(len(self.poll_calls), 1)
+        host, owner_repo, entry = self.poll_calls[0]
+        self.assertEqual(host, "github")
+        self.assertEqual(owner_repo, "acme/widget")
+        self.assertEqual(entry["name"], "widget")
+
+    def test_non_allowlisted_github_origin_project_is_never_polled(self):
+        self._write_allowlist(["acme/other"])
+        appmod.instance_names = lambda: ["widget"]
+        appmod.detect_project_origin = lambda name: {
+            "kind": "github", "owner": "acme", "repo": "widget"}
+        appmod._github_poll_if_due()
+        self.assertEqual(self.poll_calls, [])
+
+    def test_non_github_origin_project_is_skipped(self):
+        self._write_allowlist(["acme/widget"])
+        appmod.instance_names = lambda: ["widget"]
+        appmod.detect_project_origin = lambda name: {
+            "kind": "local", "owner": None, "repo": None}
+        appmod._github_poll_if_due()
+        self.assertEqual(self.poll_calls, [])
+
+    def test_origin_detection_raising_for_one_project_does_not_stop_the_rest(self):
+        self._write_allowlist(["acme/widget", "acme/gizmo"])
+        appmod.instance_names = lambda: ["bad", "good"]
+
+        def flaky_origin(name):
+            if name == "bad":
+                raise OSError("boom")
+            return {"kind": "github", "owner": "acme", "repo": "gizmo"}
+        appmod.detect_project_origin = flaky_origin
+        appmod._github_poll_if_due()  # must not raise
+        self.assertEqual(len(self.poll_calls), 1)
+        self.assertEqual(self.poll_calls[0][1], "acme/gizmo")
+
+    def test_poll_repo_raising_for_one_project_does_not_stop_the_rest(self):
+        self._write_allowlist(["acme/one", "acme/two"])
+        appmod.instance_names = lambda: ["one", "two"]
+        appmod.detect_project_origin = lambda name: {
+            "kind": "github", "owner": "acme", "repo": name}
+
+        def flaky_poll(host, owner_repo, entry):
+            self.poll_calls.append((host, owner_repo, entry))
+            if owner_repo == "acme/one":
+                raise RuntimeError("boom")
+        appmod._ai_reviewer_poll_repo = flaky_poll
+        appmod._github_poll_if_due()  # must not raise
+        self.assertEqual(len(self.poll_calls), 2)
+
+    def test_not_yet_due_makes_no_calls(self):
+        self._write_allowlist(["acme/widget"])
+        appmod.instance_names = lambda: ["widget"]
+        appmod.detect_project_origin = lambda name: {
+            "kind": "github", "owner": "acme", "repo": "widget"}
+        appmod._github_poll_last_at = time.time()  # just polled
+        appmod._github_poll_if_due()
+        self.assertEqual(self.poll_calls, [])
+
+    def test_second_call_after_interval_elapses_polls_again(self):
+        self._write_allowlist(["acme/widget"])
+        appmod.instance_names = lambda: ["widget"]
+        appmod.detect_project_origin = lambda name: {
+            "kind": "github", "owner": "acme", "repo": "widget"}
+        appmod._github_poll_last_at = time.time() - appmod.GITHUB_POLL_INTERVAL_SECONDS - 1
+        appmod._github_poll_if_due()
+        self.assertEqual(len(self.poll_calls), 1)
+
+    def test_project_with_missing_owner_or_repo_is_skipped(self):
+        self._write_allowlist(["acme/widget"])
+        appmod.instance_names = lambda: ["widget"]
+        appmod.detect_project_origin = lambda name: {
+            "kind": "github", "owner": None, "repo": None}
+        appmod._github_poll_if_due()
+        self.assertEqual(self.poll_calls, [])
+
+
+class GithubPollEndToEndReviewTests(unittest.TestCase):
+    """A single full pass through _github_poll_if_due() -> _ai_reviewer_
+    poll_repo() -> _ai_reviewer_review_bg()/_run() with only the lowest-level
+    GitHub client functions mocked (github_list_open_prs/github_pr_diff/
+    github_post_pr_comment) -- proves the acceptance criteria end to end
+    rather than piecewise, mirroring how the Gitea path is already proven
+    piecewise above (this is the one case worth the extra integration-style
+    coverage, since it's the exact shape docs/spec.md's own acceptance
+    criteria describe)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="switchboard-github-poll-e2e-")
+        self._orig_enabled = appmod.AI_REVIEWER_ENABLED
+        self._orig_label = appmod.AI_REVIEWER_LABEL
+        self._orig_token = appmod.GITHUB_TOKEN
+        self._orig_last_at = appmod._github_poll_last_at
+        self._orig_repos_file = appmod.AI_REVIEWER_GITHUB_REPOS_FILE
+        self._orig_state_file = appmod.AI_REVIEWER_STATE_FILE
+        self._orig_model = appmod.AI_REVIEWER_MODEL
+        self._orig_instance_names = appmod.instance_names
+        self._orig_detect_origin = appmod.detect_project_origin
+        self._orig_list_prs = appmod.github_list_open_prs
+        self._orig_pr_diff = appmod.github_pr_diff
+        self._orig_post_comment = appmod.github_post_pr_comment
+        self._orig_roster = appmod.teams.roster
+        self._orig_review = appmod.teams.review_pr_diff
+
+        appmod.AI_REVIEWER_ENABLED = True
+        appmod.AI_REVIEWER_LABEL = "ready for review"
+        appmod.GITHUB_TOKEN = "test-gh-token"
+        appmod._github_poll_last_at = 0.0
+        appmod.AI_REVIEWER_GITHUB_REPOS_FILE = os.path.join(self.tmp, "repos.json")
+        with open(appmod.AI_REVIEWER_GITHUB_REPOS_FILE, "w") as f:
+            json.dump(["acme/widget"], f)
+        appmod.AI_REVIEWER_STATE_FILE = os.path.join(self.tmp, "state.json")
+        appmod.AI_REVIEWER_MODEL = "ollama:qwen3:8b"
+        appmod.instance_names = lambda: ["widget"]
+        appmod.detect_project_origin = lambda name: {
+            "kind": "github", "owner": "acme", "repo": "widget"}
+        appmod.teams.roster = lambda: [
+            {"name": "qwen3:8b", "kind": "ollama", "label": "qwen3:8b", "tier": 1,
+             "delegate_capable": False}]
+        appmod.teams.review_pr_diff = lambda model, **kw: {"ok": True, "text": "Looks fine."}
+        appmod.github_pr_diff = lambda owner, repo, number: {"ok": True, "diff": "diff text"}
+        self.posted = []
+        appmod.github_post_pr_comment = lambda owner, repo, number, body: \
+            self.posted.append((owner, repo, number, body)) or {"ok": True}
+
+    def tearDown(self):
+        appmod.AI_REVIEWER_ENABLED = self._orig_enabled
+        appmod.AI_REVIEWER_LABEL = self._orig_label
+        appmod.GITHUB_TOKEN = self._orig_token
+        appmod._github_poll_last_at = self._orig_last_at
+        appmod.AI_REVIEWER_GITHUB_REPOS_FILE = self._orig_repos_file
+        appmod.AI_REVIEWER_STATE_FILE = self._orig_state_file
+        appmod.AI_REVIEWER_MODEL = self._orig_model
+        appmod.instance_names = self._orig_instance_names
+        appmod.detect_project_origin = self._orig_detect_origin
+        appmod.github_list_open_prs = self._orig_list_prs
+        appmod.github_pr_diff = self._orig_pr_diff
+        appmod.github_post_pr_comment = self._orig_post_comment
+        appmod.teams.roster = self._orig_roster
+        appmod.teams.review_pr_diff = self._orig_review
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _wait_for_state_key(self, key, timeout=2.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            s = appmod._load_ai_reviewer_state()
+            if key in s and s[key].get("reviewed_at") is not None:
+                return s
+            time.sleep(0.02)
+        return appmod._load_ai_reviewer_state()
+
+    def test_label_add_posts_exactly_one_comment_and_records_state(self):
+        appmod.github_list_open_prs = lambda owner, repo: {"ok": True, "prs": [
+            {"number": 1, "title": "t", "body": "b",
+             "labels": [{"name": "ready for review"}]}]}
+        appmod._github_poll_if_due()
+        s = self._wait_for_state_key("github:acme/widget#1")
+        self.assertEqual(len(self.posted), 1)
+        self.assertEqual(s["github:acme/widget#1"]["attempts"], 0)
+        self.assertIsNone(s["github:acme/widget#1"]["last_error"])
+
+    def test_label_still_present_on_repeated_poll_posts_no_second_comment(self):
+        appmod.github_list_open_prs = lambda owner, repo: {"ok": True, "prs": [
+            {"number": 1, "title": "t", "body": "b",
+             "labels": [{"name": "ready for review"}]}]}
+        appmod._github_poll_if_due()
+        self._wait_for_state_key("github:acme/widget#1")
+        appmod._github_poll_last_at = 0.0  # force the throttle open for a second pass
+        appmod._github_poll_if_due()
+        time.sleep(0.1)
+        self.assertEqual(len(self.posted), 1)
+
+    def test_label_removed_then_readded_is_a_fresh_episode(self):
+        appmod.github_list_open_prs = lambda owner, repo: {"ok": True, "prs": [
+            {"number": 1, "title": "t", "body": "b",
+             "labels": [{"name": "ready for review"}]}]}
+        appmod._github_poll_if_due()
+        self._wait_for_state_key("github:acme/widget#1")
+
+        appmod.github_list_open_prs = lambda owner, repo: {"ok": True, "prs": [
+            {"number": 1, "title": "t", "body": "b", "labels": []}]}
+        appmod._github_poll_last_at = 0.0
+        appmod._github_poll_if_due()
+        s = appmod._load_ai_reviewer_state()
+        self.assertFalse(s["github:acme/widget#1"]["label_present"])
+
+        appmod.github_list_open_prs = lambda owner, repo: {"ok": True, "prs": [
+            {"number": 1, "title": "t", "body": "b",
+             "labels": [{"name": "ready for review"}]}]}
+        appmod._github_poll_last_at = 0.0
+        appmod._github_poll_if_due()
+        time.sleep(0.1)
+        self.assertEqual(len(self.posted), 2)
+
+    def test_non_allowlisted_repo_never_reviewed_even_with_label(self):
+        with open(appmod.AI_REVIEWER_GITHUB_REPOS_FILE, "w") as f:
+            json.dump(["someone-else/other-repo"], f)
+        appmod.github_list_open_prs = lambda owner, repo: {"ok": True, "prs": [
+            {"number": 1, "title": "t", "body": "b",
+             "labels": [{"name": "ready for review"}]}]}
+        appmod._github_poll_if_due()
+        time.sleep(0.1)
+        self.assertEqual(self.posted, [])
+        s = appmod._load_ai_reviewer_state()
+        self.assertNotIn("github:acme/widget#1", s)
+
+    def test_diff_fetch_failure_records_failure_no_comment(self):
+        appmod.github_pr_diff = lambda owner, repo, number: {
+            "ok": False, "error": "diff fetch failed (status 404)"}
+        appmod.github_list_open_prs = lambda owner, repo: {"ok": True, "prs": [
+            {"number": 1, "title": "t", "body": "b",
+             "labels": [{"name": "ready for review"}]}]}
+        appmod._github_poll_if_due()
+
+        def _wait_for_error():
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                s = appmod._load_ai_reviewer_state()
+                if s.get("github:acme/widget#1", {}).get("last_error"):
+                    return s
+                time.sleep(0.02)
+            return appmod._load_ai_reviewer_state()
+
+        s = _wait_for_error()
+        self.assertEqual(self.posted, [])
+        self.assertIn("404", s["github:acme/widget#1"]["last_error"])
 
 
 # ═══════════════════════════ Part B: app/teams.py ═══════════════════════════

@@ -204,14 +204,21 @@ GITEA_REPO_MAP_FILE = os.environ.get(
 # env-overridable constant, same style as UPLOAD_STAGING_TTL_SECONDS.
 GITEA_POLL_INTERVAL_SECONDS = int(os.environ.get("GITEA_POLL_INTERVAL_SECONDS", "45"))
 
-# AI merge-request reviewer (backlog item 8, docs/spec.md) -- rides the same
-# _gitea_poll_if_due() pass above: watches each registered project's open
-# Gitea PRs for a configurable label, and on the label-add edge, runs a
-# roster model (item 6's roster, item 6b's read-only grounding digest)
-# against the PR diff and posts the review back as a single Gitea PR
-# comment. Standalone/poll-triggered, not a lead-loop tool -- a PR can be
-# tagged with no team session running at all. Off by default. Gitea-only
-# (docs/spec.md "Non-goals" -- GitHub is item 17, not yet built).
+# AI merge-request reviewer (backlog item 8, docs/spec.md; made host-agnostic
+# by item 17 part 2, docs/spec.md) -- rides both _gitea_poll_if_due() (Gitea)
+# and _github_poll_if_due() (GitHub, below) as its two dispatch triggers:
+# watches each registered project's open PRs for a configurable label, and on
+# the label-add edge, runs a roster model (item 6's roster, item 6b's
+# read-only grounding digest) against the PR diff and posts the review back
+# as a single PR comment. Standalone/poll-triggered, not a lead-loop tool -- a
+# PR can be tagged with no team session running at all. Off by default
+# (AI_REVIEWER_ENABLED gates both hosts identically). Every Gitea repo this
+# switchboard's own GITEA_REPO_MAP_FILE registers is automatically in scope
+# once enabled; a GitHub-origin project additionally needs its owner/repo
+# listed in AI_REVIEWER_GITHUB_REPOS_FILE below -- GitHub-origin repos can be
+# arbitrary third-party infrastructure the operator doesn't fully control
+# (item 16's clone-by-URL), a materially different trust boundary from
+# Gitea's fully-operator-owned repos (docs/spec.md "Settled scope decisions").
 AI_REVIEWER_ENABLED = os.environ.get("AI_REVIEWER_ENABLED", "0") == "1"
 AI_REVIEWER_LABEL = os.environ.get("AI_REVIEWER_LABEL", "ready for review")
 # "kind:name" (e.g. "ollama:qwen3:8b" or "engine:claude") -- split on the
@@ -226,6 +233,21 @@ AI_REVIEWER_MAX_DIFF_BYTES = int(os.environ.get("AI_REVIEWER_MAX_DIFF_BYTES", "4
 AI_REVIEWER_MAX_ATTEMPTS = int(os.environ.get("AI_REVIEWER_MAX_ATTEMPTS", "3"))
 AI_REVIEWER_STATE_FILE = os.environ.get(
     "AI_REVIEWER_STATE_FILE", "/var/lib/ai-dev-switchboard/ai-reviewer-state.json")
+# Hand-edited, operator-maintained allowlist of "owner/repo" strings gating
+# which GitHub-origin projects _github_poll_if_due() will ever poll/review at
+# all (item 17 part 2, docs/spec.md "Settled scope decisions" #3) -- same
+# /etc/ai-dev-switchboard/ placement and "app.py only ever reads it, never
+# writes it" contract DEPLOY_MAP_FILE already established. Never authored by
+# install.sh or any UI (matches DEPLOY_MAP_FILE's own precedent) -- hand-edit
+# it yourself. See _load_ai_reviewer_github_repos().
+AI_REVIEWER_GITHUB_REPOS_FILE = os.environ.get(
+    "AI_REVIEWER_GITHUB_REPOS_FILE",
+    "/etc/ai-dev-switchboard/ai-reviewer-github-repos.json")
+# How often _github_poll_if_due() itself runs (seconds) -- independent of
+# GITEA_POLL_INTERVAL_SECONDS above (different domain, different tuning
+# rationale: GitHub's 5,000 req/hour token-wide rate limit argues for a
+# materially more conservative interval than Gitea's loopback-cheap default).
+GITHUB_POLL_INTERVAL_SECONDS = int(os.environ.get("GITHUB_POLL_INTERVAL_SECONDS", "120"))
 
 # HTTP-level smoke check (backlog item 18, docs/spec.md) -- a manual,
 # per-project "Smoke check" button that makes a single in-process GET
@@ -1292,7 +1314,7 @@ def _gitea_poll_if_due(gitea_on: bool) -> None:
                 # of this feature already accepts.
                 pass
             try:
-                _ai_reviewer_poll_repo(owner_repo, entry)
+                _ai_reviewer_poll_repo("gitea", owner_repo, entry)
             except Exception:
                 # Same per-repo isolation discipline as _gitea_poll_one above
                 # (docs/spec.md backlog item 8, "Edge cases" -- a malformed
@@ -1318,12 +1340,18 @@ def _gitea_poll_one(owner_repo: str, entry: dict) -> None:
     _gitea_sync_bg(entry["name"], branch, owner_repo, remote_sha)
 
 
-# ─── AI merge-request reviewer (backlog item 8) ────────────────────────────
-# See docs/spec.md "The poll extension" -- rides _gitea_poll_if_due()'s
-# existing per-repo loop above (_ai_reviewer_poll_repo is called right
-# alongside _gitea_poll_one, its own try/except at the call site). State
-# file: {"owner/repo#number": {"label_present": bool, "attempts": int,
-# "reviewed_at": iso|null, "last_error": str|null}}. Same tmp-file-then-
+# ─── AI merge-request reviewer (backlog item 8; host-agnostic per item 17
+# part 2) ────────────────────────────────────────────────────────────────
+# See docs/spec.md "The poll extension" (item 8) and "Proposed approach" #1
+# (item 17 part 2) -- rides both _gitea_poll_if_due()'s existing per-repo
+# loop above (_ai_reviewer_poll_repo("gitea", ...), its own try/except at the
+# call site) and _github_poll_if_due() below (_ai_reviewer_poll_repo("github",
+# ...)). State file: {pr_key: {"label_present": bool, "attempts": int,
+# "reviewed_at": iso|null, "last_error": str|null}} -- pr_key is
+# "owner/repo#number" for Gitea (unchanged, byte-for-byte, since item 8
+# shipped) or "github:owner/repo#number" for GitHub (see
+# _ai_reviewer_pr_key() -- the "github:" prefix can never collide with a
+# Gitea owner/repo, which can't contain a colon). Same tmp-file-then-
 # os.replace() atomic-write idiom, and the same "missing/corrupt file
 # tolerates to {}" idiom, as _load_gitea_repo_map()/_save_gitea_repo_map_
 # entry() above.
@@ -1397,30 +1425,58 @@ def _ai_reviewer_comment_body(model_entry: dict, review_text: str, diff_truncate
     )
 
 
-def _ai_reviewer_review_run(owner_repo: str, entry: dict, pr: dict) -> None:
+def _ai_reviewer_pr_key(host: str, owner_repo: str, number) -> str:
+    """Gitea's key format is UNCHANGED ("owner/repo#number", no prefix) --
+    backward-compatible with every already-persisted AI_REVIEWER_STATE_FILE
+    entry on a live install (docs/spec.md item 17 part 2, "Non-goals": no
+    change to Gitea's own state-file key format). GitHub gets a "github:"
+    prefix -- a string Gitea's own owner/repo naming can never produce (no
+    colon allowed), so collision with an existing Gitea key is structurally
+    impossible, not just unlikely."""
+    return f"{owner_repo}#{number}" if host == "gitea" else f"github:{owner_repo}#{number}"
+
+
+def _ai_reviewer_review_run(host: str, owner_repo: str, entry: dict, pr: dict) -> None:
     """The real review-generation + comment-post work, off the request
     thread (see _ai_reviewer_review_bg). Never raises -- every failure path
-    records it via _ai_reviewer_record_failure() and returns."""
+    records it via _ai_reviewer_record_failure() and returns.
+
+    Host-agnostic (item 17 part 2, docs/spec.md "Proposed approach" #1) --
+    only the diff-fetch and comment-post calls branch per host; every other
+    line (truncation, model resolution, teams.review_pr_diff(), comment-body
+    construction, state persistence) is identical for "gitea"/"github"."""
     number = pr.get("number")
-    pr_key = f"{owner_repo}#{number}"
+    pr_key = _ai_reviewer_pr_key(host, owner_repo, number)
     try:
-        try:
-            status, diff_text = _gitea_api_raw("GET", f"/repos/{owner_repo}/pulls/{number}.diff")
-        except ConnectionError as e:
-            _ai_reviewer_record_failure(pr_key, str(e))
-            return
-        if status != 200:
-            # Covers a PR closed/merged between label-add-detection and this
-            # background run actually running (404), and any other non-2xx
-            # response -- an ordinary retried failure, not a crash
-            # (docs/spec.md "Edge cases"). A genuinely EMPTY-but-200 diff
-            # (a PR with no net changes) is deliberately NOT treated as a
-            # failure here -- docs/spec.md's own "Edge cases" section
-            # settles that explicitly ("still reviewed... not treated as an
-            # error"), which this reads as authoritative over the more
-            # terse "non-200 or empty" phrasing in the walkthrough above it.
-            _ai_reviewer_record_failure(pr_key, f"diff fetch failed (status {status})")
-            return
+        if host == "gitea":
+            try:
+                status, diff_text = _gitea_api_raw(
+                    "GET", f"/repos/{owner_repo}/pulls/{number}.diff")
+            except ConnectionError as e:
+                _ai_reviewer_record_failure(pr_key, str(e))
+                return
+            if status != 200:
+                # Covers a PR closed/merged between label-add-detection and
+                # this background run actually running (404), and any other
+                # non-2xx response -- an ordinary retried failure, not a
+                # crash (docs/spec.md "Edge cases"). A genuinely EMPTY-but-200
+                # diff (a PR with no net changes) is deliberately NOT treated
+                # as a failure here -- docs/spec.md's own "Edge cases"
+                # section settles that explicitly ("still reviewed... not
+                # treated as an error"), which this reads as authoritative
+                # over the more terse "non-200 or empty" phrasing in the
+                # walkthrough above it.
+                _ai_reviewer_record_failure(pr_key, f"diff fetch failed (status {status})")
+                return
+        else:  # github -- reuses part 1's own convenience function directly,
+               # normalizing its {"ok": bool, ...} contract against the rest
+               # of this function's status-code-based control flow.
+            owner, _sep, repo = owner_repo.partition("/")
+            result = github_pr_diff(owner, repo, number)
+            if not result.get("ok"):
+                _ai_reviewer_record_failure(pr_key, result.get("error") or "diff fetch failed")
+                return
+            diff_text = result["diff"]
 
         diff_bytes = diff_text.encode("utf-8")
         diff_truncated = len(diff_bytes) > AI_REVIEWER_MAX_DIFF_BYTES
@@ -1446,50 +1502,61 @@ def _ai_reviewer_review_run(owner_repo: str, entry: dict, pr: dict) -> None:
             return
 
         comment = _ai_reviewer_comment_body(model_entry, result.get("text", ""), diff_truncated)
-        try:
-            status, _resp = _gitea_api(
-                "POST", f"/repos/{owner_repo}/issues/{number}/comments", {"body": comment})
-        except ConnectionError as e:
-            _ai_reviewer_record_failure(pr_key, str(e))
-            return
-        if status // 100 != 2:
-            _ai_reviewer_record_failure(pr_key, f"comment post failed (status {status})")
-            return
+        if host == "gitea":
+            try:
+                status, _resp = _gitea_api(
+                    "POST", f"/repos/{owner_repo}/issues/{number}/comments", {"body": comment})
+            except ConnectionError as e:
+                _ai_reviewer_record_failure(pr_key, str(e))
+                return
+            if status // 100 != 2:
+                _ai_reviewer_record_failure(pr_key, f"comment post failed (status {status})")
+                return
+        else:  # github
+            owner, _sep, repo = owner_repo.partition("/")
+            result = github_post_pr_comment(owner, repo, number, comment)
+            if not result.get("ok"):
+                _ai_reviewer_record_failure(pr_key, result.get("error") or "comment post failed")
+                return
 
         _save_ai_reviewer_state_entry(pr_key, label_present=True, attempts=0,
                                       reviewed_at=teams._now_iso(), last_error=None)
     except Exception as e:
         # Defense in depth -- nothing above this point should be able to
         # raise, but this runs on its own background thread (not inside
-        # _gitea_poll_if_due()'s own per-repo try/except), so an
-        # unanticipated exception here must still be recorded rather than
-        # silently killing the thread with attempts never incremented.
+        # _gitea_poll_if_due()'s/_github_poll_if_due()'s own per-repo
+        # try/except), so an unanticipated exception here must still be
+        # recorded rather than silently killing the thread with attempts
+        # never incremented.
         _ai_reviewer_record_failure(pr_key, f"{type(e).__name__}: {e}")
 
 
-def _ai_reviewer_review_bg(owner_repo: str, entry: dict, pr: dict) -> None:
+def _ai_reviewer_review_bg(host: str, owner_repo: str, entry: dict, pr: dict) -> None:
     """Non-blocking dispatch -- mirrors _gitea_sync_bg() exactly. Returns
     immediately; if a previous attempt for this PR is still in flight, this
-    call is simply dropped (the next poll interval retries)."""
-    pr_key = f"{owner_repo}#{pr.get('number')}"
+    call is simply dropped (the next poll interval retries). The per-PR lock
+    is keyed by the now-host-prefixed pr_key, so a Gitea and a GitHub review
+    can never contend on the same lock even if their owner/repo strings
+    happened to be identical."""
+    pr_key = _ai_reviewer_pr_key(host, owner_repo, pr.get("number"))
     lock = _ai_reviewer_pr_lock_for(pr_key)
     if not lock.acquire(blocking=False):
         return
 
     def _run():
         try:
-            _ai_reviewer_review_run(owner_repo, entry, pr)
+            _ai_reviewer_review_run(host, owner_repo, entry, pr)
         finally:
             lock.release()
 
     threading.Thread(target=_run, daemon=True).start()
 
 
-def _ai_reviewer_poll_repo(owner_repo: str, entry: dict) -> None:
-    """Called from inside _gitea_poll_if_due()'s per-repo loop, gated on
-    AI_REVIEWER_ENABLED. Watches AI_REVIEWER_LABEL on owner_repo's open PRs
-    and fires a review on the label-absent -> label-present edge
-    (docs/spec.md "The poll extension" step 3).
+def _ai_reviewer_poll_repo(host: str, owner_repo: str, entry: dict) -> None:
+    """Called from inside _gitea_poll_if_due()'s/_github_poll_if_due()'s
+    per-repo loop, gated on AI_REVIEWER_ENABLED. Watches AI_REVIEWER_LABEL on
+    owner_repo's open PRs and fires a review on the label-absent ->
+    label-present edge (docs/spec.md "The poll extension" step 3).
 
     The retry branch below (label present, was already present) is gated on
     `last_error is not None`, not merely `attempts < AI_REVIEWER_MAX_
@@ -1503,17 +1570,28 @@ def _ai_reviewer_poll_repo(owner_repo: str, entry: dict) -> None:
     """
     if not AI_REVIEWER_ENABLED:
         return
-    status, resp = _gitea_api("GET", f"/repos/{owner_repo}/pulls?state=open")
-    if status != 200 or not isinstance(resp, list):
-        return
+    if host == "gitea":
+        status, resp = _gitea_api("GET", f"/repos/{owner_repo}/pulls?state=open")
+        if status != 200 or not isinstance(resp, list):
+            return
+        prs = resp
+    else:  # github
+        if not GITHUB_TOKEN:
+            return
+        owner, _sep, repo = owner_repo.partition("/")
+        result = github_list_open_prs(owner, repo)
+        if not result.get("ok"):
+            return
+        prs = result["prs"]
+
     state = _load_ai_reviewer_state()
-    for pr in resp:
+    for pr in prs:
         if not isinstance(pr, dict):
             continue
         number = pr.get("number")
         if number is None:
             continue
-        pr_key = f"{owner_repo}#{number}"
+        pr_key = _ai_reviewer_pr_key(host, owner_repo, number)
         labels = pr.get("labels") or []
         label_present = AI_REVIEWER_LABEL in [
             l.get("name") for l in labels if isinstance(l, dict)]
@@ -1536,15 +1614,93 @@ def _ai_reviewer_poll_repo(owner_repo: str, entry: dict) -> None:
             _save_ai_reviewer_state_entry(
                 pr_key, label_present=True, attempts=prev.get("attempts", 0),
                 reviewed_at=prev.get("reviewed_at"), last_error=None)
-            _ai_reviewer_review_bg(owner_repo, entry, pr)
+            _ai_reviewer_review_bg(host, owner_repo, entry, pr)
             continue
 
         attempts = prev.get("attempts", 0)
         if prev.get("last_error") is not None and attempts < AI_REVIEWER_MAX_ATTEMPTS:
-            _ai_reviewer_review_bg(owner_repo, entry, pr)
+            _ai_reviewer_review_bg(host, owner_repo, entry, pr)
         # else: either already successfully reviewed this episode (no
         # retry needed) or the attempt budget is exhausted -- give up
         # silently until the label cycles (removed, then re-added).
+
+
+# ─── GitHub poll pass (backlog item 17 part 2, docs/spec.md) ──────────────
+# The GitHub-side counterpart to _gitea_poll_if_due() above, but with a
+# narrower purpose: unlike Gitea (which also fast-forward-syncs the local
+# checkout via _gitea_poll_one), the ONLY thing that needs periodic
+# background polling for a GitHub-origin project is item 8's label-watching
+# (a label being added is an event a poll has to notice, not a query an
+# operator/script triggers on demand -- see docs/spec.md "Settled scope
+# decisions" #1). So this poll loop's only per-repo work is calling
+# _ai_reviewer_poll_repo("github", ...) for every allowlisted, GitHub-origin
+# local project.
+_github_poll_lock = threading.Lock()
+_github_poll_last_at = 0.0
+
+
+def _load_ai_reviewer_github_repos() -> set:
+    """Hand-edited JSON array of "owner/repo" strings -- app.py only ever
+    reads this file, same DEPLOY_MAP_FILE contract (never written by this
+    module). Missing/malformed/not-a-list-of-strings -> empty set (nothing
+    opted in), never raises -- same "never crash, safe-degrade" idiom every
+    loader in this file already follows."""
+    try:
+        with open(AI_REVIEWER_GITHUB_REPOS_FILE) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return set()
+    if not isinstance(data, list):
+        return set()
+    return {x for x in data if isinstance(x, str) and x}
+
+
+def _github_poll_if_due() -> None:
+    """Throttled, lock-guarded poll pass -- same double-checked lock +
+    timestamp shape as _gitea_poll_if_due(). No `_on`/enabled-toggle
+    parameter (unlike Gitea, GitHub isn't a locally-run service with an
+    on/off container state) -- gating is entirely via AI_REVIEWER_ENABLED/
+    GITHUB_TOKEN/the allowlist below, all checked inside this function."""
+    global _github_poll_last_at
+    if not AI_REVIEWER_ENABLED or not GITHUB_TOKEN:
+        return  # nothing this poll exists to do would run anyway -- see
+                 # docs/spec.md "Settled scope decisions" #1: this poll has
+                 # no purpose independent of item 8's label-watching.
+    if time.time() - _github_poll_last_at < GITHUB_POLL_INTERVAL_SECONDS:
+        return
+    if not _github_poll_lock.acquire(blocking=False):
+        return  # another /status request is already mid-poll-pass
+    try:
+        if time.time() - _github_poll_last_at < GITHUB_POLL_INTERVAL_SECONDS:
+            return  # lost the race -- someone else just finished a pass
+        _github_poll_last_at = time.time()
+        allowed = _load_ai_reviewer_github_repos()
+        if not allowed:
+            return  # nothing opted in -- skip even the instance_names() walk
+        for name in instance_names():
+            try:
+                origin = detect_project_origin(name)
+            except Exception:
+                continue  # same per-project isolation discipline as
+                           # _gitea_poll_if_due()'s own per-repo try/except
+            if origin.get("kind") != "github":
+                continue
+            owner, repo = origin.get("owner"), origin.get("repo")
+            if not owner or not repo:
+                continue
+            owner_repo = f"{owner}/{repo}"
+            if owner_repo not in allowed:
+                continue
+            try:
+                _ai_reviewer_poll_repo("github", owner_repo, {"name": name})
+            except Exception:
+                # One malformed/unexpected response must not stop polling
+                # for every other allowlisted project in this pass -- same
+                # discipline _gitea_poll_if_due()'s own per-repo try/except
+                # already establishes.
+                pass
+    finally:
+        _github_poll_lock.release()
 
 
 # ─── switchboard-side deploy dispatch (backlog item 2c, part 2b) ──────────
@@ -5402,6 +5558,12 @@ class Handler(BaseHTTPRequestHandler):
             # this is a cheap no-op on every tick that isn't due yet (see
             # docs/spec.md "The poll mechanism").
             _gitea_poll_if_due(gitea_on)
+            # GitHub's own poll-loop-doubling-as-item-8-dispatch counterpart
+            # (item 17 part 2, docs/spec.md) -- internally throttled to its
+            # own GITHUB_POLL_INTERVAL_SECONDS interval, and a guaranteed
+            # no-op unless AI_REVIEWER_ENABLED, GITHUB_TOKEN, and a non-empty
+            # AI_REVIEWER_GITHUB_REPOS_FILE are all set.
+            _github_poll_if_due()
             # Reverse-indexed by name, small N -- same "just iterate it"
             # style instance_names() itself already uses -- to attach an
             # optional gitea_sync field to each row below, when present.
