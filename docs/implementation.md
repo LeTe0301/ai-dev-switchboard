@@ -950,3 +950,183 @@ added, matching the task's framing. What was actually run this cycle:
    branch sets which variable — was traced by hand against the acceptance
    criteria instead, since it has no whiptail dependency once `FEATURES`/
    `$_ollama_check`-equivalent values are fixed).
+
+# Implementation: BACKLOG item 15 part 2, piece 1 -- Default/Advanced entry fork in `ct/create.sh`
+
+## Summary
+Inserts a new `whiptail --menu` entry fork ("Default Install" / "Advanced
+Install") into `ct/create.sh` immediately after the existing intro `msg()`
+call, splitting what was previously one unconditional prompt sequence
+(CTID through publish-mode, `ct/create.sh:34-158` before this change) into
+an `if [ "$INSTALL_MODE" = "default" ]; then ... else ... fi` fork.
+**Advanced** is that same prompt sequence relocated verbatim into the
+`else` branch (only the nine repeated field literals become
+`$DEFAULT_*`/`default_ctid()` references — no other change). **Default**
+is a new branch that asks nothing beyond the entry menu itself: it resolves
+`CTID` via the same `pvesh get /cluster/nextid` (fallback `900`) logic,
+assigns every other field straight from the new `DEFAULT_*` constants,
+sets `AUTH_MODE=pve` (no generated credentials), leaves all four `WITH_*`
+feature flags off, sets `PUBLISH_MODE=none`/`BASE_URL=""`, then shows one
+final `whiptail --msgbox` summarizing every resolved value before the
+shared, unchanged `TOTP_SECRET=...`-onward code (container creation,
+bootstrap, summary) runs identically regardless of which branch executed.
+Single-file change, `ct/create.sh` only.
+
+## Changes by file
+- `ct/create.sh`:
+  - Inserted the entry menu (`INSTALL_MODE=$(whiptail --menu ...)`)
+    directly after the existing intro `msg()` call (former line 32),
+    using `docs/design.md`'s finalized copy verbatim for the title,
+    prompt text, and both option descriptions.
+  - Added nine `DEFAULT_*` constants (`DEFAULT_CT_HOSTNAME`,
+    `DEFAULT_STORAGE`, `DEFAULT_DISK_GB`, `DEFAULT_CORES`,
+    `DEFAULT_MEM_MB`, `DEFAULT_BRIDGE`, `DEFAULT_IPCONFIG`,
+    `DEFAULT_TEMPLATE_STORAGE`, `DEFAULT_RUN_USER`) holding the exact
+    literal values each field already defaulted to before this change,
+    plus a `default_ctid()` function extracting the pre-existing
+    `pvesh get /cluster/nextid 2>/dev/null || echo 900` one-liner. Both
+    are declared once, above the fork, read by both branches.
+  - Wrapped the former unconditional prompt sequence
+    (`ct/create.sh:34-158` pre-change) in
+    `if [ "$INSTALL_MODE" = "default" ]; then ... else ... fi`:
+    - **`if` (Default) branch**: assigns `CTID` from `default_ctid()`
+      and every other container-spec field straight from its
+      `$DEFAULT_*` constant; sets `AUTH_MODE="pve"` with
+      `SIMPLE_USERNAME`/`SIMPLE_PASSWORD` left empty; sets all four
+      `WITH_*` flags to `0` and `OLLAMA_BASE_URL_NORM`/
+      `OLLAMA_MODEL_INPUT` to `""` (no taiga/ollama follow-up shown);
+      sets `PUBLISH_MODE="none"`/`BASE_URL=""`; then shows one
+      `whiptail --msgbox` (20x74, `docs/design.md`'s finalized copy)
+      summarizing CTID, hostname, storage+disk, cores+memory,
+      bridge+ipconfig, run-user, "your existing Proxmox VE credentials"
+      for login, "none enabled" for optional features, and "loopback
+      only" for publishing.
+    - **`else` (Advanced) branch**: the pre-change prompt sequence
+      relocated verbatim (re-indented one level for the `else` block),
+      with only the nine repeated literal pre-fill values swapped for
+      their `$DEFAULT_*` counterpart and the CTID pre-fill swapped for
+      `$(default_ctid)` — no other change to prompt text, order,
+      structure, or the taiga/ollama follow-up logic shipped in part 1.
+  - Nothing else in the file changed: `TOTP_SECRET=...` onward (template
+    resolution, `pct create`/`pct start`, in-container bootstrap,
+    `TMP_ENV`/`INSTALL_FLAGS` wiring, the final `SUMMARY` msgbox) is
+    untouched, outside the `if`/`else`, and runs identically for both
+    paths.
+
+## Key decisions / tradeoffs
+- **Entry menu and `DEFAULT_*`/`default_ctid()` declarations both sit
+  above the `if`/`else`, in the order the spec's own "Proposed approach"
+  numbered them** (menu, then shared defaults, then the fork) — this is
+  purely a within-file ordering choice with no behavioral effect, since
+  both are read-only by the time either branch runs.
+- **Advanced branch's re-indentation is the only mechanical change beyond
+  the literal→`$DEFAULT_*` substitution.** Wrapping the whole block in
+  `else ... fi` necessarily adds one level of indentation to every line;
+  the nested `OLLAMA_MODEL_CHECK_SCRIPT` heredoc body (`<<'PYEOF' ...
+  PYEOF`) was deliberately **not** re-indented, since heredoc content is
+  literal text passed to `python3` — adding leading whitespace there would
+  silently change the Python source (e.g. breaking `try/except`
+  indentation), not just cosmetic bash formatting. Verified byte-identical
+  against the pre-change heredoc (see "How to verify locally" #3).
+- **Default path's msgbox uses `docs/design.md`'s finalized copy**
+  ("Web UI login: your existing Proxmox VE credentials", the exact
+  field-by-field wording), not `docs/spec.md`'s draft placeholder
+  ("Login: your Proxmox VE credentials") — per this task's explicit
+  instruction to prefer design.md's wording wherever the two differ, and
+  design.md's own §Traceability table ties this specific wording to
+  spec's open question #4.
+
+## Deviations from spec
+None. Implemented `docs/spec.md`'s "Proposed approach" bash near-verbatim
+(entry menu, `DEFAULT_*` constants, `default_ctid()`, and the full
+if/else fork), substituting `docs/design.md`'s finalized entry-menu option
+copy and Default-path confirmation-msgbox copy for spec's own draft
+placeholder text, exactly as instructed. `docs/spec.md`'s open question #3
+(the stale "non-interactive... CT_*/SWB_* env vars" header comment at
+`ct/create.sh:13-16`) is left untouched, per spec's own explicit non-goal
+and the task's instruction not to fix it here.
+
+## Known limitations
+- Same as part 1: not exercised against a real Proxmox host / real
+  `whiptail` TTY — there is no CI harness for `ct/create.sh` and none was
+  added, matching the task's framing. What was actually run this cycle is
+  listed below.
+- Per spec's "Deferred to a later part": live storage-pool enumeration,
+  live network-bridge enumeration, and CTID/hostname pre-validation
+  (pieces 2-4) are not built here — the Default path's `local-lvm`/
+  `local`/computed-CTID values can still fail at `pveam`/`pct create` time
+  on a host where those don't exist or the CTID collides, with Proxmox's
+  own real error, identical to today's pre-existing unvalidated behavior.
+  This is spec'd as an accepted, deferred gap, not a bug introduced here.
+
+## How to verify locally
+This script only runs interactively on a real Proxmox VE host (`pct`,
+`whiptail` in a real TTY) — there is no CI harness for it and none was
+added, matching part 1's own testing bar. What was actually run this
+cycle:
+
+1. **Syntax check**: `bash -n ct/create.sh` → passed (no output, exit 0).
+2. **Full-file shellcheck**: `shellcheck ct/create.sh` → zero
+   warnings/errors anywhere in the file (not just the diff) — matches the
+   pre-change file's own zero-warning baseline from part 1.
+3. **Advanced-branch diff-verification against pre-change `ct/create.sh`**
+   (the acceptance criterion this task flagged as the one the reviewer
+   will most want independently re-confirmed):
+   - Extracted the pre-change prompt block (`git show HEAD:ct/create.sh`,
+     lines 34-158) and the post-change Advanced (`else`) branch body
+     (lines 82-206 of the new file) — both exactly 125 lines.
+   - De-indented the post-change block by one level (4 spaces), **except**
+     the heredoc body lines (`OLLAMA_MODEL_CHECK_SCRIPT`'s literal Python
+     source), which must stay untouched since heredocs are literal text.
+   - `diff -u` between the two: the only differences are the nine
+     documented literal→`$DEFAULT_*` substitutions (`CTID`'s pre-fill
+     `$(pvesh get /cluster/nextid ...)` → `$(default_ctid)`; the other
+     eight fields' literal pre-fills → `"$DEFAULT_*"`) — no reordering, no
+     dropped/added prompts, no changed prompt text.
+   - Separately confirmed the heredoc body is byte-for-byte identical
+     between pre- and post-change (`diff` exit 0), ruling out any
+     accidental heredoc re-indentation from the wrapping `else` block.
+4. **Default-branch variable-assignment harness** (same "extract the
+   logic into a standalone script, stub out non-pure dependencies"
+   technique part 1's reviewer used for the checklist-parsing logic):
+   extracted `ct/create.sh`'s `DEFAULT_*` constants, `default_ctid()`, and
+   the full Default `if`-branch body into a standalone script; stubbed
+   `whiptail()` (captures its args instead of opening a TTY) and
+   `pvesh()` (returns nonzero, forcing the `900` fallback path) with bash
+   functions of the same name; set `INSTALL_MODE="default"`; `eval`'d the
+   extracted block; then asserted on every resulting variable named in the
+   spec's acceptance criteria:
+   - `CTID=900`, `CT_HOSTNAME=ai-dev-switchboard`, `STORAGE=local-lvm`,
+     `DISK_GB=8`, `CORES=2`, `MEM_MB=2048`, `BRIDGE=vmbr0`,
+     `IPCONFIG=dhcp`, `TEMPLATE_STORAGE=local`, `RUN_USER=dev`,
+     `AUTH_MODE=pve`, `SIMPLE_USERNAME=""`, `SIMPLE_PASSWORD=""`,
+     `WITH_GIT_HOSTING=0`, `WITH_CODE_SERVER=0`, `WITH_TAIGA=0`,
+     `WITH_OLLAMA=0`, `OLLAMA_BASE_URL_NORM=""`, `OLLAMA_MODEL_INPUT=""`,
+     `PUBLISH_MODE=none`, `BASE_URL=""` — all 20 matched exactly.
+   - Also asserted the captured `whiptail --msgbox` call's message text
+     contains every one of the nine summary lines the spec's acceptance
+     criteria list (CTID, hostname, storage+disk, cores+memory,
+     bridge+ipconfig, run-user, "your existing Proxmox VE credentials",
+     "none enabled", "loopback only") — all nine present.
+   - All checks passed (`ALL CHECKS PASSED`).
+5. **Shared-variable-set convergence check**: extracted the top-level
+   uppercase variable-assignment names from the Default `if`-body
+   (`ct/create.sh:55-78`) and the Advanced `else`-body
+   (`ct/create.sh:82-206`) via `grep -oE '^\s*[A-Z_][A-Z0-9_]*='`, then
+   diffed the two sorted lists. Identical for all 20 spec-listed variable
+   names; the only two names present in Advanced-but-not-Default are
+   `FEATURES` and `OLLAMA_MODEL_CHECK_SCRIPT`, both purely internal
+   working variables local to Advanced's own dialog-processing logic
+   (never read by the shared `TOTP_SECRET=...`-onward code) — confirming
+   no variable the downstream shared code actually consumes is
+   conditionally undefined depending on which path ran.
+6. **Not checked** (genuinely requires the real environment, same
+   reasoning as part 1): an actual `whiptail --menu`/`--msgbox` render in
+   a TTY, Cancel/Esc behavior at the new entry menu or the Default
+   confirmation msgbox under `set -euo pipefail` (traced by hand against
+   the existing Cancel-aborts precedent every other dialog in the file
+   already has — `INSTALL_MODE=$(...)`'s assignment fails identically to
+   every other `$(whiptail ...)` assignment in the file on Cancel), and a
+   real `pvesh get /cluster/nextid` round-trip on an actual clustered
+   Proxmox host (only its documented fallback-to-900 behavior was
+   exercised, via the stubbed `pvesh` returning nonzero).

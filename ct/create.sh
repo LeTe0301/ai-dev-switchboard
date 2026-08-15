@@ -31,63 +31,111 @@ menu()  { whiptail --title "ai-dev-switchboard" --menu "$1" 15 74 3 "${@:2}" 3>&
 
 msg "This creates a new LXC container running ai-dev-switchboard: a web UI that starts/stops Claude Code, aider, Codex, or any CLI coding agent per project, from a phone or laptop.\n\nEach next step has a sensible default — press Enter (or Tab, Enter) to accept it."
 
-CTID=$(ask "Container ID (must be free):" "$(pvesh get /cluster/nextid 2>/dev/null || echo 900)")
-CT_HOSTNAME=$(ask "Hostname:" "ai-dev-switchboard")
-STORAGE=$(ask "Storage pool for the container's root disk:" "local-lvm")
-DISK_GB=$(ask "Disk size (GB):" "8")
-CORES=$(ask "CPU cores:" "2")
-MEM_MB=$(ask "Memory (MB):" "2048")
-BRIDGE=$(ask "Network bridge:" "vmbr0")
-IPCONFIG=$(ask "IP config (dhcp, or e.g. 192.168.1.50/24,gw=192.168.1.1):" "dhcp")
-TEMPLATE_STORAGE=$(ask "Storage where the Debian 12 container template lives/downloads to:" "local")
-
-RUN_USER=$(ask "Unprivileged user to run coding sessions as (created inside the container):" "dev")
-
-AUTH_MODE=$(menu "How should the web UI authenticate you?" \
-    "simple" "A single username + password you set now" \
-    "pve"    "Real Proxmox VE credentials (checked against this host's API)")
-
-SIMPLE_USERNAME=""
-SIMPLE_PASSWORD=""
-if [ "$AUTH_MODE" = "simple" ]; then
-    SIMPLE_USERNAME=$(ask "Web UI username:" "admin")
-    SIMPLE_PASSWORD=$(askpw "Web UI password:")
-fi
-
-FEATURES=$(whiptail --title "ai-dev-switchboard" --checklist \
-    "Optional features to enable on this container (Space to toggle, Enter to confirm):" \
-    18 78 4 \
-    "git-hosting" "Private repos over SSH + \"+ New project\" button" OFF \
-    "code-server" "VS Code in the browser, per project" OFF \
-    "taiga"       "Self-hosted Taiga backlog/kanban tracker" OFF \
-    "ollama"      "Link a remote Ollama for multi-agent team leads" OFF \
+INSTALL_MODE=$(whiptail --title "ai-dev-switchboard" --menu \
+    "How do you want to configure this container?" 15 74 2 \
+    "default"  "Create with built-in defaults (fully automated, no prompts)" \
+    "advanced" "Walk through every setting (container specs + optional features)" \
     3>&1 1>&2 2>&3)
 
-WITH_GIT_HOSTING=0
-WITH_CODE_SERVER=0
-WITH_TAIGA=0
-WITH_OLLAMA=0
-for _item in $FEATURES; do
-    _item="${_item%\"}"; _item="${_item#\"}"
-    case "$_item" in
-        git-hosting) WITH_GIT_HOSTING=1 ;;
-        code-server) WITH_CODE_SERVER=1 ;;
-        taiga)       WITH_TAIGA=1 ;;
-        ollama)      WITH_OLLAMA=1 ;;
-    esac
-done
+DEFAULT_CT_HOSTNAME="ai-dev-switchboard"
+DEFAULT_STORAGE="local-lvm"
+DEFAULT_DISK_GB="8"
+DEFAULT_CORES="2"
+DEFAULT_MEM_MB="2048"
+DEFAULT_BRIDGE="vmbr0"
+DEFAULT_IPCONFIG="dhcp"
+DEFAULT_TEMPLATE_STORAGE="local"
+DEFAULT_RUN_USER="dev"
 
-if [ "$WITH_TAIGA" -eq 1 ]; then
-    msg "Taiga runs 9 containers and can use several GB of RAM (and real disk, for Postgres/RabbitMQ data volumes) once turned on in the web UI; toggling it back off frees that RAM again right away."
-fi
+default_ctid() {
+    pvesh get /cluster/nextid 2>/dev/null || echo 900
+}
 
-OLLAMA_BASE_URL_NORM=""
-OLLAMA_MODEL_INPUT=""
-if [ "$WITH_OLLAMA" -eq 1 ]; then
-    # Copied verbatim from install.sh's own --with-ollama block (exact
-    # model-id comparison against data[].id — never substring/grep, since
-    # e.g. "qwen3:8" must not false-positive-match "qwen3:8b").
-    OLLAMA_MODEL_CHECK_SCRIPT=$(cat <<'PYEOF'
+if [ "$INSTALL_MODE" = "default" ]; then
+    CTID=$(default_ctid)
+    CT_HOSTNAME="$DEFAULT_CT_HOSTNAME"
+    STORAGE="$DEFAULT_STORAGE"
+    DISK_GB="$DEFAULT_DISK_GB"
+    CORES="$DEFAULT_CORES"
+    MEM_MB="$DEFAULT_MEM_MB"
+    BRIDGE="$DEFAULT_BRIDGE"
+    IPCONFIG="$DEFAULT_IPCONFIG"
+    TEMPLATE_STORAGE="$DEFAULT_TEMPLATE_STORAGE"
+    RUN_USER="$DEFAULT_RUN_USER"
+
+    AUTH_MODE="pve"
+    SIMPLE_USERNAME=""
+    SIMPLE_PASSWORD=""
+
+    WITH_GIT_HOSTING=0
+    WITH_CODE_SERVER=0
+    WITH_TAIGA=0
+    WITH_OLLAMA=0
+    OLLAMA_BASE_URL_NORM=""
+    OLLAMA_MODEL_INPUT=""
+
+    PUBLISH_MODE="none"
+    BASE_URL=""
+
+    whiptail --title "ai-dev-switchboard" --msgbox "About to create:\n\n  CTID: ${CTID}\n  Hostname: ${CT_HOSTNAME}\n  Storage: ${STORAGE} (${DISK_GB}G disk)\n  CPU / RAM: ${CORES} cores / ${MEM_MB}MB\n  Network: bridge ${BRIDGE}, ${IPCONFIG}\n  Run-as user: ${RUN_USER}\n  Web UI login: your existing Proxmox VE credentials\n  Optional features: none enabled\n  Terminal publishing: loopback only\n\nPress Enter to create it, or Cancel to abort." 20 74
+else
+    CTID=$(ask "Container ID (must be free):" "$(default_ctid)")
+    CT_HOSTNAME=$(ask "Hostname:" "$DEFAULT_CT_HOSTNAME")
+    STORAGE=$(ask "Storage pool for the container's root disk:" "$DEFAULT_STORAGE")
+    DISK_GB=$(ask "Disk size (GB):" "$DEFAULT_DISK_GB")
+    CORES=$(ask "CPU cores:" "$DEFAULT_CORES")
+    MEM_MB=$(ask "Memory (MB):" "$DEFAULT_MEM_MB")
+    BRIDGE=$(ask "Network bridge:" "$DEFAULT_BRIDGE")
+    IPCONFIG=$(ask "IP config (dhcp, or e.g. 192.168.1.50/24,gw=192.168.1.1):" "$DEFAULT_IPCONFIG")
+    TEMPLATE_STORAGE=$(ask "Storage where the Debian 12 container template lives/downloads to:" "$DEFAULT_TEMPLATE_STORAGE")
+
+    RUN_USER=$(ask "Unprivileged user to run coding sessions as (created inside the container):" "$DEFAULT_RUN_USER")
+
+    AUTH_MODE=$(menu "How should the web UI authenticate you?" \
+        "simple" "A single username + password you set now" \
+        "pve"    "Real Proxmox VE credentials (checked against this host's API)")
+
+    SIMPLE_USERNAME=""
+    SIMPLE_PASSWORD=""
+    if [ "$AUTH_MODE" = "simple" ]; then
+        SIMPLE_USERNAME=$(ask "Web UI username:" "admin")
+        SIMPLE_PASSWORD=$(askpw "Web UI password:")
+    fi
+
+    FEATURES=$(whiptail --title "ai-dev-switchboard" --checklist \
+        "Optional features to enable on this container (Space to toggle, Enter to confirm):" \
+        18 78 4 \
+        "git-hosting" "Private repos over SSH + \"+ New project\" button" OFF \
+        "code-server" "VS Code in the browser, per project" OFF \
+        "taiga"       "Self-hosted Taiga backlog/kanban tracker" OFF \
+        "ollama"      "Link a remote Ollama for multi-agent team leads" OFF \
+        3>&1 1>&2 2>&3)
+
+    WITH_GIT_HOSTING=0
+    WITH_CODE_SERVER=0
+    WITH_TAIGA=0
+    WITH_OLLAMA=0
+    for _item in $FEATURES; do
+        _item="${_item%\"}"; _item="${_item#\"}"
+        case "$_item" in
+            git-hosting) WITH_GIT_HOSTING=1 ;;
+            code-server) WITH_CODE_SERVER=1 ;;
+            taiga)       WITH_TAIGA=1 ;;
+            ollama)      WITH_OLLAMA=1 ;;
+        esac
+    done
+
+    if [ "$WITH_TAIGA" -eq 1 ]; then
+        msg "Taiga runs 9 containers and can use several GB of RAM (and real disk, for Postgres/RabbitMQ data volumes) once turned on in the web UI; toggling it back off frees that RAM again right away."
+    fi
+
+    OLLAMA_BASE_URL_NORM=""
+    OLLAMA_MODEL_INPUT=""
+    if [ "$WITH_OLLAMA" -eq 1 ]; then
+        # Copied verbatim from install.sh's own --with-ollama block (exact
+        # model-id comparison against data[].id — never substring/grep, since
+        # e.g. "qwen3:8" must not false-positive-match "qwen3:8b").
+        OLLAMA_MODEL_CHECK_SCRIPT=$(cat <<'PYEOF'
 import json
 import sys
 
@@ -105,56 +153,57 @@ else:
     print("MODEL_ABSENT:" + ",".join(str(i) for i in ids if i is not None))
 PYEOF
 )
-    _ollama_url_default="http://127.0.0.1:11434/v1"
-    _ollama_model_default="qwen3:8b"
-    while :; do
-        _ollama_url_input=$(ask "Ollama endpoint URL (OpenAI-compatible, e.g. an existing remote Ollama's /v1)" "$_ollama_url_default")
-        _ollama_model_input=$(ask "Model name" "$_ollama_model_default")
-        _ollama_url_norm="${_ollama_url_input%/}"
-        _ollama_models_json=$(curl -fsS --max-time 10 "$_ollama_url_norm/models" 2>/dev/null || true)
-        if [ -z "$_ollama_models_json" ]; then
-            _ollama_fail_msg="Could not reach $_ollama_url_norm/models (unreachable, no response, or an HTTP error)."
-        else
-            _ollama_check=$(printf '%s' "$_ollama_models_json" | python3 -c "$OLLAMA_MODEL_CHECK_SCRIPT" "$_ollama_model_input")
-            case "$_ollama_check" in
-                OK)
-                    OLLAMA_BASE_URL_NORM="$_ollama_url_norm"
-                    OLLAMA_MODEL_INPUT="$_ollama_model_input"
-                    break
-                    ;;
-                MODEL_ABSENT:*)
-                    _ollama_available="${_ollama_check#MODEL_ABSENT:}"
-                    if [ -z "$_ollama_available" ]; then
-                        _ollama_fail_msg="Reached $_ollama_url_norm but it has no models available."
-                    else
-                        _ollama_fail_msg="Reached $_ollama_url_norm but model '$_ollama_model_input' is not available there. Available: $_ollama_available"
-                    fi
-                    ;;
-                *)
-                    _ollama_fail_msg="Reached $_ollama_url_norm/models but its response could not be parsed as JSON."
-                    ;;
-            esac
-        fi
-        msg "$_ollama_fail_msg"
-        if yesno "Try a different URL/model?"; then
-            _ollama_url_default="$_ollama_url_input"
-            _ollama_model_default="$_ollama_model_input"
-            continue
-        else
-            WITH_OLLAMA=0
-            msg "Continuing without linking Ollama. You can re-run 'install.sh --with-ollama' inside the container later once the endpoint is reachable."
-            break
-        fi
-    done
-fi
+        _ollama_url_default="http://127.0.0.1:11434/v1"
+        _ollama_model_default="qwen3:8b"
+        while :; do
+            _ollama_url_input=$(ask "Ollama endpoint URL (OpenAI-compatible, e.g. an existing remote Ollama's /v1)" "$_ollama_url_default")
+            _ollama_model_input=$(ask "Model name" "$_ollama_model_default")
+            _ollama_url_norm="${_ollama_url_input%/}"
+            _ollama_models_json=$(curl -fsS --max-time 10 "$_ollama_url_norm/models" 2>/dev/null || true)
+            if [ -z "$_ollama_models_json" ]; then
+                _ollama_fail_msg="Could not reach $_ollama_url_norm/models (unreachable, no response, or an HTTP error)."
+            else
+                _ollama_check=$(printf '%s' "$_ollama_models_json" | python3 -c "$OLLAMA_MODEL_CHECK_SCRIPT" "$_ollama_model_input")
+                case "$_ollama_check" in
+                    OK)
+                        OLLAMA_BASE_URL_NORM="$_ollama_url_norm"
+                        OLLAMA_MODEL_INPUT="$_ollama_model_input"
+                        break
+                        ;;
+                    MODEL_ABSENT:*)
+                        _ollama_available="${_ollama_check#MODEL_ABSENT:}"
+                        if [ -z "$_ollama_available" ]; then
+                            _ollama_fail_msg="Reached $_ollama_url_norm but it has no models available."
+                        else
+                            _ollama_fail_msg="Reached $_ollama_url_norm but model '$_ollama_model_input' is not available there. Available: $_ollama_available"
+                        fi
+                        ;;
+                    *)
+                        _ollama_fail_msg="Reached $_ollama_url_norm/models but its response could not be parsed as JSON."
+                        ;;
+                esac
+            fi
+            msg "$_ollama_fail_msg"
+            if yesno "Try a different URL/model?"; then
+                _ollama_url_default="$_ollama_url_input"
+                _ollama_model_default="$_ollama_model_input"
+                continue
+            else
+                WITH_OLLAMA=0
+                msg "Continuing without linking Ollama. You can re-run 'install.sh --with-ollama' inside the container later once the endpoint is reachable."
+                break
+            fi
+        done
+    fi
 
-PUBLISH_MODE=$(menu "How should per-project ttyd/VS Code terminals be published beyond this container?" \
-    "none"      "Loopback only — you handle exposing them yourself" \
-    "tailscale" "Publish via 'tailscale serve --set-path' (requires tailscale installed+logged in later)")
+    PUBLISH_MODE=$(menu "How should per-project ttyd/VS Code terminals be published beyond this container?" \
+        "none"      "Loopback only — you handle exposing them yourself" \
+        "tailscale" "Publish via 'tailscale serve --set-path' (requires tailscale installed+logged in later)")
 
-BASE_URL=""
-if [ "$PUBLISH_MODE" = "tailscale" ]; then
-    BASE_URL=$(ask "Tailnet hostname per-project terminals get published under (see 'tailscale status' inside the container later — leave blank to fill in afterward):" "")
+    BASE_URL=""
+    if [ "$PUBLISH_MODE" = "tailscale" ]; then
+        BASE_URL=$(ask "Tailnet hostname per-project terminals get published under (see 'tailscale status' inside the container later — leave blank to fill in afterward):" "")
+    fi
 fi
 
 TOTP_SECRET="$(head -c20 /dev/urandom | base32 | tr -d '=' | head -c32)"
