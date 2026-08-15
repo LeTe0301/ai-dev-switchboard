@@ -125,7 +125,7 @@ if [ "$INSTALL_MODE" = "default" ]; then
     whiptail --title "ai-dev-switchboard" --msgbox "About to create:\n\n  CTID: ${CTID}\n  Hostname: ${CT_HOSTNAME}\n  Storage: ${STORAGE} (${DISK_GB}G disk)\n  CPU / RAM: ${CORES} cores / ${MEM_MB}MB\n  Network: bridge ${BRIDGE}, ${IPCONFIG}\n  Run-as user: ${RUN_USER}\n  Web UI login: your existing Proxmox VE credentials\n  Optional features: none enabled\n  Terminal publishing: loopback only\n\nPress Enter to create it, or Cancel to abort." 20 74
 else
     while :; do
-        CTID=$(ask "Container ID (must be free):" "$(default_ctid)")
+        CTID=$(ask "Container ID (must be free):" "${CTID:-$(default_ctid)}")
         if ! [[ "$CTID" =~ ^[0-9]+$ ]] || [ "$CTID" -lt 100 ] || [ "$CTID" -gt 999999999 ]; then
             msg "Container ID must be a number between 100 and 999999999 (got '$CTID')."
             continue
@@ -138,7 +138,7 @@ else
     done
 
     while :; do
-        CT_HOSTNAME=$(ask "Hostname:" "$DEFAULT_CT_HOSTNAME")
+        CT_HOSTNAME=$(ask "Hostname:" "${CT_HOSTNAME:-$DEFAULT_CT_HOSTNAME}")
         if ! _valid_hostname "$CT_HOSTNAME"; then
             msg "'$CT_HOSTNAME' is not a valid hostname. Use letters, digits, hyphens; each dot-separated label 1-63 characters; can't start or end with a hyphen."
             continue
