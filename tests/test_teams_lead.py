@@ -9,7 +9,7 @@ action() against every §9 category, _parse_tier1_action()/_parse_tier3_
 action(), _round_context()/_assemble_prompt()'s final cap against a
 pathological every-sub-budget-maxed-at-once case, the tier-1 transport-
 retry wrapper against a monkeypatched _lead_tier1_call()/urlopen,
-_write_inbox()'s shape/truncation, persistence/crash-recovery
+_write_ask_user_inbox()'s shape/truncation, persistence/crash-recovery
 reconstruction, and team_step()/team_run() driven with _call_lead()/
 agent_run() monkeypatched out (no tmux needed to test the LOOP's own
 bookkeeping).
@@ -504,7 +504,8 @@ class LeadToolsTests(unittest.TestCase):
     def test_enum_reflects_team_members(self):
         tools = teamsmod._lead_tools(["claude", "aider"])
         names = [t["function"]["name"] for t in tools]
-        self.assertEqual(names, ["delegate", "fact_check", "ask_user", "finish"])
+        self.assertEqual(names, ["delegate", "fact_check", "ask_user", "board_read",
+                                 "board_write", "finish"])
         delegate = tools[0]
         self.assertEqual(delegate["function"]["parameters"]["properties"]["agent"]["enum"],
                          ["claude", "aider"])
@@ -513,6 +514,21 @@ class LeadToolsTests(unittest.TestCase):
         tools = teamsmod._lead_tools([])
         delegate = tools[0]
         self.assertEqual(delegate["function"]["parameters"]["properties"]["agent"]["enum"], [])
+
+    # ─── backlog item 7 part 1: board_read/board_write native schema ──────
+    def test_board_read_args_all_optional(self):
+        tools = teamsmod._lead_tools(["claude"])
+        board_read = next(t for t in tools if t["function"]["name"] == "board_read")
+        self.assertEqual(board_read["function"]["parameters"]["required"], [])
+        self.assertEqual(set(board_read["function"]["parameters"]["properties"]), {"ref", "query"})
+
+    def test_board_write_verb_enum_and_required_args(self):
+        tools = teamsmod._lead_tools(["claude"])
+        board_write = next(t for t in tools if t["function"]["name"] == "board_write")
+        params = board_write["function"]["parameters"]
+        self.assertEqual(set(params["required"]), {"verb", "ref", "value"})
+        self.assertEqual(set(params["properties"]["verb"]["enum"]),
+                         {"set_status", "amend_description", "append_comment"})
 
 
 # ─── Tier 1: _validate_lead_action() -- every §9 category ─────────────────
@@ -712,9 +728,9 @@ class SystemFramingTests(unittest.TestCase):
         t1 = teamsmod._system_framing(self.projdir, ["claude"], 1)
         t2 = teamsmod._system_framing(self.projdir, ["claude"], 2)
         t3 = teamsmod._system_framing(self.projdir, ["claude"], 3)
-        self.assertNotIn("You have exactly four tools", t1)
-        self.assertIn("You have exactly four tools", t2)
-        self.assertIn("You have exactly four tools", t3)
+        self.assertNotIn("You have exactly six tools", t1)
+        self.assertIn("You have exactly six tools", t2)
+        self.assertIn("You have exactly six tools", t3)
 
     def test_tier3_asks_for_a_fenced_block_tier2_does_not(self):
         t2 = teamsmod._system_framing(self.projdir, ["claude"], 2)
@@ -886,9 +902,10 @@ class WriteInboxTests(_StateTestCase):
         args = {"question": "Should we do X?", "header": "ThisHeaderIsWayTooLong",
                "options": [{"label": "Yes", "description": "do it"},
                           {"label": "No", "description": "don't"}], "multi_select": False}
-        teamsmod._write_inbox(state, args)
+        teamsmod._write_ask_user_inbox(state, args)
         with open(teamsmod._inbox_path("run-inbox")) as f:
             inbox = json.load(f)
+        self.assertEqual(inbox["kind"], "ask_user")
         self.assertLessEqual(len(inbox["header"]), 12)
         self.assertEqual(inbox["question"], "Should we do X?")
         self.assertEqual(len(inbox["options"]), 2)
