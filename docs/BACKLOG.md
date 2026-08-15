@@ -713,22 +713,11 @@ switchboard release from `main`/`master` — including any config or state
 migration a given update requires — rather than the current implicit
 assumption that `install.sh` is a one-time, fresh-install-only operation.
 
-**Not yet scoped** — needs a real product-manager pass before building.
-Open questions to settle then, not now:
-- Is this a new `install.sh --update`/`--upgrade` flag (parallel to the
-  existing `--with-*` optional-feature flags), or a separate script?
-- What actually needs migrating between versions? So far this project has
-  added new `switchboard.env` keys (additive, already tolerant of being
-  unset) and new optional Docker Compose stacks (Taiga, Gitea) — a real
-  breaking schema change hasn't happened yet, so "migration scripts...
-  already exists" may be understating what's actually needed, or may be
-  referring to something the user has in mind that isn't yet visible in
-  this repo. Confirm with the user what "migration scripts" refers to
-  concretely before scoping further.
-- Does an update ever restart already-running engine sessions or team
-  runs? If so, this needs the same "never destructive, never surprise a
-  running session" discipline the rest of this project already holds to
-  (2c part 1's fast-forward-only sync, deploy being manual-click-only).
+**Settled 2026-08-14 (asked directly this session): this is a new
+`install.sh --update`/`--upgrade` flag, parallel to the existing
+`--with-*` optional-feature flags — not a separate script.** The rest of
+this item's scoping (what needs migrating, whether an update can ever
+restart a running session) is in `docs/spec.md`.
 
 ---
 
