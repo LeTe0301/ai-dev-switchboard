@@ -3273,3 +3273,288 @@ python3 -m unittest tests.test_teams_composition tests.test_teams_lead \
 python3 -m unittest discover -s tests
 # Ran 1189 tests in 158.9s ... OK
 ```
+
+# Implementation: Backlog item 21 part 2 -- the "+" button UI for growing a running team
+
+## Summary
+Ships the human-facing "+" control on top of part 1's already-merged backend
+(`teams.add_team_member()`, `POST /projects/<name>/team/add-member`,
+`TEAM_MAX_MEMBERS`): a native `<select>` + "+ Add" button on an already-
+running team's row, visible under exactly the three statuses
+`add_team_member()` itself accepts (reusing `teamAcceptsInterject(team)` as
+the visibility gate verbatim), populated with eligible roster engines
+(excludes the current engine lead and anyone already on the live team), with
+two distinct disabled-reason states (at-cap vs. no-eligible-engines) and an
+honest "will join... at its next round" success message. Two small, additive
+backend fields make this possible: `/status`'s `inst.team.members`/
+`inst.team.lead` (the run's live roster/lead, not the stale saved-picker
+`composition`) and a `member_joined` event now merged into `GET .../team/
+events` from `membership.jsonl`. Frontend + two backend field/merge
+additions, entirely within `app/app.py` -- no `app/teams.py` change, no new
+route, per docs/spec.md's own explicit scope.
+
+## Changes by file
+- `app/app.py`:
+  - `/status` handler: `inst["team"]` gains `"members"` (`run.get("members",
+    []) if run is not None else []`) and `"lead"` (`run.get("lead") if run
+    is not None else None`), read straight off the run's own persisted
+    state, never re-derived from `composition` (the saved/default picker
+    preference `add_team_member()` never touches). Top-level response gains
+    `"team_max_members": teams.TEAM_MAX_MEMBERS`, same "computed once,
+    shipped once per call" treatment `"roster"` already gets.
+  - `_handle_team_events()`: the `files` list gains `("membership",
+    teams._membership_log_path(run_id))` alongside the existing lead/human
+    sources. The `"membership"` label is only used for the malformed-line
+    fallback and the `cursors` dict key -- it does not override the `agent`
+    field already embedded in each `membership.jsonl` line by part 1's
+    `add_team_member()`, so a `member_joined` event surfaces tagged with the
+    newly-joined agent's own name/color, not a generic pseudo-agent.
+  - New CSS (near the existing `.team-interject-*` rules): `.team-add-member`
+    (flex row, reuses `.team-interject-row`'s own gap), `.team-add-member
+    select` (byte-for-byte `.team-lead-picker select`'s declaration block),
+    `.team-add-member-reason` (byte-for-byte `.team-sub`'s muted-text
+    tokens), `.team-feed-event.kind-member-joined` (`border-left: 3px solid
+    currentColor`, matching `.kind-human-message`'s own left-border-accent
+    shape but dynamic per agent instead of a fixed blue).
+  - New JS state: `teamAddMemberChoice` (name -> selected agent, same
+    "survives a mid-flow re-render/428 retry" idiom as `teamInterjectText`),
+    `TEAM_MAX_MEMBERS_CLIENT` (a `let`, not `const` -- hardcoded default `6`
+    matching the server's own default, overwritten from `s.team_max_members`
+    on every `refresh()` poll, same idiom `ROSTER` itself uses for its own
+    live override).
+  - New JS functions: `teamAddMemberEligible(team)` (pure; filters `ROSTER`
+    to `kind === 'engine'` entries not already in `team.members` and not the
+    current engine lead), `renderTeamAddMemberControl(name, team)` (visible
+    iff `teamAcceptsInterject(team)`; renders the disabled at-cap reason, the
+    disabled no-eligible-engines reason, or the live `<select>` + button),
+    `doTeamAddMember(name)` (saves the selection to `teamAddMemberChoice`
+    before dispatching, mirrors `doTeamInterject()`'s shape).
+  - `refresh()`: one new line, `if (s.team_max_members)
+    TEAM_MAX_MEMBERS_CLIENT = s.team_max_members;`, placed right after the
+    existing `ROSTER = s.roster || [];` line.
+  - `actionPath()`: one new `kind === 'team-add-member'` branch, POSTs to the
+    already-shipped `/projects/<name>/team/add-member`.
+  - `actionBody()`: one new `kind === 'team-add-member'` branch, `body.agent
+    = teamAddMemberChoice[name]`.
+  - `handleActionResult()`: one new 428-label switch entry (`'Adding
+    teammate: ' + (name || 'this')`) and one new `kind === 'team-add-member'`
+    branch, placed before the generic-400 fallback, mirroring
+    `team-interject`'s own branch shape. Success message is exactly `"✓
+    '<agent>' will join the team at its next round"` (never "has joined"),
+    using the server's own returned `data.agent`; the selection mirror is
+    deleted on success, kept on failure so a retry doesn't require re-
+    picking.
+  - `teamFeedEventKindClass()`: one new early-return branch, `if (e.kind ===
+    'member_joined') return 'member-joined';`. `teamFeedEventBody()`: one
+    new branch, `if (cls === 'member-joined') return '→ joined the team';`
+    (the agent name itself is already rendered by the existing
+    `.team-feed-agent` span, so it's not repeated here).
+  - `renderTeamFeed()`: the filter-pill agent list source changed from
+    `(team.composition && team.composition.members) || []` (a saved/default
+    picker preference, never updated by `add_team_member()`) to `team.members
+    || []` (the live `/status` field this cycle adds) -- fixes a real
+    staleness bug flagged in docs/spec.md's own "Background": a newly-added
+    teammate's events were already reachable under the `all` filter (their
+    log file was already merged into `/team/events` before this part) but
+    never got their own clickable pill.
+  - `teamRow(name, team)`: one new `addMemberControl` variable
+    (`renderTeamAddMemberControl(name, team)`), inserted into the non-idle
+    render order between `interjectBox` and `feedToggle`.
+- `tests/test_team_routes.py`:
+  - `test_status_idle_when_no_run_ever_started` (exact-dict-equality test)
+    updated to include the two new additive keys (`"members": []`,
+    `"lead": None`) -- the one existing test docs/spec.md's acceptance
+    criteria flagged as needing this.
+  - `StatusRosterAndCompositionTests` gains three new tests:
+    `test_team_max_members_top_level_field`,
+    `test_members_and_lead_reflect_live_roster_not_the_saved_composition`
+    (launches a real team with one composition saved that deliberately
+    differs from the live run, proving `members`/`lead` come from the run,
+    not from `composition`), and
+    `test_members_grows_once_add_team_member_drains_at_the_next_round`
+    (calls `add_team_member()` directly, asserts `/status` still reports the
+    OLD roster immediately after, then simulates the drain and asserts the
+    NEW roster appears).
+  - `TeamEventsEndpointTests` gains two new tests:
+    `test_membership_jsonl_merged_tagged_with_the_joined_agents_own_name`
+    (writes a raw `member_joined` envelope to `membership.jsonl`, asserts it
+    surfaces in the merged feed tagged `agent: "aider"`, and that
+    `cursors["membership"]` is present) and
+    `test_no_membership_jsonl_yet_degrades_to_no_membership_events_not_an_error`
+    (a run that never called `add_team_member()` -- confirms the existing
+    `tail_jsonl_events()` `FileNotFoundError` handling already covers this).
+- `tests/test_team_frontend.js`:
+  - Two existing tests (`'per-agent filter pills carry aria-pressed...'` and
+    `'renderTeamFeed() lists filter pills in order All, lead, human,
+    <member1>...'`) updated to set `members: ['helper']` directly on the
+    `team` object instead of `composition: { lead: null, members:
+    ['helper'] }` -- these tests assert the rendered pill list, which now
+    reads the live `team.members` field, not the stale
+    `team.composition.members` (see the `renderTeamFeed()` change above).
+  - A new "'+' add-teammate control" test section (9 new tests), placed
+    right after the chat-UI compose surface's own tests and before the
+    "Past team branches panel" section: exact eligible-option filtering
+    (already-a-member and the current engine lead both excluded, an Ollama-
+    kind lead has nothing to exclude); the POST dispatch shape (`{agent}`)
+    and 428-retry label/resend of the SAME agent; the exact success message
+    text (asserts it never contains "has joined"); a server-side 400 leaves
+    the select/button usable for retry; the at-cap disabled state (exact
+    text, no select/button rendered); the distinct under-cap-but-no-eligible
+    -engines disabled state; visibility across `running` /
+    `blocked_ask_user` / `blocked_board_write` (shown) vs. `idle` /
+    `finished` / `error` / `blocked` without `waiting_on_you` (hidden); and
+    `teamFeedEventKindClass()`/`teamFeedEventBody()` returning
+    `'member-joined'`/`'→ joined the team'` for a `member_joined` event, plus
+    the rendered row carrying `kind-member-joined`.
+
+## Key decisions / tradeoffs
+- **`TEAM_MAX_MEMBERS_CLIENT` is a `let` with a live `/status` override**,
+  unlike `TEAM_INTERJECT_MAX_CHARS_CLIENT` (a `const`, hardcoded only, never
+  overridden from any poll). docs/spec.md's own "Proposed approach" §5
+  explicitly asked for this live override and cites
+  `TEAM_INTERJECT_MAX_CHARS_CLIENT` as "the exact same precedent" -- reading
+  the actual code, that precedent is only half right (it's the
+  hardcoded-default half; there is no live-override code path for it
+  anywhere in this codebase today). Implemented per the spec's literal,
+  explicit instruction (a genuinely new field this cycle adds, cheap to
+  fetch, and directly gates a control's disabled state rather than being
+  advisory copy) rather than deviating to match the imperfect analogy — see
+  "Deviations from spec / design" below for why this isn't flagged as a
+  deviation from the *spec* (it isn't; the spec's own directive is what was
+  followed) but is flagged here as a factual correction to the spec's own
+  characterization of the precedent.
+- **`.team-feed-event.kind-member-joined`'s `border-left: 3px solid
+  currentColor` resolves to the ROW's own inherited `color` (`#eee`, from
+  the base `.team-feed-event` rule), not the joined agent's own color.**
+  `currentColor` in CSS resolves against the element's OWN computed `color`
+  property, not a descendant's -- the agent color is set via an inline
+  `style="color:...` on the nested `.team-feed-agent` `<span>` only, which
+  does not propagate to an ancestor's own `color` for border-color purposes.
+  This is implemented byte-for-byte per docs/design.md's own "Implementation
+  notes for the developer" §6 CSS snippet and its accompanying comment
+  (which asserts the opposite). The net visual effect is a plain
+  light-gray/white left border for every `member_joined` row rather than a
+  per-agent-colored one; the acceptance criterion this affects
+  ("...rendered... in aider's own established color") is still met by the
+  UNCHANGED `.team-feed-agent` span mechanism, which already colors the
+  agent name text correctly and is not touched by this border rule. Left
+  as specified rather than silently "fixed" with an inline style the
+  design doc didn't ask for -- flagged here for the reviewer to weigh
+  whether the border's own color is worth a follow-up.
+- **Visibility gate reuses `teamAcceptsInterject(team)` verbatim, no
+  rename.** Confirmed reading the code (not just docs/spec.md's claim) that
+  `interject()` and `add_team_member()` accept the identical three-status
+  set server-side, so this is a safe, intentional reuse, not an incidental
+  coupling that could silently diverge later.
+- **`renderTeamAddMemberControl()` checks the at-cap condition before the
+  no-eligible-engines condition**, matching docs/spec.md's own ordering (and
+  covering the edge case where a team is simultaneously at cap AND has no
+  further eligible engines -- the at-cap message wins, since it's the more
+  actionable of the two: adding roster engines wouldn't help until the cap
+  itself is addressed).
+
+## Deviations from spec / design
+None in substance -- every acceptance criterion in docs/spec.md is
+implemented as specified, and docs/design.md's "Implementation notes for the
+developer" section was followed near-literally (exact function
+signatures/CSS values/copy strings). The two items above are documented
+factual corrections/observations about the spec's/design's own reasoning,
+not behavioral deviations: `TEAM_MAX_MEMBERS_CLIENT`'s live-override
+behavior matches what the spec explicitly asked for (the spec's own analogy
+to an existing precedent just doesn't hold up under inspection), and the
+`kind-member-joined` border color is implemented exactly per the design
+doc's own CSS snippet (the design doc's accompanying rationale for why that
+CSS would pick up the agent's color is what doesn't hold up under
+inspection).
+
+## Known limitations
+- ~~The `kind-member-joined` left-border accent renders in the feed's base
+  text color, not the joined agent's own color~~ -- **fixed**, see "Post-review
+  fix" below; the outer row div now carries its own inline
+  `border-left-color` matching the agent-name span's color.
+- Row re-renders mid-selection reset any unsubmitted `<select>` pick (not
+  mirrored client-side pre-submit, matching the composition picker's own
+  "team-mate checkbox" precedent) -- this is docs/spec.md's own accepted
+  edge case ("Row re-renders mid-selection"), not a defect.
+- No CLI convenience flag for browsing eligible roster engines
+  (`docs/spec.md`'s own "Open questions" flagged this as a possible small
+  follow-up, explicitly out of scope for this part).
+
+## How to verify locally
+```
+# Backend: /status's new members/lead/team_max_members fields, and the
+# membership.jsonl merge into GET .../team/events.
+python3 -m unittest tests.test_team_routes.StatusRosterAndCompositionTests \
+  tests.test_team_routes.TeamEventsEndpointTests -v
+# Ran 18 tests ... OK
+
+# Full backend team-route suite (confirms the two new additive fields don't
+# break any existing exact-dict-equality assertion).
+python3 -m unittest tests.test_team_routes -v
+# Ran 126 tests ... OK
+
+# Frontend: the "+" control, its two disabled states, the 428/success/error
+# flows, the member_joined feed classification, and the filter-pill fix --
+# run against the real rendered <script> extracted from render_page(),
+# same technique as every other tests/test_team_frontend.js test.
+TOTP_SECRET=JBSWY3DPEHPK3PXP node tests/test_team_frontend.js
+# ALL PASS (103/103)
+
+# Manual check: start a team from the web UI, add a teammate via the new
+# "+" control, confirm the success message reads "will join the team at
+# its next round" (not "has joined"), then watch the live feed for a
+# "→ joined the team" line in that agent's own color within ~4s, and the
+# filter-pill row gain that agent's pill on the following /status poll.
+```
+
+## Post-review fix (should-fix from `docs/test-review.md`'s BACKLOG item 21
+part 2 review, Finding 1)
+The reviewer's diagnosis was correct: `.team-feed-event.kind-member-joined`'s
+`border-left: 3px solid currentColor` resolves against the OUTER
+`.team-feed-event` `<div>`'s own computed `color` (inherited/unset → the
+feed's base `#eee`), not the nested `.team-feed-agent` `<span>`'s inline
+`color` — CSS `currentColor` never looks at a descendant. The design doc's
+own accompanying rationale for that CSS (that it would "pick up" the agent
+color) doesn't hold up; the CSS itself was implemented exactly as specified,
+per this file's original "Key decisions" note above.
+
+Fixed in `app/app.py`'s `renderTeamFeedEvent()`: for `kind === 'member-joined'`
+specifically, the same `color` value already computed via `teamAgentColor(e.agent)`
+(previously only applied to the `.team-feed-agent` span) is now also applied
+as an inline `style="border-left-color:..."` on the OUTER
+`<div class="team-feed-event kind-member-joined">` itself, overriding the
+CSS's own (now-irrelevant for this kind) `currentColor` value via normal
+inline-style specificity. No CSS rule was removed — `border-left: 3px solid
+currentColor` is left in place as the harmless base declaration for every
+other kind (matching `kind-human-message`'s own pattern of a fixed,
+non-`currentColor` border color, which never had this bug). Every other
+event kind is untouched (`borderStyle` is only computed/emitted for
+`member-joined`).
+
+Verified structurally (not just by trusting the diff): added a new frontend
+test (`tests/test_team_frontend.js`, "a member_joined feed event's outer row
+carries an inline border-left-color matching the joined agent's own
+established color") that calls `renderTeamFeedEvent()` directly for TWO
+different agents (`aider`, `codex` — deliberately different palette buckets
+via `teamAgentColor()`'s hash), and for each asserts (a) the outer
+`kind-member-joined` div's own opening tag contains
+`style="border-left-color:<that agent's color>"`, and (b) the nested
+`.team-feed-agent` span still carries the same color — i.e. the border and
+the name text now agree, for more than one agent, not just one. Wrote the
+test first, ran it red (`AssertionError ... got attrs: ` — confirming the
+outer div carried no style attribute at all before the fix), then made the
+minimal `renderTeamFeedEvent()` change above and reran it green.
+
+No new color-value trust concern: `teamAgentColor()`'s return is always one
+of six hardcoded hex literals from `TEAM_AGENT_PALETTE` (never
+attacker/agent-name-controlled beyond which bucket it hashes into), so
+embedding it unescaped into the inline `style` attribute carries the same
+(pre-existing, already-accepted) trust profile as the untouched
+`.team-feed-agent` span's own identical `style="color:...` usage two lines
+below it.
+
+Full suite: `python3 -m unittest discover -s tests` → 1194 tests, OK
+(unchanged count — this fix touched no backend/Python code, only the
+`renderTeamFeedEvent()` JS function embedded in `app/app.py`'s
+`PAGE_TEMPLATE` string). `TOTP_SECRET=... node tests/test_team_frontend.js`
+→ 104/104 PASS (103 baseline + 1 new).

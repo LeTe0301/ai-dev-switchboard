@@ -771,10 +771,13 @@ class TeamStopEndpointTests(_RealHTTPTeamTestCase):
         # refuses, so composition is None here (no saved composition
         # either). "waiting_on_you" (backlog item 6f part 1) is additive
         # too -- False, no run at all. "escalation_kind" (backlog item 7
-        # part 2) is additive too -- None, no run at all.
+        # part 2) is additive too -- None, no run at all. "members"/"lead"
+        # (backlog item 21 part 2) are additive too -- []/None, no run at
+        # all (run is None, so both fall to their no-run defaults).
         self.assertEqual(by_name[_PROJ]["team"],
                          {"status": "idle", "run_id": None, "composition": None,
-                          "waiting_on_you": False, "escalation_kind": None})
+                          "waiting_on_you": False, "escalation_kind": None,
+                          "members": [], "lead": None})
 
     def test_stop_on_blocked_board_write_now_actually_stops(self):
         # docs/spec.md §4 (backlog item 7 part 2) -- the disclosed no-op gap
@@ -950,6 +953,69 @@ class StatusRosterAndCompositionTests(_RealHTTPTeamTestCase):
             s = self._get_status(cookie)
             by_name = {i["name"]: i for i in s["instances"]}
             self.assertEqual(by_name[_PROJ]["team"]["escalation_kind"], expected, raw_status)
+
+    def test_team_max_members_top_level_field(self):
+        # Backlog item 21 part 2, docs/spec.md "Proposed approach" §1 -- a
+        # single global constant, present unconditionally (even with no
+        # project at all), same "computed once, shipped once" treatment
+        # "roster" already gets.
+        self._project(_PROJ)
+        cookie = self._login()
+        s = self._get_status(cookie)
+        self.assertEqual(s["team_max_members"], teamsmod.TEAM_MAX_MEMBERS)
+
+    def test_members_and_lead_reflect_live_roster_not_the_saved_composition(self):
+        # Backlog item 21 part 2, docs/spec.md "Proposed approach" §1 --
+        # inst.team.members/inst.team.lead are read straight off the run's
+        # own persisted state (run["members"]/run["lead"]), NOT re-derived
+        # from the saved/default picker composition, which add_team_member()
+        # (part 1) deliberately never touches.
+        repo = self._project(_PROJ)
+        result = teamsmod.launch_team(
+            repo, "task", {"kind": "engine", "name": "lead2", "tier": 2}, ["helper"])
+        run_id = result["run_id"]
+        # A saved composition that differs from the live run -- proves
+        # members/lead come from the run, not from composition.
+        teamsmod.save_composition(_PROJ, {"kind": "engine", "name": "someone-else"},
+                                  [{"kind": "engine", "name": "another"}])
+        cookie = self._login()
+        s = self._get_status(cookie)
+        by_name = {i["name"]: i for i in s["instances"]}
+        self.assertEqual(by_name[_PROJ]["team"]["members"], ["helper"])
+        self.assertEqual(by_name[_PROJ]["team"]["lead"], {"kind": "engine", "name": "lead2", "tier": 2})
+        self.assertNotEqual(by_name[_PROJ]["team"]["composition"],
+                            {"lead": {"kind": "engine", "name": "lead2", "tier": 2}, "members": ["helper"]})
+
+    def test_members_grows_once_add_team_member_drains_at_the_next_round(self):
+        # Backlog item 21 part 2 -- add_team_member() itself deliberately
+        # never touches run.json/state["members"] (part 1's own "Key
+        # decisions"), so /status must still report the OLD roster right
+        # after the add call, and only the NEW roster once team_step()'s own
+        # membership drain has actually run (simulated here directly on the
+        # persisted state, mirroring how the real drain updates it).
+        repo = self._project(_PROJ)
+        _write_engine_file(self.engines_dir, "helper2.engine", """\
+            LABEL=Helper2
+            CMD=unused
+            HEADLESS_CMD=echo unused
+            HEADLESS_FORMAT=plain
+            HEADLESS_PROMPT=arg
+            """)
+        result = teamsmod.launch_team(repo, "task", {"kind": "ollama", "name": "m", "tier": 1}, [])
+        run_id = result["run_id"]
+        cookie = self._login()
+        add_result = teamsmod.add_team_member(run_id, "helper2")
+        self.assertTrue(add_result["ok"], add_result)
+        s = self._get_status(cookie)
+        by_name = {i["name"]: i for i in s["instances"]}
+        self.assertEqual(by_name[_PROJ]["team"]["members"], [],
+                         "must not report the new teammate before the drain runs")
+        state = teamsmod._load_state(run_id)
+        state["members"] = ["helper2"]
+        teamsmod._persist(state)
+        s2 = self._get_status(cookie)
+        by_name2 = {i["name"]: i for i in s2["instances"]}
+        self.assertEqual(by_name2[_PROJ]["team"]["members"], ["helper2"])
 
 
 # ─── GET /projects/<name>/team/grounding (backlog item 6e) ─────────────────
@@ -1149,6 +1215,38 @@ class TeamEventsEndpointTests(_RealHTTPTeamTestCase):
         cookie = self._login()
         status, payload = self._get(f"/projects/{_PROJ_B}/team/events?run_id={run_a}", cookie)
         self.assertEqual(status, 404)
+
+    def test_membership_jsonl_merged_tagged_with_the_joined_agents_own_name(self):
+        # Backlog item 21 part 2, docs/spec.md "Proposed approach" §2 --
+        # membership.jsonl (part 1's add_team_member() own append-only log)
+        # is now merged into the same chronologically-sorted feed as lead/
+        # human/teammate logs, tagged with the JOINED agent's own name (not
+        # a generic "membership" pseudo-agent) -- the "membership" file-list
+        # label is only a cursors-dict key/malformed-line fallback.
+        run_id = self._make_run(members=["claude"])
+        _append_jsonl(teamsmod._transcript_path(run_id),
+                     _envelope("lead", 1, text="delegate", ts="2026-01-01T00:00:00Z"))
+        _append_jsonl(teamsmod._membership_log_path(run_id),
+                     {"ts": "2026-01-01T00:00:01Z", "agent": "aider", "seq": 1,
+                      "kind": "member_joined", "worktree": "/tmp/wt-aider"})
+        cookie = self._login()
+        status, payload = self._get(f"/projects/{_PROJ}/team/events", cookie)
+        self.assertEqual(status, 200)
+        joined = [e for e in payload["events"] if e["kind"] == "member_joined"]
+        self.assertEqual(len(joined), 1)
+        self.assertEqual(joined[0]["agent"], "aider")
+        self.assertIn("membership", payload["cursors"])
+
+    def test_no_membership_jsonl_yet_degrades_to_no_membership_events_not_an_error(self):
+        # membership.jsonl not existing yet (no add_team_member() call for
+        # this run) -- tail_jsonl_events()'s own existing FileNotFoundError
+        # handling already covers this, same as any other never-written log.
+        run_id = self._make_run()
+        cookie = self._login()
+        status, payload = self._get(f"/projects/{_PROJ}/team/events", cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["events"], [])
+        self.assertEqual(payload["cursors"].get("membership"), 0)
 
     # ── run_id path-traversal validation (docs/BACKLOG.md item 11(b)) ───
 
