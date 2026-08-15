@@ -1,3 +1,307 @@
+# Implementation: Backlog item 7 part 2 -- web UI for approving/rejecting board_write proposals
+
+## Summary
+Extended the Teams page's existing `blocked_ask_user` web UI to also handle
+`blocked_board_write` runs, reusing part 1's already-shipped
+`resolve_board_write()` and the `inbox.json` `kind` discriminator exactly
+where their shapes already match `ask_user`'s, and adding new
+verb-specific (`set_status`/`amend_description`/`append_comment`)
+presentation only where a board-write proposal's own shape needs it. Backend:
+a new `escalation_kind` field on `/status`, a new `blocked_board_write`
+branch on `GET .../team/inbox` (with a best-effort Taiga subject-enrichment
+read), a new `POST /projects/<name>/team/board-resolve` route, and a
+one-tuple fix closing `POST .../team/stop`'s disclosed no-op gap. Frontend:
+status-strip copy distinction, a verb-specific proposal panel (Approve/
+Reject, no free-text field), `doTeamBoardResolve()` wired through the
+existing TOTP-retry machinery, and two new merged-event-feed classifiers
+(`board-write-proposal`/`board-write-resolved`) checked ahead of the
+existing generic `tool_use`/`meta.resolved` branches per the spec's called-
+out ordering requirement.
+
+## Root cause
+Not applicable (new feature, not a bugfix).
+
+## Changes by file
+- `app/app.py`:
+  - `/status` handler -- `team_status` map gains `"blocked_board_write":
+    "blocked"`; `waiting_on_you` now also true for `"blocked_board_write"`;
+    new `escalation_kind` field (`"ask_user"`/`"board_write"`/`None`), a
+    direct string comparison against the already-loaded `run["status"]`,
+    no extra read.
+  - `_handle_team_inbox()` -- new `blocked_board_write` branch, factored
+    into a sibling `_handle_team_inbox_board_write(state)` (mirrors the
+    ask_user branch's own missing/malformed-inbox fallback discipline
+    exactly), plus a best-effort `teams.taiga_board.resolve_session()` +
+    `get_userstory()` subject-enrichment read (catches
+    `teams.taiga_board.TaigaPushError`, degrades to omitting `"subject"`
+    -- never a 500, never blocks Approve/Reject). Calls through
+    `teams.taiga_board`, not a separately-imported module, matching
+    `tests/test_teams_board.py`'s own established "monkeypatch the module
+    the caller imports it through" convention (`app/teams.py` already
+    does `import taiga_board` at module level; `app/app.py` already does
+    `import teams`, so `teams.taiga_board` is the one live reference).
+  - New `POST /projects/<name>/team/board-resolve` route in `do_POST()`
+    -- mirrors `/team/resolve`'s validation shape exactly (unknown
+    project 404; empty `run_id` falls back to
+    `teams.latest_run_for_project()`; non-empty `run_id` validated via
+    `teams._RUN_ID_RE` then ownership-checked; `status !=
+    "blocked_board_write"` -> 400; `action not in ("approve", "reject")`
+    -> 400 before calling `resolve_board_write()`; the same defensive
+    "a team thread is already running" 400 check; on success, starts
+    `_run_team_in_background()` on a new thread exactly like
+    `/team/resolve` does).
+  - `POST .../team/stop` -- one-tuple fix: `("running", "blocked_ask_user")`
+    -> `("running", "blocked_ask_user", "blocked_board_write")`, closing
+    part 1's disclosed no-op gap.
+  - Frontend JS (inline in the page template):
+    - `renderTeamStatusStrip()` -- branches on `team.escalation_kind` when
+      `blocked && waiting_on_you`: "⚠ Board write pending approval" for
+      `board_write`, unchanged "⚠ Waiting on you" for `ask_user`.
+    - `renderEscalationPanel()` -- shared fetch/cache/loading/fetch-failure
+      preamble unchanged; the "already resolved" race message now branches
+      on `escalation_kind` for distinct copy (`board_write`: "This
+      proposal was already approved or rejected."; `ask_user`'s own text
+      byte-for-byte unchanged); then branches to a new
+      `renderBoardWriteEscalationPanel(name, cached)` for `board_write`,
+      the existing ask_user form body otherwise unchanged.
+    - New `renderBoardWriteEscalationPanel()` -- verb-specific summary line
+      (`set_status`: "Move **subject** from **current** to **proposed**.";
+      `amend_description`: "Replace **subject**'s description" + Current/
+      Proposed `<textarea readonly>` comparison blocks; `append_comment`:
+      "Add a comment to **subject**" + a single Comment-text block, no
+      current-value comparison), lead's note (truncated to 200 chars,
+      existing precedent) if non-null, and Approve/Reject buttons -- no
+      free-text field. Subject falls back to `#ref` when the enrichment
+      read failed.
+    - New `truncateText(text, max)` helper, the 200-char-plus-ellipsis
+      precedent extracted from `teamFeedEventBody()`'s own fact-check-match
+      rendering (used for the panel's one-line summary/note; the longer
+      description/comment comparison blocks instead rely on the scrollable
+      `max-height: 200px` box itself per docs/design.md, not hard
+      truncation).
+    - New `doTeamBoardResolve(name, action)` -- clears the row's message
+      slot, records `action` into a new client-side map
+      `teamBoardResolveAction[name]` (same "small map keyed by name,
+      survives a TOTP retry" pattern `teamEscalationOther` already
+      establishes -- see "Key decisions" below for why this was chosen
+      over `pendingToggle`), then `toggle('team-board-resolve', name,
+      true, null)`.
+    - `actionPath()`/`actionBody()`/`handleActionResult()` gain
+      `'team-board-resolve'` cases: path
+      `/projects/<name>/team/board-resolve`; body `{action:
+      teamBoardResolveAction[name]}`; result handling mirrors
+      `'team-resolve'`'s own inline-message-slot pattern exactly (success:
+      "✓ Board write resolved", clears the inbox cache; failure: "✕ Error:
+      ..."). The 428-overlay label switch gains `'Resolving board write: '
+      + name`.
+    - `teamFeedEventKindClass()`/`teamFeedEventBody()` gain two new checks,
+      placed **before** the existing generic `tool_result`+`meta.resolved`
+      -> `'resolved'` branch per the spec's called-out ordering
+      requirement: `tool_use` + `meta.verb !== undefined` ->
+      `'board-write-proposal'`; `tool_result` + `meta.approved !==
+      undefined` -> `'board-write-resolved'` (parses
+      `resolve_board_write()`'s own literal `outcome_summary`/
+      `full_result_text` strings to distinguish "approved and applied" /
+      "approved but Taiga rejected: ..." / "rejected by human").
+    - New CSS: `.team-escalation-proposal`/`-summary`/`-label`/`-box`/
+      `-note`, reusing every existing color/spacing token
+      (`.team-escalation`'s own wrapper, `#0a0a0a`/`#333`/`#ccc` for the
+      read-only comparison boxes per docs/design.md's own accessibility
+      analysis) -- no new components, no new libraries.
+- `tests/test_team_routes.py`:
+  - `TeamStopEndpointTests`: `test_status_maps_every_run_status_to_the_
+    coarse_label` extended with `"blocked_board_write": "blocked"`; new
+    `test_stop_on_blocked_board_write_now_actually_stops`.
+  - `test_status_idle_when_no_run_ever_started` updated for the new
+    `escalation_kind: None` field (exact-dict-equality regression).
+  - `StatusRosterAndCompositionTests`: `test_waiting_on_you_true_only_for_
+    blocked_ask_user_never_for_escalated_max_rounds` extended with
+    `"blocked_board_write": True`; new `test_escalation_kind_field`.
+  - `TeamInboxEndpointTests`: new board_write-branch tests (exact persisted
+    shape + subject enrichment; Taiga-unreachable graceful degradation;
+    missing/malformed inbox.json fallback) plus a regression test pinning
+    the ask_user branch's response shape byte-for-byte.
+  - New `TeamBoardResolveEndpointTests` class, mirroring
+    `TeamResolveEndpointTests`'s own structure/naming (unknown project;
+    wrong status; invalid/missing action; cross-project run_id; path-
+    traversal run_id; TOTP 428/403; approve/reject each resolving and
+    starting the background thread; a genuine two-concurrent-approves race
+    proving exactly one winner).
+  - New module-level `_patch_taiga_board()` test helper, mirroring
+    `tests/test_teams_board.py`'s own helper of the same name/shape exactly
+    (monkeypatches `teamsmod.taiga_board`'s named attributes for one test,
+    restored via `addCleanup`).
+- `tests/test_team_frontend.js`: new tests for the board_write status-strip
+  copy; `renderEscalationPanel()`'s three verb-specific layouts (including
+  the `#ref` fallback and the distinct "already resolved" race copy);
+  `doTeamBoardResolve()`'s approve/reject dispatch, success/error result
+  handling, and 428-then-retry (asserting the retried request resends the
+  *same* action the operator originally clicked); `teamFeedEventKindClass()`/
+  `teamFeedEventBody()`'s two new classifiers for all three resolution
+  outcomes, plus a regression test proving an ask_user-shaped
+  `tool_result` (`meta.resolved` only, no `meta.approved`) still renders
+  the unchanged generic `'resolved'`/`'Answer: ...'` output.
+
+## Key decisions / tradeoffs
+- **`doTeamBoardResolve()`'s TOTP-retry plumbing** (spec's own "Open
+  questions", left as a developer judgment call): chose the "small
+  client-side map keyed by name" pattern (`teamBoardResolveAction[name]`,
+  set before `toggle()`'s first optimistic POST) over reading the global
+  `pendingToggle` context inside `actionBody()`. Reason: `pendingToggle` is
+  only populated once a 428 has actually been seen (`handleActionResult()`
+  sets it inside the `r.status === 428` branch) -- `actionBody()` is also
+  called on the very FIRST, optimistic (no-code) POST, before any 428 has
+  happened, at which point `pendingToggle` is still `null`/stale from a
+  previous action. A client-side map keyed by name, set synchronously by
+  `doTeamBoardResolve()` before `toggle()` is ever called, is correct on
+  both the first attempt and any retry -- exactly the same reasoning
+  `team-start`'s own task/lead/members fields already apply (read from a
+  live DOM element/client-side mirror, never from `pendingToggle`).
+- **Truncation**: used the spec's own 200-char default (matching
+  `teamFeedEventBody()`'s existing fact-check-match precedent) for the
+  one-line proposal summary and the lead's note, but relied on the
+  description/comment comparison blocks' own `max-height: 200px;
+  overflow-y: auto` scrollable box (per docs/design.md's explicit
+  recommendation) rather than a second, harder text truncation for those
+  -- the box itself already bounds the panel's vertical footprint
+  regardless of how long the underlying text is, so a second truncation
+  layer would only lose information without solving a layout problem the
+  scroll box doesn't already solve.
+- **Subject enrichment read placement**: implemented as a private sibling
+  method `_handle_team_inbox_board_write(state)` rather than inlining a
+  second branch into `_handle_team_inbox()` itself -- keeps the existing
+  ask_user branch's own code path completely untouched (byte-for-byte,
+  confirmed by a dedicated regression test) and keeps the new branch's
+  own missing/malformed-inbox fallback logic (which is structurally
+  different from ask_user's -- different field names, a different
+  fallback shape) legible on its own rather than interleaved with it.
+- **Approve/Reject button styling**: reused the existing `.team-btn` class
+  verbatim for both buttons (same class the ask_user panel's own "Submit
+  answer" button, "Start team", "Stop team", and "Deploy" already use) --
+  docs/design.md's own accessibility section speculates about a
+  `#4da6ff`/blue button background, but no such button variant exists
+  anywhere else on this page; `.team-btn`'s actual shipped
+  green/`#34c759` background already satisfies "both primary-style, not
+  Approve highlighted and Reject greyed" (both buttons render identically),
+  so reusing it exactly (per this project's "match existing conventions,
+  don't invent a new component" discipline) was chosen over introducing a
+  new button variant color the rest of the page doesn't have.
+
+## Deviations from spec
+None substantive. Two of the spec's own explicitly-left-open points were
+resolved during implementation, both recorded above under "Key decisions"
+rather than left ambiguous:
+- `doTeamBoardResolve()`'s exact TOTP-retry plumbing mechanism (spec's
+  "Open questions" -- explicitly a developer's call).
+- Exact truncation length/strategy for long `value`/`note`/
+  `current_value.description` text (spec's "Open questions" -- explicitly
+  "not a blocker either way").
+
+One minor, disclosed wording deviation from docs/design.md's own ASCII
+mockups: the board-write-proposal event-feed line (§6, `teamFeedEventBody()`)
+literally reuses the transcript's own `args_summary` text as its trailing
+segment (e.g. `board_write (set_status): ref #42 — board_write(set_status,
+ref=42)`), per the spec's own explicit formula (`'board_write (' +
+meta.verb + '): ref #' + meta.ref + ' — ' + esc(e.text)`, "reusing the
+transcript's own args_summary text, already verb/ref-specific") -- not the
+design doc's more polished illustrative example text ("— 'Move to In
+progress per delegate'"), which does not correspond to any string the
+backend actually persists in this transcript entry's `text` field
+(`team_step()`'s own `board_write` branch sets it to exactly
+`args_summary`, not the proposal's `note`). Implemented per the spec's
+literal, backend-accurate formula rather than the design doc's
+illustrative (but not backend-derived) copy.
+
+## Known limitations
+- Same live-Taiga-instance caveat part 1 already disclosed: no live Taiga
+  server was reachable in this sandbox, so the subject-enrichment read's
+  exact behavior against a real board (response shape, timing) is verified
+  only via the same monkeypatched-`teams.taiga_board` seam part 1's own
+  tests already established, not against a live instance.
+- The board-write proposal panel's Approve/Reject buttons are visually
+  identical (both `.team-btn`, both green) per docs/design.md's own "both
+  primary-style" requirement -- an operator relies on the button *label*,
+  not color, to distinguish them. This matches the existing page's own
+  established pattern (Start/Stop/Deploy/Submit-answer all share this one
+  button style) and was a deliberate "match existing conventions" choice,
+  not an oversight, but is worth naming explicitly since docs/design.md's
+  accessibility section briefly speculated about a different color.
+
+## How to verify locally
+```
+# Full existing suite, including this cycle's new/extended tests, all green:
+python3 -m unittest discover -s tests -v
+
+# Just this cycle's new/extended backend route tests:
+python3 -m unittest tests.test_team_routes -v
+
+# Frontend tests (extracts the real, rendered <script> from
+# app.render_page() via a Python subprocess, runs it in a Node vm sandbox
+# with stub document/fetch/confirm -- no browser, no headless Chrome):
+node tests/test_team_frontend.js
+
+# Manual smoke test against a real run (requires
+# ~/.config/ai-dev-switchboard/taiga-push.env for the subject-enrichment
+# read to succeed -- omitting it still works, "subject" is simply absent):
+#   1. Start the app.py server, log in, clear the TOTP gate once.
+#   2. Start a team whose lead calls board_write (or drive one manually via
+#      the CLI's team-start, then have the lead call board_write).
+#   3. Refresh the Teams page -- status strip should read "⚠ Board write
+#      pending approval", not the old "idle" fallback.
+#   4. The escalation panel should show the verb-specific proposal
+#      (subject from Taiga if reachable, else "#<ref>"), with Approve/
+#      Reject buttons and no free-text field.
+#   5. Click Approve or Reject -- confirm the TOTP overlay appears on the
+#      first mutating action of the session, and that the row's message
+#      slot shows "✓ Board write resolved" (or a clear error).
+#   6. Click "Stop team" while a board_write proposal is still pending on
+#      a different run -- confirm it actually stops (session_removed/
+#      worktrees in the response), not the old silent no-op message.
+```
+
+## Post-review fix (test-review.md must-fix #1)
+`docs/test-review.md`'s item 7 part 2 review found (verdict: changes
+requested) that `TeamBoardResolveEndpointTests.test_approve_resolves_and_
+starts_background_thread` and `test_reject_resolves_and_starts_background_
+thread_no_taiga_call` never actually verified the "starts the background
+driving thread" half of their own name/criterion -- every assertion in both
+tests was satisfied by `resolve_board_write()`'s own synchronous side
+effects (inbox move, history entry) alone, proven via the reviewer's
+revert-and-fail (deleting the route's entire `cancel_event`/`Thread`/
+`_team_threads_set()`/`t.start()` block left all 12 tests in the class
+passing). The route's production code in `app/app.py` was already correct
+(confirmed to mirror `/team/resolve`'s dispatch exactly) -- this was a
+test-coverage gap only, no production code change.
+
+Fixed per the reviewer's recommended fix (a): both tests now install a
+`_record_team_threads()` fixture that rebinds `app.py`'s own module-level
+`threading` name (not the shared `threading` module -- rebinding the
+module's own attribute globally also intercepted `ThreadingHTTPServer`'s
+per-connection threads in an earlier attempt, inflating the recorded count
+to 3) to a thin proxy whose `Thread` is a subclass recording `(target,
+args)` on every construction before delegating to the real
+`threading.Thread`. This lets the background thread still genuinely run
+(so the existing inbox/history assertions stay meaningful) while adding an
+unambiguous, race-free assertion that `_run_team_in_background` was
+constructed with `(name, run_id, cancel_event)` -- stronger than
+`TeamResolveEndpointTests`'s existing `elapsed < 3.0` timing proxy, which a
+fast stub lead could satisfy even with no thread dispatch at all.
+
+Re-verified with the same revert-and-fail technique the reviewer used:
+temporarily removed the route's thread-dispatch block again -- both
+strengthened tests failed (`AssertionError: 0 != 1` on the recorded-thread
+count) while the other 10 tests in the class stayed green; restored the
+block and reran -- all 12 pass again, `git diff --stat app/app.py`
+byte-identical to the pre-probe state (+302/-11, matching the reviewer's
+own probe). Full suites also reran clean: `python3 -m unittest discover -s
+tests` -> `Ran 874 tests` / `OK`; `node tests/test_team_frontend.js` ->
+`ALL PASS (74/74)`.
+
+No change to `app/app.py`, `docs/design.md`, or any other file -- this fix
+is scoped to `tests/test_team_routes.py` only, per the dispatch's explicit
+"do NOT touch the should-fix" instruction (the WCAG contrast finding on
+`.team-btn` is unchanged, still open as a non-blocking follow-up).
+
 # Implementation: Backlog item 7 part 1 -- board_read/board_write on the lead loop (backend)
 
 ## Summary

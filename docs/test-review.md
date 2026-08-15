@@ -231,3 +231,391 @@ disclosed `app.py` blindness to the new status. Full regression suite
 no-op) and two nits do not block this cycle — they're worth a quick
 follow-up note in `docs/implementation.md` but not worth bouncing back to
 the developer for.
+
+---
+
+# Test & Review: Backlog item 7 part 2 — web UI for approving/rejecting board_write proposals
+
+## Scope
+Covers `docs/spec.md`'s newest section (item 7 part 2) and `docs/design.md`'s
+newest section against the uncommitted working tree on
+`backlog/lead-kanban-write-web-7b`: `app/app.py` (313 lines, +302/-11 —
+`/status`'s `escalation_kind`, `_handle_team_inbox()`'s new
+`blocked_board_write` branch + `_handle_team_inbox_board_write()`, new
+`POST .../team/board-resolve` route, `/team/stop`'s one-tuple fix, and the
+frontend JS/CSS), `tests/test_team_routes.py` (+342), `tests/test_team_frontend.js`
+(+270). Confirmed via `git diff --stat` that `app/teams.py`/`app/taiga_board.py`
+are untouched, matching the spec's explicit "call site, not a new function"
+scope.
+
+## Test cases
+
+| # | Criterion / case | Method | Result | Evidence |
+|---|---|---|---|---|
+| 1 | `blocked_board_write` → `/status` reports `status="blocked"`, `waiting_on_you=true`, `escalation_kind="board_write"` | Automated, `test_escalation_kind_field`, `test_waiting_on_you_true_only_for_blocked_ask_user_never_for_escalated_max_rounds` | pass | `python3 -m unittest tests.test_team_routes -v` → OK |
+| 2 | `blocked_ask_user` → `escalation_kind="ask_user"` (regression) | Automated, same `test_escalation_kind_field` cases dict | pass | Same run |
+| 3 | `running`/`finished`/`error`/`stopped`/no-run → `escalation_kind` null/absent | Automated, same test + `test_status_idle_when_no_run_ever_started` | pass | Same run |
+| 4 | `GET .../team/inbox` on `blocked_board_write` returns exact persisted shape + enriched `subject` | Automated, `test_board_write_genuinely_blocked_returns_exact_persisted_proposal_shape_plus_subject` | pass | Same run |
+| 5 | Same but Taiga unreachable → still `pending:true`, `subject` omitted, not a 500 | Automated, `test_board_write_taiga_unreachable_degrades_gracefully_no_subject` | pass | Same run |
+| 6 | `inbox.json` missing/malformed despite `blocked_board_write` → safe fallback, never a 500 | Automated, `test_board_write_missing_inbox_json_still_pending_true_with_fallback`, `test_board_write_malformed_inbox_json_still_pending_true_with_fallback` | pass | Same run |
+| 7 | `blocked_ask_user` branch of `/team/inbox` byte-for-byte unchanged (regression) | Automated, `test_ask_user_branch_response_shape_unchanged_regression` | pass | Same run |
+| 8 | `POST .../team/board-resolve` approve/reject: 200, resolves, resumes | Automated, `TeamBoardResolveEndpointTests.test_approve_resolves_and_starts_background_thread`/`test_reject_resolves_and_starts_background_thread_no_taiga_call` | **pass, but the "starts the background driving thread" half of this criterion is not actually exercised** | See "Review pass" §1 below — confirmed via revert-and-fail that these two tests still pass with the thread-dispatch code entirely removed |
+| 9 | Wrong status / invalid action / missing run / cross-project run_id / path-traversal run_id → 400, no mutation, no thread | Automated, `test_not_blocked_400_no_resolve_call_no_thread`, `test_invalid_action_400_before_resolve_called`, `test_missing_action_400`, `test_no_run_at_all_400`, `test_explicit_run_id_for_a_different_project_400`, `test_path_traversal_run_id_400_planted_file_never_opened_no_thread_started` | pass | Same run |
+| 10 | TOTP 428 (no code) / 403 (wrong code), same shared gate | Automated, `test_totp_428_with_no_code`, `test_totp_403_with_wrong_code` | pass | Same run |
+| 11 | Two concurrent approves: exactly one 200, one 400 | Automated, real-thread, `test_two_concurrent_resolves_exactly_one_succeeds` | pass | Same run |
+| 12 | `POST .../team/stop` now actually stops a `blocked_board_write` run (was a silent no-op) | Automated, `test_stop_on_blocked_board_write_now_actually_stops` | pass — **and independently confirmed load-bearing** | Revert-and-fail: reverted the one-tuple fix (`"running", "blocked_ask_user", "blocked_board_write"` → `"running", "blocked_ask_user"`), reran the test, got a genuine `AssertionError: 'session_removed' not found in {..., 'message': 'no team currently running...'}`; restored, reran, green again |
+| 13 | `renderEscalationPanel()` on `escalation_kind='board_write'` renders verb-specific content (all 3 verbs) + Approve/Reject, no free-text field; `ask_user` path unchanged | Automated, `node tests/test_team_frontend.js` — 5 new panel tests (set_status, `#ref` fallback, amend_description, append_comment, "already resolved" race copy) | pass | `node tests/test_team_frontend.js` → 74/74 |
+| 14 | `doTeamBoardResolve()` dispatches the right action, success/error inline messaging, 428-then-retry resends the same action | Automated, 4 new tests | pass | Same run |
+| 15 | `teamFeedEventKindClass()`/`teamFeedEventBody()` new `board-write-proposal`/`board-write-resolved` classes, checked **before** the generic `tool_result`+`meta.resolved`→`'resolved'` branch; ask_user regression unaffected | Automated, 5 new tests | pass — **and independently confirmed load-bearing (the specific ordering)** | Revert-and-fail: moved the `meta.approved !== undefined` check to *after* the `meta.resolved` check, reran — 3 tests failed exactly as predicted (`board-write-resolved` never matched, fell through to generic `'resolved'`/`'Answer: ...'` instead); restored the correct order, reran — 74/74 green again |
+| 16 | Full existing suite green, no regression | Automated | pass | `python3 -m unittest discover -s tests -v` → `Ran 874 tests in 137.308s` / `OK` (matches the 813 pre-existing baseline + 61 from part 1 already counted there, no reduction) |
+
+## Regression check
+- Full Python suite: `python3 -m unittest discover -s tests -v` → `Ran 874 tests` / `OK`, 0 failures/errors (`grep -c "^FAIL\|^ERROR"` → 0).
+- Full Node suite: `node tests/test_team_frontend.js` → `ALL PASS (74/74)`.
+- `tests.test_team_routes` in isolation: `Ran 95 tests` / `OK`.
+- Two revert-and-fail checks per this project's established discipline (BACKLOG item 9 history) — both confirmed genuinely load-bearing, not vacuous (see test cases #12, #15 above); `git diff --stat app/app.py` confirmed byte-identical to the pre-check state after each restore (+302/-11 both times).
+- A third, self-initiated revert-and-fail check (not one of the two the dispatch prompt named) on the new route's thread-dispatch block found a genuine gap — see "Review pass" §1.
+
+No test run itself failed — proceeding to the review pass. (The one substantive finding below surfaced during independent review verification, not during the testing pass itself, per this role's own testing-pass-vs-review-pass distinction.)
+
+---
+
+## Spec coverage
+
+| Acceptance criterion (`docs/spec.md`) | Implemented | Tested | Notes |
+|---|---|---|---|
+| `/status`: `blocked_board_write` → blocked/waiting_on_you/`escalation_kind="board_write"` | Yes | Yes (#1) | |
+| `/status`: `blocked_ask_user` → `escalation_kind="ask_user"` (regression) | Yes | Yes (#2) | |
+| `/status`: other statuses/no-run → `escalation_kind` null | Yes | Yes (#3) | |
+| `GET .../team/inbox`: board_write branch, exact shape + subject | Yes | Yes (#4) | |
+| `GET .../team/inbox`: Taiga-unreachable graceful degradation | Yes | Yes (#5) | |
+| `GET .../team/inbox`: ask_user branch unchanged | Yes | Yes (#7) | |
+| `POST .../team/board-resolve`: approve returns 200, calls `resolve_board_write` once, **starts the background driving thread** | Yes (code read directly, matches `/team/resolve`'s dispatch exactly) | **No** — see must-fix #1 | The route code is correct; the two tests written for it do not exercise this half of the criterion at all (proven by revert-and-fail) |
+| Same for reject | Yes | **No** — same gap | |
+| Wrong status → 400, zero `resolve_board_write()` calls, no thread | Yes | Yes (#9) | |
+| Invalid action → 400 before calling `resolve_board_write()` | Yes | Yes (#9) | |
+| TOTP 428/403, same shared gate | Yes | Yes (#10) | |
+| `POST .../team/stop` fix | Yes | Yes (#12, revert-and-fail confirmed) | |
+| `renderEscalationPanel()` board_write branch, all 3 verbs, no free-text field; ask_user unchanged | Yes | Yes (#13) | |
+| `doTeamBoardResolve()` approve/reject dispatch, TOTP-retry resending the same action | Yes | Yes (#14) | |
+| `teamFeedEventKindClass()` new classes, correct precedence order | Yes | Yes (#15, revert-and-fail confirmed) | |
+| Full existing suite green | Yes | Yes (#16) | |
+
+17 of 18 acceptance criteria are implemented and independently verified by
+tests I ran myself this session. One (the "starts the background driving
+thread" half of the approve/reject criterion) is implemented correctly but
+not provably covered by any test — see must-fix #1.
+
+## Review pass
+
+### 1. Must-fix: the new route's "starts the background driving thread" tests are vacuous
+`docs/spec.md`'s acceptance criteria explicitly require: "...calls
+`teams.resolve_board_write(run_id, "approve")` exactly once, **and starts the
+background driving thread** (mirroring `/team/resolve`'s own dispatch —
+verified via the same thread-registration check `test_team_routes.py`'s
+existing `/team/resolve` tests use)."
+
+I traced `resolve_board_write()` and confirmed it performs its own
+`os.replace()`/history-append synchronously, *inside* the route handler,
+before the route ever reaches the `cancel_event = threading.Event(); t =
+threading.Thread(...); t.start()` block. That means
+`test_approve_resolves_and_starts_background_thread`'s and
+`test_reject_resolves_and_starts_background_thread_no_taiga_call`'s own
+assertions (inbox moved to `.resolved.json`, exactly one
+`board_write_resolved` history entry) are all satisfied by
+`resolve_board_write()` alone — none of them require the subsequent thread
+dispatch to have happened at all.
+
+I verified this is not a hypothetical concern: I temporarily commented out
+the entire `cancel_event`/`Thread`/`_team_threads_set`/`t.start()` block in
+the new route (leaving only the `{"ok": True, "run_id": run_id}` response),
+reran `tests.test_team_routes.TeamBoardResolveEndpointTests`, and **all 12
+tests, including both "starts_background_thread"-named tests, still passed**.
+I restored the code immediately afterward and reran to confirm the restore
+was clean (`git diff --stat app/app.py` byte-identical to before the probe).
+
+The shipped route code itself is correct — I read it directly and it
+mirrors `/team/resolve`'s dispatch pattern exactly (same
+`_team_threads_get()` defensive check, same `threading.Thread(target=
+_run_team_in_background, ...)`, same `_team_threads_set()`/`t.start()`
+sequence). This is a test-coverage gap, not a functional bug. I also
+checked whether `TeamResolveEndpointTests`' own precedent test
+(`test_genuinely_blocked_valid_answer_resolves_and_returns_immediately`)
+provides a real template to copy: it adds one thing these two new tests
+don't — an `elapsed < 3.0` fast-return timing assertion, intended as
+indirect proof the POST didn't block for the full driving loop. No
+existing test in this file (for `/team/start`, `/team/resolve`, or now
+`/team/board-resolve`) asserts `_team_threads_get()` is *populated* on a
+success path (the three existing `_team_threads_get()` call sites all check
+the *rejection* paths, confirmed by grep) — so the spec's own premise that
+this "verified via the same thread-registration check" precedent already
+exists is not quite accurate either; the closest existing precedent is the
+weaker timing proxy, and even that is missing from the two new tests here.
+
+**Recommended fix**: add a deterministic check to both success-path tests —
+either (a) monkeypatch `appmod.threading.Thread` (or `appmod
+._run_team_in_background`) for the duration of the test to record it was
+invoked with `(name, run_id, cancel_event)`, which is unambiguous and
+race-free, or (b) at minimum mirror `/team/resolve`'s own `elapsed < 3.0`
+timing proxy for consistency with existing precedent. (a) is preferable
+since a fast stub lead could complete in well under 3 seconds whether or
+not it was ever actually threaded, making (b) a weak signal on its own.
+
+### 2. Should-fix (non-blocking): Approve/Reject button contrast — design doc's own claim is inaccurate, and the actual implemented color fails WCAG
+Recomputed WCAG relative-luminance contrast from the literal hex values
+rather than trusting `docs/design.md`'s "Accessibility & platform notes"
+section, per this role's own mandate:
+- `docs/design.md` claims: "Action button text: `#ffffff` on `#4da6ff`
+  (action button background, reused from existing buttons) = 9.15:1
+  (passes WCAG AA for large button text)."
+- This is inaccurate on two counts. First, `#4da6ff` is not the color the
+  implementation (or any existing button on this page) actually uses —
+  `docs/implementation.md`'s own "Key decisions" section discloses that the
+  developer deliberately reused the existing `.team-btn` class verbatim
+  (background `#34c759`, per `app/app.py` line ~1701, the same class
+  Start/Stop/Deploy/Submit-answer already share), not a new `#4da6ff`
+  variant. Second, recomputing contrast for the color that *is* actually
+  used — white `#ffffff` text on `#34c759` — gives **≈2.22:1**
+  (relative luminances 1.0 and 0.4232; `(1.0+0.05)/(0.4232+0.05) ≈ 2.22`),
+  which fails WCAG AA for text (4.5:1) and fails even the 3:1 threshold for
+  large/graphical elements.
+- This is **not a new regression** — `.team-btn`'s white-on-`#34c759`
+  styling is inherited unchanged from 6d part 2a (Start/Stop/Deploy) and 6f
+  part 2 (Submit answer), both already reviewed and approved in earlier
+  cycles this session, and the developer's choice to reuse it verbatim here
+  (rather than inventing a new button color) is the right scope-discipline
+  call, explicitly disclosed in "Known limitations." But this diff does
+  extend the same low-contrast text to two more interactive controls
+  (Approve/Reject), and the design doc's own accessibility section makes a
+  factually wrong "passes AA" claim for this cycle specifically.
+- I independently re-verified the design doc's *other* contrast claims for
+  this cycle (status-strip `#ffb648`-on-`#1c1c1c` = 9.77:1; proposal text
+  `#ffffff`-on-`#1c1c1c` ≈ 21:1; message-slot success `#34c759`-on-`#1c1c1c`
+  = 7.68:1; error `#ff6b6b`-on-`#1c1c1c` = 6.14:1) and all of those compute
+  correctly and do pass — only the button-text-on-button-background claim
+  is wrong, both in which color it names and in whether the actual color
+  passes.
+- **Recommendation**: not a blocker for this narrow feature (label text,
+  not color, already distinguishes Approve from Reject, and fixing it
+  ad hoc for just these two buttons would create a new visual
+  inconsistency with Start/Stop/Deploy/Submit-answer). File a follow-up
+  backlog item to fix `.team-btn`'s contrast project-wide in one pass, and
+  correct `docs/design.md`'s accessibility section to reflect the actual
+  shipped color rather than the unused `#4da6ff`.
+
+### 3. Correctness: the two disclosed deviations, independently verified
+- **`teamBoardResolveAction[name]` map instead of `pendingToggle`**:
+  confirmed sound by reading `toggle()`/`handleActionResult()` directly.
+  `toggle(kind, name, on, checkboxEl)`'s fourth parameter is specifically
+  `checkboxEl` (used only to revert an on/off switch's checked state on
+  cancel, line ~3200), not a generic context bag — `pendingToggle` is set
+  to `{kind, name, on, checkboxEl}` only inside `handleActionResult()`'s
+  `r.status === 428` branch (line 2973), so it is `null`/stale on the very
+  first optimistic POST. The design doc's own suggested `actionBody()`
+  snippet (`const ctx = pendingToggle || {}; body.action = ctx.action;`)
+  would in fact never work as written — `pendingToggle.action` is never a
+  top-level property under any code path, only `pendingToggle.checkboxEl`
+  is populated from the fourth `toggle()` argument, and even that only
+  after a 428. The developer's chosen alternative is not just "a reasonable
+  choice between two working options" as the design doc frames it — it is
+  the *only* one of the two that actually functions, and the 428-then-retry
+  test (test case #14) confirms the retry resends the correct action.
+- **`args_summary` reused verbatim instead of the design doc's illustrative
+  feed-line text**: confirmed by reading `app/teams.py` line 3008/3052
+  directly — the proposal's transcript entry is literally
+  `("tool_use", args_summary, {"verb": verb, "ref": ref})` where
+  `args_summary = f"board_write({verb}, ref={ref})"`. The lead's `note` is
+  never placed into this transcript entry's `text` field anywhere in
+  `team_step()`'s `board_write` branch. The developer's implementation
+  matches `docs/spec.md` §6's own literal formula
+  (`'board_write (' + meta.verb + '): ref #' + meta.ref + ' — ' + esc(e.text)`)
+  exactly — this is compliance with the spec over a design-doc mockup that
+  turned out not to correspond to any backend-persisted string, correctly
+  disclosed as such, not a defect.
+
+### 4. TOTP gating and `resolve_board_write()` call correctness (specifically requested checks)
+- The new route sits inside the same `do_POST()` dispatch chain, after the
+  single shared TOTP gate at the top of the method (`session_totp_ok`/428/403,
+  lines ~4454-4470) that every other mutating route (`/team/start`,
+  `/team/stop`, `/team/resolve`) already passes through — there is no
+  separate/duplicated gating logic for the new route, confirmed by reading
+  `do_POST()` top-to-bottom.
+- Validation order/shape is byte-for-byte structurally identical to
+  `/team/resolve`'s own route (unknown project 404 → empty-`run_id`
+  fallback via `latest_run_for_project()` → `_RUN_ID_RE` validation →
+  `_load_state()` → ownership check → status check → the route-specific
+  body validation → the "already running" defensive check → thread
+  dispatch), confirmed by reading both route bodies side by side.
+- `teams.resolve_board_write(run_id, action)` is called with exactly the
+  signature `resolve_board_write(run_id: str, action: str)` defined in
+  `app/teams.py` line 4085 — confirmed by grep and by direct comparison of
+  the call site's two positional arguments against the function signature.
+
+### 5. Simplicity
+No unnecessary abstraction. `_handle_team_inbox_board_write()` as a sibling
+method (rather than inlining into `_handle_team_inbox()`) is a reasonable,
+disclosed choice that keeps the unchanged `ask_user` branch legible and
+literally untouched (confirmed by the passing byte-for-byte regression
+test). `truncateText()` is a small, genuinely-reused extraction, not a new
+abstraction layer. No new libraries, no new CSS components beyond what
+`docs/design.md` itself calls for.
+
+### 6. Security
+- Every new interpolated value in `renderBoardWriteEscalationPanel()`
+  (`subject`, `cur`, `cached.value`, `curDesc`, `cached.note` via
+  `truncateText()`, `cached.ref` in the `#ref` fallback) is passed through
+  `esc()` (confirmed `esc()`'s implementation uses
+  `textContent`/`innerHTML`, a real HTML-escaping mechanism, not a
+  hand-rolled regex) — no new XSS surface.
+- `name` is interpolated unescaped into the `onclick="doTeamBoardResolve('...',...)"` attribute
+  strings for the two new buttons — matches the exact pre-existing
+  convention `doTeamResolve()`/`doTeamStart()`/`doTeamStop()` already use
+  identically elsewhere on this page (project names are constrained at
+  creation time), not a new or widened surface introduced by this diff.
+- The subject-enrichment Taiga read (`_handle_team_inbox_board_write()`) is
+  read-only, wrapped in `except teams.taiga_board.TaigaPushError: pass`,
+  and never touches `version` or performs a write — matches the spec's own
+  "read, not proposal-affecting" requirement.
+- The approval gate is unchanged from part 1 (already reviewed): the new
+  route only ever calls `resolve_board_write()`, never a `taiga_board`
+  write function directly.
+
+## Findings (ranked)
+
+1. **Must-fix** — `tests/test_team_routes.py`'s
+   `test_approve_resolves_and_starts_background_thread` and
+   `test_reject_resolves_and_starts_background_thread_no_taiga_call` do not
+   verify the "starts the background driving thread" half of their own
+   acceptance criterion. Confirmed via revert-and-fail: both tests (and the
+   whole `TeamBoardResolveEndpointTests` class) still pass with the route's
+   entire `cancel_event`/`Thread`/`_team_threads_set()`/`t.start()` block
+   removed. The shipped route code is correct (verified by direct reading
+   against `/team/resolve`'s identical pattern); only the tests need
+   strengthening. See "Review pass" §1 for the recommended fix.
+2. **Should-fix** — Approve/Reject buttons (`.team-btn`, white text on
+   `#34c759`) compute to ≈2.22:1 contrast, failing WCAG AA; `docs/design.md`'s
+   own accessibility section makes an inaccurate "9.15:1, passes AA" claim
+   against a `#4da6ff` background that isn't actually used anywhere on this
+   page. Inherited from already-approved earlier cycles (6d part 2a, 6f
+   part 2), not a new regression, and correctly reusing existing convention
+   is the right scope-discipline call for this diff — but this does extend
+   the underlying issue to two more controls. Recommend a follow-up backlog
+   item to fix `.team-btn`'s contrast project-wide, plus a correction to
+   `docs/design.md`'s accessibility section. See "Review pass" §2.
+3. **Nit** — none beyond the above; the rest of the diff (validation order,
+   TOTP gating, escaping, the two disclosed deviations, the ordering-critical
+   event-feed fix, the `/team/stop` fix) all independently checked out under
+   direct code reading and/or revert-and-fail.
+
+## Overall verdict: **Changes requested**
+
+Every acceptance criterion is either fully implemented-and-tested (17/18) or
+implemented-correctly-but-under-tested (1/18, the thread-dispatch half of
+the board-resolve success criterion). The one must-fix is a test-strengthening
+task, not a functional bug — the shipped `app/app.py` code correctly starts
+the background driving thread on both approve and reject, mirroring
+`/team/resolve` exactly, confirmed by direct reading. Once
+`TeamBoardResolveEndpointTests`'s two success-path tests are strengthened to
+actually prove the thread dispatch happened (not just that
+`resolve_board_write()`'s own synchronous side effects occurred), this cycle
+should re-enter the reviewer's testing pass to confirm the new assertions are
+themselves genuine (not vacuous), then proceed to approval — the should-fix
+accessibility note does not need to block that.
+
+---
+
+## Re-review: Backlog item 7 part 2 — must-fix #1 fix-and-reapprove round
+
+### Scope
+Covers `tests/test_team_routes.py`'s diff only (the developer's disclosed
+"Post-review fix" in `docs/implementation.md`, scoped to that file alone —
+confirmed no other file changed for this specific fix beyond the two docs
+files the developer itself updates as part of any cycle). Re-verified from
+scratch, not by re-trusting the developer's own revert-and-fail claim.
+
+### What I checked
+1. **Read the actual diff.** `tests/test_team_routes.py` gained a
+   `_record_team_threads()` fixture on `TeamBoardResolveEndpointTests` that
+   rebinds `appmod.threading` (i.e. `app.py`'s own module-level name bound
+   by its `import threading` at line 49 — not the shared `threading` module
+   object) to a thin proxy object whose `Thread` attribute is a subclass
+   recording `(target, args)` on every construction, then delegating to the
+   real `threading.Thread.__init__`/`.start()`. Both
+   `test_approve_resolves_and_starts_background_thread` and
+   `test_reject_resolves_and_starts_background_thread_no_taiga_call` now
+   install this fixture and assert `len(started) == 1`,
+   `target is appmod._run_team_in_background`, and `args == (name, run_id,
+   cancel_event-instance)`. Confirmed the rebind is scoped correctly: since
+   `app/app.py`'s own `threading` name is a module-level binding distinct
+   from any other module's own `import threading` reference, this does not
+   touch `ThreadingHTTPServer`'s per-connection thread creation (which lives
+   in `http.server`'s own module namespace) — matches the fixture's own
+   docstring explanation of why an earlier attempt (mutating the shared
+   `threading` module's `Thread` attribute globally) over-recorded 3 threads
+   instead of 1.
+2. **Ran the full suite for real.**
+   `python3 -m unittest discover -s tests -v` → `Ran 874 tests in 137.360s`
+   / `OK`. `node tests/test_team_frontend.js` → `ALL PASS (74/74)`. Also ran
+   `TeamBoardResolveEndpointTests` in isolation → `Ran 12 tests` / `OK`,
+   including both strengthened tests passing (`started` recorded exactly one
+   thread for each).
+3. **My own independent revert-and-fail**, not a re-run of the developer's:
+   temporarily deleted the entire `cancel_event =
+   threading.Event()`/`t = threading.Thread(...)`/`_team_threads_set(...)`/
+   `t.start()` block from the `POST .../team/board-resolve` route in
+   `app/app.py` (lines ~4711-4717), leaving only the
+   `{"ok": True, "run_id": run_id}` response. Reran
+   `TeamBoardResolveEndpointTests` — both strengthened tests now fail
+   genuinely:
+   `AssertionError: 0 != 1` on `self.assertEqual(len(started), 1)` for both
+   `test_approve_resolves_and_starts_background_thread` and
+   `test_reject_resolves_and_starts_background_thread_no_taiga_call` — while
+   the other 10 tests in the class stayed green (they don't touch thread
+   dispatch at all). This proves the strengthened assertions are genuinely
+   load-bearing against exactly the code path the must-fix identified, not
+   vacuously passing for some other reason.
+4. **Restored** the deleted block and reran: all 12 tests pass again, and
+   `git diff --stat app/app.py` reports `313 ++...--- / 302 insertions(+),
+   11 deletions(-)`, byte-identical to the pre-probe state (confirmed
+   against the state captured before my probe) — no residual change from my
+   own revert-and-fail check.
+5. **Confirmed the should-fix was correctly left untouched.** `.team-btn`'s
+   CSS (`app/app.py` line 1701: `background: #34c759; color: #fff`) is
+   unchanged — no contrast fix was applied, matching the explicit "do NOT
+   touch the should-fix" instruction for this round. `docs/design.md` was
+   not further modified for this fix (the developer's own disclosure that
+   this fix is scoped to `tests/test_team_routes.py` only checks out).
+6. **Confirmed no other regression.** Full Python (874/874) and Node
+   (74/74) suites both green, matching the pre-fix baseline counts exactly
+   (874 was already the count before this fix — a test-only change adds no
+   new test files, so the total is unchanged from the prior round's `Ran
+   874 tests` because the two strengthened tests replace, not add to, the
+   existing two test methods).
+
+### Verdict on the must-fix
+**Resolved.** The fix is real, not cosmetic: the new assertions are proven
+load-bearing by my own from-scratch revert-and-fail (not a re-trust of the
+developer's report), the fixture's scoping rationale (module-level rebind,
+not global mutation) checks out by direct reading of `app.py`'s own
+`import threading` and the route's call sites, and the restore left no
+residual diff. All 18 of `docs/spec.md`'s item 7 part 2 acceptance criteria
+are now implemented and independently verified by tests I ran myself this
+session (the 17 already-clean ones from the prior round, plus the
+previously-gapped "starts the background driving thread" half of #8, now
+closed).
+
+The should-fix (WCAG contrast on `.team-btn`, pre-existing from earlier
+cycles, not a regression) remains open as a non-blocking follow-up, exactly
+as instructed — not touched this round, correctly so.
+
+## Overall verdict (re-review): **Approve**
+
+This closes the fix-and-reapprove round and the item 7 part 2 build cycle.
+No further changes requested. Outstanding non-blocking follow-ups for a
+future cycle: (1) disclose `/team/stop`'s pre-existing no-op-on-
+`blocked_board_write` gap in `docs/implementation.md`'s "Known limitations"
+(carried from part 1's review, already fixed in part 2's own code per test
+case #12 — this is now just a stale doc-only item, arguably moot), (2) file
+a project-wide `.team-btn` contrast fix and correct `docs/design.md`'s
+accessibility section to name the actual `#34c759` color instead of the
+unused `#4da6ff`.

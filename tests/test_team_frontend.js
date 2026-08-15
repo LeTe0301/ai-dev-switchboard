@@ -299,6 +299,19 @@ test('blocked + waiting_on_you renders "Waiting on you" and the escalation panel
   assert.ok(!html.includes('Max rounds reached'), 'must not show the terminal-escalation copy here');
 });
 
+// backlog item 7 part 2, docs/spec.md §1 / docs/design.md "Status Strip:
+// Board Write Pending Approval" -- escalation_kind distinguishes the strip
+// copy from the ask_user case above without opening the panel.
+test('blocked + waiting_on_you + escalation_kind board_write renders distinct strip copy, not "Waiting on you"', async () => {
+  const c = await setupCase([inst('proj', {
+    status: 'blocked', run_id: 'run-bw1', waiting_on_you: true, escalation_kind: 'board_write',
+  })]);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('status-blocked'));
+  assert.ok(html.includes('Board write pending approval'), 'expected the board_write strip copy, got: ' + html);
+  assert.ok(!html.includes('Waiting on you'), 'must not render the ask_user copy for a board_write escalation');
+});
+
 test('blocked without waiting_on_you (escalated_max_rounds) renders terminal copy, no escalation panel', async () => {
   const c = await setupCase([inst('proj', { status: 'blocked', run_id: 'run-abc123', waiting_on_you: false })]);
   const html = c.instanceRowHtml('proj');
@@ -1045,6 +1058,180 @@ test('a 428 mid-resolve shows the code overlay labeled for this team\'s answer s
   assert.strictEqual(c.msgEl('proj').textContent, '✓ Answer submitted');
 });
 
+// ─── Board-write escalation panel (backlog item 7 part 2, docs/spec.md §5 /
+// docs/design.md) ──────────────────────────────────────────────────────
+
+test('board_write set_status renders the from/to summary, Approve/Reject, no free-text field', async () => {
+  const instances = [inst('proj', {
+    status: 'blocked', run_id: 'run-sv', waiting_on_you: true, escalation_kind: 'board_write',
+  })];
+  const c = await setupCase(instances);
+  await deliverTeamInbox(c, 'proj', 'run-sv', instances, {
+    pending: true, run_id: 'run-sv', kind: 'board_write', verb: 'set_status', ref: 42,
+    value: 'In progress', note: null, current_value: { status_id: 1, status_name: 'New' },
+    proposed_at: '2026-08-14T12:00:00Z', subject: 'Implement auth system',
+  });
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('Implement auth system'), 'expected the enriched subject, got: ' + html);
+  assert.ok(html.includes('New'), 'expected the current status name, got: ' + html);
+  assert.ok(html.includes('In progress'), 'expected the proposed status name, got: ' + html);
+  assert.ok(html.includes("doTeamBoardResolve('proj', 'approve')"));
+  assert.ok(html.includes("doTeamBoardResolve('proj', 'reject')"));
+  assert.ok(!html.includes('escalation-other-proj'), 'board_write must never render the ask_user free-text field');
+  assert.ok(!html.includes('team-escalation-form'), 'board_write must not render the ask_user options form');
+});
+
+test('board_write falls back to "#ref" when subject enrichment failed', async () => {
+  const instances = [inst('proj', {
+    status: 'blocked', run_id: 'run-noref', waiting_on_you: true, escalation_kind: 'board_write',
+  })];
+  const c = await setupCase(instances);
+  await deliverTeamInbox(c, 'proj', 'run-noref', instances, {
+    pending: true, run_id: 'run-noref', kind: 'board_write', verb: 'set_status', ref: 99,
+    value: 'Done', note: null, current_value: { status_id: 2, status_name: 'In progress' },
+    proposed_at: '2026-08-14T12:00:00Z',
+    // no "subject" key -- Taiga was unreachable (docs/spec.md "Edge cases")
+  });
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('#99'), 'expected the #ref fallback, got: ' + html);
+});
+
+test('board_write amend_description renders Current/Proposed comparison blocks', async () => {
+  const instances = [inst('proj', {
+    status: 'blocked', run_id: 'run-desc', waiting_on_you: true, escalation_kind: 'board_write',
+  })];
+  const c = await setupCase(instances);
+  await deliverTeamInbox(c, 'proj', 'run-desc', instances, {
+    pending: true, run_id: 'run-desc', kind: 'board_write', verb: 'amend_description', ref: 35,
+    value: 'New description text', note: 'Updated per delegate feedback',
+    current_value: { description: 'Old description text' },
+    proposed_at: '2026-08-14T12:00:00Z', subject: 'Fix login redirect',
+  });
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('Current:'));
+  assert.ok(html.includes('Old description text'));
+  assert.ok(html.includes('Proposed:'));
+  assert.ok(html.includes('New description text'));
+  assert.ok(html.includes('Lead') && html.includes('note') && html.includes('Updated per delegate feedback'),
+    'expected the lead\'s note rendered, got: ' + html);
+});
+
+test('board_write append_comment renders only the proposed comment text, no current-value comparison', async () => {
+  const instances = [inst('proj', {
+    status: 'blocked', run_id: 'run-cmt', waiting_on_you: true, escalation_kind: 'board_write',
+  })];
+  const c = await setupCase(instances);
+  await deliverTeamInbox(c, 'proj', 'run-cmt', instances, {
+    pending: true, run_id: 'run-cmt', kind: 'board_write', verb: 'append_comment', ref: 67,
+    value: 'Verified in staging, ready to deploy.', note: null, current_value: {},
+    proposed_at: '2026-08-14T12:00:00Z', subject: 'Fix password reset',
+  });
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('Verified in staging, ready to deploy.'));
+  assert.ok(!html.includes('Current:'), 'append_comment must never render a current-value comparison block');
+});
+
+test('board_write waiting_on_you true but a fresh /team/inbox reports pending:false shows the distinct board_write "already resolved" copy', async () => {
+  const instances = [inst('proj', {
+    status: 'blocked', run_id: 'run-late-bw', waiting_on_you: true, escalation_kind: 'board_write',
+  })];
+  const c = await setupCase(instances);
+  await deliverTeamInbox(c, 'proj', 'run-late-bw', instances, { pending: false });
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('already approved or rejected'), 'expected the board_write race copy, got: ' + html);
+  assert.ok(!html.includes('already answered'), 'must not reuse the ask_user race copy');
+});
+
+test('doTeamBoardResolve("proj", "approve") dispatches POST /team/board-resolve with {action: "approve"}', async () => {
+  const instances = [inst('proj', {
+    status: 'blocked', run_id: 'run-appr', waiting_on_you: true, escalation_kind: 'board_write',
+  })];
+  const c = await setupCase(instances);
+  await deliverTeamInbox(c, 'proj', 'run-appr', instances, {
+    pending: true, run_id: 'run-appr', kind: 'board_write', verb: 'set_status', ref: 1,
+    value: 'Done', note: null, current_value: { status_id: 1, status_name: 'New' },
+    proposed_at: '2026-08-14T12:00:00Z',
+  });
+  c.call('doTeamBoardResolve', 'proj', 'approve');
+  await tick();
+  const f = c.pendingFetches.find((x) => x.url === '/projects/proj/team/board-resolve');
+  assert.ok(f, 'expected a pending POST /projects/proj/team/board-resolve');
+  assert.strictEqual(f.opts.method, 'POST');
+  assert.strictEqual(JSON.parse(f.opts.body).action, 'approve');
+  c.resolveFetch((x) => x.url === '/projects/proj/team/board-resolve', 200, { ok: true, run_id: 'run-appr' });
+  await tick();
+  await tick();
+  const msg = c.msgEl('proj');
+  assert.strictEqual(msg.textContent, '✓ Board write resolved');
+  assert.ok(msg.className.includes('success'));
+});
+
+test('doTeamBoardResolve("proj", "reject") dispatches {action: "reject"}', async () => {
+  const instances = [inst('proj', {
+    status: 'blocked', run_id: 'run-rej', waiting_on_you: true, escalation_kind: 'board_write',
+  })];
+  const c = await setupCase(instances);
+  await deliverTeamInbox(c, 'proj', 'run-rej', instances, {
+    pending: true, run_id: 'run-rej', kind: 'board_write', verb: 'append_comment', ref: 1,
+    value: 'a comment', note: null, current_value: {}, proposed_at: '2026-08-14T12:00:00Z',
+  });
+  c.call('doTeamBoardResolve', 'proj', 'reject');
+  await tick();
+  const f = c.pendingFetches.find((x) => x.url === '/projects/proj/team/board-resolve');
+  assert.ok(f);
+  assert.strictEqual(JSON.parse(f.opts.body).action, 'reject');
+});
+
+test('a 400 from board-resolve shows the server error inline, not the generic new-project field', async () => {
+  const instances = [inst('proj', {
+    status: 'blocked', run_id: 'run-400', waiting_on_you: true, escalation_kind: 'board_write',
+  })];
+  const c = await setupCase(instances);
+  await deliverTeamInbox(c, 'proj', 'run-400', instances, {
+    pending: true, run_id: 'run-400', kind: 'board_write', verb: 'set_status', ref: 1,
+    value: 'Done', note: null, current_value: {}, proposed_at: '2026-08-14T12:00:00Z',
+  });
+  c.call('doTeamBoardResolve', 'proj', 'approve');
+  await tick();
+  c.resolveFetch((x) => x.url === '/projects/proj/team/board-resolve', 400,
+    { error: 'no pending board write for this project' });
+  await tick();
+  await tick();
+  const msg = c.msgEl('proj');
+  assert.ok(msg.textContent.includes('no pending board write for this project'), 'got: ' + msg.textContent);
+  assert.ok(msg.className.includes('error'));
+});
+
+test('a 428 mid-board-resolve shows the code overlay labeled for this team, and a correct retry resends the same action', async () => {
+  const instances = [inst('proj', {
+    status: 'blocked', run_id: 'run-bw428', waiting_on_you: true, escalation_kind: 'board_write',
+  })];
+  const c = await setupCase(instances);
+  await deliverTeamInbox(c, 'proj', 'run-bw428', instances, {
+    pending: true, run_id: 'run-bw428', kind: 'board_write', verb: 'set_status', ref: 1,
+    value: 'Done', note: null, current_value: {}, proposed_at: '2026-08-14T12:00:00Z',
+  });
+  c.call('doTeamBoardResolve', 'proj', 'approve');
+  await tick();
+  c.resolveFetch((f) => f.url === '/projects/proj/team/board-resolve', 428, { error: 'totp_required' });
+  await tick();
+  await tick();
+  const label = c.elements.get('code-overlay-label');
+  assert.strictEqual(label.textContent, 'Resolving board write: proj');
+  c.elements.get('action-code').value = '123456';
+  c.call('submitActionCode');
+  await tick();
+  const retry = c.pendingFetches.find((f) => f.url === '/projects/proj/team/board-resolve');
+  assert.ok(retry);
+  const body = JSON.parse(retry.opts.body);
+  assert.strictEqual(body.code, '123456');
+  assert.strictEqual(body.action, 'approve', 'the retry must resend the SAME action the operator originally clicked');
+  c.resolveFetch((f) => f.url === '/projects/proj/team/board-resolve', 200, { ok: true, run_id: 'run-bw428' });
+  await tick();
+  await tick();
+  assert.strictEqual(c.msgEl('proj').textContent, '✓ Board write resolved');
+});
+
 // ─── Merged event feed ──────────────────────────────────────────────────
 
 test('events from the lead and a teammate render merged, in chronological order, colour-coded per agent', async () => {
@@ -1240,6 +1427,89 @@ test('a handoff event renders "Delegating to <teammate>"', async () => {
   await rerenderRow(c, instances);
   const html = c.instanceRowHtml('proj');
   assert.ok(html.includes('Delegating to helper'), 'got: ' + html);
+});
+
+// ─── Board-write event feed classification (backlog item 7 part 2,
+// docs/spec.md §6) -- both checked BEFORE the existing generic
+// 'tool_result'+meta.resolved -> 'resolved' branch, since a
+// board_write_resolved transcript entry's own meta ALSO sets
+// meta.resolved: true on both approve and reject (part 1).
+
+test('a board_write proposal (tool_use, meta.verb) renders the board-write-proposal class, not generic tool_use', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-bwp' })];
+  const c = await setupCase(instances);
+  const events = [
+    { ts: '2026-08-14T12:00:00Z', agent: 'lead', seq: 1, kind: 'tool_use',
+      text: 'board_write(set_status, ref=42)', meta: { verb: 'set_status', ref: 42 } },
+  ];
+  await openFeedAndDeliverEvents(c, 'proj', events);
+  await rerenderRow(c, instances);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('kind-board-write-proposal'), 'expected the board-write-proposal class, got: ' + html);
+  assert.ok(html.includes('board_write (set_status): ref #42'), 'got: ' + html);
+});
+
+test('a board_write approved-and-applied resolution renders the board-write-resolved class, not generic "resolved"/"Answer:"', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-bwr1' })];
+  const c = await setupCase(instances);
+  const events = [
+    { ts: '2026-08-14T12:00:01Z', agent: 'lead', seq: 1, kind: 'tool_result',
+      text: 'approved and applied', meta: { resolved: true, approved: true } },
+  ];
+  await openFeedAndDeliverEvents(c, 'proj', events);
+  await rerenderRow(c, instances);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('kind-board-write-resolved'), 'expected the board-write-resolved class, got: ' + html);
+  assert.ok(!html.includes('kind-resolved"'), 'must not ALSO/instead match the generic resolved class, got: ' + html);
+  assert.ok(html.includes('Change approved and applied'), 'got: ' + html);
+  assert.ok(!html.includes('Answer: approved and applied'), 'must not reuse the generic ask_user copy, got: ' + html);
+});
+
+test('a board_write approved-but-Taiga-rejected resolution renders the Taiga error detail', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-bwr2' })];
+  const c = await setupCase(instances);
+  const events = [
+    { ts: '2026-08-14T12:00:01Z', agent: 'lead', seq: 1, kind: 'tool_result',
+      text: 'approved but Taiga rejected the write: version mismatch',
+      meta: { resolved: true, approved: true } },
+  ];
+  await openFeedAndDeliverEvents(c, 'proj', events);
+  await rerenderRow(c, instances);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('kind-board-write-resolved'));
+  assert.ok(html.includes('approved but Taiga rejected the write: version mismatch'), 'got: ' + html);
+});
+
+test('a board_write rejected-by-human resolution renders "rejected by human", using meta.approved === false', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-bwr3' })];
+  const c = await setupCase(instances);
+  const events = [
+    { ts: '2026-08-14T12:00:01Z', agent: 'lead', seq: 1, kind: 'tool_result',
+      text: 'rejected by human', meta: { resolved: true, approved: false } },
+  ];
+  await openFeedAndDeliverEvents(c, 'proj', events);
+  await rerenderRow(c, instances);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('kind-board-write-resolved'));
+  assert.ok(html.includes('Change rejected by human'), 'got: ' + html);
+});
+
+// Regression guard (docs/spec.md §6): an ask_user-shaped tool_result -- only
+// meta.resolved, no meta.approved at all -- must still classify/render
+// exactly as before, never mistaken for a board_write resolution.
+test('an ask_user resolution (tool_result, only meta.resolved) still renders the generic "resolved"/"Answer:" class, unaffected by the new board_write checks', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-au-regress' })];
+  const c = await setupCase(instances);
+  const events = [
+    { ts: '2026-08-14T12:00:01Z', agent: 'lead', seq: 1, kind: 'tool_result',
+      text: 'Yes, proceed', meta: { resolved: true } },
+  ];
+  await openFeedAndDeliverEvents(c, 'proj', events);
+  await rerenderRow(c, instances);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('kind-resolved'), 'expected the unchanged generic resolved class, got: ' + html);
+  assert.ok(!html.includes('kind-board-write-resolved'), 'must not match the new, narrower board_write class');
+  assert.ok(html.includes('Answer: Yes, proceed'), 'got: ' + html);
 });
 
 test('a truncated:true response triggers an immediate follow-up /team/events call, not waiting for the next tick', async () => {
