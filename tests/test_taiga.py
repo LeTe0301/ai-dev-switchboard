@@ -82,11 +82,15 @@ class TaigaRunTests(unittest.TestCase):
         # which would have killed the script mid-retry. Raised to 180s for
         # "up" specifically (docs/spec.md "Fix 2", the explicitly-required
         # arithmetic check against taiga_run()'s real caller-side timeout).
+        # Round 6: the script also gained a settle-window recheck (up to
+        # TAIGA_UP_MAX_ATTEMPTS x TAIGA_UP_SETTLE_SECONDS = 25s more worst-
+        # case pure sleep at defaults), so this was raised again, to 220s
+        # (docs/spec.md "Proposed approach" Item 30, margin re-verified).
         self._fake_run("")
         appmod.taiga_run("up")
         cmd, kwargs = self.calls[0]
         self.assertEqual(cmd, ["sudo", appmod.TAIGA_UP_SCRIPT])
-        self.assertEqual(kwargs.get("timeout"), 180)
+        self.assertEqual(kwargs.get("timeout"), 220)
 
     def test_down_uses_longer_timeout(self):
         self._fake_run("")

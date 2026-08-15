@@ -1,379 +1,222 @@
-# Spec: E2E regression-verification follow-ups, round 5 (items 29-v2, 30-v2, 34, 35)
+# Spec: Round 6 — Taiga gateway startup-ordering crash-loop, ACL-aware push-spec security check, /status terminal-state staleness
 
 ## Summary
-A real Proxmox regression-verification pass (fresh container, CTID 901,
-against `main` with all four round-1-4 fixes merged) confirmed 10 of the
-original 12 findings genuinely fixed, but found: item 29's fix closed the
-*path*-mismatch but exposed a *permission* gap that reproduces the exact
-same user-visible symptom; item 30's fix doesn't actually recover the
-race on this host, and a second, distinct failure mode (nginx/DNS) was
-found; and two new bugs (items 34, 35) were found incidentally while
-setting up the verification container. All four are precisely diagnosed
-with real repro evidence — see `docs/BACKLOG.md`'s "Items 22-33 regression
-verification" section and new items 34/35 for full detail; this spec adds
-the fix design on top of that already-complete diagnosis.
+Three independent, already-diagnosed bugfixes from round-5 Proxmox verification (docs/BACKLOG.md items 30/37/38): gate `taiga-gateway`'s startup on `taiga-front` actually being resolvable instead of retrying a doomed recreate loop, make `taiga_push_spec.py`'s permission check ACL-aware so it stops recommending a `chmod` that undoes item 29's fix, and make `GET /status` report a run's terminal state from the same source `/team/stop` already uses instead of leaving `escalated_max_rounds` runs stuck looking `blocked` forever.
 
-## Orchestrator note
-No product-manager/ux-designer dispatch — same "fully-diagnosed follow-up"
-precedent as rounds 1-4. One of the four (item 30's Docker-restart
-fallback) involves a real, stated design judgment call (see Fix 2) worth
-a second look at review time, not a rubber-stamp.
+## Goals
+- **Item 30**: `taiga-up.sh` reliably brings `taiga-gateway` up on a fresh `--with-taiga` install without hitting the nginx-can't-resolve-`taiga-front`-yet crash-loop, and its success check confirms the container stays up past a short settle window instead of trusting a single point-in-time read.
+- **Item 37**: `taiga_push_spec.py`'s config-permission check correctly recognizes a narrowly-ACL'd (item 29 style) config file as safe, and never prints a `chmod` remediation that would collapse its ACL mask.
+- **Item 38**: `GET /status` exposes an unambiguous, correct terminal/non-terminal signal for a team run, sourced from the same status set `stop_team()` already treats as terminal, so a poller waiting on run completion doesn't hang forever on `escalated_max_rounds`. The `"project": null` observation is investigated and either explained/fixed or confirmed not to reproduce with current code.
 
----
+## Non-goals
+- **Item 30**: not patching `taiga.conf` or any other file inside the `taigaio/taiga-docker` checkout at `$TAIGA_DIR` directly (see "Proposed approach" for why); not re-investigating or fixing the original, still-unconfirmed root cause of the underlying Docker port-bind race itself, only the crash-loop it triggers; not changing the opt-in `TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION` escape hatch; not adding disk-space preflight checks (that's the separate, already-filed item 31).
+- **Item 37**: not building a general-purpose ACL auditor (e.g. flagging unexpected extra named user/group grants beyond the specific `other::`-exposure check); not touching `taiga-configure-push.sh`'s own `setfacl` grant logic (already correct, per item 29); not adding an auto-remediate/`--fix` flag — only correcting the diagnosis and the printed remediation text.
+- **Item 38**: not reworking the existing coarse `team.status` UI enum (`idle`/`running`/`blocked`/`finished`/`error`) the frontend already renders off, or `waiting_on_you`/`escalation_kind` semantics — the fix is additive only. Not building a fix for the `"project": null` observation if it turns out not to reproduce under current code (see "Open questions").
 
-## Fix 1 — Item 29 (v2): grant `switchboard-svc` a narrow read ACL on the Taiga push config, and stop conflating "missing" with "unreadable"
+## Background / current state
 
-**Where**: `scripts/taiga-configure-push.sh`, `app/taiga_board.py:129-153`
-(`load_config()`), `install.sh` (the `runtime.env` write from round 1's
-item-25 fix, and the apt-get dependency line).
+### Item 30 — `taiga-gateway` crash-loops on startup-ordering, not a real DNS outage
+`scripts/taiga-up.sh` (installed as `/usr/local/bin/ai-dev-switchboard-taiga-up.sh`, root-run via sudoers, invoked by `app.py`'s `taiga_run("up")` with a 180s timeout — `tests/test_taiga.py::test_up_uses_even_longer_timeout_to_cover_its_own_retry_loop`) already has a round-5 retry/backoff loop (5 attempts, 10/20/40/80s exponential backoff, `rm -f taiga-gateway` between attempts) built on the theory that the failure was a transient Docker port-bind race. Round-5 verification (docs/BACKLOG.md "Round 5 regression verification", item 30 entry) reproduced the failure on the very first `POST /taiga/on` of a fresh install and ran the backoff to full exhaustion without recovering, then found the real cause: `taiga-gateway` is `nginx:1.19-alpine`, and its shipped config (`taigaio/taiga-docker`'s `taiga-gateway/taiga.conf`, mounted read-only into the container) does `proxy_pass http://taiga-front/;` with **no `resolver` directive and no `upstream` block** — nginx resolves that hostname once, at config-load/startup time, using the system resolver. If `taiga-front` isn't yet attached to the network (a real, ordinary startup-ordering race — Compose's `depends_on: [taiga-front, taiga-back, taiga-events]` on `taiga-gateway` in `taigaio/taiga-docker`'s own `docker-compose.yml` only waits for those containers to *start*, not to actually be ready to resolve/serve), nginx fails to start and the container exits immediately. The exited container retains its `127.0.0.1:9000` port reservation, so every remove+recreate collides on that same port, reproducing the identical failure — no amount of retrying `docker compose up`/`rm -f`/recreate can win, because each attempt recreates straight back into the same crash. This matches every symptom round 5 observed: `address already in use` with nothing actually bound to port 9000, the gateway ending up `Created` with `NetworkSettings.Networks == {}`, and `docker start` never reattaching it.
 
-**Problem**: the original path-mismatch bug is genuinely fixed — both
-sides now resolve to `/home/dev/.config/ai-dev-switchboard/taiga-push.env`.
-But that file is deliberately `600`-mode, `RUN_USER`-owned (it holds a
-real Taiga password — this is a correct, intentional security choice, not
-a bug). `switchboard-svc` (who actually runs `board_read`/`board_write`)
-has no read access to it, so `load_config()`'s `open()` call raises
-`PermissionError` — and the function's bare `except OSError:` at line 149
-gives the exact same "Taiga isn't configured" message it gives for a
-genuinely-missing file, hiding the real cause completely.
+Confirmed via GitHub (`taigaio/taiga-docker` `stable` branch):
+- `taiga-gateway` service: `image: nginx:1.19-alpine`, `volumes: [./taiga-gateway/taiga.conf:/etc/nginx/conf.d/default.conf, ...]`, `depends_on: [taiga-front, taiga-back, taiga-events]` (plain list form — Compose's default `service_started` condition, not `service_healthy`).
+- `taiga-gateway/taiga.conf`: `proxy_pass http://taiga-front/;` (frontend), `http://taiga-back:8000/...` (API/admin), `http://taiga-events:8888/events` (websockets) — no `resolver`, no `upstream` block anywhere.
+- `taiga-front` service: `image: taigaio/taiga-front:latest` — **no healthcheck defined** upstream (only `taiga-db` has one, which is what lets `taiga-back` already use `depends_on: {taiga-db: {condition: service_healthy}, ...}` in the *same* file — i.e. this exact long-form `depends_on`/`condition` syntax is already proven to work against this Compose/file combination, it's just not used for `taiga-front`→`taiga-gateway`).
+- `taigaio/taiga-front`'s own Dockerfile: `FROM nginx:1.23-alpine`, plus `apk add bash` — no `curl`, but Alpine's base BusyBox ships a minimal `wget` without needing an explicit `apk add` (the standard reason `wget --spider` is nginx:alpine's idiomatic healthcheck-without-extra-install choice); needs hands-on confirmation on the real image (see "Open questions").
 
-**Fix, two layers — a real grant, plus an honest failure message if the
-grant isn't in place:**
+`install.sh` (`--with-taiga` block, lines ~363-451) clones `taiga-docker` **pinned** at whatever commit is first checked out (`git clone --branch stable --depth 1 ...`, never `git pull`'d on re-run, per its own comment at line 377) into `$TAIGA_DIR=/opt/ai-dev-switchboard-taiga`, then — separately, and this is the load-bearing precedent for this fix — **regenerates `$TAIGA_DIR/docker-compose.override.yml` deterministically on every install run** (lines 417-432) specifically so Compose's file-merge behavior can apply this project's own customizations (currently just the loopback-only port bind) "without ever conflicting with a future manual `git pull` in $TAIGA_DIR" (the comment's own words). This override file is the one piece of Taiga's stack this repo already treats as safely, repeatedly regeneratable and deliberately never touches `taiga.conf`/`docker-compose.yml` inside the checkout itself.
 
-### 1a. `install.sh` — make `SVC_USER`'s name discoverable, and ensure `setfacl` exists
-Add `SVC_USER=$SVC_USER` as a third line to the `runtime.env` file this
-project's own item-25 fix already writes (world-readable, non-secret
-values only — `SVC_USER`'s literal username is not a secret, same
-category as `RUN_USER`/`PROJECTS_DIR` already in that file). Add `acl` to
-the existing `apt-get install` line (`install.sh:214`) so `setfacl`/
-`getfacl` are available — currently not installed.
+`scripts/taiga-up.sh`'s success check (lines 42-46) is a single `docker compose ps taiga-gateway --format '{{.State}}'` read immediately after `up -d` returns — round 5 saw the gateway report `Up` for under a second before crashing, so the script exited 0 while `taiga-status.sh` briefly reported `on` for an already-dead public entrypoint.
 
-### 1b. `scripts/taiga-configure-push.sh` — grant the ACL right after writing the file
-After the existing `chmod 600 "$CONFIG_FILE"` line, add:
-```bash
-# Item 29 (v2): switchboard-svc (running app.py/teams.py) needs read
-# access to this file for board_read/board_write, but the file correctly
-# stays 600/RUN_USER-owned -- never loosened to group/world-readable
-# (this holds a live Taiga password). Grant a narrow, single-user POSIX
-# ACL instead. Best-effort: if setfacl is unavailable or the filesystem
-# doesn't support ACLs, warn clearly rather than silently leaving
-# board_read/board_write broken with no signal -- app/taiga_board.py's own
-# load_config() (see its own fix, same cycle) gives a distinct error in
-# that case too, so this isn't the only signal an operator gets.
-RUNTIME_ENV=/etc/ai-dev-switchboard/runtime.env
-SVC_USER_NAME="switchboard-svc"
-[ -f "$RUNTIME_ENV" ] && SVC_USER_NAME="$(grep '^SVC_USER=' "$RUNTIME_ENV" 2>/dev/null | tail -1 | cut -d= -f2-)"
-[ -n "$SVC_USER_NAME" ] || SVC_USER_NAME="switchboard-svc"
-if command -v setfacl >/dev/null 2>&1; then
-    if setfacl -m "u:${SVC_USER_NAME}:r" "$CONFIG_FILE" 2>/dev/null; then
-        echo "Granted $SVC_USER_NAME read access to $CONFIG_FILE (ACL)."
-    else
-        echo "WARNING: could not grant $SVC_USER_NAME read access to $CONFIG_FILE (setfacl failed -- does this filesystem support POSIX ACLs?). board_read/board_write will not work until this is granted manually: sudo setfacl -m u:${SVC_USER_NAME}:r $CONFIG_FILE" >&2
-    fi
-else
-    echo "WARNING: 'setfacl' not found -- $SVC_USER_NAME cannot read $CONFIG_FILE, so board_read/board_write will not work until this is granted manually. Install the 'acl' package and re-run this script, or: sudo setfacl -m u:${SVC_USER_NAME}:r $CONFIG_FILE" >&2
-fi
-```
+### Item 37 — `_check_config_permissions` misreads an ACL mask as loose group permissions
+`scripts/taiga_push_spec.py:145-159` (`_check_config_permissions`) reads `stat.S_IMODE(os.stat(path).st_mode)` and warns + prints `chmod 600 <path>` whenever `mode & 0o077` is nonzero. `scripts/taiga-configure-push.sh` (lines 40-77) creates the config at mode 600, then (item 29) runs `setfacl -m u:${SVC_USER_NAME}:r "$CONFIG_FILE"` to grant `switchboard-svc` narrow read access. Setting that named-user ACL entry makes `setfacl` recompute the file's **ACL mask** to the union of the owning group's permission and every named user/group entry — here, `r`. Once a file carries an extended ACL, `stat`/`ls -l` report the **mask**, not the traditional group permission, in the group-class bits — so the file now reports mode `0640` even though its real *effective* group-class exposure is still nothing beyond the one explicit `switchboard-svc:r--` grant, and `other::` is still `---`. `_check_config_permissions` sees `0640 & 0o077 == 0o040`, calls it loose, and prints `Run: chmod 600 <path>` — which, if followed, runs `chmod 600` and recomputes the ACL mask down to `mask::---`, making the `switchboard-svc` grant's *effective* permission `---` (the ACL entry itself is still listed by `getfacl`, but is now meaningless) and silently reverting item 29 with no indication anything changed. `_check_config_permissions(args.config)` is called unconditionally at the top of `_run()` (`scripts/taiga_push_spec.py:322-323`), so this fires on every `board_read`/`board_write`/CLI push.
 
-### 1c. `app/taiga_board.py`'s `load_config()` — distinguish permission-denied from missing
+Existing tests: `tests/test_taiga_push.py::ConfigPermissionsTests` (lines 101-126) — `test_mode_600_prints_no_warning`, `test_looser_mode_prints_a_loud_warning_but_does_not_raise`, `test_missing_file_is_silently_ignored_here`. These only exercise plain `os.chmod` modes, never an ACL'd file, so the current suite doesn't catch this.
+
+`taiga_push_spec.py` is explicitly stdlib-only (its own module docstring: "Stdlib-only ... no python-dotenv, no requests"), and `subprocess` is not currently imported. `getfacl`/`setfacl` (the `acl` package) is already an established, best-effort dependency of this exact feature area (`taiga-configure-push.sh` already checks `command -v setfacl` and warns rather than requiring it) — shelling out to `getfacl` here is consistent with that precedent rather than a new one, and avoids adding a third-party ACL binding (`pylibacl`) that would break the stdlib-only convention.
+
+### Item 38 — `/status` never resolves a terminal run to a terminal-looking state; `run.json`'s `"project"` field
+`app/app.py:5869-5874` (inside the `/status` handler's per-instance loop) computes a coarse `team_status` for the frontend:
 ```python
-    if not os.path.isfile(path):
-        raise TaigaPushError(
-            f"Taiga isn't configured — run scripts/taiga-configure-push.sh first "
-            f"(expected config at {path}).")
-    _check_config_permissions(path)
-    cfg = {}
+run = teams.latest_run_for_project(n)
+team_status = ("idle" if run is None else
+              {"running": "running", "blocked_ask_user": "blocked",
+               "blocked_board_write": "blocked",
+               "escalated_max_rounds": "blocked", "finished": "finished",
+               "error": "error", "stopped": "idle"}.get(run["status"], "idle"))
+```
+This bucketing is deliberate for the frontend's rendering purposes (the adjacent comment at lines 5919-5926 explains `escalated_max_rounds` is intentionally grouped under the coarser `"blocked"` bucket, distinguished only by `waiting_on_you`/`escalation_kind`, both already correctly `False`/`None` for it). But nothing in the `/status` response gives a caller an explicit, unambiguous **terminal** signal — a poller has to infer "is this actually done" from `status === 'blocked' && waiting_on_you === false`, which is exactly what round 5's own verification poller (and presumably the reported real-world poller) failed to do, per docs/BACKLOG.md item 38: a run that had already reached `escalated_max_rounds` — which `app/teams.py:4089`'s `stop_team()` (`if state["status"] not in ("finished", "escalated_max_rounds", "error", "stopped"): state["status"] = "stopped"`, item 35's fix) already correctly treats as terminal and leaves alone — was still reported `blocked` by `/status` 17+ minutes later. `teams.py` has this exact 4-status terminal tuple duplicated verbatim as an inline literal in three places (`stop_team()` line 4089, `sweep_dead_teams()` line 4334, `interject()` line 4506) but `/status`'s own mapping in `app.py` is a *fourth*, independently-written mapping that doesn't reuse it and doesn't expose the distinction at all.
+
+Separately, item 38 also reports that the same run's `run.json` carried `"project": null`. Investigated: `app/teams.py`'s `_new_state()` (lines 2793-2821) only ever sets a `"project_name"` key (`"project_name": project_name`, defaulting to `None` only for a bare `team-start` CLI run that skipped `team-launch` — per its own comment, intentional for that path), never a key literally named `"project"`. `_persist()` (lines 2824-2838) writes exactly the `state` dict via `json.dump`, adding no extra keys. A grep of the entire repo (`app/`, `scripts/`, `tests/`) and of git history for a literal `"project":` key assignment touching team state found none — the only other `"project"` key in the codebase is `scripts/taiga_push_spec.py`'s unrelated Taiga API request body (`_create_userstory`, line 196), a completely separate subsystem. It's also inconsistent with `latest_run_for_project()` (lines 4223-4260), which filters strictly on `state.get("project_name") != project_name` and would have **skipped** (never associated) any run whose `project_name` was `None` — yet item 38 says this run *was* correctly associated with `testproj` everywhere else, including presumably via `/status`. This means the `"project": null` observation cannot currently be explained by anything in the code as read; see "Open questions" — it needs a fresh hands-on repro against current code before deciding whether it's a live bug, a terminology slip in the original report (meaning `project_name`, which then would have to have been *not* null for this run given the above), or leftover data from an older schema.
+
+## Proposed approach
+
+### Item 30
+**Architecture decision (flagged per the requested explicit call-out): gate `taiga-gateway`'s startup on `taiga-front` health via `docker-compose.override.yml`, not an nginx `resolver` directive patch.** Both options from the backlog's "Revised shape of the fix" were evaluated:
+- *Rejected*: patching `taiga.conf` (adding a `resolver 127.0.0.11 valid=10s;` plus rewriting `proxy_pass http://taiga-front/;` to use a resolver-backed variable so nginx re-resolves per-request instead of failing at startup). This file lives inside the git-cloned, pinned-commit `taigaio/taiga-docker` checkout at `$TAIGA_DIR` — a third-party release train this repo does not own and, per `install.sh`'s own documented intent, deliberately never mutates in place (only the separately-regenerated `docker-compose.override.yml` is treated as safe to touch repeatedly). Patching `taiga.conf` directly would mean either hand-editing a file inside a git checkout on every install run (fragile — silently no-ops or breaks if upstream ever changes that file's content) or forking it entirely (diverges from Taiga's own release train, defeating the point of tracking `stable`).
+- *Adopted*: extend `$TAIGA_DIR/docker-compose.override.yml` — the file `install.sh` already regenerates deterministically every run specifically so it "never conflicts with a future manual `git pull` in $TAIGA_DIR" — to (a) give `taiga-front` a healthcheck (upstream doesn't define one) and (b) change `taiga-gateway`'s `depends_on` entry for `taiga-front` from the default `service_started` condition to `service_healthy`. This uses the exact `depends_on: {service: {condition: ...}}` long-form syntax `taigaio/taiga-docker`'s own `docker-compose.yml` already uses for `taiga-back`→`taiga-db` in the same file (proven compatible with this stack), and Compose merges `depends_on` across `-f` files by service key — the override's `taiga-gateway.depends_on` mapping takes precedence per-key over the base file's short-form list (normalized internally to the same shape), so listing all three existing dependencies (`taiga-front`, `taiga-back`, `taiga-events`) in the override is both correct and self-documenting even though only `taiga-front` gets an upgraded condition. Compose will not start `taiga-gateway` until `taiga-front` is genuinely marked healthy — which only happens once it's actually attached to the network and serving — eliminating the startup-ordering race nginx currently loses to, entirely within the file this repo already owns and safely regenerates.
+
+Add to the heredoc at `install.sh` lines 427-432 (single-quoted heredoc stays single-quoted — `${TAIGA_PORT}` must remain literal for Compose's own substitution, unchanged from today):
+```yaml
+services:
+  taiga-front:
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost/ || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+  taiga-gateway:
+    ports:
+      - "127.0.0.1:${TAIGA_PORT}:80"
+    depends_on:
+      taiga-front:
+        condition: service_healthy
+      taiga-back:
+        condition: service_started
+      taiga-events:
+        condition: service_started
+```
+(The `wget --spider` test command needs hands-on confirmation against the real `taigaio/taiga-front:latest` image — see "Open questions" for the fallback if it's missing; the interval/timeout/retries/start_period values are reasonable starting defaults, not measured against the real host's actual `taiga-front` boot time, and should be tuned during hands-on verification if needed.)
+
+Separately, strengthen `scripts/taiga-up.sh`'s success check with a settle window (docs/BACKLOG.md's explicit ask, independent of the root-cause fix above — defense in depth against *any* remaining transient early-exit, not just this one). Add a `TAIGA_UP_SETTLE_SECONDS="${TAIGA_UP_SETTLE_SECONDS:-5}"` env var (same override-with-env-var convention `TAIGA_UP_MAX_ATTEMPTS`/`TAIGA_UP_RETRY_BACKOFF_SECONDS` already use). After the loop's existing initial `state = ... running` check succeeds, `sleep "$TAIGA_UP_SETTLE_SECONDS"` and re-run the same `docker compose ps taiga-gateway --format '{{.State}}'` check; only `exit 0` if it's *still* `running` at that second read. If it isn't, fall through into the existing "didn't come up cleanly" branch (message, `rm -f`, backoff, loop) rather than a separate code path — this attempt is simply treated as failed and consumes one of `TAIGA_UP_MAX_ATTEMPTS` like any other.
+
+Because the settle-window sleeps add to the script's total worst-case runtime, re-check the arithmetic behind `app.py`'s `TAIGA_UP_SCRIPT` timeout (currently 180s, covering 5 attempts × 10/20/40/80s backoff = 150s) against the new worst case (+ up to `TAIGA_UP_MAX_ATTEMPTS` × `TAIGA_UP_SETTLE_SECONDS` = +25s at defaults = 175s) and bump the timeout (and `tests/test_taiga.py::test_up_uses_even_longer_timeout_to_cover_its_own_retry_loop`) if it no longer leaves comfortable margin.
+
+### Item 37
+Add a small ACL-aware helper to `scripts/taiga_push_spec.py` (add `import subprocess` to the existing stdlib-only import block) and change `_check_config_permissions` to use it:
+
+```python
+def _parse_acl_other_bits(getfacl_output: str) -> dict | None:
+    """Parses `getfacl -p <path>` output. Returns None if the file has only
+    a minimal ACL (no `mask::` line -- st_mode's group/other bits are then
+    accurate and the plain check below applies unchanged). Returns
+    {"other": 0-7 int, "other_str": "r--"} from the `other::` line when an
+    extended ACL is present -- the only entry that reflects genuine
+    world-exposure once a mask entry exists (item 37: the group-class bits
+    stat() reports become the ACL mask, not real group permissions, once
+    any named user/group ACL entry -- e.g. item 29's switchboard-svc:r --
+    is present, so they must never drive this warning)."""
+    lines = getfacl_output.splitlines()
+    if not any(l.startswith("mask::") for l in lines):
+        return None
+    other_line = next((l for l in lines if l.startswith("other::")), None)
+    if other_line is None:
+        return None
+    other_str = other_line.split("::", 1)[1].strip()
+    bits = (4 if "r" in other_str else 0) | (2 if "w" in other_str else 0) | (1 if "x" in other_str else 0)
+    return {"other": bits, "other_str": other_str}
+
+
+def _read_getfacl(path: str) -> str | None:
+    """The one seam this ACL check monkeypatches in tests (mirrors
+    _taiga_request's own "one seam per shelled-out call" convention).
+    Returns None (not a raised exception) if `getfacl` isn't installed or
+    the call otherwise fails -- best-effort, same as taiga-configure-
+    push.sh's own `command -v setfacl` fallback -- so a host without the
+    'acl' package degrades to the plain st_mode check below, not a crash."""
     try:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                cfg[key.strip()] = value.strip()
-    except PermissionError:
-        raise TaigaPushError(
-            f"Found {path} but couldn't read it (permission denied) — the account "
-            f"running this service needs read access. Re-run "
-            f"scripts/taiga-configure-push.sh (it now grants this automatically), "
-            f"or grant it manually: sudo setfacl -m u:<service-user>:r {path}.")
+        result = subprocess.run(["getfacl", "-p", path], capture_output=True,
+                                 text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _check_config_permissions(path: str) -> None:
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
     except OSError:
-        raise TaigaPushError(
-            f"Taiga isn't configured — run scripts/taiga-configure-push.sh first "
-            f"(expected config at {path}).")
-    return cfg
+        return
+    raw = _read_getfacl(path)
+    acl = _parse_acl_other_bits(raw) if raw is not None else None
+    if acl is not None:
+        if acl["other"] != 0:
+            print(
+                f"WARNING: {path} is readable/writable by 'other' via its ACL "
+                f"(other::{acl['other_str']}) — it holds a live Taiga password. "
+                f"Run: setfacl -m o::--- {path}  (do NOT run chmod -- with an ACL "
+                f"present, chmod recomputes the ACL mask and can silently break "
+                f"a legitimate named grant, e.g. a service account's read access).",
+                file=sys.stderr,
+            )
+        return  # ACL present and other:: clean -- narrowly-ACL'd, not loose
+    if mode & 0o077:
+        print(  # unchanged from today
+            f"WARNING: {path} is readable by group/other (mode {oct(mode)}) — it holds a "
+            f"live Taiga password. Run: chmod 600 {path}",
+            file=sys.stderr,
+        )
 ```
-(`except PermissionError:` must come *before* the existing `except
-OSError:` — `PermissionError` is an `OSError` subclass, so Python's
-except-clause ordering matters here: the more specific clause needs to be
-listed first or it will never be reached.)
+Scope is deliberately narrow: the only new signal is `other::` from `getfacl`, which is the one bit that's still a genuine, unambiguous leak regardless of what named ACL entries exist. This does not attempt to validate that a file's named-entry grants are the "correct"/expected ones (e.g. flag an unexpected `user:someone-else:r` entry) — out of scope per "Non-goals".
 
-**Non-goal**: does not touch `_check_config_permissions()` (the existing
-group/other-readable *warning*, unrelated to this fix) or
-`scripts/taiga_push_spec.py`'s own config-loading path (that script always
-runs as `RUN_USER`, the file's own owner — never hits this permission
-gap).
-
-**Acceptance criteria**:
-- [ ] Fresh `taiga-configure-push.sh` run grants `switchboard-svc` (or
-      whatever `SVC_USER` actually is) read access via ACL, confirmed via
-      `getfacl` showing the grant.
-- [ ] `sudo -u <svc_user> cat <config_path>` succeeds after running the
-      script (currently: permission denied).
-- [ ] A team lead's `board_read` call succeeds (not "Taiga isn't
-      configured") without any manual permission fix needed.
-- [ ] If `setfacl` is missing or fails, the operator sees a specific,
-      actionable warning at config-setup time, AND a specific (not
-      generic "not configured") error at actual use time — never total
-      silence about the real cause.
-
----
-
-## Fix 2 — Item 30 (v2): longer/smarter retry covers both observed failure modes; Docker-daemon-restart fallback is opt-in, not automatic
-
-**Where**: `scripts/taiga-up.sh`.
-
-**Problem**: the round-4 fix's 3-attempt/flat-2s retry doesn't recover
-the port-bind race on the verification host — real recovery needed
-"tens of seconds to a couple of minutes," or a full `systemctl restart
-docker` (100% reliable in testing, but restarts *every* Docker container
-on the host, not just Taiga's — a genuinely broad blast radius). A
-second, distinct failure mode was also found live: `taiga-gateway`'s
-nginx resolves `taiga-front` via Docker's embedded DNS at container
-startup with no retry, and exits immediately if that DNS entry hasn't
-propagated yet. This project doesn't own that nginx config (it's baked
-into the upstream `taigaio/taiga-docker` image), so the fix has to be at
-the orchestration layer, not a config edit.
-
-**Design decision, stated explicitly for review**: both failure modes
-manifest identically from `taiga-up.sh`'s own vantage point (`taiga-
-gateway` not reaching `running` state after `up -d`), and both appear to
-be transient docker-internal-state conditions that clear given enough
-time. So a single, longer/smarter generic retry (not failure-mode-
-specific detection) should recover from either. The `systemctl restart
-docker` fallback is real and effective, but restarting the whole Docker
-daemon as an *automatic, unattended* side effect of a Taiga toggle-on
-click is a broader action than this project takes anywhere else without
-an explicit operator decision (manual-click-only deploy, propose-then-
-approve board writes, etc.) — **default this fallback to OFF**, opt-in
-via an env var, rather than making it the automatic behavior after
-bounded retries exhaust. State this reasoning in the script's own
-comment, not just here.
-
-**Fix**:
-```bash
-TAIGA_UP_MAX_ATTEMPTS="${TAIGA_UP_MAX_ATTEMPTS:-5}"
-TAIGA_UP_RETRY_BACKOFF_SECONDS="${TAIGA_UP_RETRY_BACKOFF_SECONDS:-10}"
-# Item 30 (v2): a full `systemctl restart docker` was the only 100%-
-# reliable recovery found on the verification host, but it restarts
-# EVERY Docker container on this machine, not just Taiga's -- a real,
-# host-wide side effect this project doesn't take automatically/
-# unattended anywhere else without an explicit operator decision.
-# Default OFF; an operator who's confirmed this is safe on their own host
-# (e.g. nothing else Docker-based shares it) can opt in.
-TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION="${TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION:-0}"
-
-attempt=1
-backoff="$TAIGA_UP_RETRY_BACKOFF_SECONDS"
-while [ "$attempt" -le "$TAIGA_UP_MAX_ATTEMPTS" ]; do
-    "${COMPOSE[@]}" up -d
-    state=$("${COMPOSE[@]}" ps taiga-gateway --format '{{.State}}' 2>/dev/null)
-    if [ "$state" = "running" ]; then
-        exit 0
-    fi
-    echo "taiga-up: taiga-gateway didn't come up cleanly (state: ${state:-<none>}), attempt $attempt/$TAIGA_UP_MAX_ATTEMPTS" >&2
-    if [ "$attempt" -lt "$TAIGA_UP_MAX_ATTEMPTS" ]; then
-        "${COMPOSE[@]}" rm -f taiga-gateway >/dev/null 2>&1 || true
-        sleep "$backoff"
-        backoff=$((backoff * 2))
-    fi
-    attempt=$((attempt + 1))
-done
-
-if [ "$TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION" -eq 1 ]; then
-    echo "taiga-up: all $TAIGA_UP_MAX_ATTEMPTS attempts exhausted -- TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION=1, restarting the Docker daemon itself (affects every container on this host) and trying once more" >&2
-    systemctl restart docker
-    sleep 5
-    "${COMPOSE[@]}" up -d
-    state=$("${COMPOSE[@]}" ps taiga-gateway --format '{{.State}}' 2>/dev/null)
-    if [ "$state" = "running" ]; then
-        exit 0
-    fi
-fi
-
-echo "taiga-up: taiga-gateway failed to come up after $TAIGA_UP_MAX_ATTEMPTS attempts -- manual intervention needed (check 'docker compose logs taiga-gateway' in $TAIGA_DIR, 'docker network ls', available disk space, or set TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION=1 to let this script restart the Docker daemon itself as a last resort next time)." >&2
-exit 1
-```
-(`backoff=$((backoff * 2))` gives 10s, 20s, 40s, 80s across 5 attempts —
-comfortably inside `taiga_run()`'s existing 90s `subprocess.run` timeout
-in `app/app.py`? **Check this explicitly** — 10+20+40+80 = 150s of sleep
-alone already exceeds 90s. Either raise `taiga_run()`'s own timeout for
-the `"up"` action specifically, or tune `TAIGA_UP_MAX_ATTEMPTS`/
-`TAIGA_UP_RETRY_BACKOFF_SECONDS`'s defaults down so the total stays under
-90s — this spec deliberately leaves the exact numbers to whoever
-implements it, but the arithmetic must actually be checked against the
-real caller-side timeout, not just look reasonable in isolation.)
-
-**Acceptance criteria**:
-- [ ] Total worst-case retry time (all attempts, without the opt-in
-      Docker-restart fallback) is verified against `taiga_run()`'s actual
-      timeout for the `"up"` action — either fits inside it, or that
-      timeout is raised alongside this change. Not left unchecked.
-- [ ] `TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION` defaults to `0`/off.
-- [ ] `bash -n`/`shellcheck` clean.
-
----
-
-## Fix 3 — Item 34: don't start the service until every optional-feature config block has finished writing
-
-**Where**: `install.sh` — the `systemctl daemon-reload` /
-`systemctl enable --now ai-dev-switchboard` pair (currently
-`install.sh:580-581`), the existing `--update`-gated guarded-restart
-block that immediately follows it (currently `install.sh:583-599`), and
-the very end of the script (currently `install.sh:939` region, right
-before the `echo "== Done =="` summary).
-
-**Problem**: `enable --now` starts the service immediately after the
-systemd unit is generated — before the `--with-git-hosting` block (which
-writes `GITEA_ENABLED` at `install.sh:731`) and the other `--with-*`
-blocks even run. `EnvironmentFile=` is read once at process start, so a
-fresh install with `--with-git-hosting` ends up running with
-`GITEA_ENABLED` simply absent from the process environment, even though
-`switchboard.env` on disk correctly has it — confirmed via
-`/proc/<pid>/environ`. The existing `--update`-path guarded restart has
-the same latent ordering bug if `--update` is ever combined with a
-`--with-*` flag in one invocation (less common, same root cause, not
-separately reported but worth closing at the same time since the fix is
-identical).
-
-**Fix**: keep `enable --now` where it is (still useful for a plain
-install with no `--with-*` flags at all — the service comes up
-immediately in that case, which is correct behavior, not a bug). Move
-the existing guarded-restart block from right after it to the very end of
-the script (after every `--with-*` block, immediately before the
-`echo "== Done =="` summary), and make it run **unconditionally** instead
-of only when `$UPDATE -eq 1` — a fresh install needs exactly the same
-"pick up everything that got written since the process started" restart
-an update does; there's nothing update-specific about the fix. Reuse the
-existing live-session detection unchanged (same
-`sudo -u "$RUN_USER" tmux list-sessions`-based guard, same defer-with-a-
-clear-message behavior if any session is live):
-
-```bash
-# (delete the existing block from right after `systemctl enable --now`)
-# (insert this, unconditionally, right before `echo "== Done =="`)
-
-# Guarded restart -- refuses to restart (not just warns) whenever
-# RUN_USER has ANY live tmux session, no --force override (item 13's own
-# no-`--force` precedent). Runs unconditionally, not just for --update:
-# `systemctl enable --now` above starts the service before any --with-*
-# block below it has finished writing its own config to switchboard.env
-# (item 34) -- EnvironmentFile= is read once at process start, so without
-# this final restart, a fresh install's own optional-feature flags never
-# actually take effect in the running process, only on disk.
-LIVE_SESSIONS="$(sudo -u "$RUN_USER" tmux list-sessions -F '#{session_name}' 2>/dev/null || true)"
-if [ -n "$LIVE_SESSIONS" ]; then
-    echo "WARNING: $RUN_USER has live tmux session(s):" >&2
-    echo "$LIVE_SESSIONS" | sed 's/^/  - /' >&2
-    echo "ai-dev-switchboard was NOT restarted -- restarting now would very likely interrupt these (see docs/ARCHITECTURE.md). Stop them (or wait for them to finish), then run: sudo systemctl restart ai-dev-switchboard -- to pick up every config value written during this install/update run." >&2
-else
-    echo "-- Restarting ai-dev-switchboard to pick up this run's full configuration --"
-    systemctl restart ai-dev-switchboard
-fi
-```
-
-**Acceptance criteria**:
-- [ ] A fresh `install.sh --yes --with-git-hosting` run: `GITEA_ENABLED`
-      is present in the running process's environment
-      (`/proc/<pid>/environ` or equivalent) without any manual restart.
-- [ ] A plain `install.sh --yes` run with no `--with-*` flags: service is
-      running and correctly configured, same as today.
-- [ ] A live-tmux-session re-run still defers the restart with the
-      existing clear warning message, not a behavior change from what
-      `--update` already does today.
-- [ ] `bash -n`/`shellcheck` clean.
-
----
-
-## Fix 4 — Item 35: `/team/stop` cleans up a terminal-status run too, not just an active one
-
-**Where**: `app/app.py:6311-6334` (the `/team/stop` route).
-
-**Problem**: `teams.stop_team()` is already correctly unconditional — its
-own docstring states it "works regardless of status (running /
-blocked_ask_user / finished / error / escalated_max_rounds / stopped)",
-and the CLI's `team-stop <run_id>` (which calls it directly) already
-works correctly for a terminal run today. The bug is entirely at the web
-route layer: `install.sh:6327`'s
-`if run is None or run["status"] not in ("running", "blocked_ask_user",
-"blocked_board_write"): return {"ok": True, "message": "no team
-currently running for this project"}` never calls `stop_team()` at all
-for a `finished` or `escalated_max_rounds` run — even though the web
-UI's own "Stop team" button is rendered unconditionally for any
-non-`idle` status (confirmed by reading `teamRow()`, `app/app.py:4330-
-4334` — there's no frontend gating hiding it for a terminal run), so an
-operator clicking it on a finished run gets a silent, misleading "no team
-currently running" response instead of the cleanup they're asking for.
-
-**Fix**: widen the gate to only exclude the genuine "nothing to do"
-case (`run is None`), and let `stop_team()`'s own already-correct,
-already-unconditional logic handle every real status itself:
-```python
-            run = teams.latest_run_for_project(name)
-            if run is None:
-                return self._json({"ok": True, "message": "no team currently running for this project"})
-            entry = _team_threads_get(name)
-            if entry is not None and entry.get("run_id") == run["run_id"]:
-                entry["cancel_event"].set()
-            result = teams.stop_team(run["run_id"])
-            self._json({"ok": True, "session_removed": result["session_removed"],
-                       "worktrees": result["worktrees"]})
-```
-(Only the `if` condition changes — drop the `or run["status"] not in
-(...)` clause entirely. Nothing else in this route needs to change.)
-
-**Non-goal**: does not touch `launch_team()`'s own pre-flight
-`tmux_has(session)` check (`app/teams.py:3980-3983`), which still refuses
-to start a new team while a raw tmux session name is taken, regardless of
-that session's run's actual status. Deliberate: auto-cleaning up a
-terminal run's worktrees as a side effect of trying to start an unrelated
-new one would mean a human never got the chance to inspect that finished
-run's state first, which conflicts with this project's own "nothing an
-agent did is ever silently discarded" precedent (`docs/ARCHITECTURE.md`'s
-worktree-cleanup section). The fix here restores the *existing, already-
-designed-for* explicit path (a human calling Stop) rather than adding a
-new implicit one. If this project decides later that a terminal run
-should be auto-reclaimed on the next `team/start` too, that's a separate,
-explicitly-scoped decision — not assumed here.
-
-**Acceptance criteria**:
-- [ ] `POST /team/stop` against a project with a `finished`-status run:
-      actually removes the tmux session and worktrees (previously: silent
-      no-op, "no team currently running").
-- [ ] Same for `escalated_max_rounds`.
-- [ ] `POST /team/start` on that same project now succeeds immediately
-      after (previously: blocked by the leftover tmux session name).
-- [ ] Existing behavior for `running`/`blocked_ask_user`/
-      `blocked_board_write` (already working) is unchanged.
-- [ ] `run is None` (no run has ever existed for this project) still
-      returns the same "no team currently running" message as today —
-      that specific case is genuinely a no-op, correctly.
+### Item 38
+1. In `app/teams.py`, add a module-level constant near the other `TEAM_*` constants (e.g. after `TEAM_SESSION_STALE_TTL_SECONDS`, line 169):
+   ```python
+   # The 4 terminal run statuses -- a run in one of these is done, one way
+   # or another, and nothing further will ever drive it. Single source of
+   # truth for stop_team()/sweep_dead_teams()/interject()'s existing inline
+   # checks (item 38: previously duplicated verbatim in three places, and
+   # NOT what /status's own separately-written team_status mapping used,
+   # which is the root cause of escalated_max_rounds runs reporting
+   # "blocked" forever with no terminal signal at all).
+   TEAM_TERMINAL_STATUSES = ("finished", "escalated_max_rounds", "error", "stopped")
+   ```
+   Replace the three inline literal tuples (`stop_team()` line 4089, `sweep_dead_teams()` line 4334, `interject()` line 4506) with references to `TEAM_TERMINAL_STATUSES` — pure refactor, no behavior change at those three call sites.
+2. In `app/app.py`'s `/status` handler, add an additive `"terminal"` field to the `inst["team"]` dict (alongside `waiting_on_you`/`escalation_kind`, same "additive only" precedent already used for both — lines 5939-5941):
+   ```python
+   "terminal": run is not None and run["status"] in teams.TEAM_TERMINAL_STATUSES,
+   ```
+   `team_status`, `waiting_on_you`, and `escalation_kind` are all unchanged — this is a new field only, so no existing frontend rendering logic (the `team.status === 'blocked'` branches noted in "Background") needs to change. While implementing, check whether any existing client-side JS polls `/status` waiting for a run to finish by inferring completion from `status`/`waiting_on_you` rather than a dedicated signal — if so, point it at the new `terminal` field instead; this pass found no such polling loop in `app.py`'s JS but flags it for the developer's own check since it wasn't exhaustively verified.
+3. For the `"project": null` observation: reproduce first, don't fix blind. Launch a real team run (via the normal `/team/launch` path, matching how the round-5 run was almost certainly started) through to `escalated_max_rounds` (or grab an existing terminal run.json from a prior verification pass if one is still on a test host) and inspect the raw `run.json` with current code. If no top-level `"project"` key appears (expected, per the "Background" archaeology above — only `"project_name"` is ever written), record that finding in `docs/implementation.md` and treat it as resolved-by-explanation (most likely the original report meant `project_name`, or was looking at stale data from before some earlier schema/rename that predates this round). If a literal `"project": null` key genuinely does reproduce, root-cause it from scratch at that point (do not guess the fix now) and note it as a real second defect, separate from the `/status` staleness fix above.
 
 ## Affected areas
-`scripts/taiga-configure-push.sh`, `app/taiga_board.py`, `install.sh`
-(fixes 1, 3), `scripts/taiga-up.sh` (fix 2), `app/app.py` (fix 4). No
-frontend/JS changes needed for any of these four (fix 4's frontend
-already correctly shows the Stop button for a terminal run — only the
-backend route needed to catch up to it).
+- **Item 30**: `install.sh` (`docker-compose.override.yml` heredoc, `--with-taiga` block), `scripts/taiga-up.sh` (settle-window recheck), `app/app.py` (`TAIGA_UP_SCRIPT` timeout, only if the new worst-case arithmetic requires it), `tests/test_taiga_up_retry.py` (new settle-window test), `tests/test_taiga.py` (timeout test, only if changed). No changes inside the `taigaio/taiga-docker` checkout itself.
+- **Item 37**: `scripts/taiga_push_spec.py` (`_check_config_permissions` + two new helpers, `import subprocess`), `tests/test_taiga_push.py` (`ConfigPermissionsTests`, extended with ACL-aware cases).
+- **Item 38**: `app/teams.py` (`TEAM_TERMINAL_STATUSES` constant + 3 call-site refactors), `app/app.py` (`/status` handler, `terminal` field), `tests/test_team_routes.py` (new parametrized test mirroring the existing `test_waiting_on_you_true_only_for_blocked_ask_user_never_for_escalated_max_rounds`/`test_escalation_kind_field` style at lines 964-1011).
+
+## Edge cases
+- **Item 30**: `taiga-front` never becomes healthy at all (e.g. a genuinely broken image) — `docker compose up -d` for `taiga-gateway` should fail/skip starting it (Compose's own `service_healthy` semantics), which the existing retry loop's post-`up -d` state check already handles by treating "not running" as a failed attempt; verify hands-on that this doesn't produce a different, unhandled failure mode (e.g. a nonzero `up -d` exit the script doesn't currently branch on — it doesn't need to, since it inspects gateway state afterward regardless, but confirm this holds). `taiga-front` reports healthy but then dies immediately after (a first-cousin of the original bug, one layer removed) — the settle-window recheck in `taiga-up.sh` is the backstop for this case, not the healthcheck. Repeated toggle on/off/on cycles (matches round 5's own repeated-attempts verification methodology) must not regress once the fix is in place.
+- **Item 37**: `getfacl` not installed (best-effort fallback to the plain `st_mode` check, matching `taiga-configure-push.sh`'s own precedent) — must not crash. A file with an extended ACL where `other::` is *not* clean (a genuinely loose ACL'd file) must still warn, just with ACL-safe remediation text, not `chmod`. A file with no ACL at all (today's un-migrated case, or a fresh install before `taiga-configure-push.sh` ever runs `setfacl`) must behave exactly as before (unchanged `mode & 0o077` path). Missing file — unchanged (`_check_config_permissions` returns silently; `_load_config` is what raises for that).
+- **Item 38**: `run is None` (no run ever launched for this project) — `terminal` must be `False`, not raise. A run mid-flight (`status == "running"`) — `terminal` is `False`. Every status value in `TEAM_TERMINAL_STATUSES` reachable via `/status`, not just `escalated_max_rounds` — `finished`/`error`/`stopped` must also report `terminal: True` for completeness/consistency even though `escalated_max_rounds` is the one item 38 specifically reported broken (the other three already "look" terminal today via their coarse `status` values, so this is about consistency of the new field, not fixing a second observed symptom).
+
+## Acceptance criteria
+
+### Item 30
+- [ ] `docker-compose.override.yml` generated by `install.sh` includes the `taiga-front` healthcheck and `taiga-gateway`'s upgraded `depends_on` shown above; no file inside the `taiga-docker` git checkout itself is modified.
+- [ ] Hands-on, on a fresh (or equivalently reset) Proxmox `--with-taiga` install: `POST /taiga/on` succeeds on the first `taiga-up.sh` attempt (no `rm -f`/backoff needed) where it previously crash-looped to full exhaustion.
+- [ ] `docker compose ps taiga-gateway` reports `State: running` and a non-empty `NetworkSettings.Networks` after toggle-on; `docker compose logs taiga-gateway` shows no "host not found in upstream" crash.
+- [ ] Repeated toggle off/on cycles (at least 3, matching round-5's own methodology) all succeed cleanly.
+- [ ] `taiga-up.sh`'s settle-window recheck: a gateway that reports `running` on the first check but dies before the settle window elapses is treated as a failed attempt (consumes an attempt, triggers `rm -f` + backoff), verified both by a new/updated `tests/test_taiga_up_retry.py` case (using the existing stubbed-`docker`-shell-function technique) and, if reproducible, hands-on.
+- [ ] `app.py`'s `TAIGA_UP_SCRIPT` timeout and its test are re-verified against the new worst-case arithmetic (backoff + settle-window sleeps × max attempts) and bumped if the existing 180s no longer leaves comfortable margin.
+- [ ] Full existing test suite (`python3 -m unittest discover -s tests`) passes.
+
+### Item 37
+- [ ] Given a config file at mode 600 with an item-29-style `setfacl -m u:switchboard-svc:r` grant (mask now `r--`, `stat` mode `0640`), `_check_config_permissions` prints **no** warning.
+- [ ] Given the same ACL'd file, the printed output never contains the string `chmod 600` for that file.
+- [ ] Given a config file with an extended ACL where `other::` is *not* `---` (a genuinely loose ACL'd file), `_check_config_permissions` prints a warning whose remediation is `setfacl`-based, not `chmod`.
+- [ ] Given a config file with no ACL at all (plain `st_mode`), behavior is unchanged from today: mode 600 → no warning; mode 644 → warning with `chmod 600` remediation (existing `ConfigPermissionsTests` cases keep passing unmodified).
+- [ ] Given `getfacl` is unavailable (simulated in a test), falls back to the plain `st_mode` check without raising.
+- [ ] Hands-on: on a real host, run `taiga-configure-push.sh` (which sets up the item-29 ACL), then trigger a `board_read`/`board_write` (or run `taiga_push_spec.py` directly) and confirm no `chmod`-collapsing warning appears, and that following any warning that *does* appear (in the genuinely-loose case) does not break the `switchboard-svc` grant.
+
+### Item 38
+- [ ] Given `run["status"] == "escalated_max_rounds"`, `/status`'s `team.terminal` is `True` (with `team.status` staying `"blocked"`, `waiting_on_you` staying `False`, unchanged from today).
+- [ ] Given `run["status"] in ("blocked_ask_user", "blocked_board_write")`, `team.terminal` is `False`.
+- [ ] Given `run["status"] in ("finished", "error", "stopped")`, `team.terminal` is `True`.
+- [ ] Given `run["status"] == "running"`, `team.terminal` is `False`.
+- [ ] Given no run at all for a project, `team.terminal` is `False`.
+- [ ] `app/teams.py` has a single `TEAM_TERMINAL_STATUSES` constant; `stop_team()`, `sweep_dead_teams()`, `interject()`, and `/status`'s new `terminal` computation all reference it (grep confirms no remaining duplicate inline literal tuple).
+- [ ] Hands-on: drive a real run to `escalated_max_rounds` (same repro item 35/round-5 used), poll `GET /status` repeatedly, and confirm `team.terminal` flips to `True` — a poller checking `terminal === true` instead of the coarse `status` field correctly detects completion instead of hanging.
+- [ ] The `"project": null` observation is investigated per "Proposed approach" §3 and the finding (reproduces vs. doesn't, and if it does, the root cause) is documented in `docs/implementation.md`.
+- [ ] Full existing test suite passes, including the existing `test_waiting_on_you_true_only_for_blocked_ask_user_never_for_escalated_max_rounds`/`test_escalation_kind_field` tests unchanged.
+
+## Open questions
+- **Item 30 (the real architectural call)**: decided above — health-gate via `docker-compose.override.yml` over an nginx `resolver` patch inside the third-party `taiga-docker` checkout, on the grounds that only the former is a file this repo already owns and safely regenerates every install run. Flagging explicitly per this round's request rather than treating it as settled without comment; open to being overridden if there's a reason to prefer the resolver-directive approach despite the divergence-from-upstream concern.
+- **Item 30**: `wget --spider` as the `taiga-front` healthcheck test command is a strong guess (Alpine BusyBox `wget` is present without an explicit `apk add`, and the upstream Dockerfile doesn't remove it) but not hands-on confirmed against the real `taigaio/taiga-front:latest` image — verify with `docker exec <container> wget --version` (or equivalent) during implementation; if missing, fall back to a bash `/dev/tcp` check (`bash` is confirmed present via the Dockerfile's `apk add bash`), e.g. `CMD-SHELL exec 3<>/dev/tcp/localhost/80 && echo -e 'GET / HTTP/1.0\r\n\r\n' >&3 && head -1 <&3 | grep -q '^HTTP/'`.
+- **Item 30**: the healthcheck's `interval`/`timeout`/`retries`/`start_period` and `TAIGA_UP_SETTLE_SECONDS` are reasonable starting defaults, not measured against real observed `taiga-front` boot time on the actual host — tune based on hands-on timing during verification (round 5's own evidence — "Up for under a second before crashing" — suggests the settle window mainly needs to beat sub-second failures, so 5s has real margin, but confirm rather than assume).
+- **Item 38**: the `"project": null` observation could not be explained by any current code path (see "Background" archaeology) — genuinely open whether it reproduces at all under current code, is a terminology slip in the original report (meaning `project_name`, which per `latest_run_for_project()`'s filtering would then have to be non-null for this run to have been findable in the first place, which is itself odd), or is leftover data from before some earlier schema change. Proceeding under the assumption that it needs a fresh hands-on repro before any code change is justified, per "Proposed approach" §3 — do not guess a fix for a write path that doesn't appear to exist.
 
 ## Risk / rollback notes
-Fix 4 is the lowest-risk (one `if` condition narrowed, reusing an
-already-correct, already-tested underlying function). Fix 3 changes
-install-time ordering, not runtime logic — the guard it reuses is
-unmodified. Fix 1 adds a new dependency (`acl` package) and a best-effort
-ACL grant with an honest failure mode if that grant doesn't take — no
-existing behavior is removed. Fix 2's Docker-restart fallback is
-deliberately opt-in/off-by-default specifically to keep its risk bounded;
-review should specifically check the retry-timing-vs-90s-timeout
-arithmetic before approving. Plain `git revert` on any of the four
-independently if something regresses — no shared code path between them.
+- **Item 30**: the `docker-compose.override.yml` change is regenerated fresh by `install.sh` every run and only affects `--with-taiga` installs; rollback is reverting the heredoc content (or simply not re-running `install.sh` with the new version) — no migration/state to undo. The `taiga-up.sh` settle-window change adds latency (up to `TAIGA_UP_SETTLE_SECONDS` per attempt) to every successful toggle-on, not just failures — acceptable given item 30's severity, but worth noting if toggle-on latency becomes a complaint. If the healthcheck-gate approach turns out not to fully resolve the crash-loop on hands-on verification, the existing retry/backoff loop and `TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION` escape hatch remain as fallbacks — nothing is removed.
+- **Item 37**: purely a diagnostic/warning-text change with a `getfacl`-unavailable fallback to today's exact behavior — low risk. Worst case if the ACL detection has a bug: reverts to over-warning (annoying but safe) rather than under-warning (a real file left loose without notice) as long as the fallback path is exercised whenever parsing is uncertain; the implementation above only suppresses the warning when it can positively confirm `other::` is clean, not merely when ACL parsing fails.
+- **Item 38**: additive-only field on `/status`; no rollback concerns beyond reverting the added field and the `TEAM_TERMINAL_STATUSES` refactor (which is behavior-preserving by construction — same 4 literal values, just centralized).

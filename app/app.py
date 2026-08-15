@@ -2706,19 +2706,31 @@ def taiga_run(action: str) -> str:
     # give that retry loop room to run to exhaustion; "down"/"status" never
     # retry, so their timeouts are unchanged.
     #
-    # Margin arithmetic (docs/test-review.md round-5 Finding 2): 180s total
-    # minus the 150s worst-case pure `sleep` above leaves ~30s for the loop's
-    # 14 real subprocess calls (5x `up -d` + 5x `ps` + 4x `rm -f`), ~2.1s/call
-    # average if spread evenly. That's thin for the exact degraded-Docker
-    # scenario this retry loop exists to survive, but this ceiling is a
-    # last-resort safety net, not the loop's primary defense -- the retry
-    # loop's own 5-attempt/exponential-backoff logic is what actually
-    # recovers from a slow daemon; this timeout only guards against the
-    # subprocess wedging entirely (e.g. a hung `docker compose` call that
-    # never returns). Widen this (and SINGLETON_TOGGLE_CONFIG.taiga.timeoutMs
-    # below, which is deliberately kept >= this value -- see its own comment)
-    # together if real-world margin turns out to be too thin.
-    timeout = 180 if action == "up" else (10 if action == "status" else 90)
+    # Item 30 (round 6): the script also gained a settle-window recheck --
+    # after an attempt's initial `ps` reports "running", it sleeps
+    # TAIGA_UP_SETTLE_SECONDS (default 5s) and rechecks before trusting it,
+    # treating a die-before-settled as a failed attempt like any other. That
+    # adds up to TAIGA_UP_MAX_ATTEMPTS x TAIGA_UP_SETTLE_SECONDS = 5x5 = 25s
+    # of additional worst-case pure `sleep` (only paid on attempts whose
+    # initial check reported "running", so this is the ceiling, not the
+    # typical case) on top of the 150s backoff above. Raised to 220s.
+    #
+    # Margin arithmetic (docs/test-review.md round-5 Finding 2, updated for
+    # round 6's settle window): 220s total minus the 175s worst-case pure
+    # `sleep` (150s backoff + 25s settle windows) leaves ~45s for the loop's
+    # up to 19 real subprocess calls (5x `up -d` + up to 10x `ps` now that
+    # each attempt can call it twice + 4x `rm -f`), ~2.4s/call average if
+    # spread evenly -- comparable margin-per-call to the previous 180s/14-call
+    # budget (~2.1s/call). That's thin for the exact degraded-Docker scenario
+    # this retry loop exists to survive, but this ceiling is a last-resort
+    # safety net, not the loop's primary defense -- the retry loop's own
+    # 5-attempt/exponential-backoff logic is what actually recovers from a
+    # slow daemon; this timeout only guards against the subprocess wedging
+    # entirely (e.g. a hung `docker compose` call that never returns). Widen
+    # this (and SINGLETON_TOGGLE_CONFIG.taiga.timeoutMs below, which is
+    # deliberately kept >= this value -- see its own comment) together if
+    # real-world margin turns out to be too thin.
+    timeout = 220 if action == "up" else (10 if action == "status" else 90)
     r = subprocess.run(["sudo", script], capture_output=True, text=True,
                        timeout=timeout)
     return r.stdout.strip()
@@ -3231,10 +3243,13 @@ let singletonToggleState = {
 // flips to "error" while the backend POST is still legitimately in flight
 // (docs/test-review.md round-5 Finding 1 — this broke once, when the
 // backend's "up" timeout was raised to 180s for item 30's retry-loop fix but
-// this value was left at the old 90000). Gitea's own backend timeout is
-// unchanged (still 90s), so its timeoutMs stays 90000 too.
+// this value was left at the old 90000). Round 6 raised the backend "up"
+// timeout again, to 220s, to cover taiga-up.sh's new settle-window recheck
+// (see taiga_run()'s own comment) — kept in sync here for the same reason.
+// Gitea's own backend timeout is unchanged (still 90s), so its timeoutMs
+// stays 90000 too.
 const SINGLETON_TOGGLE_CONFIG = {
-  taiga: {timeoutMs: 180000, badgeText: '⚠ ~3–5 GB RAM when running',
+  taiga: {timeoutMs: 220000, badgeText: '⚠ ~3–5 GB RAM when running',
           badgeClass: 'taiga-ram', errClass: 'taiga-err', spinnerClass: 'taiga-starting-spinner'},
   gitea: {timeoutMs: 90000, badgeText: 'ℹ ~1 GB RAM when running',
           badgeClass: 'gitea-resources', errClass: 'gitea-err', spinnerClass: 'gitea-starting-spinner'},
@@ -5936,9 +5951,20 @@ class Handler(BaseHTTPRequestHandler):
                     "ask_user" if run is not None and run["status"] == "blocked_ask_user" else
                     "board_write" if run is not None and run["status"] == "blocked_board_write" else
                     None)
+                # terminal (item 38, docs/spec.md) -- additive only. Sourced
+                # from teams.TEAM_TERMINAL_STATUSES, the same single source
+                # of truth stop_team()/sweep_dead_teams()/interject() already
+                # use, so a poller has an unambiguous "is this run actually
+                # done" signal instead of having to infer it from the
+                # coarser team_status/waiting_on_you combination above --
+                # which is exactly what let escalated_max_rounds runs (which
+                # stay under the "blocked" team_status bucket, deliberately,
+                # per waiting_on_you's own comment above) look stuck forever
+                # to a caller that only checked status/waiting_on_you.
+                terminal = run is not None and run["status"] in teams.TEAM_TERMINAL_STATUSES
                 inst["team"] = {"status": team_status, "run_id": run["run_id"] if run else None,
                                 "composition": composition, "waiting_on_you": waiting_on_you,
-                                "escalation_kind": escalation_kind,
+                                "escalation_kind": escalation_kind, "terminal": terminal,
                                 # Backlog item 21 part 2, docs/spec.md
                                 # "Proposed approach" §1 -- the run's LIVE
                                 # roster/lead, read directly off the

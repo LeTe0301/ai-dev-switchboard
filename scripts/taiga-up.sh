@@ -23,6 +23,12 @@ CONFIG=/etc/ai-dev-switchboard/switchboard.env
 TAIGA_DIR="${TAIGA_DIR:-/opt/ai-dev-switchboard-taiga}"
 TAIGA_UP_MAX_ATTEMPTS="${TAIGA_UP_MAX_ATTEMPTS:-5}"
 TAIGA_UP_RETRY_BACKOFF_SECONDS="${TAIGA_UP_RETRY_BACKOFF_SECONDS:-10}"
+# Item 30: the original success check was a single point-in-time read right
+# after `up -d` returns -- round 5 saw the gateway report "running" for
+# under a second before crashing. Sleep this long and re-check before
+# trusting a "running" read; a die-before-settled is treated as a failed
+# attempt, same as any other (docs/spec.md "Proposed approach" Item 30).
+TAIGA_UP_SETTLE_SECONDS="${TAIGA_UP_SETTLE_SECONDS:-5}"
 # Item 30 (v2): a full `systemctl restart docker` was the only 100%-
 # reliable recovery found on the verification host, but it restarts
 # EVERY Docker container on this machine, not just Taiga's -- a real,
@@ -42,9 +48,15 @@ while [ "$attempt" -le "$TAIGA_UP_MAX_ATTEMPTS" ]; do
     "${COMPOSE[@]}" up -d
     state=$("${COMPOSE[@]}" ps taiga-gateway --format '{{.State}}' 2>/dev/null)
     if [ "$state" = "running" ]; then
-        exit 0
+        sleep "$TAIGA_UP_SETTLE_SECONDS"
+        state=$("${COMPOSE[@]}" ps taiga-gateway --format '{{.State}}' 2>/dev/null)
+        if [ "$state" = "running" ]; then
+            exit 0
+        fi
+        echo "taiga-up: taiga-gateway was running but died within the ${TAIGA_UP_SETTLE_SECONDS}s settle window (state: ${state:-<none>}), attempt $attempt/$TAIGA_UP_MAX_ATTEMPTS" >&2
+    else
+        echo "taiga-up: taiga-gateway didn't come up cleanly (state: ${state:-<none>}), attempt $attempt/$TAIGA_UP_MAX_ATTEMPTS" >&2
     fi
-    echo "taiga-up: taiga-gateway didn't come up cleanly (state: ${state:-<none>}), attempt $attempt/$TAIGA_UP_MAX_ATTEMPTS" >&2
     if [ "$attempt" -lt "$TAIGA_UP_MAX_ATTEMPTS" ]; then
         "${COMPOSE[@]}" rm -f taiga-gateway >/dev/null 2>&1 || true
         sleep "$backoff"

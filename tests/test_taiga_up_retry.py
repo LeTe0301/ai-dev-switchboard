@@ -54,7 +54,8 @@ class TaigaUpRetryTests(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def _run(self, success_at, max_attempts=3, timeout=10):
+    def _run(self, success_at, max_attempts=3, timeout=10, settle_die_at=0,
+             settle_seconds=None):
         """Runs the real taiga-up.sh with `docker` stubbed as a shell
         function (shell functions take priority over PATH executables, so
         no real `docker` binary is needed). The stub tracks how many times
@@ -63,11 +64,20 @@ class TaigaUpRetryTests(unittest.TestCase):
         ...)` forks into) and reports taiga-gateway as "running" only once
         that count reaches `success_at`; `docker compose ... rm -f
         taiga-gateway` calls are logged to a separate file for assertion.
-        `sleep` is stubbed to a no-op to keep the exhaustion case fast.
+        `sleep` is stubbed to a no-op (but still logs its argument) to keep
+        the exhaustion case fast. Item 30's settle-window recheck means each
+        attempt can call `ps taiga-gateway` up to twice (an initial check,
+        then -- only if that reported "running" -- a second check after the
+        settle-window sleep); the stub tracks the per-attempt ps-call count
+        via PS_COUNT_FILE (reset on every `up -d`) so `settle_die_at` can
+        simulate a gateway that reports "running" on the first check of that
+        specific attempt but "exited" on the settle-window recheck.
         `TAIGA_DIR` points at an empty temp directory (never inspected by
         the stub -- only `cd` needs it to exist)."""
         counter_file = os.path.join(self.tmpdir, "up-calls")
         rm_log = os.path.join(self.tmpdir, "rm-calls")
+        ps_count_file = os.path.join(self.tmpdir, "ps-count")
+        sleep_log = os.path.join(self.tmpdir, "sleep-calls")
         taiga_dir = os.path.join(self.tmpdir, "taiga-dir")
         os.makedirs(taiga_dir, exist_ok=True)
 
@@ -76,16 +86,24 @@ class TaigaUpRetryTests(unittest.TestCase):
             set -uo pipefail
             COUNTER_FILE={counter_file!r}
             RM_LOG={rm_log!r}
+            PS_COUNT_FILE={ps_count_file!r}
+            SLEEP_LOG={sleep_log!r}
             SUCCESS_AT={success_at}
+            SETTLE_DIE_AT={settle_die_at}
             docker() {{
                 case "$*" in
                     *"up -d"*)
                         n=$(( $(cat "$COUNTER_FILE" 2>/dev/null || echo 0) + 1 ))
                         echo "$n" > "$COUNTER_FILE"
+                        echo 0 > "$PS_COUNT_FILE"
                         ;;
                     *"ps taiga-gateway"*)
                         n=$(cat "$COUNTER_FILE" 2>/dev/null || echo 0)
-                        if [ "$n" -ge "$SUCCESS_AT" ]; then
+                        pc=$(( $(cat "$PS_COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
+                        echo "$pc" > "$PS_COUNT_FILE"
+                        if [ "$n" -eq "$SETTLE_DIE_AT" ] && [ "$pc" -eq 2 ]; then
+                            echo "exited"
+                        elif [ "$n" -ge "$SUCCESS_AT" ]; then
                             echo "running"
                         else
                             echo "created"
@@ -96,12 +114,14 @@ class TaigaUpRetryTests(unittest.TestCase):
                         ;;
                 esac
             }}
-            sleep() {{ :; }}
+            sleep() {{ echo "$1" >> "$SLEEP_LOG"; }}
             {self.script_source}
             """)
         env = dict(os.environ)
         env["TAIGA_DIR"] = taiga_dir
         env["TAIGA_UP_MAX_ATTEMPTS"] = str(max_attempts)
+        if settle_seconds is not None:
+            env["TAIGA_UP_SETTLE_SECONDS"] = str(settle_seconds)
         result = subprocess.run(
             ["bash", "-c", wrapper], capture_output=True, text=True,
             timeout=timeout, env=env,
@@ -114,12 +134,16 @@ class TaigaUpRetryTests(unittest.TestCase):
         if os.path.exists(rm_log):
             with open(rm_log) as f:
                 rm_calls = len(f.read().splitlines())
-        return result, up_calls, rm_calls
+        sleep_calls = []
+        if os.path.exists(sleep_log):
+            with open(sleep_log) as f:
+                sleep_calls = f.read().splitlines()
+        return result, up_calls, rm_calls, sleep_calls
 
     # ── common case: running on the first attempt -> exit 0, no retry ───
 
     def test_succeeds_on_first_attempt_no_retry(self):
-        result, up_calls, rm_calls = self._run(success_at=1)
+        result, up_calls, rm_calls, _sleeps = self._run(success_at=1)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(up_calls, 1)
         self.assertEqual(rm_calls, 0)
@@ -128,7 +152,7 @@ class TaigaUpRetryTests(unittest.TestCase):
     # ── recovers on the second attempt after one targeted rm+retry ──────
 
     def test_succeeds_on_second_attempt_after_one_retry(self):
-        result, up_calls, rm_calls = self._run(success_at=2)
+        result, up_calls, rm_calls, _sleeps = self._run(success_at=2)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(up_calls, 2)
         self.assertEqual(rm_calls, 1)
@@ -140,7 +164,9 @@ class TaigaUpRetryTests(unittest.TestCase):
     # ── exhausts all attempts -> non-zero exit, specific stderr message ─
 
     def test_exhausts_all_attempts_and_fails_loudly(self):
-        result, up_calls, rm_calls = self._run(success_at=99, max_attempts=3)
+        result, up_calls, rm_calls, _sleeps = self._run(
+            success_at=99, max_attempts=3
+        )
         self.assertEqual(result.returncode, 1)
         self.assertEqual(up_calls, 3)
         # rm -f is only run *between* attempts, never after the last one.
@@ -157,11 +183,50 @@ class TaigaUpRetryTests(unittest.TestCase):
     # ── TAIGA_UP_MAX_ATTEMPTS is honored when overridden ────────────────
 
     def test_max_attempts_env_override_is_honored(self):
-        result, up_calls, rm_calls = self._run(success_at=99, max_attempts=5)
+        result, up_calls, rm_calls, _sleeps = self._run(
+            success_at=99, max_attempts=5
+        )
         self.assertEqual(result.returncode, 1)
         self.assertEqual(up_calls, 5)
         self.assertEqual(rm_calls, 4)
         self.assertIn("after 5 attempts", result.stderr)
+
+    # ── settle-window recheck: a gateway that reports "running" on the ──
+    # ── first check but dies before the settle window elapses is a fail ─
+
+    def test_settle_window_recheck_catches_gateway_that_dies_before_settling(
+        self,
+    ):
+        # Attempt 1: initial `ps` reports "running" (success_at=1), but the
+        # settle-window recheck for that same attempt reports "exited" --
+        # this must be treated as a failed attempt (rm -f + backoff +
+        # retry), not an immediate exit 0. Attempt 2 then genuinely settles.
+        result, up_calls, rm_calls, _sleeps = self._run(
+            success_at=1, settle_die_at=1, max_attempts=3
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(up_calls, 2)
+        self.assertEqual(rm_calls, 1)
+        self.assertIn(
+            "taiga-up: taiga-gateway was running but died within the "
+            "5s settle window",
+            result.stderr,
+        )
+        self.assertIn("attempt 1/3", result.stderr)
+
+    # ── TAIGA_UP_SETTLE_SECONDS is honored when overridden ──────────────
+
+    def test_settle_seconds_env_override_is_honored(self):
+        result, up_calls, rm_calls, sleeps = self._run(
+            success_at=1, settle_seconds=2
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("2", sleeps)
+
+    def test_default_settle_seconds_is_5(self):
+        result, up_calls, rm_calls, sleeps = self._run(success_at=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("5", sleeps)
 
 
 if __name__ == "__main__":

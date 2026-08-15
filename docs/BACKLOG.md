@@ -2224,3 +2224,61 @@ already uses (per item 35), not a stale/separately-computed value.
 Worth checking why `run.json`'s `project` field ends up `null` in the
 same run as a first step, since it may point at the same underlying
 write path being incomplete or racy.
+
+---
+
+## Round 6 fixes (2026-08-15): items 30, 37, 38
+
+Closes the two remaining crash/staleness bugs from round-5 verification
+(item 30's crash-loop root cause, item 38's stuck `/status`) plus the
+security-hygiene regression item 37 found (the tool that was supposed to
+warn about a loose config file instead silently reverting item 29's ACL
+fix).
+
+- **30**: root cause was startup-ordering, not a transient port-bind
+  race — `taiga-gateway`'s bundled nginx resolves `taiga-front` once at
+  container-start with no `resolver` directive, so if `taiga-front` isn't
+  attached to the network yet it exits immediately and its port
+  reservation wedges every subsequent recreate. `install.sh`'s
+  `docker-compose.override.yml` now gives `taiga-front` a healthcheck
+  (`wget --spider http://127.0.0.1/` — not `localhost`, confirmed
+  hands-on that BusyBox wget on this image resolves `localhost` to `::1`
+  first and gets connection-refused) and upgrades `taiga-gateway`'s
+  `depends_on` on it to `condition: service_healthy`, entirely inside the
+  override file this repo already regenerates every run — no changes
+  inside the pinned third-party `taiga-docker` checkout. `taiga-up.sh`
+  also gained a settle-window recheck (`TAIGA_UP_SETTLE_SECONDS`,
+  default 5s): a gateway reporting `running` that dies before the window
+  elapses is now treated as a failed attempt rather than a false-positive
+  success. `app.py`'s `TAIGA_UP_SCRIPT` timeout was raised 180s→220s (and
+  the paired frontend `SINGLETON_TOGGLE_CONFIG.taiga.timeoutMs` in
+  lockstep) to keep comfortable margin over the new worst-case retry
+  arithmetic (175s of pure sleep across up to 5 attempts).
+- **37**: `_check_config_permissions` in `scripts/taiga_push_spec.py` is
+  now ACL-aware — when an extended ACL is present it reads `getfacl`'s
+  `other::` entry (the one bit that's still a genuine leak regardless of
+  named-user grants) instead of misreading the recomputed ACL mask in
+  `st_mode`'s group bits as a loose group permission. It no longer prints
+  a `chmod`-based remediation for an ACL'd file (which would collapse the
+  item-29 grant); a genuinely loose ACL'd file now gets `setfacl`-based
+  remediation instead. Falls back to the original plain `st_mode` check
+  when `getfacl` is unavailable or the file has no extended ACL, so
+  today's behavior is unchanged for the un-migrated case.
+- **38**: added a single `TEAM_TERMINAL_STATUSES` constant to
+  `app/teams.py`, replacing three previously-duplicated inline literal
+  tuples (`stop_team()`, `sweep_dead_teams()`, `interject()`). `/status`
+  now exposes an additive `team.terminal` boolean sourced from that same
+  constant, so a poller can detect `escalated_max_rounds`/`finished`/
+  `error`/`stopped` completion directly instead of inferring it from the
+  coarser `status`/`waiting_on_you` fields (which is what let a poller
+  hang indefinitely on an `escalated_max_rounds` run). The `"project":
+  null` observation from item 38's original report was investigated
+  fresh against current code and does not reproduce — no code path
+  anywhere writes a literal `"project"` key (only `"project_name"`);
+  treated as resolved-by-explanation, most likely a terminology slip in
+  the original report.
+
+Reviewed via a full developer→reviewer cycle, approved with one
+non-blocking follow-up (this entry). Full test suite passes at 1232
+tests with the same 3 pre-existing failures (untracked `CLAUDE.md` in
+the repo root, unrelated to this round, confirmed via `git stash`).

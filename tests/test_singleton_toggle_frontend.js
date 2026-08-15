@@ -255,9 +255,11 @@ const BADGE_CONFIG = {
 // SINGLETON_TOGGLE_CONFIG configures (docs/test-review.md round-5 Finding 1
 // — taiga's was raised from 90000 to 180000 to stay >= taiga_run()'s own
 // 180s backend "up" timeout; gitea's backend timeout is unchanged, so its
-// timeoutMs stays 90000). Duplicated deliberately, not imported, same
-// rationale as BADGE_CONFIG above.
-const TIMEOUT_MS_CONFIG = { taiga: 180000, gitea: 90000 };
+// timeoutMs stays 90000; round 6 raised taiga's again, to 220000, to stay
+// >= taiga_run()'s new 220s backend "up" timeout after item 30's
+// settle-window recheck was added). Duplicated deliberately, not imported,
+// same rationale as BADGE_CONFIG above.
+const TIMEOUT_MS_CONFIG = { taiga: 220000, gitea: 90000 };
 
 function statusFor(kind, { on, url = null }) {
   const other = OTHER_KIND[kind];

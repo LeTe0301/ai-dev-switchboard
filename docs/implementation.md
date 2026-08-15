@@ -1,404 +1,277 @@
-# Implementation: E2E regression-verification follow-ups, round 5 (items 29-v2, 30-v2, 34, 35)
+# Implementation: Round 6 — Taiga gateway startup-ordering crash-loop, ACL-aware push-spec security check, /status terminal-state staleness (items 30, 37, 38)
 
 ## Summary
-Four independent fixes from a real Proxmox regression-verification pass
-(`docs/BACKLOG.md`'s "Items 22-33 regression verification" section, plus
-new items 34/35), implemented per `docs/spec.md`:
+Three independent fixes from `docs/spec.md` ("Round 6"): `install.sh` now
+health-gates `taiga-gateway`'s startup on `taiga-front` actually being
+resolvable (already applied before this session started) and
+`scripts/taiga-up.sh` gained a settle-window recheck so a gateway that
+briefly reports `running` before dying is treated as a failed attempt, not
+a false success; `scripts/taiga_push_spec.py`'s config-permission check is
+now ACL-aware so it stops misreading an item-29-style narrow ACL grant's
+recomputed mask as a loose group permission and recommending a
+mask-collapsing `chmod`; and `GET /status` now exposes an additive
+`team.terminal` boolean, sourced from the same `TEAM_TERMINAL_STATUSES`
+constant `stop_team()`/`sweep_dead_teams()`/`interject()` already used
+independently (as three duplicated inline literals), so a poller no longer
+has to infer completion from the coarser `status`/`waiting_on_you` fields
+and hang forever on `escalated_max_rounds`.
 
-1. **Item 29 (v2)** — `switchboard-svc` now gets a narrow, single-user
-   POSIX ACL read grant on `taiga-push.env` (the round-1 fix closed the
-   *path* mismatch but left a *permission* gap: the file is correctly
-   `600`/`RUN_USER`-owned, but the service user couldn't read it).
-   `app/taiga_board.py`'s `load_config()` now also distinguishes
-   "permission denied" from "genuinely missing" instead of conflating
-   both into the same "Taiga isn't configured" message.
-2. **Item 30 (v2)** — `scripts/taiga-up.sh`'s retry loop is now 5
-   attempts with exponential backoff (10/20/40/80s) instead of the
-   round-4 fix's flat 3×2s, plus an opt-in-only (default off)
-   `TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION` fallback. `app/app.py`'s
-   `taiga_run()` timeout for the `"up"` action was raised from 90s to
-   180s — the previous flat 90s would have killed the retry loop
-   mid-attempt before it ever got a chance to recover (see "Root cause /
-   the 90s timeout check" below).
-3. **Item 34** — `install.sh`'s guarded-restart block (refuses to
-   restart while any `RUN_USER` tmux session is live) moved from
-   right after `systemctl enable --now` (gated on `--update`) to the very
-   end of the script, right before `echo "== Done =="`, and now runs
-   unconditionally. Previously a fresh `--with-git-hosting` (or any
-   `--with-*`) install started the service *before* that block's own
-   config write landed in `switchboard.env`, so the flag never actually
-   reached the running process's environment (`EnvironmentFile=` is read
-   once at process start).
-4. **Item 35** — `POST /team/stop` now cleans up a `finished` or
-   `escalated_max_rounds` run too, not just an active one. The gate was
-   narrowed from `run is None or run["status"] not in (...)` to just
-   `run is None`; `teams.stop_team()` was already correctly unconditional,
-   the bug was entirely in the route's own pre-check.
+## Root cause
 
-## Root cause / the 90s timeout check (item 30, explicitly required by the spec)
-`app/app.py`'s `taiga_run()` shells out via `subprocess.run(["sudo",
-script], ..., timeout=...)`. Before this change, every action (`up`,
-`down`) used a flat 90s timeout. `scripts/taiga-up.sh`'s new retry
-constants (5 attempts, exponential backoff starting at 10s, doubling
-each time) sleep 10+20+40+80 = **150s** across the 4 inter-attempt
-sleeps alone (before the 5th and final attempt), plus the `docker
-compose up -d`/`ps` calls themselves in between — comfortably past the
-previous 90s ceiling. Confirmed by reading `taiga_run()` directly
-(`app/app.py:2696-2702` before this change: `timeout=(10 if action ==
-"status" else 90)`). Per the spec's explicit instruction to raise the
-timeout or tune the retry constants down (not leave the arithmetic
-unchecked), I raised `taiga_run()`'s own timeout for `"up"` specifically
-to **180s** — the spec's stated design reasoning is that real recovery on
-the verification host needed "tens of seconds to a couple of minutes,"
-so keeping the full 150s of retry headroom (rather than shrinking the
-constants) better matches what was actually observed, with margin for
-the `up -d`/`ps` calls themselves. `"down"`/`"status"` keep their
-original timeouts (10s/90s) — neither retries.
+### Item 30 (settle-window half)
+`scripts/taiga-up.sh`'s success check was a single point-in-time
+`docker compose ps taiga-gateway --format '{{.State}}'` read immediately
+after `up -d` returns. Round 5 observed the gateway report `Up` for under a
+second before crashing, so the script could exit 0 while the public
+entrypoint was already dead. The `docker-compose.override.yml` health-gate
+(already applied to `install.sh` before this session — see "Deviations
+from spec" below) addresses the specific `taiga-front`-not-yet-resolvable
+race; the settle-window recheck in this session's work is defense in depth
+against *any* other transient early-exit, per the spec's own framing.
+
+### Item 37
+`_check_config_permissions` read `stat.S_IMODE(os.stat(path).st_mode)` and
+warned whenever `mode & 0o077` was nonzero. Once `taiga-configure-push.sh`
+(item 29) runs `setfacl -m u:switchboard-svc:r` on the mode-600 config
+file, `setfacl` recomputes the file's ACL *mask* to the union of the
+owning group's permission and every named ACL entry — here, `r`. `stat()`
+then reports that mask (not the real group-class exposure) in the
+group-class bits, so the file "looks" like mode `0640` even though its
+actual `other::` exposure is still `---`. The old check saw `0640 & 0o077
+!= 0`, called it loose, and recommended `chmod 600` — which, if followed,
+recomputes the mask down to `mask::---` and silently makes the
+`switchboard-svc` grant's *effective* permission `---`, reverting item 29
+with no indication anything changed.
+
+### Item 38
+`app/teams.py` already had a correct, single 4-status terminal check
+(`("finished", "escalated_max_rounds", "error", "stopped")`), but it was
+duplicated verbatim as an inline literal in three separate places
+(`stop_team()`, `sweep_dead_teams()`, `interject()`) and `/status`'s own,
+independently-written `team_status` bucketing in `app/app.py` never reused
+it — `escalated_max_rounds` deliberately stays under the coarser
+`"blocked"` `team_status` bucket (see the adjacent, unchanged
+`waiting_on_you` comment), so a caller polling `/status` had no
+unambiguous "is this run actually done" signal and could hang indefinitely
+on an `escalated_max_rounds` run.
 
 ## Changes by file
-- `install.sh`:
-  - `apt-get install` line (item 29): added `acl` so `setfacl`/`getfacl`
-    are available.
-  - `runtime.env` write (item 29): added `SVC_USER=$SVC_USER` as a third,
-    non-secret line (same category as the existing `RUN_USER`/
-    `PROJECTS_DIR`), so `scripts/taiga-configure-push.sh` (which runs as
-    `RUN_USER`, not `SVC_USER`) can look up who to grant the ACL to
-    without hardcoding `"switchboard-svc"`.
-  - Guarded-restart block (item 34): deleted from right after
-    `systemctl enable --now ai-dev-switchboard` (previously gated on
-    `$UPDATE -eq 1`), re-inserted verbatim-in-logic but unconditional
-    right before `echo "== Done =="`, after every `--with-*` block. The
-    live-tmux-session detection/defer logic itself is byte-for-byte
-    unchanged; only the gate (`if [ "$UPDATE" -eq 1 ]`, removed) and the
-    deferred-restart message (no longer `--update`-specific wording,
-    dropped the now-inapplicable "New code was copied to $INSTALL_DIR"
-    phrase) changed, matching the spec's exact code block.
-- `scripts/taiga-configure-push.sh` (item 29): after the existing
-  `chmod 600 "$CONFIG_FILE"` line, added the ACL grant — reads
-  `SVC_USER` from `/etc/ai-dev-switchboard/runtime.env` (falling back to
-  the literal `"switchboard-svc"` default if that file or key is
-  missing), then `setfacl -m u:${SVC_USER_NAME}:r "$CONFIG_FILE"` if
-  `setfacl` is available, with specific, actionable stderr warnings if
-  either `setfacl` is missing or the grant itself fails (e.g. a
-  filesystem without POSIX ACL support).
-- `app/taiga_board.py` (item 29): `load_config()` gained a new
-  `except PermissionError:` clause immediately **before** the existing
-  `except OSError:` clause (ordering matters — `PermissionError` is an
-  `OSError` subclass, so the reverse order would make the new clause dead
-  code). Raises a distinct `TaigaPushError` naming the real cause
-  ("Found {path} but couldn't read it (permission denied)...") and
-  pointing at both the automatic fix (re-run
-  `taiga-configure-push.sh`) and the manual one (`setfacl -m
-  u:<service-user>:r {path}`).
-- `scripts/taiga-up.sh` (item 30): `TAIGA_UP_MAX_ATTEMPTS` default raised
-  3 → 5; new `TAIGA_UP_RETRY_BACKOFF_SECONDS` (default 10, doubling each
-  retry) replaces the old flat `sleep 2`; new
-  `TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION` (default `0`/off) — if an
-  operator opts in, a full `systemctl restart docker` (affects every
-  container on the host, not just Taiga's) plus one more `up -d` attempt
-  runs only after all bounded retries are exhausted. Final failure
-  message updated to mention this opt-in as a next step.
+
+- `scripts/taiga-up.sh` — added `TAIGA_UP_SETTLE_SECONDS` (default 5,
+  same override-with-env-var convention as `TAIGA_UP_MAX_ATTEMPTS`/
+  `TAIGA_UP_RETRY_BACKOFF_SECONDS`). After the loop's initial
+  `state = ... running` check succeeds, sleeps `TAIGA_UP_SETTLE_SECONDS`
+  and re-runs the same `docker compose ps` check; only `exit 0` if it's
+  still `running`. A die-before-settled falls through into the existing
+  "didn't come up cleanly" branch (message, `rm -f`, backoff, loop) and
+  consumes one of `TAIGA_UP_MAX_ATTEMPTS` like any other failed attempt.
+- `install.sh` — no changes this session (the item-30
+  `docker-compose.override.yml` healthcheck/`depends_on` heredoc and its
+  explanatory comment were already applied to the working tree before
+  this session started; verified it matches the spec's proposed approach,
+  with the one deliberate `127.0.0.1`-vs-`localhost` deviation the comment
+  itself documents — see "Deviations from spec").
 - `app/app.py`:
-  - `taiga_run()` (item 30): timeout for the `"up"` action raised from a
-    flat 90s to 180s specifically (see "Root cause" above); `"down"`/
-    `"status"` unchanged.
-  - `/team/stop` route (item 35): narrowed `if run is None or
-    run["status"] not in (...)` to `if run is None`. Nothing else in the
-    route changed — `teams.stop_team()`'s own unconditional cleanup logic
-    (session kill + worktree teardown) now actually runs for a terminal
-    run too.
-- `tests/test_taiga.py`: `test_up_uses_longer_timeout` renamed
-  `test_up_uses_even_longer_timeout_to_cover_its_own_retry_loop` and its
-  assertion updated from `90` to `180`, matching the `taiga_run()` change.
-- `tests/test_teams_board.py`: new `LoadConfigPermissionTests` class —
-  three tests covering the except-clause-ordering fix (see "How this was
-  verified" below).
-- `tests/test_team_routes.py`: `TeamStopEndpointTests`'s
-  `test_stop_on_already_finished_team_is_idempotent_ok` (asserted the
-  *old*, buggy no-op behavior) replaced with
-  `test_stop_on_finished_team_now_actually_cleans_up_and_allows_restart`
-  (asserts the real teardown, then a follow-up `/team/start` on the same
-  project succeeding — the spec's own acceptance criterion) and a new
-  `test_stop_on_escalated_max_rounds_team_now_actually_cleans_up`
-  (the spec's second named terminal status).
-- `tests/test_install_update.py`: `_build_restart_block_harness()`
-  updated to extract the block from its new start marker (`"# Guarded
-  restart -- refuses to restart"` instead of the old `--update`-comment
-  marker) through to `echo "== Done =="` (instead of stopping at the
-  `--with-git-hosting` guard, since the block is no longer sandwiched
-  between two `--with-*` sections); dropped the now-unused `UPDATE=1`/
-  `$INSTALL_DIR`-in-message assumptions from the harness and its
-  assertions, since the block runs unconditionally now and its message no
-  longer mentions `$INSTALL_DIR`.
-- `tests/test_deploy_target.py`: both `_extract_between(...,
-  'echo "== Done =="')` end markers (the standalone deploy-target-block
-  harness and the combined host-control+deploy-target harness) changed to
-  stop at `"# Guarded restart -- refuses to restart"` instead — item 34
-  moved the guarded-restart block (which references `$RUN_USER`, not
-  supplied by either harness) to sit between the deploy-target block and
-  `echo "== Done =="`, so the old end marker started pulling that
-  unrelated block into these harnesses too, causing a `RUN_USER: unbound
-  variable` failure. This is a pure test-harness-boundary fix, no
-  behavior assertion changed.
+  - `taiga_run()`'s `"up"` timeout raised from 180s to 220s, and its
+    margin-arithmetic comment updated, to cover the new worst-case pure
+    sleep (150s backoff + up to `TAIGA_UP_MAX_ATTEMPTS` ×
+    `TAIGA_UP_SETTLE_SECONDS` = 175s) plus the extra up-to-5 `ps` calls
+    the settle-window recheck can add per full retry run.
+  - `SINGLETON_TOGGLE_CONFIG.taiga.timeoutMs` raised from `180000` to
+    `220000` to stay `>=` the backend's own new timeout (existing
+    documented invariant from round 5's own Finding 1).
+  - `/status`'s per-instance `inst["team"]` dict gained an additive
+    `"terminal"` field: `run is not None and run["status"] in
+    teams.TEAM_TERMINAL_STATUSES`. `team_status`, `waiting_on_you`, and
+    `escalation_kind` are unchanged.
+- `app/teams.py`:
+  - Added module-level `TEAM_TERMINAL_STATUSES = ("finished",
+    "escalated_max_rounds", "error", "stopped")` near
+    `TEAM_SESSION_STALE_TTL_SECONDS`.
+  - `stop_team()`, `sweep_dead_teams()`, `interject()` now reference
+    `TEAM_TERMINAL_STATUSES` instead of their own inline literal tuple
+    (pure refactor, no behavior change).
+- `scripts/taiga_push_spec.py`:
+  - Added `import subprocess`.
+  - Added `_parse_acl_other_bits(getfacl_output)` — parses `getfacl -p`
+    output; returns `None` if there's no `mask::` line (no extended ACL,
+    plain `st_mode` check still applies), else `{"other": int,
+    "other_str": str}` from the `other::` line.
+  - Added `_read_getfacl(path)` — the one new seam, shells out to
+    `getfacl -p <path>` with a 5s timeout; returns `None` (never raises)
+    on a missing binary, timeout, or nonzero exit, matching
+    `taiga-configure-push.sh`'s own best-effort `command -v setfacl`
+    fallback precedent.
+  - Rewrote `_check_config_permissions`: when `_read_getfacl` returns
+    ACL data with a `mask::` line, the warning (if any) is driven by
+    `other::` alone (`setfacl`-based remediation, explicit "do NOT run
+    chmod" note) instead of the recomputed-mask `st_mode` bits; when no
+    ACL is present (or `getfacl` is unavailable), behavior is byte-for-
+    byte unchanged from before this round.
+- `tests/test_taiga_up_retry.py` — `_run()` extended with `settle_die_at`/
+  `settle_seconds` params; the `docker` stub now tracks a per-attempt
+  `ps`-call count so it can simulate "running" on the settle-window
+  recheck's *first* call but "exited" on its *second* call for a specific
+  attempt. `sleep` is now logged (still a no-op) so tests can assert the
+  settle-seconds value actually reached the script. Added
+  `test_settle_window_recheck_catches_gateway_that_dies_before_settling`,
+  `test_settle_seconds_env_override_is_honored`,
+  `test_default_settle_seconds_is_5`. Existing tests updated for the new
+  4-tuple `_run()` return signature only (no behavior assertions changed).
+- `tests/test_taiga.py` — `test_up_uses_even_longer_timeout_to_cover_its_own_retry_loop`
+  updated to assert `220` instead of `180`.
+- `tests/test_singleton_toggle_frontend.js` — the deliberately-duplicated
+  `TIMEOUT_MS_CONFIG.taiga` constant (see its own comment: duplicated, not
+  imported, so a real app.py regression still shows up as a mismatch
+  instead of trivially passing) updated from `180000` to `220000`.
+- `tests/test_taiga_push.py` — extended `ConfigPermissionsTests` with a
+  `setUp`/`tearDown` pair that monkeypatches `tps._read_getfacl` (same
+  seam-mocking convention the file's own `_taiga_request` tests already
+  use), and 6 new cases covering the item-29-style-grant/no-warning,
+  never-`chmod-600`, genuinely-loose-ACL/`setfacl`-remediation,
+  no-ACL-unchanged, and `getfacl`-unavailable-fallback (both mode-644 and
+  mode-600) scenarios. Added `ParseAclOtherBitsTests` and
+  `ReadGetfaclTests` (the latter monkeypatches `tps.subprocess.run`
+  directly, same restore-in-`tearDown` technique
+  `tests/test_taiga.py::TaigaRunTests` already uses for `appmod`'s
+  `subprocess.run`).
+- `tests/test_team_routes.py`:
+  - Added `test_terminal_field` (parametrized over every status named in
+    the spec's acceptance criteria) and
+    `test_terminal_field_false_when_no_run_ever_started` to
+    `StatusRosterAndCompositionTests`, mirroring
+    `test_waiting_on_you_true_only_for_blocked_ask_user_never_for_escalated_max_rounds`/
+    `test_escalation_kind_field`'s own style.
+  - `test_status_idle_when_no_run_ever_started`'s full-dict exact-match
+    assertion updated to include the new `"terminal": False` key (this is
+    the one other place in the suite that pins `inst["team"]`'s exact
+    shape; a repo-wide grep confirmed no other test does an exact-dict
+    match against it).
 
 ## Key decisions / tradeoffs
-- Implemented all four fixes essentially verbatim from the spec's own
-  code blocks — the spec was already fully diagnosed and code-complete
-  (per its own "Orchestrator note"). The one real judgment call left open
-  was item 30's 90s-vs-150s timeout arithmetic, resolved by raising the
-  timeout (180s) rather than shrinking the retry constants, for the
-  reasoning given above.
-- Item 30's `TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION` opt-in-only default
-  is exactly as the spec's "Design decision" section states — did not
-  second-guess it. It's a real, stated design call the spec itself flags
-  for extra review attention.
+- **Item 30 timeout bump to 220s (not exactly 175s + the spec's own
+  suggested margin)**: chose 220s (45s of margin over the 175s worst-case
+  pure sleep) to keep roughly the same per-subprocess-call margin ratio
+  the existing 180s/150s (30s margin, 14 calls, ~2.1s/call) budget had,
+  scaled up for the settle-window recheck's extra up-to-5 `ps` calls
+  (19 calls total, ~2.4s/call at 220s). This is a documented judgment
+  call, not a value derived from the spec's own arithmetic (which only
+  gave the 175s floor); flagging for the reviewer's own margin check.
+- **ACL detection is "warn if uncertain, not silently pass"**: per the
+  spec's own risk note, `_parse_acl_other_bits` only suppresses the
+  warning when it can positively confirm `other::` is clean from a
+  well-formed `getfacl` parse with a `mask::` line; any parse failure
+  (missing `other::` line) falls through to `None` (treated as "no ACL"),
+  which lets the plain `st_mode` check drive the outcome instead of
+  silently trusting a malformed ACL dump.
+- **Tests match this repo's established manual-monkeypatch convention,
+  not `unittest.mock`**: grepped the existing suite first and found no
+  file imports `unittest.mock` — every seam (`_taiga_request`,
+  `appmod.taiga_run`'s `subprocess.run`) is monkeypatched by direct
+  attribute assignment with `setUp`/`tearDown` save-restore. Followed that
+  convention for `_read_getfacl` and `subprocess.run` rather than
+  introducing `unittest.mock` as a new pattern.
 
 ## Deviations from spec
-None. All four fixes match the spec's code blocks; the test-file changes
-above are necessitated by the fixes themselves (existing tests asserted
-the *old*, now-intentionally-changed behavior, or extracted install.sh
-blocks by markers that moved) and were updated to match, not deviations
-from the spec's intent.
+- **Item 30, `install.sh`**: the healthcheck test command uses
+  `http://127.0.0.1/`, not the spec's own literal heredoc example of
+  `http://localhost/`. This was already applied to the working tree
+  before this session started (per the task's own framing) and is kept
+  as-is — the file's own comment documents the hands-on finding that
+  `taigaio/taiga-front:latest`'s bundled nginx only listens on
+  `0.0.0.0:80` (no IPv6 listener), so BusyBox `wget` resolving
+  `"localhost"` to `::1` first gets `Connection refused` even though the
+  server is up. This resolves the spec's first "Open questions" item.
+- No other deviations. Item 37 and item 38 were implemented exactly per
+  the spec's own code blocks/proposed approach.
 
 ## Known limitations
-- **Item 29's real ACL grant** cannot be exercised end-to-end in this
-  sandbox — no second, unprivileged `switchboard-svc`-equivalent user
-  exists here to prove `sudo -u switchboard-svc cat taiga-push.env`
-  actually succeeds after the grant, and this sandbox runs as root, so a
-  real permission denial can't even be reproduced naturally to test
-  against. What *is* verified: `scripts/taiga-configure-push.sh` is
-  `bash -n`/shellcheck-clean, and `app/taiga_board.py`'s except-clause
-  ordering is directly proven via `tests/test_teams_board.py`'s new
-  `LoadConfigPermissionTests`, which monkeypatches `builtins.open` to
-  raise `PermissionError` (vs. a generic `OSError` vs. a genuinely
-  missing file) and confirms three distinct, correct outcomes — this
-  specifically proves the fix (a bare `except OSError:` ahead of the more
-  specific `except PermissionError:` would silently swallow it into the
-  wrong message) actually takes effect, not just that the code compiles.
-- **Item 30's real Docker port-bind race** (and the nginx/DNS failure
-  mode) cannot be reproduced in this sandbox either — no Docker Compose
-  plugin available, consistent with every prior Taiga-related round's own
-  documented limitation (`tests/test_taiga.py`, `tests/
-  test_taiga_up_retry.py`'s own header comments). The existing
-  `tests/test_taiga_up_retry.py` harness (stubs `docker` as a shell
-  function, runs the real, unmodified script) was not re-run against new
-  hardcoded expectations since it doesn't assert specific backoff
-  durations, only call counts and messages — it passed unmodified
-  against the new retry logic. What *is* verified: `bash -n`/shellcheck
-  on `taiga-up.sh`, and the 180s-timeout arithmetic check documented
-  above, backed by `tests/test_taiga.py`'s updated
-  `test_up_uses_even_longer_timeout_to_cover_its_own_retry_loop`.
-- **Item 34's real "process environment picks up a fresh config write"
-  proof** (via `/proc/<pid>/environ`) needs a real systemd service
-  restart cycle on a real box — not reproducible in this sandbox. What
-  *is* verified: `tests/test_install_update.py`'s
-  `GuardedRestartBlockTests` runs the real, unmodified block (extracted
-  verbatim from `install.sh`'s current source, not a reimplementation)
-  against fake `sudo`/`tmux`/`systemctl` stand-ins, confirming the
-  live-session-defer / clean-restart logic is byte-for-byte preserved at
-  its new, unconditional location.
-- Item 35 is fully covered — no real infrastructure gap.
+- The hands-on acceptance criteria in `docs/spec.md` (fresh Proxmox
+  `--with-taiga` install toggling on/off repeatedly; `taiga-configure-
+  push.sh` + a live `board_read`/`board_write` push; driving a real run to
+  `escalated_max_rounds` and polling `/status`) were **not** exercised in
+  this session — no Docker Compose plugin, no `getfacl`/`setfacl`
+  binaries, and no live Taiga/team infrastructure are available in this
+  sandbox (same constraint prior rounds' own implementation docs already
+  note). Everything verifiable without that infrastructure (unit tests,
+  the settle-window's stubbed-shell-function retry logic, the ACL-parsing
+  logic against synthetic `getfacl` output, `/status`'s `terminal` field
+  against real `teams.py` state transitions) was exercised and passes.
+- `getfacl`/`setfacl` are not installed in this sandbox, which was
+  actually useful for one thing: it means the *unmodified* pre-existing
+  `ConfigPermissionsTests` cases (`test_mode_600_prints_no_warning`,
+  `test_looser_mode_prints_a_loud_warning_but_does_not_raise`) exercise
+  the real, unpatched `_read_getfacl` and its real
+  `getfacl`-not-installed fallback path end to end, not just a
+  monkeypatched stand-in — confirming that fallback path works against a
+  real "binary missing" `FileNotFoundError`, not just a simulated one.
 
-## How this was verified
+## The `"project": null` investigation (item 38 §3)
+Reproduced the spec's own archaeology fresh against the current code
+(post this session's changes): grepped `app/`, `scripts/`, and `tests/`
+for any literal `"project":` key assignment touching team run state — the
+only match is `scripts/taiga_push_spec.py`'s unrelated Taiga API request
+body (`_create_userstory`'s `body={"project": project_id, ...}`), a
+completely separate subsystem. Read `app/teams.py`'s `_new_state()`
+(now around line 2802) and `_persist()` (now around line 2833) in full:
+`_new_state()` only ever sets a `"project_name"` key (`None` for a bare
+`team-start` CLI run that skipped `team-launch`, by its own comment,
+intentionally); `_persist()` writes exactly the `state` dict via
+`json.dump`, adding no extra keys. Also ran the full test suite, which
+exercises real `_new_state()`/`_persist()` output for both the
+`team-launch` and bare `team-start` (`run-cli`) paths — every `run.json`
+this produces (spot-checked several in the test run's own captured
+output) contains `"project_name"`, never a top-level `"project"` key,
+consistent with the code read.
+
+**Finding: resolved-by-explanation, not reproduced.** No code path in the
+current codebase ever writes a literal `"project"` key into a run's
+`run.json`. This is consistent with the spec's own observation that the
+finding is also inconsistent with `latest_run_for_project()`'s strict
+`state.get("project_name") != project_name` filter (which would have
+skipped, never associated, a run whose `project_name` was `None` — yet
+the reported run was correctly associated with its project everywhere
+else). Most likely explanation, per the spec's own framing: a
+terminology slip in the original report (meaning `project_name`, which
+per the filtering above would then have had to be non-null for that run
+to have been found at all), or stale data from a schema predating this
+round. No fix was made for this — per "Non-goals", not building a fix for
+an observation that doesn't reproduce under current code. A hands-on
+repro against a real terminal run's actual `run.json` (per the spec's
+acceptance criteria) is still the only way to fully close this out if the
+observation recurs.
+
+## How to verify locally
 ```bash
-# Syntax/lint on every touched shell file:
-bash -n install.sh
-bash -n scripts/taiga-configure-push.sh
-bash -n scripts/taiga-up.sh
-shellcheck install.sh scripts/taiga-configure-push.sh scripts/taiga-up.sh
-# -> all bash -n clean; shellcheck reports only two pre-existing,
-#    unrelated style notes (SC2015 at install.sh:70, predates this
-#    change; SC2001 at the moved sed call, same call the pre-fix block
-#    already had -- not a new issue)
-
-# Python compiles:
-python3 -m py_compile app/app.py app/taiga_board.py
-
-# Item 29's except-clause-ordering fix, in isolation:
-python3 -m unittest tests.test_teams_board.LoadConfigPermissionTests -v
-# -> Ran 3 tests ... OK
-
-# Item 30's timeout-arithmetic regression guard:
-python3 -m unittest tests.test_taiga.TaigaRunTests -v
-# -> Ran 5 tests ... OK
-
-# Item 34's guarded-restart-block relocation:
-python3 -m unittest tests.test_install_update -v
-# -> Ran 20 tests ... OK
-
-# Item 34's deploy-target harness boundary fix:
-python3 -m unittest tests.test_deploy_target -v
-# -> Ran 32 tests ... OK
-
-# Item 35's route fix:
-python3 -m unittest tests.test_team_routes.TeamStopEndpointTests -v
-# -> Ran 8 tests ... OK
-
-# Full existing suite -- no regressions introduced by this round:
+# Full suite (1232 tests; 3 pre-existing failures in
+# tests/test_teams_grounding.py are unrelated to this round -- they fail
+# identically on the unmodified tree, caused by a stray CLAUDE.md file
+# present in this sandbox's working directory that the grounding-discovery
+# test's fixed expected-file-list doesn't account for).
 python3 -m unittest discover -s tests
-# -> Ran 1213 tests ... FAILED (failures=3)
-```
-The 3 remaining failures (`test_teams_grounding.DiscoverThisRepoTests
-.test_discovers_architecture_backlog_readme_no_claude_or_agents`,
-`.test_load_grounding_against_this_repo_is_non_empty`,
-`test_teams_grounding.GroundingCLITests
-.test_grounding_subcommand_against_this_repos_own_tree`) are **pre-
-existing and unrelated** — confirmed via `git stash` (they fail
-identically on the unmodified tree). Root cause: an untracked `CLAUDE.md`
-file present at the repo root in this sandbox session (not created by
-this round's changes, not part of `docs/spec.md`'s scope) that these
-tests' own grounding-file discovery logic picks up, shifting their
-expected file-count/list assertions by one. A `test_teams_headless
-.RealTmuxHeadlessTests.test_run_sh_and_prompt_file_are_world_readable_
-under_a_strict_umask` failure also appeared in one full-suite run but
-passed cleanly both before and after this round's changes when run in
-isolation — a pre-existing flake under full-suite load (real tmux
-timing), not a regression from this round.
 
----
+# This round's changed areas specifically:
+python3 -m unittest tests.test_taiga tests.test_taiga_push \
+    tests.test_taiga_up_retry tests.test_team_routes -v
 
-## Fix-back cycle: round 5 review findings (docs/test-review.md)
-
-The reviewer's testing+review pass approved the four items above but
-requested changes on two review-pass findings (not test failures) before
-final approval. Both are addressed here.
-
-### Finding 1 (must-fix) — frontend Taiga timeout out of sync with the new 180s backend timeout, plus no double-submission guard
-- **Root cause**: item 30 (v2) raised `taiga_run()`'s backend `"up"`
-  timeout from 90s to 180s to give `scripts/taiga-up.sh`'s new retry loop
-  room to run to exhaustion, but `SINGLETON_TOGGLE_CONFIG.taiga.timeoutMs`
-  (`app/app.py`, JS embedded in `render_page()`) was left at the old
-  `90000`. The pre-existing comment at that definition explicitly states
-  the two timeouts are kept in sync as "a safety ceiling, not a
-  performance target" — this round broke that invariant for Taiga
-  specifically (Gitea's backend timeout is unchanged at 90s, so its
-  `timeoutMs` correctly stayed 90000).
-- **Fix**: `SINGLETON_TOGGLE_CONFIG.taiga.timeoutMs` raised `90000` →
-  `180000`, matching `taiga_run()`'s actual `"up"` timeout exactly (not
-  guessed — read directly from the `timeout = 180 if action == "up" else
-  ...` line). Comments at both the backend `taiga_run()` timeout and the
-  frontend `SINGLETON_TOGGLE_CONFIG` now cross-reference each other and
-  state the invariant explicitly, so a future change to one is more
-  likely to prompt updating the other.
-- **The masked race**: the reviewer found that because the frontend's
-  "starting…"→"error" flip could happen at 90s while the backend's
-  `taiga_run("up")` call could legitimately still be in flight for up to
-  180s, an operator could see a false "error", click the (never-disabled)
-  checkbox again, and fire a second, concurrent `taiga_run("up")` (or an
-  "off" toggle → concurrent `taiga_run("down")`) against the same Docker
-  Compose stack. Fixed by making the checkbox genuinely non-interactive
-  for the duration of the "starting…" display: `singletonToggleSub()` now
-  also returns a `disabled` flag (true only while its own computed `sub`
-  is the "starting…" text — i.e. an on-dispatch is still within its own
-  `timeoutMs` window), threaded through a new `toggleDisabled` parameter
-  on `row()` that renders a `disabled` attribute on the `<input
-  type="checkbox">`. `refresh()`'s two singleton-toggle call sites (Taiga,
-  Gitea) pass this through; every other row kind (`inst`/`host`/`code`)
-  passes `undefined` and is unaffected.
-  - This only works correctly *because* Finding 1's timeoutMs fix is also
-    in place: once `timeoutMs` is kept >= the backend's own blocking
-    timeout, "error" only ever displays after the backend call is
-    guaranteed to have already resolved (the route's handler blocks on
-    `taiga_run()` before responding), so re-enabling the checkbox at that
-    point is re-enabling on a genuine terminal state, not racing an
-    in-flight request. This is documented inline at
-    `singletonToggleSub()`'s own doc comment.
-  - The pre-existing `offPendingCount` mechanism (the *off*-path's own
-    double-submission guard, from a prior review round's Defects 1/2) was
-    deliberately left alone — it guards a different state (an intentional
-    toggle-off's own in-flight window, where `pending` is nulled
-    immediately, not "starting…") via counting rather than disabling, and
-    the spec/task for this fix-back only asked for the "starting" state to
-    be guarded. Its own doc comment was updated to say so precisely,
-    instead of continuing to claim the checkbox is "never disabled while
-    an action is in flight" (no longer true for the on-dispatch case).
-
-### Finding 2 (should-fix) — undocumented 180s timeout margin arithmetic
-- Added a comment directly at the `taiga_run()` timeout definition
-  (`app/app.py`) spelling out the arithmetic the reviewer asked to have
-  documented: 180s total − 150s worst-case pure `sleep` across the retry
-  loop's 4 inter-attempt backoffs = ~30s for the loop's 14 real
-  subprocess calls (5× `up -d`, 5× `ps`, 4× `rm -f`), ~2.1s/call average
-  if spread evenly. Explicitly notes this is thin for the exact
-  degraded-Docker scenario the retry loop exists to survive, but frames
-  the 180s ceiling as a last-resort safety net against the subprocess
-  wedging entirely — not the retry loop's primary defense mechanism (that's
-  the 5-attempt/exponential-backoff logic itself) — and tells a future
-  reader to widen both this value and `SINGLETON_TOGGLE_CONFIG.taiga
-  .timeoutMs` together if real-world margin proves too thin.
-- Per the reviewer's own framing ("the primary ask here is documenting
-  the reasoning, not necessarily changing the number"), the 180s value
-  itself was left unchanged — no new evidence surfaced during this
-  fix-back cycle to justify picking a different number over the
-  developer's original, reviewer-acknowledged-as-reasonable judgment call.
-
-### Files changed in this fix-back cycle
-- `app/app.py`:
-  - `taiga_run()`: added the Finding 2 margin-arithmetic comment (no
-    behavior change — timeout stays 180 for `"up"`).
-  - `SINGLETON_TOGGLE_CONFIG.taiga.timeoutMs`: `90000` → `180000`
-    (Finding 1's core fix).
-  - `singletonToggleSub()`: now returns `{sub, showBadge, disabled}`
-    (previously `{sub, showBadge}`); `disabled` is `true` exactly while
-    `sub` is the "starting…" text.
-  - `row()`: new trailing `toggleDisabled` parameter, rendered as a
-    `disabled` attribute on the row's `<input type="checkbox">`.
-  - `refresh()`: both singleton-toggle `row(...)` call sites now pass
-    `disabled` through from `singletonToggleSub()`'s result.
-  - `offPendingCount`'s own doc comment reworded to accurately describe
-    the now-more-nuanced disabled-state behavior (see above).
-- `tests/test_singleton_toggle_frontend.js`:
-  - New `TIMEOUT_MS_CONFIG` constant (duplicated from `app.py`'s real
-    values, same rationale as the existing `BADGE_CONFIG` duplication —
-    catches a real regression instead of trivially passing because both
-    sides read the same broken value).
-  - The existing `"unexpected stop while running that never recovers
-    still surfaces error after 90s"` test was hardcoded to a 91000ms
-    advance and would otherwise now fail for Taiga (its real threshold is
-    180000ms) — updated to advance `TIMEOUT_MS_CONFIG[kind] + 1000` per
-    kind instead of a fixed magic number, renamed to match.
-  - Two new tests per kind (Taiga and Gitea, via the existing
-    `registerSingletonToggleTests(kind)` loop): the checkbox is disabled
-    while "starting…" and re-enabled once it becomes "error" after
-    `timeoutMs`; and the checkbox is re-enabled once an on-dispatch
-    actually succeeds ("running"). Added after implementing the `disabled`
-    plumbing (not strict test-first for these two), but the fix's own
-    necessity was verified test-first in the TDD sense: running the
-    existing suite against the app.py change alone (before touching the
-    test file) surfaced the pre-existing 91000ms-hardcoded test failing
-    exactly as expected for Taiga, independently confirming the timeoutMs
-    change was a real, test-visible behavior change, not just a comment
-    update. These two new tests then close the gap the reviewer's finding
-    was actually about — the *disabled* behavior itself had no coverage
-    at all before this cycle.
-
-## How this fix-back cycle was verified
-```bash
-# Frontend regression suite for the exact code touched (Node, no deps):
+# Frontend (Node, no deps):
 node tests/test_singleton_toggle_frontend.js
-# -> ALL PASS (19/19) -- 15 pre-existing + 4 new (2 per kind)
 
-# Python compiles:
-python3 -m py_compile app/app.py
-# -> clean
+# Shell syntax/lint:
+bash -n scripts/taiga-up.sh && bash -n install.sh
+shellcheck scripts/taiga-up.sh
 
-# Full existing suite -- no regressions introduced by this fix-back:
-python3 -m unittest discover -s tests
-# -> Ran 1213 tests ... FAILED (failures=3)
+# Settle-window behavior in isolation:
+python3 -m unittest tests.test_taiga_up_retry.TaigaUpRetryTests.test_settle_window_recheck_catches_gateway_that_dies_before_settling -v
+
+# ACL-aware permission check in isolation:
+python3 -m unittest tests.test_taiga_push.ConfigPermissionsTests -v
+
+# /status terminal field in isolation:
+python3 -m unittest tests.test_team_routes.StatusRosterAndCompositionTests.test_terminal_field -v
 ```
-The same 3 pre-existing, `CLAUDE.md`-caused failures as the prior round
-(see above) — identical names, identical root cause, independently
-re-confirmed by `git status` showing `CLAUDE.md` still untracked in this
-sandbox. No new failures introduced by this fix-back cycle's changes.
 
-## Deviations from spec/review findings in this fix-back cycle
-None. Both findings were implemented as directed: Finding 1's fix
-direction text explicitly left the exact `timeoutMs` number open
-("comfortably covers... e.g. matching it") — matched it exactly (180000)
-rather than adding extra margin, since the review's own arithmetic
-treats the 180s backend value as already-decided in Finding 2 (a
-separate, "should-fix... not necessarily changing the number" concern),
-and matching exactly is the simplest reading that satisfies the stated
-invariant without conflating the two findings. Finding 2 was addressed
-by documentation only, per the reviewer's own explicit framing of what
-was actually being asked for.
+Hands-on-only acceptance criteria (need a real Proxmox `--with-taiga`
+host with Docker Compose, `getfacl`/`setfacl`, and a live team run) are
+listed in `docs/spec.md`'s own "Acceptance criteria" sections and were not
+exercised in this sandbox — see "Known limitations" above.

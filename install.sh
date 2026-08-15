@@ -414,21 +414,64 @@ if [ "$WITH_TAIGA" -eq 1 ]; then
     # wrapper scripts needing to export anything themselves.
     set_env "$TAIGA_ENV" TAIGA_PORT "$TAIGA_PORT"
 
-    # 4. Loopback-only binding — taiga-gateway's own docker-compose.yml
-    # binds "9000:80" on all interfaces, which conflicts with this project's
-    # "everything binds 127.0.0.1 only" rule. Compose auto-merges
-    # docker-compose.yml + docker-compose.override.yml in the same
-    # directory, so this override never conflicts with a future manual
-    # `git pull` in $TAIGA_DIR. Regenerated deterministically every run,
-    # like the systemd unit / sudoers file below. The single-quoted heredoc
-    # is deliberate: ${TAIGA_PORT} must stay literal here so Compose (not
-    # this shell) substitutes it from $TAIGA_DIR/.env at `docker compose`
-    # time.
+    # 4. Loopback-only binding, and (item 30) health-gating taiga-gateway's
+    # startup on taiga-front actually being resolvable — taiga-gateway's own
+    # docker-compose.yml binds "9000:80" on all interfaces (conflicts with
+    # this project's "everything binds 127.0.0.1 only" rule), and its
+    # taiga.conf does `proxy_pass http://taiga-front/;` with no `resolver`
+    # directive, so nginx resolves that hostname once at startup — if
+    # taiga-front isn't attached to the network yet (an ordinary Compose
+    # startup-ordering race; upstream's own `depends_on: [taiga-front, ...]`
+    # only waits for it to *start*, not to be ready), taiga-gateway crashes
+    # immediately and, because the exited container retains its port
+    # reservation, every remove+recreate collides on the same port and can
+    # never recover (docs/BACKLOG.md item 30). taiga-front has no healthcheck
+    # upstream, so one is added here, and taiga-gateway's depends_on for it
+    # is upgraded to `condition: service_healthy` (the same long-form
+    # depends_on/condition syntax upstream's own docker-compose.yml already
+    # uses for taiga-back -> taiga-db, proven compatible with this stack) —
+    # Compose won't start taiga-gateway until taiga-front is genuinely
+    # healthy, eliminating the race instead of retrying into it. This is
+    # deliberately done here, in the override file this repo already
+    # regenerates deterministically every run, and not by patching
+    # taiga.conf/docker-compose.yml inside the pinned, third-party
+    # taiga-docker checkout itself (docs/spec.md "Proposed approach" —
+    # Item 30 architecture decision). The healthcheck test command uses
+    # `http://127.0.0.1/`, not `http://localhost/` — confirmed hands-on
+    # against the real taigaio/taiga-front:latest image that its bundled
+    # nginx only listens on 0.0.0.0:80 (no IPv6 listener), so BusyBox wget
+    # resolving "localhost" to ::1 first gets "Connection refused" even
+    # though the server is up; 127.0.0.1 sidesteps that entirely (BusyBox
+    # wget has no -4/--prefer-family flag to force IPv4 for a "localhost"
+    # URL instead). Compose merges depends_on per-service-key across -f
+    # files, so listing all three of taiga-gateway's existing dependencies
+    # here (only taiga-front's condition actually changes) is both correct
+    # and self-documenting. Compose auto-merges docker-compose.yml +
+    # docker-compose.override.yml in the same directory, so this override
+    # never conflicts with a future manual `git pull` in $TAIGA_DIR.
+    # Regenerated deterministically every run, like the systemd unit /
+    # sudoers file below. The single-quoted heredoc is deliberate:
+    # ${TAIGA_PORT} must stay literal here so Compose (not this shell)
+    # substitutes it from $TAIGA_DIR/.env at `docker compose` time.
     cat > "$TAIGA_DIR/docker-compose.override.yml" <<'YAML'
 services:
+  taiga-front:
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1/ || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
   taiga-gateway:
     ports:
       - "127.0.0.1:${TAIGA_PORT}:80"
+    depends_on:
+      taiga-front:
+        condition: service_healthy
+      taiga-back:
+        condition: service_started
+      taiga-events:
+        condition: service_started
 YAML
 
     # 5. Pre-pull images at install time, not first toggle — otherwise the
