@@ -1,500 +1,299 @@
-# Spec: Item 21 part 2 — the "+" button UI for growing a running team
+# Spec: follow-up fixes — items 8, 12 (piece C), 20 (broader audit)
 
 ## Summary
-Ship the actual "+"-button UI backlog item 21's original request asked for,
-on top of part 1's already-merged backend (`teams.add_team_member()`,
-`POST /projects/<name>/team/add-member`, `team-add-member` CLI, the
-`TEAM_MAX_MEMBERS` cap). A new inline control on an already-running team's
-row lets a human pick one roster engine (via a native `<select>`, mirroring
-the existing lead-picker's own control) and add it to the live team, reusing
-`toggle()`'s existing TOTP-retry plumbing exactly like every other team
-action. This also requires two small, necessary backend additions
-`docs/spec.md` (part 1) explicitly deferred/left open: exposing the run's
-*live* roster (`state["members"]`/`state["lead"]`) via `/status`, and
-merging `membership.jsonl` into `GET .../team/events` so a `member_joined`
-event is actually visible in the feed — without both, the UI this part adds
-would have no correct data source to build the picker from, and no feed
-evidence the add succeeded.
+Three independent, non-blocking follow-ups recorded in `docs/BACKLOG.md`,
+all found by the reviewer during earlier cycles and deliberately deferred
+rather than fixed in-cycle. All three are fully diagnosed already — this
+spec is mechanical, not exploratory (except item 20's audit step, which is
+inherently investigative). Bundled into one cycle since all three are
+small, same-file (`app/app.py`), non-overlapping edits — mirrors item 12's
+own PR #4 precedent of bundling A/B/C sub-fixes together.
 
-## Goals
-- A "+"-style control on a `running`/`blocked_ask_user`/`blocked_board_write`
-  team's row (the exact three statuses `add_team_member()` already accepts
-  server-side — no new status set to invent) that lets a human pick ONE
-  roster engine not already on the team and add it.
-- The picker is a native `<select>`, populated only with eligible
-  candidates (roster engines, excluding the current lead if the lead is an
-  engine, excluding anyone already in the live roster) — mirrors the
-  existing composition picker's lead-`<select>` exactly, not a new picker
-  widget.
-- When `TEAM_MAX_MEMBERS` is reached (or no eligible roster engine remains
-  for a smaller reason), the control is disabled with an explicit, distinct
-  reason shown inline — never hidden outright, and never a silent failed
-  click.
-- Accurate, non-oversold feedback: a successful add shows a message that
-  states the new teammate will join **at the next round boundary** (part
-  1's own delivery semantics), not that it is immediately available to
-  delegate to. The `membership.jsonl` `member_joined` event becomes visible
-  in the merged event feed on the very next `/team/events` poll (same ~4s
-  cadence as everything else in that feed) — this is the honest "how do I
-  know it worked" signal, not a fabricated instant-success UI state.
-- The event feed's per-agent filter pills and the newly-added teammate's own
-  events become reachable once the lead actually delegates to them, without
-  requiring a full page reload.
+## Orchestrator note
+No product-manager/ux-designer dispatch — each fix's shape was already
+fully diagnosed by a reviewer in a prior cycle (items 8/12) or is a
+mechanical CSS-value swap following an already-shipped pattern (item 20,
+PR #12). Matches this project's own "skip full triage for a
+fully-diagnosed follow-up" precedent.
 
-## Non-goals
-- **Removing/shrinking a team** — unrelated, not part of this backlog item.
-- **A live terminal/window view of any teammate (original or newly added)**
-  in the web UI — no such view exists for ANY teammate today (only the
-  merged transcript-style event feed does); out of scope for this part,
-  which only needs to reuse that existing feed, not build a new observation
-  surface.
-- **A confirm() dialog before adding.** This project's own established
-  convention (`doDeploy()`'s and `doTeamStop()`'s comments, `app/app.py`)
-  reserves `confirm()` for actions that mutate a remote target or kill/
-  destroy in-flight work. Adding a teammate is additive and has no such
-  effect — `doTeamStart()`/`doTeamInterject()`/`doTeamBoardResolve()` (the
-  closest precedents) have no `confirm()` either.
-- **Multi-select / adding more than one teammate per click** — the backlog
-  item's own open question already framed this as "pick WHICH agent," not
-  "pick several"; one `<select>` + one action, matching `add_team_member()`'s
-  own single-`agent`-argument contract.
-- **Renaming/relabeling `membership.jsonl`'s already-shipped envelope
-  shape.** Part 1 persisted `{"agent": <joined-agent-name>, ...}` (the
-  literal spec text it implemented), not `agent: "system"` — part 1's own
-  "Open questions" floated `agent="system"` as a *possible* future
-  rendering choice, not a commitment. This part reuses the already-shipped
-  shape as-is (see "Proposed approach" §3 for why that's actually the
-  better choice, not a compromise).
-- **A client-side or server-side warning about resource cost beyond the
-  existing `TEAM_MAX_MEMBERS` cap.** Part 1 already settled that; this part
-  only surfaces the cap in the UI, it doesn't re-litigate its value.
-- **Retrofitting `renderTeamFeed()`'s filter-pill list is broader than just
-  this feature would need** — see "Proposed approach" §4: the fix (switch
-  from the stale `team.composition.members` to the new live `team.members`)
-  is scoped narrowly to what's needed for a newly-added teammate to get a
-  filter pill at all; no other filter/feed behavior changes.
+---
 
-## Background / current state
-- Part 1 (merged into this branch) shipped `teams.add_team_member(run_id,
-  agent)`, `POST /projects/<name>/team/add-member` (`app/app.py`, right
-  after `/team/interject`), and `team-add-member <run_id> <agent>` (CLI).
-  Accepts exactly the same three statuses `interject()` does: `running`,
-  `blocked_ask_user`, `blocked_board_write`. Returns `{"ok": true, "agent":
-  ..., "worktree": ...}` / `{"error": ...}` (400) — confirmed directly from
-  `docs/implementation.md`'s "item 21 part 1" section and the route code
-  (`app/app.py`, `/team/add-member` branch).
-- `TEAM_MAX_MEMBERS` (`app/teams.py`, default `6`) is enforced in
-  `add_team_member()` itself — the route surfaces its rejection message
-  verbatim as a 400, no separate check needed at the route or UI layer for
-  correctness (the UI's own cap-awareness below is purely a UX
-  convenience/reason-surfacing layer, not a second source of truth).
-- **`/status`'s `inst["team"]` object does NOT currently expose the run's
-  live roster.** Confirmed by reading `app/app.py`'s `/status` handler
-  directly (~line 5600-5666): `composition` is read from
-  `teams.load_compositions()` (a per-project *saved picker preference*,
-  used to pre-fill the Start-time picker) — it is computed and returned
-  unconditionally, including for an already-running team, but it is
-  **never updated by `add_team_member()`** (which deliberately never
-  touches `run.json`/`state["members"]` directly — see part 1's own "Key
-  decisions"). For a grown team, `team.composition.members` is therefore
-  stale the moment a teammate is added. `run` (the value
-  `teams.latest_run_for_project()` returns) IS the full persisted state
-  dict and already has `run["members"]`/`run["lead"]` — just not currently
-  copied into the JSON response.
-- **`renderTeamFeed()`'s per-agent filter-pill list is built from
-  `team.composition.members`** (`app/app.py`, ~line 3877:
-  `const agents = ['lead', 'human'].concat((team.composition &&
-  team.composition.members) || []);`), the same stale field. A newly-added
-  teammate's events would already appear in the merged feed under `filter
-  === 'all'` once the lead delegates to them (their own `<agent>.jsonl` is
-  already included via `state.get("members", [])` inside
-  `_handle_team_events()`, which itself IS live/fresh every poll — only the
-  *pill list* is stale), but they would have no dedicated filter pill to
-  click, and would never appear in the pill list at all if the operator
-  never happens to see one of their `all`-filtered events go by.
-- **`GET .../team/events` (`_handle_team_events()`, `app/app.py` ~line
-  5763) does not merge `membership.jsonl` into its file list today** — only
-  `transcript.jsonl` ("lead"), `human.jsonl` ("human"), and one file per
-  `state.get("members", [])`. This means the one durable, already-persisted
-  record that an add succeeded (`membership.jsonl`'s `member_joined`
-  envelope, written synchronously inside `add_team_member()`) is currently
-  invisible in the web UI's own event feed — part 1's own "Open questions"
-  flagged this exact gap and deferred it here.
-- The composition picker (`renderTeamPicker()`, `app/app.py` ~line 3495) is
-  this project's own established "pick one engine via native `<select>`"
-  precedent — its lead-`<select>` is the direct model for this part's new
-  control (one dropdown, `ROSTER` entries as `<option>`s, `tierLabel()` for
-  the visible label). Item 19 part 2's compose box
-  (`renderTeamInterjectBox()`, `app/app.py` ~line 4039) is the direct model
-  for "a new control that posts to a team-scoped route, visible under the
-  same status conditions `add_team_member()` itself accepts" — in fact its
-  own `teamAcceptsInterject(team)` helper computes EXACTLY the visibility
-  condition this part needs too (same three statuses), since `interject()`
-  and `add_team_member()` were both built to accept the identical status
-  set.
+## Piece 1 — Item 8: AI reviewer lock keyed on `(pr_key, episode)`
 
-## Proposed approach
+### Problem (from `docs/BACKLOG.md` item 8)
+`_ai_reviewer_pr_lock_for()` keys the in-flight lock on `pr_key` alone. If
+a human removes and re-adds the "ready for review" label while the
+*previous* episode's review thread is still running, `_ai_reviewer_poll_repo()`
+correctly detects the label-absent→present edge as a fresh trigger and
+writes fresh state — but `_ai_reviewer_review_bg()`'s lock acquisition then
+fails (the stale thread still holds the `pr_key`-only lock), so the new
+review is silently dropped, no error surfaced. When the stale thread later
+finishes, its completion write (success or failure) overwrites the state
+the new episode's trigger edge just wrote, making the new episode look
+already-handled when it never actually ran.
 
-### 1. `/status` gains the live roster (`app/app.py`, `/status` handler)
-Add two fields:
-- `inst["team"]["members"]`: `run.get("members", []) if run is not None else
-  []` — the live, currently-drained roster (grows the moment `team_step()`'s
-  membership drain runs, i.e. one round-poll after `add_team_member()`
-  succeeds — never earlier, matching part 1's own delivery semantics).
-- `inst["team"]["lead"]`: `run.get("lead") if run is not None else None` —
-  the run's actual lead (`{"kind", "name"}` or `None`), read directly from
-  the live state rather than re-deriving it from the picker's saved/default
-  `composition.lead`, which could in principle differ if an operator saved a
-  new preference after this run's own team-start.
+### Root cause
+No episode identity exists anywhere — state is keyed purely by `pr_key`,
+so there's no way to tell "this completion belongs to episode N" from "a
+newer episode M > N is now current."
 
-Also add one new top-level field, alongside the existing `"roster": roster`:
-`"team_max_members": teams.TEAM_MAX_MEMBERS` — a single global constant,
-same "computed once, shipped once per `/status` call" treatment `roster`
-itself already gets (not per-project, since the cap is one process-wide
-config value).
+### Fix
+Add a persisted `episode: int` field to the per-PR state entry (absent/old
+entries default to `0` via `.get("episode", 0)`, no migration needed).
+Increment it exactly at the trigger edge (the one place a *new* review
+cycle begins). Thread `episode` through the whole review-run call chain so
+a completion write only applies if it's still for the current episode, and
+key the in-flight lock on `(pr_key, episode)` instead of `pr_key` alone so
+a new episode is never silently dropped just because a stale one is still
+running.
 
-Both additions are purely additive to the JSON shape — no existing field
-changes meaning, no existing test asserting exact-dict-equality on `/status`
-should need more than adding the two new keys to its expected shape (per
-this codebase's own established "additive JSON field" precedent, e.g. how
-`escalation_kind` was added in item 7 part 2).
-
-### 2. `GET .../team/events` merges `membership.jsonl` too (`app/app.py`,
-`_handle_team_events()`)
-One new line in the `files` list, alongside the existing three sources:
+**`_save_ai_reviewer_state_entry`** (`app/app.py:1369`): add an `episode`
+keyword param, store it in the entry:
 ```python
-files = [("lead", teams._transcript_path(run_id)), ("human", teams._human_log_path(run_id)),
-         ("membership", teams._membership_log_path(run_id))]
-files += [(m, teams._agent_log_path(run_id, m)) for m in state.get("members", [])]
+def _save_ai_reviewer_state_entry(pr_key: str, *, label_present: bool, attempts: int,
+                                  reviewed_at, last_error, episode: int) -> None:
+    with _ai_reviewer_state_lock:
+        s = _load_ai_reviewer_state()
+        s[pr_key] = {"label_present": label_present, "attempts": attempts,
+                    "reviewed_at": reviewed_at, "last_error": last_error,
+                    "episode": episode}
+        ...  # unchanged below
 ```
-The `agent` label passed to `tail_jsonl_events()` here (`"membership"`) is
-only used for the malformed-line fallback and the `cursors` dict's own key
-— it does NOT override the `agent` field already embedded in each
-`membership.jsonl` line by `add_team_member()` (`{"agent": <joined-agent-
-name>, ...}`, part 1's own shipped shape — `tail_jsonl_events()` only
-substitutes its own `agent` label when a line fails to parse as JSON at
-all). So a `member_joined` event surfaces in the merged feed tagged with the
-NEWLY-JOINED agent's own name (e.g. `"aider"`), not a generic `"system"`
-pseudo-agent.
 
-**This is a deliberate choice, not an oversight** (see "Non-goals" above):
-tagging the event with the joined agent's own name means it renders in that
-agent's own established color (`teamAgentColor()`), visually tying "this is
-the moment this color/agent became available" together — arguably more
-useful than a flat gray system line, and it requires zero change to
-`_handle_team_events()`'s per-file `agent` parameter contract or to
-`tail_jsonl_events()` itself. `cursors["membership"]` is a new key in the
-response; the frontend's cursor-merge logic (`app/app.py`, the
-`pollTeamFeed()`-equivalent client function) already treats `cursors` as an
-open dict keyed by whatever agent labels the server returns (proven by how
-it already handles `"human"` today, added by item 19 part 1 with zero
-frontend cursor-logic change) — no frontend cursor-handling change needed
-beyond what "Proposed approach" §5 below already describes for rendering.
+**`_ai_reviewer_record_failure`** (`app/app.py:1382`): add `episode: int`
+param; only write if the state's current episode still matches (a stale
+thread whose episode has since been superseded is a silent no-op, not an
+error — the newer episode's own state is authoritative):
+```python
+def _ai_reviewer_record_failure(pr_key: str, message: str, episode: int) -> None:
+    prev = _load_ai_reviewer_state().get(pr_key, {})
+    if prev.get("episode", 0) != episode:
+        return  # superseded by a newer episode; this completion is stale
+    _save_ai_reviewer_state_entry(
+        pr_key, label_present=True, attempts=prev.get("attempts", 0) + 1,
+        reviewed_at=prev.get("reviewed_at"), last_error=message, episode=episode)
+```
 
-### 3. New frontend event classification for `member_joined`
-(`app/app.py`, `teamFeedEventKindClass()`/`teamFeedEventBody()`)
+**`_ai_reviewer_review_run`** (`app/app.py:1439`): add an `episode: int`
+param; pass it to every `_ai_reviewer_record_failure(...)` call site inside
+it (9 call sites — mechanical, add `, episode` to each); guard the final
+success write the same way:
+```python
+def _ai_reviewer_review_run(host: str, owner_repo: str, entry: dict, pr: dict, episode: int) -> None:
+    ...
+    # every _ai_reviewer_record_failure(pr_key, "...") call becomes
+    # _ai_reviewer_record_failure(pr_key, "...", episode)
+    ...
+    # final success save, guarded the same way as record_failure:
+    prev = _load_ai_reviewer_state().get(pr_key, {})
+    if prev.get("episode", 0) == episode:
+        _save_ai_reviewer_state_entry(pr_key, label_present=True, attempts=0,
+                                      reviewed_at=teams._now_iso(), last_error=None,
+                                      episode=episode)
+    except Exception as e:
+        _ai_reviewer_record_failure(pr_key, f"{type(e).__name__}: {e}", episode)
+```
 
-One new branch in `teamFeedEventKindClass()`, placed alongside the other
-`kind`-based checks (order doesn't matter here — `kind === 'member_joined'`
-is structurally disjoint from every existing branch, none of which check
-that `kind` value):
+**`_ai_reviewer_review_bg`** (`app/app.py:1534`): add `episode: int` param;
+key the lock on `(pr_key, episode)`; clean up the lock entry once the
+thread finishes (bounded growth — otherwise `_ai_reviewer_pr_locks` grows
+one entry per label-toggle cycle forever, not just once per PR):
+```python
+def _ai_reviewer_review_bg(host: str, owner_repo: str, entry: dict, pr: dict, episode: int) -> None:
+    pr_key = _ai_reviewer_pr_key(host, owner_repo, pr.get("number"))
+    lock_key = (pr_key, episode)
+    lock = _ai_reviewer_pr_lock_for(lock_key)
+    if not lock.acquire(blocking=False):
+        return
+
+    def _run():
+        try:
+            _ai_reviewer_review_run(host, owner_repo, entry, pr, episode)
+        finally:
+            lock.release()
+            with _ai_reviewer_pr_locks_guard:
+                _ai_reviewer_pr_locks.pop(lock_key, None)
+
+    threading.Thread(target=_run, daemon=True).start()
+```
+`_ai_reviewer_pr_lock_for()` itself (`app/app.py:1403`) needs no change —
+it's already generic over its key type (`dict.get`/`dict[key] = ...` work
+identically for a `str` or `tuple` key); only its type hint
+(`pr_key: str` → `key`) needs updating for accuracy.
+
+**`_ai_reviewer_poll_repo`** (`app/app.py:1555`): the trigger edge
+(currently line ~1610-1618) increments episode and passes it down; the
+retry branch (currently line ~1620-1622) passes the *current* (unchanged)
+episode; the label-absent branch (currently line ~1601-1608) carries the
+episode forward unchanged (it's not starting a new one, just arming the
+next add):
+```python
+        if not label_present:
+            if was_present or pr_key not in state:
+                _save_ai_reviewer_state_entry(
+                    pr_key, label_present=False, attempts=0,
+                    reviewed_at=prev.get("reviewed_at"), last_error=None,
+                    episode=prev.get("episode", 0))
+            continue
+
+        if not was_present:
+            episode = prev.get("episode", 0) + 1
+            _save_ai_reviewer_state_entry(
+                pr_key, label_present=True, attempts=prev.get("attempts", 0),
+                reviewed_at=prev.get("reviewed_at"), last_error=None, episode=episode)
+            _ai_reviewer_review_bg(host, owner_repo, entry, pr, episode)
+            continue
+
+        attempts = prev.get("attempts", 0)
+        if prev.get("last_error") is not None and attempts < AI_REVIEWER_MAX_ATTEMPTS:
+            _ai_reviewer_review_bg(host, owner_repo, entry, pr, prev.get("episode", 0))
+```
+
+### Acceptance criteria
+- [ ] A label removed-and-re-added while the previous episode's review
+      thread is still in-flight results in a NEW thread actually being
+      dispatched (not silently dropped) — verifiable with a harness that
+      starts a slow fake "in-flight" thread holding the old episode's lock,
+      then calls `_ai_reviewer_poll_repo` again with a fresh label-absent
+      then label-present pair, and asserts a second thread was started.
+- [ ] When the stale (old-episode) thread eventually completes (success or
+      failure), its state write is a no-op — the state file's `episode`
+      field still reflects whichever episode is actually current, and
+      `reviewed_at`/`attempts`/`last_error` reflect the NEW episode's own
+      outcome, not the stale one's.
+- [ ] A normal, non-racing single-episode review (today's existing
+      behavior) is unaffected: trigger → review → success/failure write,
+      exactly as before, just with `episode` now present in the persisted
+      entry.
+- [ ] `_ai_reviewer_pr_locks` does not grow by one entry per label-toggle
+      cycle forever — a finished thread's `(pr_key, episode)` lock entry is
+      removed.
+- [ ] Pre-existing state-file entries with no `episode` key (from before
+      this fix) are read correctly (`.get("episode", 0)`), no crash, no
+      forced re-review.
+
+---
+
+## Piece 2 — Item 12 piece C: widen the transient poll-boundary gate
+
+### Problem (from `docs/BACKLOG.md` item 12)
+`teamFeedEventKindClass()` (`app/app.py:3789`)'s transient-classification
+branch, line ~3833, only guards against the poll-boundary
+misclassification-as-'finish' bug while `status === 'running'`. The
+reviewer confirmed (adversarially, not just by reading) a structurally
+identical gap while `status === 'blocked'`: a trailing empty-meta
+`tool_use` from the lead with no paired `tool_result` yet, while a
+*different* in-flight round's `ask_user` escalation has already flipped
+status to `blocked`, still falls through to `'finish'` — the exact bug
+this branch exists to prevent, just for a status this narrow `'running'`
+check didn't cover.
+
+### Fix
+Backend-confirmed status vocabulary the frontend actually receives
+(`app/app.py:5731-5735`'s `/status` mapping): `"idle"`, `"running"`,
+`"blocked"`, `"finished"`, `"error"` — exactly five values, no others ever
+reach this JS. `"finished"`/`"error"` are the only genuinely terminal ones
+(no further events will ever arrive); `"idle"`/`"running"`/`"blocked"` are
+all non-terminal. Widen the gate to the non-terminal set, per the
+backlog's own suggested shape:
+
 ```javascript
-if (e.kind === 'member_joined') return 'member-joined';
+    if (!next && e.agent === 'lead' && status !== 'finished' && status !== 'error') return 'pending-classification';
 ```
-One new branch in `teamFeedEventBody()`:
-```javascript
-if (cls === 'member-joined') return '→ joined the team';
-```
-(The agent name itself is already rendered by `renderTeamFeedEvent()`'s
-existing `<span class="team-feed-agent">` — no need to repeat it in the
-body text.) New CSS: `.team-feed-event.kind-member-joined` — a left-border
-accent using that event's own agent color inline style already applied via
-`renderTeamFeedEvent()`'s existing `style="color:' + color + '"` mechanism;
-no new color token needed, reuses `TEAM_AGENT_PALETTE`.
+(single-line change at `app/app.py:3833`; update the explanatory comment
+immediately above it, currently written only in terms of `'running'`, to
+describe the widened non-terminal set instead of just one status value).
 
-### 4. Filter-pill list now reads the live roster, not the stale composition
-(`app/app.py`, `renderTeamFeed()`, ~line 3877)
-```javascript
-const agents = ['lead', 'human'].concat(team.members || []);
-```
-replacing `(team.composition && team.composition.members) || []`. This is
-the one necessary correction identified in "Background" above — without it,
-a newly-added teammate's events are reachable under the `all` filter (their
-own log file was already merged by `_handle_team_events()` before this
-part) but never get their own clickable pill. `team.members` is the new
-`/status` field from §1; every existing caller of `renderTeamFeed()` already
-receives the full `team` object, so no signature change.
+### Acceptance criteria
+- [ ] Given `status === 'blocked'`, a trailing empty-meta lead `tool_use`
+      event with no next lead event classifies as `'pending-classification'`,
+      not `'finish'` — the exact case the reviewer's adversarial test in
+      part 2's review already reproduced.
+- [ ] `status === 'running'` behavior is unchanged (already covered before
+      this fix, must remain covered after).
+- [ ] `status === 'idle'` also now gets the transient-gate treatment
+      (previously fell through to `'finish'` same as `'blocked'` did) —
+      no acceptance criterion in the original bug report calls this out
+      specifically, but it's the same class of gap and the widened
+      condition covers it for free; note this in `docs/implementation.md`
+      as a bonus, not a scope expansion requiring its own justification.
+- [ ] `status === 'finished'` / `status === 'error'` still classify a
+      trailing empty-meta `tool_use` as `'finish'`, unchanged (these are
+      the genuinely terminal cases where "assume finish" is correct, not
+      a poll-boundary artifact).
+- [ ] `tests/test_team_frontend.js` (or wherever this function's existing
+      coverage lives) passes; add a case for the newly-covered `'blocked'`
+      scenario if no existing test already covers it.
 
-### 5. The "+" control itself (`app/app.py`, new functions alongside
-`renderTeamInterjectBox()`/`doTeamInterject()`)
+---
 
-**Eligibility helper**, pure, no I/O:
-```javascript
-function teamAddMemberEligible(team) {
-  const already = new Set(team.members || []);
-  const leadName = team.lead && team.lead.kind === 'engine' ? team.lead.name : null;
-  return ROSTER.filter(e => e.kind === 'engine' && e.name !== leadName && !already.has(e.name));
-}
-```
-(`e.kind === 'engine'` mirrors `add_team_member()`'s own server-side
-rejection of the Ollama lead-only roster entry — same rule, restated
-client-side for fast feedback, exactly the same "client mirrors server,
-server stays authoritative" discipline `teamCompositionError()` already
-documents for the Start-time picker.)
+## Piece 3 — Item 20: broader button/control contrast audit
 
-**Visibility gate**: reuse `teamAcceptsInterject(team)` as-is (see
-"Background" — the status set is identical by construction). No rename;
-add a one-line comment at the new call site noting the reuse is
-intentional, not incidental.
+### Problem (from `docs/BACKLOG.md` item 20, "Open for the future session")
+PR #12 fixed `.team-btn`/`.deploy-btn`'s specific white-on-`#34c759` AA
+failure but did not audit whether other button/control color pairings in
+`app/app.py`'s CSS have the same undetected drift. This piece is that
+audit.
 
-**Render function**, placed directly below `renderTeamInterjectBox()` in
-`teamRow()`'s non-idle branch (own visual block, between the interject box
-and the feed toggle — matches "coexists with other controls" without
-crowding the `.team-actions` row, which stays reserved for the single
-"Stop team" button per existing convention):
-```javascript
-function renderTeamAddMemberControl(name, team) {
-  if (!teamAcceptsInterject(team)) return '';
-  const members = team.members || [];
-  const atCap = members.length >= (TEAM_MAX_MEMBERS_CLIENT || 6);
-  const eligible = teamAddMemberEligible(team);
-  if (atCap) {
-    return '<div class="team-add-member"><span class="team-add-member-reason">' +
-      'Team is at the maximum of ' + (TEAM_MAX_MEMBERS_CLIENT || 6) + ' teammates.</span></div>';
-  }
-  if (eligible.length === 0) {
-    return '<div class="team-add-member"><span class="team-add-member-reason">' +
-      'No more roster engines available to add.</span></div>';
-  }
-  const options = eligible.map(e =>
-    '<option value="' + esc(e.name) + '">' + esc(e.name) + ' (' + tierLabel(e.tier) + ')</option>').join('');
-  return '<div class="team-add-member">' +
-    '<select id="team-add-member-select-' + esc(name) + '">' + options + '</select>' +
-    '<button class="team-btn" onclick="doTeamAddMember(' + "'" + name + "'" + ')">+ Add</button></div>';
-}
-```
-`TEAM_MAX_MEMBERS_CLIENT`: a new client-side global, hardcoded default `6`
-(matching the server default), overwritten from `s.team_max_members` on
-every `/status` poll — exact same "hardcoded default + live override"
-precedent `TEAM_INTERJECT_MAX_CHARS_CLIENT` already establishes (item 19
-part 2), not a new pattern.
+### Approach (inherently investigative — developer executes, not
+pre-computed here)
+1. Extract every CSS rule in `app/app.py`'s `<style>` block that sets both
+   a `color` and a `background`/`background-color` on the same selector
+   (or a selector whose ancestor sets the background — check computed
+   pairs, not just same-rule pairs) for interactive controls (buttons,
+   pills, badges, status strips) specifically — not body text/links,
+   which is a much larger surface and not what item 20 was scoped to
+   originally (`.team-btn` was a *button*).
+2. For each pair, compute the real WCAG contrast ratio from the actual hex
+   values (same method PR #12 used to independently recompute rather than
+   trust `docs/design.md`'s claimed numbers, which were wrong twice
+   already for `.team-btn` — do not trust any existing in-repo comment
+   claiming a ratio without recomputing it).
+3. Flag any pairing under 4.5:1 (normal text) / 3:1 (large-or-bold text,
+   ~18.66px+ or ~14.66px+bold) as a failure.
+4. Fix each failure found using PR #12's own established pattern: match
+   text color to an already-passing pairing used elsewhere for the same
+   background color in this file (e.g. dark `#111` text on light/saturated
+   backgrounds, matching `.pill.active`/wizard buttons/the already-fixed
+   `.team-btn`) rather than inventing a new color. If a background has no
+   existing passing-text precedent in the file, darken/lighten per PR #12's
+   own reasoning (recompute, don't guess) and note the new pairing's ratio
+   in a comment the same way `.team-btn`'s fix did.
+5. If zero additional failures are found, that is a valid, complete
+   outcome for this piece — say so plainly in `docs/implementation.md`
+   with the full list of pairs checked and their ratios, not just "looked
+   fine."
 
-**Dispatch function**, mirrors `doTeamInterject()`'s shape:
-```javascript
-let teamAddMemberChoice = {};  // name -> agent name, set before toggle() fires (survives a 428 retry)
-function doTeamAddMember(name) {
-  const sel = document.getElementById('team-add-member-select-' + name);
-  if (!sel || !sel.value) return;
-  teamAddMemberChoice[name] = sel.value;
-  const msgEl = document.getElementById('team-msg-' + name);
-  if (msgEl) { msgEl.textContent = ''; msgEl.className = 'team-msg'; }
-  toggle('team-add-member', name, true, null);
-}
-```
+### Non-goals
+- Body text, links, and non-interactive text colors — out of scope, this
+  audit is about controls (the class of thing `.team-btn` was), matching
+  item 20's own backlog framing ("other button/control color pairings").
+- Any pairing already covered by PR #12 (`.team-btn`/`.deploy-btn`) —
+  already fixed, not re-touched here.
 
-**Wiring into the existing shared plumbing** (`app/app.py`):
-- `actionPath()`: `if (kind === 'team-add-member') return '/projects/' +
-  encodeURIComponent(name) + '/team/add-member';`
-- `actionBody()`: `if (kind === 'team-add-member') body.agent =
-  teamAddMemberChoice[name];`
-- `handleActionResult()`: new branch, same "own inline result slot, handled
-  before the generic 400 branch" pattern `team-interject`/
-  `team-board-resolve` already use:
-  ```javascript
-  if (kind === 'team-add-member') {
-    hideCodeOverlay();
-    const data = await r.json().catch(() => ({}));
-    const msgEl = document.getElementById('team-msg-' + name);
-    if (msgEl) {
-      if (r.ok && data.ok) {
-        msgEl.textContent = '✓ \'' + esc(data.agent) + '\' will join the team at its next round';
-        msgEl.className = 'team-msg success';
-        delete teamAddMemberChoice[name];
-      } else {
-        msgEl.textContent = '✕ Error: ' + (data.error || 'could not add teammate');
-        msgEl.className = 'team-msg error';
-      }
-    }
-    return;
-  }
-  ```
-  (Deliberately says "will join... at its next round," never "has joined" —
-  directly satisfies this spec's own "accurate, non-oversold feedback"
-  goal.)
-- The 428 code-overlay label ternary (`handleActionResult()`, the existing
-  chain of `kind === '...' ? '...' :`) gains: `kind === 'team-add-member' ?
-  'Adding teammate: ' + (name || 'this') :`.
-- `teamRow()`'s non-idle branch: insert
-  `renderTeamAddMemberControl(name, team)` between `interjectBox` and
-  `feedToggle`.
+### Acceptance criteria
+- [ ] `docs/implementation.md` lists every interactive-control color pair
+      checked and its computed ratio (pass or fail), not just the ones
+      that failed.
+- [ ] Every pairing under the applicable WCAG AA threshold is fixed using
+      an existing in-file passing precedent (or, failing that, a freshly
+      computed and stated ratio), and no fix introduces a new failure
+      elsewhere (e.g. a hover/disabled/focus variant using a different
+      background with the same text color).
+- [ ] No change to `.team-btn`/`.deploy-btn` itself (already correct,
+      already shipped).
 
-**New CSS**: `.team-add-member { display: flex; gap: 8px; align-items:
-center; margin-top: 4px; }`, `.team-add-member select { font-size: 13px;
-padding: 6px 8px; border-radius: 8px; ... }` (reusing
-`.team-lead-picker select`'s existing declaration block's values, not
-inventing new tokens), `.team-add-member-reason { font-size: 12px; color:
-#888; }` (same muted-informational-text token `.team-branches` already
-uses for its own "unavailable"/"none" states).
+---
 
 ## Affected areas
-- `app/app.py`:
-  - `/status` handler: two new fields on `inst["team"]` (`members`, `lead`),
-    one new top-level field (`team_max_members`).
-  - `_handle_team_events()`: `membership.jsonl` added to the merged file
-    list.
-  - Frontend JS: `teamAddMemberEligible()`, `renderTeamAddMemberControl()`,
-    `doTeamAddMember()`, `teamAddMemberChoice` (new); `actionPath()`/
-    `actionBody()`/`handleActionResult()` gain `'team-add-member'` branches;
-    `teamFeedEventKindClass()`/`teamFeedEventBody()` gain the
-    `member_joined` branch; `renderTeamFeed()`'s `agents` line changed to
-    read `team.members`; `teamRow()` gains one new call; new
-    `TEAM_MAX_MEMBERS_CLIENT` global, updated from `/status`.
-  - New CSS: `.team-add-member`/`.team-add-member select`/
-    `.team-add-member-reason`; `.team-feed-event.kind-member-joined`.
-- No `app/teams.py` change — part 1's backend is reused entirely as-is; no
-  new function, no new route beyond what part 1 already shipped, no schema
-  change to `run.json`/`membership.jsonl`.
-- No new route. `/status` and `GET .../team/events` are both existing
-  routes gaining additive fields/merged sources, not new endpoints.
-
-## Edge cases
-- **Team at `TEAM_MAX_MEMBERS` already** — control renders disabled with
-  the "Team is at the maximum of N teammates" reason, computed from the
-  live `team.members.length` (not a snapshot) every `/status` poll, so it
-  flips to enabled again automatically if the operator (or a future
-  "shrink" feature, not built here) ever reduces the count — no manual
-  refresh needed.
-- **Fewer roster engines configured than `TEAM_MAX_MEMBERS`, and every one
-  is already on the team** — distinct reason text ("No more roster engines
-  available to add") from the at-cap case, so an operator isn't told to
-  wait for a cap that was never actually the blocker.
-- **Server rejects anyway despite client-side eligibility passing** (a race:
-  another operator/tab added the same or a different teammate between this
-  tab's last `/status` poll and this click, pushing the count to the cap in
-  between) — the existing generic 400-handling path in `handleActionResult()`
-  surfaces `data.error` verbatim in the row's `team-msg` slot; the server
-  (`add_team_member()`) remains the sole source of truth, exactly as every
-  other client-side-mirrored validation in this codebase already documents
-  (`teamCompositionError()`'s own comment).
-- **Team transitions out of an accepted status between render and click**
-  (e.g. it finishes or errors while the control is visible) — `toggle()`'s
-  own existing POST still fires; `add_team_member()`'s own status check
-  rejects with a clear error, surfaced the same way as any other race here
-  — no new handling needed, same class of race `doTeamInterject()` already
-  accepts unhandled-beyond-the-server-check.
-- **Row re-renders mid-selection** (a `/status` poll lands while the
-  `<select>` is open) — `refresh()`'s existing full-row re-render already
-  resets any unsubmitted, unmirrored `<select>` choice on every poll for
-  every kind of control in this codebase that isn't backed by a client-side
-  text mirror (e.g. the lead-picker's own `<select>` IS mirrored via
-  `teamPickerLead`/survives redraws; this new `<select>`'s value is NOT
-  separately mirrored client-side pre-submit, matching `team-mate` checkbox
-  behavior's own precedent of "state lives in the DOM until submitted, not
-  a JS mirror" — acceptable because, unlike the interject textarea, there's
-  no risk of losing meaningful typed text here, only a re-picked dropdown
-  selection, which is cheap to redo).
-- **`membership.jsonl` doesn't exist yet for a run that predates part 1**
-  (impossible in practice on this branch, since part 1 is already merged
-  and no run persists across a deploy that removed the feature, but as a
-  defensive matter) — `tail_jsonl_events()` already returns `([], offset,
-  False)` on `FileNotFoundError`, so this degrades to "no membership events
-  ever appear," not an error.
-- **Two operators in two browser tabs both add a teammate concurrently** —
-  covered entirely by part 1's own already-documented concurrent
-  `add_team_member()` race handling (independent worktree/window/queued
-  envelope per distinct agent; a narrow, accepted false-positive "still has
-  uncommitted changes" error only for the exact-same-agent-name race). No
-  new handling needed at the UI layer beyond surfacing whatever error the
-  server returns.
-
-## Acceptance criteria
-- [ ] Given a `running` team with members `["codex"]` and roster
-      `["codex", "aider", "claude"]` (lead = a separate Ollama entry), when
-      the row renders, then the "+" control shows a `<select>` with exactly
-      `aider` and `claude` as options (not `codex`, already a member; not
-      the Ollama lead entry).
-- [ ] Given the same team, when `aider` is selected and "+ Add" is clicked,
-      then `POST /projects/<name>/team/add-member` is sent with
-      `{"agent": "aider"}`, and on success the row's message slot shows
-      "✓ 'aider' will join the team at its next round" (not "has joined" /
-      "is now available").
-- [ ] Given the add above succeeded, when the next `/team/events` poll
-      lands, then a `member_joined`-kind event tagged `agent: "aider"`
-      appears in the merged feed (rendered as "→ joined the team" in
-      `aider`'s own established color), even before the lead's next round
-      has run.
-- [ ] Given the same add, when the run's next `team_step()` round runs (a
-      subsequent `/status` poll after that), then `team.members` in the
-      `/status` response includes `"aider"`, and the feed's filter pills now
-      include an `aider` pill.
-- [ ] Given a team already at `TEAM_MAX_MEMBERS` (`team.members.length ===
-      team_max_members` from `/status`), when the row renders, then the "+"
-      control is disabled/replaced with "Team is at the maximum of N
-      teammates." and no `<select>`/button is clickable.
-- [ ] Given a team with every roster engine already a member (but under the
-      numeric cap), when the row renders, then the control shows "No more
-      roster engines available to add." — distinct text from the at-cap
-      case.
-- [ ] Given a team in `blocked_ask_user` or `blocked_board_write`, when the
-      row renders, then the "+" control is visible and enabled (same
-      condition `teamAcceptsInterject()` already computes for the compose
-      box) — and given a team in `escalated_max_rounds`/`finished`/`error`/
-      `idle`, then it is not rendered at all.
-- [ ] Given a server-side rejection (e.g. a genuine concurrent-add race
-      pushing the team over the cap between poll and click), when the POST
-      returns 400, then the row's message slot shows "✕ Error: <the
-      server's exact message>", and the `<select>`/button remain usable for
-      a retry.
-- [ ] Given a 428 TOTP challenge mid-flow, when the code is submitted, then
-      the retry resends the SAME `agent` value originally selected (via
-      `teamAddMemberChoice[name]`, not a re-read of a possibly-already-
-      cleared `<select>`).
-- [ ] All existing frontend tests (`tests/test_team_frontend.js`) and
-      backend team-route tests continue to pass with the two new additive
-      `/status`/`/team/events` fields — no existing exact-dict-equality test
-      should need more than adding the new keys to its expected shape.
-
-## Open questions
-- **`ux-designer` IS needed this cycle.** This is a genuinely new UI
-  control (not a copy of an existing one wired to a new endpoint) —
-  reviewing/refining the exact placement (between interject box and feed
-  toggle vs. inside `.team-actions`), spacing, and the two distinct
-  disabled-reason copy strings against `docs/design.md`'s own established
-  visual language (status-strip colors, `.team-escalation`/`.team-interject`
-  spacing tokens) is real design work, not a mechanical extension. Unlike
-  item 13's "Past team branches" panel (which the product-manager judged
-  didn't need a design pass, being a plain read-only list with an obvious
-  single layout), this control has real states (enabled / two distinct
-  disabled reasons / mid-request) worth a design pass. **Assumption
-  proceeding under**: `ux-designer` runs next, using this spec's "Proposed
-  approach" as its functional baseline — the exact CSS values above are a
-  developer-ready starting point, not a locked-in final design.
-- **Whether `member_joined`'s feed row should additionally trigger any kind
-  of transient visual highlight** (e.g. briefly flashing the new filter
-  pill) — no such affordance is specced here; flagging in case product
-  intent wants stronger immediate feedback than a feed line + message-slot
-  text. Assumption: not needed: the existing feed's own scroll/append
-  behavior is already the established "something happened" signal for
-  every other event kind.
-- **Whether the CLI (`team-add-member`) should also gain a `--roster` /
-  list-eligible-first convenience flag** now that a UI exists to browse the
-  roster visually — out of scope here (this part is UI-only, no CLI
-  change); flagging as a possible small follow-up, not blocking.
+`app/app.py` only, three non-overlapping regions: the AI-reviewer poll/lock
+block (~1345-1626), `teamFeedEventKindClass()` (~3789-3838), and whatever
+CSS rules item 20's audit finds (scoped to interactive-control selectors
+in the `<style>` block).
 
 ## Risk / rollback notes
-- Fully additive on both the backend-field and frontend-control level: no
-  existing `/status`/`/team/events` field is removed or reinterpreted, no
-  existing route's request/response shape for any OTHER action changes. A
-  revert of this commit removes the control and the two additive fields
-  with zero data-model migration (nothing new is persisted server-side by
-  this part at all — `membership.jsonl`'s shape and write path are entirely
-  part 1's, untouched here).
-- Worst-case failure mode if the `/status`/`/team/events` additions are
-  buggy: the "+" control renders with an empty/wrong option list, or the
-  feed misses/misrenders a `member_joined` line — cosmetic degradation, not
-  a functional regression, since `add_team_member()`'s own server-side
-  validation (unchanged, part 1) remains the sole correctness gate no
-  matter what the UI shows or omits.
-- No new privileged code path, no new sudoers entry, no new tmux/subprocess
-  call anywhere in this part — every mutation still flows through part 1's
-  already-reviewed `add_team_member()`.
+Piece 1 is the highest-risk of the three (concurrency-sensitive, threading
+changes) — mitigated by the acceptance criteria's explicit race-simulation
+test requirement. Pieces 2 and 3 are low-risk, single-value/single-line
+changes. All three are independently revertable (no shared code path
+between them).

@@ -1473,6 +1473,37 @@ test('the transient pending state resolves to finish once a terminal status arri
   assert.ok(html.includes('[Finish summary]'), 'expected it to resolve to the finish summary, got: ' + html);
 });
 
+// ─── Widened poll-boundary gate (backlog item 12 piece C, docs/spec.md) ───
+//
+// The reviewer confirmed (adversarially) a structurally identical gap while
+// status === 'blocked': a trailing empty-meta lead tool_use with no next
+// lead event, while a DIFFERENT in-flight round's ask_user escalation has
+// already flipped status to 'blocked', used to fall through to 'finish' --
+// the exact bug the 'running'-only gate above already existed to prevent,
+// just for a status that narrower check didn't cover. Widened to the full
+// non-terminal status set ('idle'/'running'/'blocked'); 'finished'/'error'
+// remain genuinely terminal and still classify as 'finish'.
+
+test('teamFeedEventKindClass classifies a trailing empty-meta lead tool_use as pending-classification for every non-terminal status', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-gate' })];
+  const c = await setupCase(instances);
+  const event = { ts: '2026-08-14T12:00:00Z', agent: 'lead', seq: 1, kind: 'tool_use', text: 'All done: summary text', meta: {} };
+  for (const status of ['idle', 'running', 'blocked']) {
+    assert.strictEqual(c.call('teamFeedEventKindClass', event, [], status), 'pending-classification',
+      `expected pending-classification for status=${status}, the adversarial case being status=blocked (a DIFFERENT in-flight round's ask_user escalation)`);
+  }
+});
+
+test('teamFeedEventKindClass still classifies a trailing empty-meta lead tool_use as finish for genuinely terminal statuses', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-gate-terminal' })];
+  const c = await setupCase(instances);
+  const event = { ts: '2026-08-14T12:00:00Z', agent: 'lead', seq: 1, kind: 'tool_use', text: 'All done: summary text', meta: {} };
+  for (const status of ['finished', 'error']) {
+    assert.strictEqual(c.call('teamFeedEventKindClass', event, [], status), 'finish',
+      `expected finish for terminal status=${status} -- not a poll-boundary artifact here`);
+  }
+});
+
 test('a handoff event renders "Delegating to <teammate>"', async () => {
   const instances = [inst('proj', { status: 'running', run_id: 'run-handoff' })];
   const c = await setupCase(instances);

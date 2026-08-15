@@ -1366,29 +1366,76 @@ def _load_ai_reviewer_state() -> dict:
         return {}
 
 
+def _ai_reviewer_state_entry_dict(*, label_present: bool, attempts: int,
+                                  reviewed_at, last_error, episode: int) -> dict:
+    return {"label_present": label_present, "attempts": attempts,
+            "reviewed_at": reviewed_at, "last_error": last_error,
+            "episode": episode}
+
+
+def _write_ai_reviewer_state(s: dict) -> None:
+    """Assumes the caller already holds _ai_reviewer_state_lock. Same
+    tmp-file-then-os.replace() atomic-write idiom as _save_gitea_repo_map_
+    entry() above."""
+    os.makedirs(os.path.dirname(AI_REVIEWER_STATE_FILE), exist_ok=True)
+    tmp = AI_REVIEWER_STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(s, f, indent=2, sort_keys=True)
+    os.replace(tmp, AI_REVIEWER_STATE_FILE)
+
+
 def _save_ai_reviewer_state_entry(pr_key: str, *, label_present: bool, attempts: int,
-                                  reviewed_at, last_error) -> None:
+                                  reviewed_at, last_error, episode: int) -> None:
     with _ai_reviewer_state_lock:
         s = _load_ai_reviewer_state()
-        s[pr_key] = {"label_present": label_present, "attempts": attempts,
-                    "reviewed_at": reviewed_at, "last_error": last_error}
-        os.makedirs(os.path.dirname(AI_REVIEWER_STATE_FILE), exist_ok=True)
-        tmp = AI_REVIEWER_STATE_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(s, f, indent=2, sort_keys=True)
-        os.replace(tmp, AI_REVIEWER_STATE_FILE)
+        s[pr_key] = _ai_reviewer_state_entry_dict(
+            label_present=label_present, attempts=attempts, reviewed_at=reviewed_at,
+            last_error=last_error, episode=episode)
+        _write_ai_reviewer_state(s)
 
 
-def _ai_reviewer_record_failure(pr_key: str, message: str) -> None:
+def _ai_reviewer_save_if_current_episode(pr_key: str, episode: int, *, label_present: bool,
+                                         attempts: int, reviewed_at, last_error) -> bool:
+    """Same write as _save_ai_reviewer_state_entry(), but the "is `episode`
+    still current?" check happens INSIDE this same critical section
+    (_ai_reviewer_state_lock), not before it -- closing a check-then-write
+    race a prior version of this code had (docs/test-review.md Defect 1): an
+    unlocked `prev.get("episode", 0) == episode` check followed by a
+    *separate*, later locked write let a concurrent trigger-edge write
+    (episode N+1) land in the gap between the check and the write, so the
+    stale (episode N) thread's check -- which had already passed -- went on
+    to clobber the newer episode's state anyway, moving `episode` backwards.
+    Re-reading and re-checking under the same lock that performs the write
+    makes the two indivisible: either this call observes the newer episode
+    (already persisted) and no-ops, or it wins the race and its own write is
+    the one a subsequent trigger edge will itself see and check against.
+    Returns True if the write happened, False if it was a stale no-op."""
+    with _ai_reviewer_state_lock:
+        s = _load_ai_reviewer_state()
+        if s.get(pr_key, {}).get("episode", 0) != episode:
+            return False  # superseded by a newer episode; this completion is stale
+        s[pr_key] = _ai_reviewer_state_entry_dict(
+            label_present=label_present, attempts=attempts, reviewed_at=reviewed_at,
+            last_error=last_error, episode=episode)
+        _write_ai_reviewer_state(s)
+        return True
+
+
+def _ai_reviewer_record_failure(pr_key: str, message: str, episode: int) -> None:
     """Re-reads the current state entry, increments attempts, records
     last_error. label_present is left True -- already set synchronously by
     the trigger edge in _ai_reviewer_poll_repo() below -- so a failed
     attempt is retried by that function's own "already present" branch,
     never re-triggered as a brand new episode (docs/spec.md "Record
-    failure")."""
+    failure"). If the state's current episode has since moved past
+    `episode` (a newer episode superseded this one while this thread was
+    still running -- backlog item 8), this write is a stale no-op; the
+    newer episode's own state is authoritative -- see
+    _ai_reviewer_save_if_current_episode()'s own docstring for why the
+    currency check and the write must happen inside the SAME lock."""
     prev = _load_ai_reviewer_state().get(pr_key, {})
-    _save_ai_reviewer_state_entry(
-        pr_key, label_present=True, attempts=prev.get("attempts", 0) + 1,
+    _ai_reviewer_save_if_current_episode(
+        pr_key, episode, label_present=True, attempts=prev.get("attempts", 0) + 1,
         reviewed_at=prev.get("reviewed_at"), last_error=message)
 
 
@@ -1400,12 +1447,12 @@ _ai_reviewer_pr_locks_guard = threading.Lock()
 _ai_reviewer_pr_locks = {}
 
 
-def _ai_reviewer_pr_lock_for(pr_key: str) -> threading.Lock:
+def _ai_reviewer_pr_lock_for(key) -> threading.Lock:
     with _ai_reviewer_pr_locks_guard:
-        lock = _ai_reviewer_pr_locks.get(pr_key)
+        lock = _ai_reviewer_pr_locks.get(key)
         if lock is None:
             lock = threading.Lock()
-            _ai_reviewer_pr_locks[pr_key] = lock
+            _ai_reviewer_pr_locks[key] = lock
         return lock
 
 
@@ -1436,7 +1483,7 @@ def _ai_reviewer_pr_key(host: str, owner_repo: str, number) -> str:
     return f"{owner_repo}#{number}" if host == "gitea" else f"github:{owner_repo}#{number}"
 
 
-def _ai_reviewer_review_run(host: str, owner_repo: str, entry: dict, pr: dict) -> None:
+def _ai_reviewer_review_run(host: str, owner_repo: str, entry: dict, pr: dict, episode: int) -> None:
     """The real review-generation + comment-post work, off the request
     thread (see _ai_reviewer_review_bg). Never raises -- every failure path
     records it via _ai_reviewer_record_failure() and returns.
@@ -1444,7 +1491,13 @@ def _ai_reviewer_review_run(host: str, owner_repo: str, entry: dict, pr: dict) -
     Host-agnostic (item 17 part 2, docs/spec.md "Proposed approach" #1) --
     only the diff-fetch and comment-post calls branch per host; every other
     line (truncation, model resolution, teams.review_pr_diff(), comment-body
-    construction, state persistence) is identical for "gitea"/"github"."""
+    construction, state persistence) is identical for "gitea"/"github".
+
+    `episode` identifies which trigger edge this run belongs to (backlog
+    item 8) -- threaded through every _ai_reviewer_record_failure() call and
+    the final success write so a stale run (superseded by a newer episode
+    while this one was still in flight) can never clobber the newer
+    episode's state; see _ai_reviewer_record_failure()'s own docstring."""
     number = pr.get("number")
     pr_key = _ai_reviewer_pr_key(host, owner_repo, number)
     try:
@@ -1453,7 +1506,7 @@ def _ai_reviewer_review_run(host: str, owner_repo: str, entry: dict, pr: dict) -
                 status, diff_text = _gitea_api_raw(
                     "GET", f"/repos/{owner_repo}/pulls/{number}.diff")
             except ConnectionError as e:
-                _ai_reviewer_record_failure(pr_key, str(e))
+                _ai_reviewer_record_failure(pr_key, str(e), episode)
                 return
             if status != 200:
                 # Covers a PR closed/merged between label-add-detection and
@@ -1466,7 +1519,7 @@ def _ai_reviewer_review_run(host: str, owner_repo: str, entry: dict, pr: dict) -
                 # treated as an error"), which this reads as authoritative
                 # over the more terse "non-200 or empty" phrasing in the
                 # walkthrough above it.
-                _ai_reviewer_record_failure(pr_key, f"diff fetch failed (status {status})")
+                _ai_reviewer_record_failure(pr_key, f"diff fetch failed (status {status})", episode)
                 return
         else:  # github -- reuses part 1's own convenience function directly,
                # normalizing its {"ok": bool, ...} contract against the rest
@@ -1474,7 +1527,7 @@ def _ai_reviewer_review_run(host: str, owner_repo: str, entry: dict, pr: dict) -
             owner, _sep, repo = owner_repo.partition("/")
             result = github_pr_diff(owner, repo, number)
             if not result.get("ok"):
-                _ai_reviewer_record_failure(pr_key, result.get("error") or "diff fetch failed")
+                _ai_reviewer_record_failure(pr_key, result.get("error") or "diff fetch failed", episode)
                 return
             diff_text = result["diff"]
 
@@ -1490,7 +1543,7 @@ def _ai_reviewer_review_run(host: str, owner_repo: str, entry: dict, pr: dict) -
                 (m for m in teams.roster() if m["kind"] == kind and m["name"] == name), None)
         if model_entry is None:
             _ai_reviewer_record_failure(
-                pr_key, f"AI_REVIEWER_MODEL {AI_REVIEWER_MODEL!r} not found in roster")
+                pr_key, f"AI_REVIEWER_MODEL {AI_REVIEWER_MODEL!r} not found in roster", episode)
             return
 
         workdir = os.path.join(PROJECTS_DIR, entry["name"])
@@ -1498,7 +1551,7 @@ def _ai_reviewer_review_run(host: str, owner_repo: str, entry: dict, pr: dict) -
             model_entry, workdir=workdir, pr_title=pr.get("title", "") or "",
             pr_body=pr.get("body") or "", diff_text=diff_text, diff_truncated=diff_truncated)
         if not result.get("ok"):
-            _ai_reviewer_record_failure(pr_key, result.get("error") or "review generation failed")
+            _ai_reviewer_record_failure(pr_key, result.get("error") or "review generation failed", episode)
             return
 
         comment = _ai_reviewer_comment_body(model_entry, result.get("text", ""), diff_truncated)
@@ -1507,20 +1560,21 @@ def _ai_reviewer_review_run(host: str, owner_repo: str, entry: dict, pr: dict) -
                 status, _resp = _gitea_api(
                     "POST", f"/repos/{owner_repo}/issues/{number}/comments", {"body": comment})
             except ConnectionError as e:
-                _ai_reviewer_record_failure(pr_key, str(e))
+                _ai_reviewer_record_failure(pr_key, str(e), episode)
                 return
             if status // 100 != 2:
-                _ai_reviewer_record_failure(pr_key, f"comment post failed (status {status})")
+                _ai_reviewer_record_failure(pr_key, f"comment post failed (status {status})", episode)
                 return
         else:  # github
             owner, _sep, repo = owner_repo.partition("/")
             result = github_post_pr_comment(owner, repo, number, comment)
             if not result.get("ok"):
-                _ai_reviewer_record_failure(pr_key, result.get("error") or "comment post failed")
+                _ai_reviewer_record_failure(pr_key, result.get("error") or "comment post failed", episode)
                 return
 
-        _save_ai_reviewer_state_entry(pr_key, label_present=True, attempts=0,
-                                      reviewed_at=teams._now_iso(), last_error=None)
+        _ai_reviewer_save_if_current_episode(
+            pr_key, episode, label_present=True, attempts=0,
+            reviewed_at=teams._now_iso(), last_error=None)
     except Exception as e:
         # Defense in depth -- nothing above this point should be able to
         # raise, but this runs on its own background thread (not inside
@@ -1528,26 +1582,46 @@ def _ai_reviewer_review_run(host: str, owner_repo: str, entry: dict, pr: dict) -
         # try/except), so an unanticipated exception here must still be
         # recorded rather than silently killing the thread with attempts
         # never incremented.
-        _ai_reviewer_record_failure(pr_key, f"{type(e).__name__}: {e}")
+        _ai_reviewer_record_failure(pr_key, f"{type(e).__name__}: {e}", episode)
 
 
-def _ai_reviewer_review_bg(host: str, owner_repo: str, entry: dict, pr: dict) -> None:
+def _ai_reviewer_review_bg(host: str, owner_repo: str, entry: dict, pr: dict, episode: int) -> None:
     """Non-blocking dispatch -- mirrors _gitea_sync_bg() exactly. Returns
-    immediately; if a previous attempt for this PR is still in flight, this
-    call is simply dropped (the next poll interval retries). The per-PR lock
-    is keyed by the now-host-prefixed pr_key, so a Gitea and a GitHub review
-    can never contend on the same lock even if their owner/repo strings
-    happened to be identical."""
+    immediately; if a previous attempt for this exact (pr, episode) is still
+    in flight, this call is simply dropped (the next poll interval retries).
+    The lock is keyed on (pr_key, episode), not pr_key alone (backlog item
+    8) -- so a new episode (label removed and re-added while the previous
+    episode's review thread is still running) is never silently dropped
+    just because a stale episode's thread still holds the pr_key-only lock.
+    A Gitea and a GitHub review can never contend on the same lock either,
+    since pr_key itself is already host-prefixed."""
     pr_key = _ai_reviewer_pr_key(host, owner_repo, pr.get("number"))
-    lock = _ai_reviewer_pr_lock_for(pr_key)
+    lock_key = (pr_key, episode)
+    lock = _ai_reviewer_pr_lock_for(lock_key)
     if not lock.acquire(blocking=False):
         return
 
     def _run():
         try:
-            _ai_reviewer_review_run(host, owner_repo, entry, pr)
+            _ai_reviewer_review_run(host, owner_repo, entry, pr, episode)
         finally:
-            lock.release()
+            # Pop the dict entry and release the lock inside the SAME
+            # _ai_reviewer_pr_locks_guard critical section (docs/test-
+            # review.md Defect 2) -- releasing first, then popping as a
+            # separate statement, left a gap where a concurrent caller for
+            # this exact (pr_key, episode) key could see the entry (now
+            # unlocked), acquire it, and start running, only for this
+            # thread's later pop to remove it anyway -- letting a THIRD,
+            # even-later caller create a brand-new unlocked lock and run
+            # concurrently with the second, defeating this lock's own
+            # mutual-exclusion guarantee. Popping first (while still holding
+            # the guard, before the underlying lock is released) means no
+            # other thread can observe this key at all until it's already
+            # gone -- the next lookup via _ai_reviewer_pr_lock_for() always
+            # creates a fresh lock instead of racing this one.
+            with _ai_reviewer_pr_locks_guard:
+                _ai_reviewer_pr_locks.pop(lock_key, None)
+                lock.release()
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -1601,25 +1675,31 @@ def _ai_reviewer_poll_repo(host: str, owner_repo: str, entry: dict) -> None:
         if not label_present:
             if was_present or pr_key not in state:
                 # Arms the next add as a fresh episode -- no-op if already
-                # recorded absent.
+                # recorded absent. episode carries forward unchanged (it's
+                # not starting a new one, just arming the next add).
                 _save_ai_reviewer_state_entry(
                     pr_key, label_present=False, attempts=0,
-                    reviewed_at=prev.get("reviewed_at"), last_error=None)
+                    reviewed_at=prev.get("reviewed_at"), last_error=None,
+                    episode=prev.get("episode", 0))
             continue
 
         if not was_present:
             # Trigger edge -- write synchronously BEFORE any slow work so no
             # other/later poll pass can re-decide this is a fresh edge while
-            # the review is in flight (closes the double-post race).
+            # the review is in flight (closes the double-post race). Bumps
+            # episode (backlog item 8) so a completion write from any prior,
+            # now-superseded episode's still-in-flight thread can recognize
+            # itself as stale and no-op instead of clobbering this write.
+            episode = prev.get("episode", 0) + 1
             _save_ai_reviewer_state_entry(
                 pr_key, label_present=True, attempts=prev.get("attempts", 0),
-                reviewed_at=prev.get("reviewed_at"), last_error=None)
-            _ai_reviewer_review_bg(host, owner_repo, entry, pr)
+                reviewed_at=prev.get("reviewed_at"), last_error=None, episode=episode)
+            _ai_reviewer_review_bg(host, owner_repo, entry, pr, episode)
             continue
 
         attempts = prev.get("attempts", 0)
         if prev.get("last_error") is not None and attempts < AI_REVIEWER_MAX_ATTEMPTS:
-            _ai_reviewer_review_bg(host, owner_repo, entry, pr)
+            _ai_reviewer_review_bg(host, owner_repo, entry, pr, prev.get("episode", 0))
         # else: either already successfully reviewed this episode (no
         # retry needed) or the attempt budget is exhausted -- give up
         # silently until the label cycles (removed, then re-added).
@@ -2926,7 +3006,12 @@ PAGE_TEMPLATE = """<!doctype html>
                         margin: 0 0 16px; text-align: center; }
   .wizard-card { max-width: 420px; max-height: 85vh; overflow-y: auto; }
   .wizard-step-indicator { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 16px; }
-  .wizard-step { font-size: 11px; padding: 4px 9px; border-radius: 12px; background: #2a2a2a; color: #666; }
+  /* #666 on #2a2a2a was a WCAG AA failure (~2.5:1, needs 4.5:1 -- backlog
+     item 20's broader audit, docs/spec.md). #aaa matches .pill's/
+     .wizard-actions .secondary's own already-passing #2a2a2a pairing
+     elsewhere in this file (~6.18:1), same PR #12 precedent-reuse approach
+     as .team-btn's own fix -- not a new color. */
+  .wizard-step { font-size: 11px; padding: 4px 9px; border-radius: 12px; background: #2a2a2a; color: #aaa; }
   .wizard-step.active { background: #16324a; color: #4da6ff; font-weight: 600; }
   .wizard-step.done { color: #34c759; }
   .wizard-step.disabled { opacity: 0.4; }
@@ -3821,16 +3906,22 @@ function teamFeedEventKindClass(e, leadEvents, status) {
       return 'fact-check-claim';
     }
     // Poll-boundary self-healing refinement (docs/spec.md "Background"
-    // item C / docs/design.md is silent -- new for this cycle): `e` is the
-    // event buffer's own LAST lead-agent event (no next lead event yet)
-    // AND the run hasn't finished (team.status === 'running') -- the
-    // paired tool_result (fact_check) or the terminal status (finish)
-    // simply hasn't arrived on a poll yet, so render neither assumption
-    // and wait for the next poll instead of guessing "finish". Once a
-    // terminal status arrives (status !== 'running') or the paired
-    // tool_result shows up (next is no longer null), this branch stops
-    // matching and the disambiguation above resolves normally.
-    if (!next && e.agent === 'lead' && status === 'running') return 'pending-classification';
+    // item C / docs/design.md is silent -- new for this cycle; widened from
+    // status === 'running' to the full non-terminal set in a later cycle,
+    // docs/spec.md item 12 piece C): `e` is the event buffer's own LAST
+    // lead-agent event (no next lead event yet) AND the run hasn't reached
+    // a genuinely terminal status yet ('idle'/'running'/'blocked' are all
+    // non-terminal -- a still-in-flight ask_user escalation can flip status
+    // to 'blocked' for a DIFFERENT in-flight round while this event's own
+    // paired tool_result hasn't arrived yet, the same poll-boundary gap
+    // 'running' alone was guarding against) -- the paired tool_result
+    // (fact_check) or the terminal status (finish) simply hasn't arrived on
+    // a poll yet, so render neither assumption and wait for the next poll
+    // instead of guessing "finish". Once a terminal status arrives
+    // ('finished'/'error') or the paired tool_result shows up (next is no
+    // longer null), this branch stops matching and the disambiguation above
+    // resolves normally.
+    if (!next && e.agent === 'lead' && status !== 'finished' && status !== 'error') return 'pending-classification';
     return 'finish';
   }
   if (e.kind === 'status' && meta.forced && meta.final_status) return 'terminal-escalation';
