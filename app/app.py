@@ -36,6 +36,7 @@ import base64
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import os
 import re
@@ -148,6 +149,40 @@ NEW_PROJECT_FROM_GITEA_SCRIPT = os.environ.get(
     "NEW_PROJECT_FROM_GITEA_SCRIPT",
     "/usr/local/bin/ai-dev-switchboard-new-project-from-gitea.sh")
 
+# GitHub REST API client (backlog item 17 part 1, docs/spec.md) -- unlike
+# GITEA_API_TOKEN above, GitHub isn't a service this switchboard runs, so
+# there's no bootstrap script: GITHUB_TOKEN is a PAT the operator creates
+# directly on github.com and pastes into switchboard.env, same
+# documented-but-never-shipped-a-value treatment as SIMPLE_PASSWORD/
+# TOTP_SECRET. Gated purely on GITHUB_TOKEN being set -- no separate
+# GITHUB_ENABLED toggle (host detection itself needs no token and is always
+# available; see docs/spec.md "Non-goals").
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_API_BASE = "https://api.github.com"        # fixed -- GitHub, unlike
+                                                    # self-hosted Gitea, has
+                                                    # no configurable port/host
+GITHUB_API_TIMEOUT_SECONDS = 15                    # matches _gitea_api's own
+                                                    # hardcoded timeout
+GITHUB_RATE_LIMIT_FALLBACK_SECONDS = 60            # conservative default
+                                                    # cooldown when a 403/429
+                                                    # carries neither
+                                                    # Retry-After nor a
+                                                    # parseable
+                                                    # X-RateLimit-Reset
+
+# Clone-from-URL (backlog item 16, docs/spec.md) -- unlike NEW_PROJECT_FROM_
+# GITEA_SCRIPT above, installed UNCONDITIONALLY (base install.sh block, like
+# NEW_PROJECT_FROM_UPLOAD_SCRIPT) -- cloning an arbitrary external repo URL
+# never depends on --with-git-hosting.
+NEW_PROJECT_FROM_URL_SCRIPT = os.environ.get(
+    "NEW_PROJECT_FROM_URL_SCRIPT",
+    "/usr/local/bin/ai-dev-switchboard-new-project-from-url.sh")
+# Generous relative to the 30s/60s timeouts create_project()/confirm_upload()
+# use for their own privileged scripts -- an arbitrary external repo's
+# history can legitimately take a while to transfer, unlike a Gitea repo
+# this switchboard just created itself (2b) or a local cp -a (3).
+CLONE_TIMEOUT_SECONDS = int(os.environ.get("CLONE_TIMEOUT_SECONDS", "180"))
+
 # Poll-based sync-on-push (backlog item 2c, part 1 -- docs/spec.md) -- keeps
 # PROJECTS_DIR/<name> in sync when a push lands on its Gitea repo from
 # somewhere else (another contributor via Gitea's own web UI, a merged PR, a
@@ -168,6 +203,60 @@ GITEA_REPO_MAP_FILE = os.environ.get(
 # written by install.sh (docs/spec.md "Open questions" #5) -- an
 # env-overridable constant, same style as UPLOAD_STAGING_TTL_SECONDS.
 GITEA_POLL_INTERVAL_SECONDS = int(os.environ.get("GITEA_POLL_INTERVAL_SECONDS", "45"))
+
+# AI merge-request reviewer (backlog item 8, docs/spec.md; made host-agnostic
+# by item 17 part 2, docs/spec.md) -- rides both _gitea_poll_if_due() (Gitea)
+# and _github_poll_if_due() (GitHub, below) as its two dispatch triggers:
+# watches each registered project's open PRs for a configurable label, and on
+# the label-add edge, runs a roster model (item 6's roster, item 6b's
+# read-only grounding digest) against the PR diff and posts the review back
+# as a single PR comment. Standalone/poll-triggered, not a lead-loop tool -- a
+# PR can be tagged with no team session running at all. Off by default
+# (AI_REVIEWER_ENABLED gates both hosts identically). Every Gitea repo this
+# switchboard's own GITEA_REPO_MAP_FILE registers is automatically in scope
+# once enabled; a GitHub-origin project additionally needs its owner/repo
+# listed in AI_REVIEWER_GITHUB_REPOS_FILE below -- GitHub-origin repos can be
+# arbitrary third-party infrastructure the operator doesn't fully control
+# (item 16's clone-by-URL), a materially different trust boundary from
+# Gitea's fully-operator-owned repos (docs/spec.md "Settled scope decisions").
+AI_REVIEWER_ENABLED = os.environ.get("AI_REVIEWER_ENABLED", "0") == "1"
+AI_REVIEWER_LABEL = os.environ.get("AI_REVIEWER_LABEL", "ready for review")
+# "kind:name" (e.g. "ollama:qwen3:8b" or "engine:claude") -- split on the
+# FIRST ':' only below, since an Ollama tag can itself contain ':'.
+# Validated against a live teams.roster() lookup at trigger time, not at
+# startup (same "engines.d is meant to be edited without a restart"
+# philosophy roster() itself documents) -- unset or naming a roster entry
+# that no longer exists is a per-repo, per-poll-pass no-op, logged via the
+# state file's last_error, never fatal.
+AI_REVIEWER_MODEL = os.environ.get("AI_REVIEWER_MODEL", "")
+AI_REVIEWER_MAX_DIFF_BYTES = int(os.environ.get("AI_REVIEWER_MAX_DIFF_BYTES", "40000"))
+AI_REVIEWER_MAX_ATTEMPTS = int(os.environ.get("AI_REVIEWER_MAX_ATTEMPTS", "3"))
+AI_REVIEWER_STATE_FILE = os.environ.get(
+    "AI_REVIEWER_STATE_FILE", "/var/lib/ai-dev-switchboard/ai-reviewer-state.json")
+# Hand-edited, operator-maintained allowlist of "owner/repo" strings gating
+# which GitHub-origin projects _github_poll_if_due() will ever poll/review at
+# all (item 17 part 2, docs/spec.md "Settled scope decisions" #3) -- same
+# /etc/ai-dev-switchboard/ placement and "app.py only ever reads it, never
+# writes it" contract DEPLOY_MAP_FILE already established. Never authored by
+# install.sh or any UI (matches DEPLOY_MAP_FILE's own precedent) -- hand-edit
+# it yourself. See _load_ai_reviewer_github_repos().
+AI_REVIEWER_GITHUB_REPOS_FILE = os.environ.get(
+    "AI_REVIEWER_GITHUB_REPOS_FILE",
+    "/etc/ai-dev-switchboard/ai-reviewer-github-repos.json")
+# How often _github_poll_if_due() itself runs (seconds) -- independent of
+# GITEA_POLL_INTERVAL_SECONDS above (different domain, different tuning
+# rationale: GitHub's 5,000 req/hour token-wide rate limit argues for a
+# materially more conservative interval than Gitea's loopback-cheap default).
+GITHUB_POLL_INTERVAL_SECONDS = int(os.environ.get("GITHUB_POLL_INTERVAL_SECONDS", "120"))
+
+# HTTP-level smoke check (backlog item 18, docs/spec.md) -- a manual,
+# per-project "Smoke check" button that makes a single in-process GET
+# against that project's own already-captured _session_urls entry. Bounded
+# by construction: a request timeout and a capped response-body read, same
+# "never trust an outbound call to behave" discipline AI_REVIEWER_MAX_DIFF_
+# BYTES already established for a different bounded read.
+SMOKE_CHECK_TIMEOUT_SECONDS = int(os.environ.get("SMOKE_CHECK_TIMEOUT_SECONDS", "10"))
+SMOKE_CHECK_MAX_BODY_BYTES = int(os.environ.get("SMOKE_CHECK_MAX_BODY_BYTES", "65536"))
 
 # Team session lifecycle, part 2a (backlog item 6d, docs/spec.md §5) --
 # throttles _team_reap_if_due()'s own opportunistic sweep_dead_teams() call
@@ -664,6 +753,114 @@ def _code_stop(name: str):
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]{0,59}$")
 
+# Clone-from-URL allowlist (backlog item 16, docs/spec.md "URL validation --
+# allowlist, not denylist"). Only http(s)://, ssh://, or git's own scp-like
+# user@host:path shorthand are accepted -- file://, git://, ext::/fd::
+# transport helpers (a known git RCE shape when an attacker controls the
+# clone URL), a bare/relative local filesystem path, and a string with no
+# recognizable scheme at all are all rejected before any subprocess is ever
+# spawned.
+#
+# This allowlist is also what has to block git's own known argument-injection
+# shape (a "URL" whose host or scp-path component is actually a
+# `-oProxyCommand=...`-style flag, CVE-2017-1000117). A first pass at that
+# used negative lookaheads pinned right after the scheme/`@` (`(?!-)`); a
+# review found that insufficient -- those lookaheads only ever check the
+# character *immediately* following a fixed anchor, but both accepted
+# grammars allow an optional `user@` (for `scheme://`) or `:path` (for the
+# scp-like shorthand) segment between that anchor and the component that
+# actually matters to ssh/git, so a URL like `ssh://user@-oProxyCommand=.../x`
+# or `user@host:-oProxyCommand=...` slipped straight past the lookahead and
+# reached a real `git clone` subprocess, protected only by installed git's
+# own (version-dependent) downstream hardening -- not by this codebase.
+#
+# The regexes below are now only a coarse "does this look like the right
+# grammar at all" pre-filter. The actual security-relevant check parses out
+# the real host (and, for scp-like shorthand, the real path) component and
+# validates THAT specific substring via _clone_url_host_is_safe() /
+# `path[0] != "-"` below -- see clone_project_from_url()'s docs/spec.md
+# history and docs/test-review.md's item 16 re-review for the two concrete
+# bypasses (`ssh://user@-oProxyCommand=...` and
+# `user@host:-oProxyCommand=...`) this replaced the lookahead approach to
+# close.
+CLONE_URL_MAX_LEN = 2048
+_CLONE_URL_SCHEME_RE = re.compile(r"^(https?|ssh)://\S+$", re.IGNORECASE)
+_CLONE_URL_SCP_RE = re.compile(r"^[A-Za-z0-9_.-]+@\S+:\S.*$")
+
+# Host-validation charset for the non-IPv6 case: must start AND end with an
+# alphanumeric character (never '-', the shape ssh/git can mistake for the
+# start of an option flag) and contain only characters a real hostname or
+# IPv4 literal can use in between.
+_SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$")
+
+
+def _clone_url_host_is_safe(host) -> bool:
+    """True only for a syntactically legitimate hostname, IPv4 literal, or
+    IPv6 literal -- never for an empty/None host, never for anything
+    starting with '-', and never for a stray '@'/':' smuggled in from a
+    malformed or adversarial URL. See the module comment above
+    _CLONE_URL_SCHEME_RE for why this replaced the prior
+    per-character-after-a-fixed-anchor lookahead approach."""
+    if not host:
+        return False
+    if ":" in host:
+        # Only ever legitimate for an IPv6 literal (a bracketed
+        # ssh://user@[::1]:22/path host, urlsplit() already strips the
+        # brackets into plain "::1"). ipaddress.ip_address() is a strict,
+        # well-tested parser for that shape (including a %<scope-id>
+        # suffix) -- anything that isn't genuinely a valid IPv6 literal is
+        # rejected outright rather than falling through to the plain
+        # hostname charset below, which would wrongly accept a ':'-laden
+        # injection attempt.
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            return False
+        return True
+    return bool(_SAFE_HOST_RE.match(host))
+
+
+def _validate_clone_url(url: str) -> str:
+    """Returns an error message if url is rejected, None if it passes. See
+    module-level comment above _CLONE_URL_SCHEME_RE for the reasoning."""
+    err = ("unsupported URL — use http://, https://, ssh://, or "
+           "user@host:path (git's own shorthand)")
+    if not url or not isinstance(url, str):
+        return "a URL is required"
+    if len(url) > CLONE_URL_MAX_LEN:
+        return f"URL is too long (max {CLONE_URL_MAX_LEN} characters)"
+    if any(ord(c) < 0x20 or c == "\x7f" for c in url):
+        return "URL contains control characters"
+
+    if _CLONE_URL_SCHEME_RE.match(url):
+        # urlsplit() (not hand-rolled slicing) isolates the real host --
+        # correctly ignoring an optional user@ prefix, a bracketed IPv6
+        # literal, and a :port suffix -- exactly the component ssh/git
+        # itself treats as a connection target.
+        try:
+            host = urllib.parse.urlsplit(url).hostname
+        except ValueError:
+            return err
+        return None if _clone_url_host_is_safe(host) else err
+
+    if _CLONE_URL_SCP_RE.match(url):
+        # git's scp-like shorthand has no scheme for urlsplit() to parse --
+        # isolate host/path ourselves: split on the first '@' (the regex
+        # above already anchored the user to a safe charset with no '@' or
+        # ':' in it, so the first '@' is unambiguous), then the first ':'
+        # after that splits the real host from the real path. Both
+        # components matter here (unlike the scheme case): host is ssh's
+        # connection target, and path is what git hands to the remote
+        # git-upload-pack invocation -- a leading '-' on either is the
+        # injection shape.
+        _user, _, rest = url.partition("@")
+        host, _, path = rest.partition(":")
+        if _clone_url_host_is_safe(host) and path and path[0] != "-":
+            return None
+        return err
+
+    return err
+
 
 def _gitea_slug(name: str) -> str:
     # NAME_RE already guarantees name starts with an alnum and is otherwise
@@ -698,6 +895,303 @@ def _gitea_api(method: str, path: str, body: dict = None) -> tuple:
             return e.code, {}
     except (urllib.error.URLError, TimeoutError, ValueError):
         raise ConnectionError("gitea unreachable")
+
+
+def _gitea_api_raw(method: str, path: str) -> tuple:
+    """Like _gitea_api() but returns (status, text) without attempting
+    json.loads on the body -- needed for Gitea's `.diff` endpoint (backlog
+    item 8), which returns plain diff text, not JSON. _gitea_api() itself
+    would misclassify a non-JSON 2xx body as ConnectionError, since its own
+    `except (URLError, TimeoutError, ValueError)` also catches json.loads's
+    ValueError. Same "raise ConnectionError only on a real transport
+    failure, never on a non-2xx status" contract as _gitea_api()."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{GITEA_PORT}/api/v1{path}", method=method,
+        headers={"Authorization": f"token {GITEA_API_TOKEN}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as e:
+        return e.code, (e.read() or b"").decode("utf-8", errors="ignore")
+    except (urllib.error.URLError, TimeoutError):
+        raise ConnectionError("gitea unreachable")
+
+
+# ─── external-origin detection + GitHub REST client (backlog item 17 part 1,
+# docs/spec.md) ─────────────────────────────────────────────────────────────
+# Detects, per project, whether its `origin` remote is this switchboard's
+# own local Gitea, github.com, or something else -- unprivileged, on demand,
+# no new sudoers entry (SVC_USER already has ambient read access under
+# PROJECTS_DIR, same basis teams.load_grounding() already relies on). Plus a
+# GitHub REST API client mirroring _gitea_api/_gitea_api_raw's exact
+# contract. Nothing here is wired into a poll loop, a route, or item 8's
+# Gitea-only reviewer yet -- see docs/spec.md "Non-goals" (that's item 17
+# part 2).
+
+def _project_origin_url(name: str) -> str | None:
+    """Unprivileged `git remote get-url origin` against
+    PROJECTS_DIR/<name>. Returns None (never raises) for: not a git repo,
+    no `origin` remote configured, or any subprocess/timeout failure -- all
+    three are ordinary, expected states (a local-only `git init` project, an
+    upload-wizard project with no remote at all), not errors."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", os.path.join(PROJECTS_DIR, name), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=10)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    url = r.stdout.strip()
+    return url or None
+
+
+def _classify_origin_url(url: str) -> dict:
+    """Never raises. Returns {"kind": "local"|"github"|"external"|"none",
+    "owner": str|None, "repo": str|None}.
+
+    "none" -- no url at all (empty string). "local" -- origin's host parses
+    as a loopback IP (ipaddress.ip_address(host).is_loopback) -- covers
+    every origin this switchboard itself has ever generated (always
+    literally 127.0.0.1, see scripts/new-project-from-gitea.sh) and is
+    robust to a bracketed ::1 too, without hardcoding the string
+    "127.0.0.1". "github" -- host case-insensitively equals "github.com",
+    with owner/repo parsed from the path (both scheme:// and
+    user@host:path forms) and a trailing ".git" stripped. Anything else
+    (unparseable, or a real but non-github, non-loopback host) is
+    "external" with owner/repo left None -- no client exists for it in
+    this part.
+
+    Parsing detail: try urllib.parse.urlsplit(url).hostname first (handles
+    https://github.com/owner/repo.git, ssh://git@github.com/owner/repo.git,
+    bracketed IPv6 loopback); if that yields no host (e.g. git's
+    scp-shorthand, which has no scheme for urlsplit to parse), fall back to
+    a plain user@host:path split. This is a read-only classification of an
+    already-existing origin, not a security-validation path like item 16's
+    _validate_clone_url() -- item 16's injection-safety regexes are
+    deliberately not reused here (see docs/spec.md "Background")."""
+    if not url:
+        return {"kind": "none", "owner": None, "repo": None}
+    try:
+        host = None
+        path = ""
+        try:
+            parts = urllib.parse.urlsplit(url)
+        except ValueError:
+            parts = None
+        if parts is not None and parts.hostname:
+            host = parts.hostname
+            path = parts.path or ""
+        else:
+            _user, sep, rest = url.partition("@")
+            if sep:
+                h, csep, p = rest.partition(":")
+                if h and csep and p:
+                    host, path = h, p
+        if not host:
+            return {"kind": "external", "owner": None, "repo": None}
+        try:
+            if ipaddress.ip_address(host).is_loopback:
+                return {"kind": "local", "owner": None, "repo": None}
+        except ValueError:
+            pass
+        if host.lower() == "github.com":
+            segments = [s for s in path.strip("/").split("/") if s]
+            owner = segments[0] if len(segments) >= 1 else None
+            repo = segments[1] if len(segments) >= 2 else None
+            if repo and repo.endswith(".git"):
+                repo = repo[:-4]
+            return {"kind": "github", "owner": owner, "repo": repo}
+        return {"kind": "external", "owner": None, "repo": None}
+    except Exception:
+        # Classification must never crash a caller over a malformed origin
+        # some unrelated process created.
+        return {"kind": "external", "owner": None, "repo": None}
+
+
+def detect_project_origin(name: str) -> dict:
+    """Public entry point -- composes _project_origin_url()/
+    _classify_origin_url() (docs/spec.md "Detection mechanism")."""
+    return _classify_origin_url(_project_origin_url(name) or "")
+
+
+_github_rate_limit_lock = threading.Lock()
+_github_rate_limited_until = 0.0
+
+
+def _github_rate_limited() -> bool:
+    with _github_rate_limit_lock:
+        return time.time() < _github_rate_limited_until
+
+
+def _github_note_rate_limit(headers, status: int) -> None:
+    """Called after every real GitHub HTTP response (success or
+    HTTPError). Sets _github_rate_limited_until (never lowers an existing,
+    still-active cooldown) when:
+    - status in (403, 429) and a Retry-After header is present -> now +
+      int(Retry-After) seconds (the most authoritative signal GitHub
+      gives; a malformed/non-numeric value falls back to
+      GITHUB_RATE_LIMIT_FALLBACK_SECONDS rather than being ignored).
+    - status in (403, 429) and X-RateLimit-Remaining == "0" (no
+      Retry-After) -> X-RateLimit-Reset epoch seconds, if present and
+      parses as an int; else now + GITHUB_RATE_LIMIT_FALLBACK_SECONDS as a
+      conservative default rather than not backing off at all.
+    - Otherwise (a normal 2xx/4xx with remaining quota, or a 403/429 with
+      neither signal) -> no-op. Never raises."""
+    global _github_rate_limited_until
+    if status not in (403, 429):
+        return
+    now = time.time()
+    headers = headers or {}
+    retry_after = headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            until = now + int(retry_after)
+        except (TypeError, ValueError):
+            until = now + GITHUB_RATE_LIMIT_FALLBACK_SECONDS
+    else:
+        remaining = headers.get("X-RateLimit-Remaining")
+        if remaining != "0":
+            return
+        reset = headers.get("X-RateLimit-Reset")
+        try:
+            until = float(int(reset))
+        except (TypeError, ValueError):
+            until = now + GITHUB_RATE_LIMIT_FALLBACK_SECONDS
+    with _github_rate_limit_lock:
+        if until > _github_rate_limited_until:
+            _github_rate_limited_until = until
+
+
+def _github_request_headers(accept: str = None) -> dict:
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": accept or "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        # GitHub's API rejects requests with no User-Agent at all -- a real,
+        # documented GitHub-specific requirement Gitea doesn't have.
+        "User-Agent": "ai-dev-switchboard",
+    }
+
+
+def _github_api(method: str, path: str, body: dict = None) -> tuple:
+    """Returns (status, parsed_json_or_{}). Never raises for a non-2xx HTTP
+    status -- only for a real connection failure, converted to
+    ConnectionError, same contract as _gitea_api(). Checks the rate-limit
+    cooldown gate BEFORE building the request; if still cooling down,
+    returns (429, {"error": "rate limited, retry later"}) without making an
+    HTTP call at all. After any real response (success or HTTPError), calls
+    _github_note_rate_limit() with the response headers + status."""
+    if _github_rate_limited():
+        return 429, {"error": "rate limited, retry later"}
+    data = json.dumps(body).encode() if body is not None else None
+    headers = _github_request_headers()
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(
+        f"{GITHUB_API_BASE}{path}", data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=GITHUB_API_TIMEOUT_SECONDS) as resp:
+            _github_note_rate_limit(resp.headers, resp.status)
+            return resp.status, json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        _github_note_rate_limit(e.headers, e.code)
+        try:
+            return e.code, json.loads(e.read() or b"{}")
+        except ValueError:
+            return e.code, {}
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        raise ConnectionError("github unreachable")
+
+
+def _github_api_raw(method: str, path: str, accept: str = None) -> tuple:
+    """Like _github_api() but returns (status, text) without attempting
+    json.loads on the body -- needed for GitHub's diff Accept header
+    (application/vnd.github.v3.diff), which returns plain diff text, not
+    JSON. Same rate-limit-gate-then-note handling, and the same "raise
+    ConnectionError only on a real transport failure, never on a non-2xx
+    status" contract, as _github_api()."""
+    if _github_rate_limited():
+        return 429, "rate limited, retry later"
+    headers = _github_request_headers(accept)
+    req = urllib.request.Request(f"{GITHUB_API_BASE}{path}", method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=GITHUB_API_TIMEOUT_SECONDS) as resp:
+            _github_note_rate_limit(resp.headers, resp.status)
+            return resp.status, resp.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as e:
+        _github_note_rate_limit(e.headers, e.code)
+        return e.code, (e.read() or b"").decode("utf-8", errors="ignore")
+    except (urllib.error.URLError, TimeoutError):
+        raise ConnectionError("github unreachable")
+
+
+def _github_token_missing_error() -> dict:
+    return {"ok": False, "error": "GITHUB_TOKEN isn't configured -- see switchboard.env"}
+
+
+def github_list_open_prs(owner: str, repo: str) -> dict:
+    """GET /repos/{owner}/{repo}/pulls?state=open. {"ok": True,
+    "prs": [...]} -- each item keeps GitHub's own shape (number, title,
+    body, labels: [{"name": ...}, ...]), same "don't reshape the upstream
+    response" choice _gitea_api's own callers already make."""
+    if not GITHUB_TOKEN:
+        return _github_token_missing_error()
+    try:
+        status, resp = _github_api("GET", f"/repos/{owner}/{repo}/pulls?state=open")
+    except ConnectionError as e:
+        return {"ok": False, "error": str(e)}
+    if status != 200 or not isinstance(resp, list):
+        return {"ok": False, "error": f"unexpected response (status {status})"}
+    return {"ok": True, "prs": resp}
+
+
+def github_pr_diff(owner: str, repo: str, number: int) -> dict:
+    """GET /repos/{owner}/{repo}/pulls/{number} with the diff Accept
+    header (_github_api_raw). {"ok": True, "diff": <text>}."""
+    if not GITHUB_TOKEN:
+        return _github_token_missing_error()
+    try:
+        status, text = _github_api_raw(
+            "GET", f"/repos/{owner}/{repo}/pulls/{number}",
+            accept="application/vnd.github.v3.diff")
+    except ConnectionError as e:
+        return {"ok": False, "error": str(e)}
+    if status != 200:
+        return {"ok": False, "error": f"diff fetch failed (status {status})"}
+    return {"ok": True, "diff": text}
+
+
+def github_list_branches(owner: str, repo: str) -> dict:
+    """GET /repos/{owner}/{repo}/branches. {"ok": True, "branches": [...]}."""
+    if not GITHUB_TOKEN:
+        return _github_token_missing_error()
+    try:
+        status, resp = _github_api("GET", f"/repos/{owner}/{repo}/branches")
+    except ConnectionError as e:
+        return {"ok": False, "error": str(e)}
+    if status != 200 or not isinstance(resp, list):
+        return {"ok": False, "error": f"unexpected response (status {status})"}
+    return {"ok": True, "branches": resp}
+
+
+def github_post_pr_comment(owner: str, repo: str, number: int, body: str) -> dict:
+    """POST /repos/{owner}/{repo}/issues/{number}/comments, {"body": body}
+    -- GitHub, like Gitea, treats a PR's comments as issue comments. Posted
+    directly and synchronously, same as _gitea_api's own POST call in
+    _ai_reviewer_review_run() -- see docs/spec.md "Settled scope decision"
+    for why this write needs no extra confirmation gate. {"ok": True} on a
+    2xx status."""
+    if not GITHUB_TOKEN:
+        return _github_token_missing_error()
+    try:
+        status, _resp = _github_api(
+            "POST", f"/repos/{owner}/{repo}/issues/{number}/comments", {"body": body})
+    except ConnectionError as e:
+        return {"ok": False, "error": str(e)}
+    if status // 100 != 2:
+        return {"ok": False, "error": f"comment post failed (status {status})"}
+    return {"ok": True}
 
 
 # ─── poll-based sync-on-push (backlog item 2c, part 1) ─────────────────────
@@ -819,6 +1313,13 @@ def _gitea_poll_if_due(gitea_on: bool) -> None:
                 # nit, never a correctness/safety issue" tolerance the rest
                 # of this feature already accepts.
                 pass
+            try:
+                _ai_reviewer_poll_repo("gitea", owner_repo, entry)
+            except Exception:
+                # Same per-repo isolation discipline as _gitea_poll_one above
+                # (docs/spec.md backlog item 8, "Edge cases" -- a malformed
+                # response for one repo must not stop other repos' polls).
+                pass
     finally:
         _gitea_poll_lock.release()
 
@@ -837,6 +1338,449 @@ def _gitea_poll_one(owner_repo: str, entry: dict) -> None:
     if not remote_sha or remote_sha == entry.get("remote_sha"):
         return  # nothing new since the last time this was checked
     _gitea_sync_bg(entry["name"], branch, owner_repo, remote_sha)
+
+
+# ─── AI merge-request reviewer (backlog item 8; host-agnostic per item 17
+# part 2) ────────────────────────────────────────────────────────────────
+# See docs/spec.md "The poll extension" (item 8) and "Proposed approach" #1
+# (item 17 part 2) -- rides both _gitea_poll_if_due()'s existing per-repo
+# loop above (_ai_reviewer_poll_repo("gitea", ...), its own try/except at the
+# call site) and _github_poll_if_due() below (_ai_reviewer_poll_repo("github",
+# ...)). State file: {pr_key: {"label_present": bool, "attempts": int,
+# "reviewed_at": iso|null, "last_error": str|null}} -- pr_key is
+# "owner/repo#number" for Gitea (unchanged, byte-for-byte, since item 8
+# shipped) or "github:owner/repo#number" for GitHub (see
+# _ai_reviewer_pr_key() -- the "github:" prefix can never collide with a
+# Gitea owner/repo, which can't contain a colon). Same tmp-file-then-
+# os.replace() atomic-write idiom, and the same "missing/corrupt file
+# tolerates to {}" idiom, as _load_gitea_repo_map()/_save_gitea_repo_map_
+# entry() above.
+_ai_reviewer_state_lock = threading.Lock()
+
+
+def _load_ai_reviewer_state() -> dict:
+    try:
+        with open(AI_REVIEWER_STATE_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _ai_reviewer_state_entry_dict(*, label_present: bool, attempts: int,
+                                  reviewed_at, last_error, episode: int) -> dict:
+    return {"label_present": label_present, "attempts": attempts,
+            "reviewed_at": reviewed_at, "last_error": last_error,
+            "episode": episode}
+
+
+def _write_ai_reviewer_state(s: dict) -> None:
+    """Assumes the caller already holds _ai_reviewer_state_lock. Same
+    tmp-file-then-os.replace() atomic-write idiom as _save_gitea_repo_map_
+    entry() above."""
+    os.makedirs(os.path.dirname(AI_REVIEWER_STATE_FILE), exist_ok=True)
+    tmp = AI_REVIEWER_STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(s, f, indent=2, sort_keys=True)
+    os.replace(tmp, AI_REVIEWER_STATE_FILE)
+
+
+def _save_ai_reviewer_state_entry(pr_key: str, *, label_present: bool, attempts: int,
+                                  reviewed_at, last_error, episode: int) -> None:
+    with _ai_reviewer_state_lock:
+        s = _load_ai_reviewer_state()
+        s[pr_key] = _ai_reviewer_state_entry_dict(
+            label_present=label_present, attempts=attempts, reviewed_at=reviewed_at,
+            last_error=last_error, episode=episode)
+        _write_ai_reviewer_state(s)
+
+
+def _ai_reviewer_save_if_current_episode(pr_key: str, episode: int, *, label_present: bool,
+                                         attempts: int, reviewed_at, last_error) -> bool:
+    """Same write as _save_ai_reviewer_state_entry(), but the "is `episode`
+    still current?" check happens INSIDE this same critical section
+    (_ai_reviewer_state_lock), not before it -- closing a check-then-write
+    race a prior version of this code had (docs/test-review.md Defect 1): an
+    unlocked `prev.get("episode", 0) == episode` check followed by a
+    *separate*, later locked write let a concurrent trigger-edge write
+    (episode N+1) land in the gap between the check and the write, so the
+    stale (episode N) thread's check -- which had already passed -- went on
+    to clobber the newer episode's state anyway, moving `episode` backwards.
+    Re-reading and re-checking under the same lock that performs the write
+    makes the two indivisible: either this call observes the newer episode
+    (already persisted) and no-ops, or it wins the race and its own write is
+    the one a subsequent trigger edge will itself see and check against.
+    Returns True if the write happened, False if it was a stale no-op."""
+    with _ai_reviewer_state_lock:
+        s = _load_ai_reviewer_state()
+        if s.get(pr_key, {}).get("episode", 0) != episode:
+            return False  # superseded by a newer episode; this completion is stale
+        s[pr_key] = _ai_reviewer_state_entry_dict(
+            label_present=label_present, attempts=attempts, reviewed_at=reviewed_at,
+            last_error=last_error, episode=episode)
+        _write_ai_reviewer_state(s)
+        return True
+
+
+def _ai_reviewer_record_failure(pr_key: str, message: str, episode: int) -> None:
+    """Re-reads the current state entry, increments attempts, records
+    last_error. label_present is left True -- already set synchronously by
+    the trigger edge in _ai_reviewer_poll_repo() below -- so a failed
+    attempt is retried by that function's own "already present" branch,
+    never re-triggered as a brand new episode (docs/spec.md "Record
+    failure"). If the state's current episode has since moved past
+    `episode` (a newer episode superseded this one while this thread was
+    still running -- backlog item 8), this write is a stale no-op; the
+    newer episode's own state is authoritative -- see
+    _ai_reviewer_save_if_current_episode()'s own docstring for why the
+    currency check and the write must happen inside the SAME lock."""
+    prev = _load_ai_reviewer_state().get(pr_key, {})
+    _ai_reviewer_save_if_current_episode(
+        pr_key, episode, label_present=True, attempts=prev.get("attempts", 0) + 1,
+        reviewed_at=prev.get("reviewed_at"), last_error=message)
+
+
+# Per-PR (owner/repo#number) non-blocking lock -- same _gitea_sync_lock_for
+# idiom as sync-on-push above: a review dispatch that finds the lock already
+# held (a previous attempt for this exact PR is still running) is dropped,
+# not queued -- the next poll interval sees `attempts` unchanged and retries.
+_ai_reviewer_pr_locks_guard = threading.Lock()
+_ai_reviewer_pr_locks = {}
+
+
+def _ai_reviewer_pr_lock_for(key) -> threading.Lock:
+    with _ai_reviewer_pr_locks_guard:
+        lock = _ai_reviewer_pr_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _ai_reviewer_pr_locks[key] = lock
+        return lock
+
+
+def _ai_reviewer_comment_body(model_entry: dict, review_text: str, diff_truncated: bool) -> str:
+    truncation_note = ""
+    if diff_truncated:
+        truncation_note = (
+            f"\n> Note: this diff was truncated to the first {AI_REVIEWER_MAX_DIFF_BYTES} "
+            "bytes before review -- some changes may not have been evaluated.\n")
+    return (
+        f"**AI code review** (model: `{model_entry['kind']}:{model_entry['name']}`, "
+        "via ai-dev-switchboard)\n"
+        f"{truncation_note}\n"
+        f"{review_text}\n\n"
+        "---\n"
+        "_Comment-only — this review never blocks, approves, or merges this PR._\n"
+    )
+
+
+def _ai_reviewer_pr_key(host: str, owner_repo: str, number) -> str:
+    """Gitea's key format is UNCHANGED ("owner/repo#number", no prefix) --
+    backward-compatible with every already-persisted AI_REVIEWER_STATE_FILE
+    entry on a live install (docs/spec.md item 17 part 2, "Non-goals": no
+    change to Gitea's own state-file key format). GitHub gets a "github:"
+    prefix -- a string Gitea's own owner/repo naming can never produce (no
+    colon allowed), so collision with an existing Gitea key is structurally
+    impossible, not just unlikely."""
+    return f"{owner_repo}#{number}" if host == "gitea" else f"github:{owner_repo}#{number}"
+
+
+def _ai_reviewer_review_run(host: str, owner_repo: str, entry: dict, pr: dict, episode: int) -> None:
+    """The real review-generation + comment-post work, off the request
+    thread (see _ai_reviewer_review_bg). Never raises -- every failure path
+    records it via _ai_reviewer_record_failure() and returns.
+
+    Host-agnostic (item 17 part 2, docs/spec.md "Proposed approach" #1) --
+    only the diff-fetch and comment-post calls branch per host; every other
+    line (truncation, model resolution, teams.review_pr_diff(), comment-body
+    construction, state persistence) is identical for "gitea"/"github".
+
+    `episode` identifies which trigger edge this run belongs to (backlog
+    item 8) -- threaded through every _ai_reviewer_record_failure() call and
+    the final success write so a stale run (superseded by a newer episode
+    while this one was still in flight) can never clobber the newer
+    episode's state; see _ai_reviewer_record_failure()'s own docstring."""
+    number = pr.get("number")
+    pr_key = _ai_reviewer_pr_key(host, owner_repo, number)
+    try:
+        if host == "gitea":
+            try:
+                status, diff_text = _gitea_api_raw(
+                    "GET", f"/repos/{owner_repo}/pulls/{number}.diff")
+            except ConnectionError as e:
+                _ai_reviewer_record_failure(pr_key, str(e), episode)
+                return
+            if status != 200:
+                # Covers a PR closed/merged between label-add-detection and
+                # this background run actually running (404), and any other
+                # non-2xx response -- an ordinary retried failure, not a
+                # crash (docs/spec.md "Edge cases"). A genuinely EMPTY-but-200
+                # diff (a PR with no net changes) is deliberately NOT treated
+                # as a failure here -- docs/spec.md's own "Edge cases"
+                # section settles that explicitly ("still reviewed... not
+                # treated as an error"), which this reads as authoritative
+                # over the more terse "non-200 or empty" phrasing in the
+                # walkthrough above it.
+                _ai_reviewer_record_failure(pr_key, f"diff fetch failed (status {status})", episode)
+                return
+        else:  # github -- reuses part 1's own convenience function directly,
+               # normalizing its {"ok": bool, ...} contract against the rest
+               # of this function's status-code-based control flow.
+            owner, _sep, repo = owner_repo.partition("/")
+            result = github_pr_diff(owner, repo, number)
+            if not result.get("ok"):
+                _ai_reviewer_record_failure(pr_key, result.get("error") or "diff fetch failed", episode)
+                return
+            diff_text = result["diff"]
+
+        diff_bytes = diff_text.encode("utf-8")
+        diff_truncated = len(diff_bytes) > AI_REVIEWER_MAX_DIFF_BYTES
+        if diff_truncated:
+            diff_text = diff_bytes[:AI_REVIEWER_MAX_DIFF_BYTES].decode("utf-8", errors="ignore")
+
+        kind, _sep, name = AI_REVIEWER_MODEL.partition(":")
+        model_entry = None
+        if name:
+            model_entry = next(
+                (m for m in teams.roster() if m["kind"] == kind and m["name"] == name), None)
+        if model_entry is None:
+            _ai_reviewer_record_failure(
+                pr_key, f"AI_REVIEWER_MODEL {AI_REVIEWER_MODEL!r} not found in roster", episode)
+            return
+
+        workdir = os.path.join(PROJECTS_DIR, entry["name"])
+        result = teams.review_pr_diff(
+            model_entry, workdir=workdir, pr_title=pr.get("title", "") or "",
+            pr_body=pr.get("body") or "", diff_text=diff_text, diff_truncated=diff_truncated)
+        if not result.get("ok"):
+            _ai_reviewer_record_failure(pr_key, result.get("error") or "review generation failed", episode)
+            return
+
+        comment = _ai_reviewer_comment_body(model_entry, result.get("text", ""), diff_truncated)
+        if host == "gitea":
+            try:
+                status, _resp = _gitea_api(
+                    "POST", f"/repos/{owner_repo}/issues/{number}/comments", {"body": comment})
+            except ConnectionError as e:
+                _ai_reviewer_record_failure(pr_key, str(e), episode)
+                return
+            if status // 100 != 2:
+                _ai_reviewer_record_failure(pr_key, f"comment post failed (status {status})", episode)
+                return
+        else:  # github
+            owner, _sep, repo = owner_repo.partition("/")
+            result = github_post_pr_comment(owner, repo, number, comment)
+            if not result.get("ok"):
+                _ai_reviewer_record_failure(pr_key, result.get("error") or "comment post failed", episode)
+                return
+
+        _ai_reviewer_save_if_current_episode(
+            pr_key, episode, label_present=True, attempts=0,
+            reviewed_at=teams._now_iso(), last_error=None)
+    except Exception as e:
+        # Defense in depth -- nothing above this point should be able to
+        # raise, but this runs on its own background thread (not inside
+        # _gitea_poll_if_due()'s/_github_poll_if_due()'s own per-repo
+        # try/except), so an unanticipated exception here must still be
+        # recorded rather than silently killing the thread with attempts
+        # never incremented.
+        _ai_reviewer_record_failure(pr_key, f"{type(e).__name__}: {e}", episode)
+
+
+def _ai_reviewer_review_bg(host: str, owner_repo: str, entry: dict, pr: dict, episode: int) -> None:
+    """Non-blocking dispatch -- mirrors _gitea_sync_bg() exactly. Returns
+    immediately; if a previous attempt for this exact (pr, episode) is still
+    in flight, this call is simply dropped (the next poll interval retries).
+    The lock is keyed on (pr_key, episode), not pr_key alone (backlog item
+    8) -- so a new episode (label removed and re-added while the previous
+    episode's review thread is still running) is never silently dropped
+    just because a stale episode's thread still holds the pr_key-only lock.
+    A Gitea and a GitHub review can never contend on the same lock either,
+    since pr_key itself is already host-prefixed."""
+    pr_key = _ai_reviewer_pr_key(host, owner_repo, pr.get("number"))
+    lock_key = (pr_key, episode)
+    lock = _ai_reviewer_pr_lock_for(lock_key)
+    if not lock.acquire(blocking=False):
+        return
+
+    def _run():
+        try:
+            _ai_reviewer_review_run(host, owner_repo, entry, pr, episode)
+        finally:
+            # Pop the dict entry and release the lock inside the SAME
+            # _ai_reviewer_pr_locks_guard critical section (docs/test-
+            # review.md Defect 2) -- releasing first, then popping as a
+            # separate statement, left a gap where a concurrent caller for
+            # this exact (pr_key, episode) key could see the entry (now
+            # unlocked), acquire it, and start running, only for this
+            # thread's later pop to remove it anyway -- letting a THIRD,
+            # even-later caller create a brand-new unlocked lock and run
+            # concurrently with the second, defeating this lock's own
+            # mutual-exclusion guarantee. Popping first (while still holding
+            # the guard, before the underlying lock is released) means no
+            # other thread can observe this key at all until it's already
+            # gone -- the next lookup via _ai_reviewer_pr_lock_for() always
+            # creates a fresh lock instead of racing this one.
+            with _ai_reviewer_pr_locks_guard:
+                _ai_reviewer_pr_locks.pop(lock_key, None)
+                lock.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _ai_reviewer_poll_repo(host: str, owner_repo: str, entry: dict) -> None:
+    """Called from inside _gitea_poll_if_due()'s/_github_poll_if_due()'s
+    per-repo loop, gated on AI_REVIEWER_ENABLED. Watches AI_REVIEWER_LABEL on
+    owner_repo's open PRs and fires a review on the label-absent ->
+    label-present edge (docs/spec.md "The poll extension" step 3).
+
+    The retry branch below (label present, was already present) is gated on
+    `last_error is not None`, not merely `attempts < AI_REVIEWER_MAX_
+    ATTEMPTS` as docs/spec.md's own walkthrough literally states -- see
+    docs/implementation.md "Deviations from spec" for why the literal
+    reading would re-post a review on every single poll interval forever
+    after the FIRST successful review of an episode (a successful review
+    resets attempts to 0, which is always < AI_REVIEWER_MAX_ATTEMPTS),
+    directly violating the spec's own acceptance criterion that a still-
+    present, never-removed label must not cause a second comment post.
+    """
+    if not AI_REVIEWER_ENABLED:
+        return
+    if host == "gitea":
+        status, resp = _gitea_api("GET", f"/repos/{owner_repo}/pulls?state=open")
+        if status != 200 or not isinstance(resp, list):
+            return
+        prs = resp
+    else:  # github
+        if not GITHUB_TOKEN:
+            return
+        owner, _sep, repo = owner_repo.partition("/")
+        result = github_list_open_prs(owner, repo)
+        if not result.get("ok"):
+            return
+        prs = result["prs"]
+
+    state = _load_ai_reviewer_state()
+    for pr in prs:
+        if not isinstance(pr, dict):
+            continue
+        number = pr.get("number")
+        if number is None:
+            continue
+        pr_key = _ai_reviewer_pr_key(host, owner_repo, number)
+        labels = pr.get("labels") or []
+        label_present = AI_REVIEWER_LABEL in [
+            l.get("name") for l in labels if isinstance(l, dict)]
+        prev = state.get(pr_key, {})
+        was_present = prev.get("label_present")
+
+        if not label_present:
+            if was_present or pr_key not in state:
+                # Arms the next add as a fresh episode -- no-op if already
+                # recorded absent. episode carries forward unchanged (it's
+                # not starting a new one, just arming the next add).
+                _save_ai_reviewer_state_entry(
+                    pr_key, label_present=False, attempts=0,
+                    reviewed_at=prev.get("reviewed_at"), last_error=None,
+                    episode=prev.get("episode", 0))
+            continue
+
+        if not was_present:
+            # Trigger edge -- write synchronously BEFORE any slow work so no
+            # other/later poll pass can re-decide this is a fresh edge while
+            # the review is in flight (closes the double-post race). Bumps
+            # episode (backlog item 8) so a completion write from any prior,
+            # now-superseded episode's still-in-flight thread can recognize
+            # itself as stale and no-op instead of clobbering this write.
+            episode = prev.get("episode", 0) + 1
+            _save_ai_reviewer_state_entry(
+                pr_key, label_present=True, attempts=prev.get("attempts", 0),
+                reviewed_at=prev.get("reviewed_at"), last_error=None, episode=episode)
+            _ai_reviewer_review_bg(host, owner_repo, entry, pr, episode)
+            continue
+
+        attempts = prev.get("attempts", 0)
+        if prev.get("last_error") is not None and attempts < AI_REVIEWER_MAX_ATTEMPTS:
+            _ai_reviewer_review_bg(host, owner_repo, entry, pr, prev.get("episode", 0))
+        # else: either already successfully reviewed this episode (no
+        # retry needed) or the attempt budget is exhausted -- give up
+        # silently until the label cycles (removed, then re-added).
+
+
+# ─── GitHub poll pass (backlog item 17 part 2, docs/spec.md) ──────────────
+# The GitHub-side counterpart to _gitea_poll_if_due() above, but with a
+# narrower purpose: unlike Gitea (which also fast-forward-syncs the local
+# checkout via _gitea_poll_one), the ONLY thing that needs periodic
+# background polling for a GitHub-origin project is item 8's label-watching
+# (a label being added is an event a poll has to notice, not a query an
+# operator/script triggers on demand -- see docs/spec.md "Settled scope
+# decisions" #1). So this poll loop's only per-repo work is calling
+# _ai_reviewer_poll_repo("github", ...) for every allowlisted, GitHub-origin
+# local project.
+_github_poll_lock = threading.Lock()
+_github_poll_last_at = 0.0
+
+
+def _load_ai_reviewer_github_repos() -> set:
+    """Hand-edited JSON array of "owner/repo" strings -- app.py only ever
+    reads this file, same DEPLOY_MAP_FILE contract (never written by this
+    module). Missing/malformed/not-a-list-of-strings -> empty set (nothing
+    opted in), never raises -- same "never crash, safe-degrade" idiom every
+    loader in this file already follows."""
+    try:
+        with open(AI_REVIEWER_GITHUB_REPOS_FILE) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return set()
+    if not isinstance(data, list):
+        return set()
+    return {x for x in data if isinstance(x, str) and x}
+
+
+def _github_poll_if_due() -> None:
+    """Throttled, lock-guarded poll pass -- same double-checked lock +
+    timestamp shape as _gitea_poll_if_due(). No `_on`/enabled-toggle
+    parameter (unlike Gitea, GitHub isn't a locally-run service with an
+    on/off container state) -- gating is entirely via AI_REVIEWER_ENABLED/
+    GITHUB_TOKEN/the allowlist below, all checked inside this function."""
+    global _github_poll_last_at
+    if not AI_REVIEWER_ENABLED or not GITHUB_TOKEN:
+        return  # nothing this poll exists to do would run anyway -- see
+                 # docs/spec.md "Settled scope decisions" #1: this poll has
+                 # no purpose independent of item 8's label-watching.
+    if time.time() - _github_poll_last_at < GITHUB_POLL_INTERVAL_SECONDS:
+        return
+    if not _github_poll_lock.acquire(blocking=False):
+        return  # another /status request is already mid-poll-pass
+    try:
+        if time.time() - _github_poll_last_at < GITHUB_POLL_INTERVAL_SECONDS:
+            return  # lost the race -- someone else just finished a pass
+        _github_poll_last_at = time.time()
+        allowed = _load_ai_reviewer_github_repos()
+        if not allowed:
+            return  # nothing opted in -- skip even the instance_names() walk
+        for name in instance_names():
+            try:
+                origin = detect_project_origin(name)
+            except Exception:
+                continue  # same per-project isolation discipline as
+                           # _gitea_poll_if_due()'s own per-repo try/except
+            if origin.get("kind") != "github":
+                continue
+            owner, repo = origin.get("owner"), origin.get("repo")
+            if not owner or not repo:
+                continue
+            owner_repo = f"{owner}/{repo}"
+            if owner_repo not in allowed:
+                continue
+            try:
+                _ai_reviewer_poll_repo("github", owner_repo, {"name": name})
+            except Exception:
+                # One malformed/unexpected response must not stop polling
+                # for every other allowlisted project in this pass -- same
+                # discipline _gitea_poll_if_due()'s own per-repo try/except
+                # already establishes.
+                pass
+    finally:
+        _github_poll_lock.release()
 
 
 # ─── switchboard-side deploy dispatch (backlog item 2c, part 2b) ──────────
@@ -950,6 +1894,103 @@ def deploy_run(name: str) -> tuple:
         lock.release()
 
 
+# Per-project non-blocking lock, identical shape to _deploy_locks/
+# _deploy_lock_for above -- a concurrent second smoke check for the same
+# project is dropped (the route maps this to 409), never queued.
+_smoke_check_locks_guard = threading.Lock()
+_smoke_check_locks = {}
+
+
+def _smoke_check_lock_for(name: str) -> threading.Lock:
+    with _smoke_check_locks_guard:
+        lock = _smoke_check_locks.get(name)
+        if lock is None:
+            lock = threading.Lock()
+            _smoke_check_locks[name] = lock
+        return lock
+
+
+def smoke_check_run(name: str, expect_contains: str) -> dict:
+    """Synchronous, request-thread dispatch -- same "manually clicked
+    one-shot action can and should just block the request" reasoning
+    deploy_run()'s own docstring gives. HTTP-level only (backlog item 18,
+    docs/spec.md): a single GET against _session_urls[name], the
+    switchboard's own trusted, server-derived URL for that project (never
+    an arbitrary client-supplied URL, so no SSRF-style concern). Never
+    raises -- every branch below returns a dict; on/OSError-shaped failures
+    from urlopen()/resp.read() are caught and turned into a clean
+    {"ok": False, ...} result instead.
+
+    Returns one of:
+    - {"ok": False, "error": "no captured URL for this project"} -- no
+      _session_urls entry for `name` (engine off, no url_regex, or hasn't
+      printed a matching URL yet). Returned immediately, before the lock is
+      even touched.
+    - {"ok": False, "error": <msg>, "locked": True} -- a check for this
+      project is already in flight. "locked" is an internal-only marker
+      the route below reads (and strips) to answer with HTTP 409, mirroring
+      deploy_run()'s own 409 contract -- never sent to the client verbatim.
+    - {"ok": False, "status_code": None, "elapsed_ms": int, "error": <msg>}
+      -- the request itself never completed (timeout, connection refused,
+      or any other transport-level failure).
+    - {"ok": True, "status_code": int, "elapsed_ms": int,
+       "content_ok": bool | None} -- a completed request, success or not:
+      a 404/500 from the target is a smoke-check RESULT, not a mechanism
+      failure, so it lands here with its real status_code, same as a 200.
+      content_ok is None (never False) when `expect_contains` was empty --
+      "not checked" must stay visibly distinct from "checked and failed".
+    """
+    url = _session_urls.get(name)
+    if url is None:
+        return {"ok": False, "error": "no captured URL for this project"}
+
+    lock = _smoke_check_lock_for(name)
+    if not lock.acquire(blocking=False):
+        return {"ok": False, "error": "a smoke check for this project is already in progress",
+                "locked": True}
+    try:
+        start = time.monotonic()
+        try:
+            with urllib.request.urlopen(url, timeout=SMOKE_CHECK_TIMEOUT_SECONDS) as resp:
+                status_code = resp.status
+                body = resp.read(SMOKE_CHECK_MAX_BODY_BYTES)
+        except urllib.error.HTTPError as e:
+            # Still a completed request -- a 4xx/5xx from the target is a
+            # smoke-check RESULT, not a mechanism failure.
+            status_code = e.code
+            body = e.read(SMOKE_CHECK_MAX_BODY_BYTES) or b""
+        except (urllib.error.URLError, TimeoutError, ConnectionRefusedError) as e:
+            # A bare TimeoutError/ConnectionRefusedError can surface here
+            # un-wrapped (e.g. resp.read() timing out on a stalled body
+            # AFTER urlopen() already returned headers successfully) as well
+            # as wrapped inside URLError.reason (e.g. a refused connection
+            # at connect time) -- unwrap either shape the same way.
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            reason = e.reason if isinstance(e, urllib.error.URLError) else e
+            if isinstance(reason, TimeoutError):
+                error = f"timed out after {SMOKE_CHECK_TIMEOUT_SECONDS}s"
+            elif isinstance(reason, ConnectionRefusedError):
+                error = "connection refused"
+            else:
+                error = str(reason) or "request failed"
+            return {"ok": False, "status_code": None, "elapsed_ms": elapsed_ms, "error": error}
+
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        content_ok = None
+        if expect_contains:
+            # errors="ignore" -- never raise on a non-UTF-8 body, same
+            # decode discipline AI_REVIEWER's own diff-decode already uses.
+            # The substring check only ever sees the (possibly truncated,
+            # per SMOKE_CHECK_MAX_BODY_BYTES) prefix read above -- a match
+            # past the cap is a documented, accepted limitation, not a bug.
+            body_text = body.decode("utf-8", errors="ignore")
+            content_ok = expect_contains in body_text
+        return {"ok": True, "status_code": status_code, "elapsed_ms": elapsed_ms,
+               "content_ok": content_ok}
+    finally:
+        lock.release()
+
+
 def create_project(name: str) -> tuple[bool, str]:
     if not NAME_RE.match(name or ""):
         return False, "Use letters, numbers, spaces, - or _ (must start with a letter/number)."
@@ -1007,6 +2048,62 @@ def create_project(name: str) -> tuple[bool, str]:
         _save_gitea_repo_map_entry(f"{owner}/{repo_name}", name, "main")
     except OSError:
         pass
+    return True, ""
+
+
+def _last_path_segment_from_clone_url(url: str) -> str:
+    """Naming-only heuristic ("what's the repo's own name") for
+    clone_project_from_url()'s default-name derivation (backlog item 16,
+    docs/spec.md "Name derivation and collision handling") -- this never
+    itself needs to reject anything, since _validate_clone_url() has already
+    run by the time this is called."""
+    m = _CLONE_URL_SCP_RE.match(url)
+    path = url.split(":", 1)[1] if m else urllib.parse.urlsplit(url).path
+    last = path.rstrip("/").rsplit("/", 1)[-1]
+    if last.endswith(".git"):
+        last = last[:-4]
+    return last
+
+
+def clone_project_from_url(url: str, name_override: str) -> tuple[bool, str]:
+    """Clones an arbitrary existing remote git repo URL into
+    PROJECTS_DIR/<name> (backlog item 16, docs/spec.md). No Gitea
+    involvement at all -- reads neither GITEA_ENABLED nor GITEA_API_TOKEN,
+    same "general-purpose entry point, no dependency" positioning as the
+    upload wizard. Validation/naming/collision checks run entirely
+    unprivileged here; only the final mkdir/chown/git-clone crosses into
+    root via NEW_PROJECT_FROM_URL_SCRIPT, same privilege-separation shape as
+    create_project()'s own NEW_PROJECT_FROM_GITEA_SCRIPT hand-off above."""
+    url = (url or "").strip()
+    err = _validate_clone_url(url)
+    if err:
+        return False, err
+
+    name = (name_override or "").strip()
+    if name:
+        if not NAME_RE.match(name):
+            return False, "Use letters, numbers, spaces, - or _ (must start with a letter/number)."
+    else:
+        name = _derive_project_name(_last_path_segment_from_clone_url(url), fallback_prefix="clone")
+
+    if name in instance_names():
+        return False, f"'{name}' already exists."
+
+    # deploy_run() (app/app.py) is this codebase's own precedent for
+    # wrapping a synchronous, request-thread subprocess.run(..., timeout=...)
+    # call in try/except (subprocess.SubprocessError, OSError) -- catches
+    # subprocess.TimeoutExpired too (a SubprocessError subclass), unlike
+    # create_project()'s/confirm_upload()'s own privileged-script calls,
+    # which don't guard against a timeout exception at all (a pre-existing
+    # gap in both, out of scope to fix here, but not one this new code
+    # should repeat).
+    try:
+        r = subprocess.run(["sudo", NEW_PROJECT_FROM_URL_SCRIPT, url, name],
+                           capture_output=True, text=True, timeout=CLONE_TIMEOUT_SECONDS)
+    except (subprocess.SubprocessError, OSError) as e:
+        return False, f"clone failed: {e}"
+    if r.returncode != 0:
+        return False, (r.stderr or r.stdout or "clone script failed").strip()[:300]
     return True, ""
 
 
@@ -1140,20 +2237,22 @@ def detect_structure(effective_root: str) -> dict:
 # collision-checking here still runs entirely unprivileged; only the final
 # per-project registration step crosses into RUN_USER's territory, via
 # NEW_PROJECT_FROM_UPLOAD_SCRIPT (see "Crossing the privilege boundary").
-def _derive_project_name(raw: str) -> str:
+def _derive_project_name(raw: str, fallback_prefix: str = "upload") -> str:
     """
-    Sanitizes a raw folder name (from the uploaded zip's own contents —
-    fully attacker-controlled) into a NAME_RE-valid project name
-    (docs/spec.md step 5): strip disallowed characters, strip any leading
-    non-alnum run (NAME_RE requires starting with a letter/number), cap at
-    60 chars. Falls back to "upload-<8 hex chars>" if nothing usable
-    survives.
+    Sanitizes a raw name (from the uploaded zip's own contents, or —
+    backlog item 16 — a clone URL's last path segment; either way, fully
+    attacker-controlled) into a NAME_RE-valid project name (docs/spec.md
+    step 5): strip disallowed characters, strip any leading non-alnum run
+    (NAME_RE requires starting with a letter/number), cap at 60 chars. Falls
+    back to "<fallback_prefix>-<8 hex chars>" if nothing usable survives --
+    fallback_prefix defaults to "upload" (the upload wizard's own original,
+    unchanged behavior); clone_project_from_url() passes "clone" instead.
     """
     cleaned = re.sub(r"[^A-Za-z0-9 _-]+", "", raw or "")
     cleaned = re.sub(r"^[^A-Za-z0-9]+", "", cleaned)[:60]
     if NAME_RE.match(cleaned):
         return cleaned
-    return f"upload-{secrets.token_hex(4)}"
+    return f"{fallback_prefix}-{secrets.token_hex(4)}"
 
 
 def _register_via_privileged_script(source: str, name: str) -> subprocess.CompletedProcess:
@@ -1699,11 +2798,29 @@ PAGE_TEMPLATE = """<!doctype html>
      (tests/test_deploy_frontend.js's own existing, reviewer-approved
      assertion), and every project unconditionally renders a team control. */
   .deploy-btn, .team-btn { font-size: 14px; padding: 10px 16px; border-radius: 10px; border: none;
-                background: #34c759; color: #fff; font-weight: 600; cursor: pointer;
+                background: #34c759; color: #111; font-weight: 600; cursor: pointer;
                 white-space: nowrap; }
   .deploy-msg { font-size: 12px; color: #888; margin: 4px 0 0; min-height: 14px; word-break: break-all; }
   .deploy-msg.success { color: #34c759; }
   .deploy-msg.error { color: #ff6b6b; }
+  /* HTTP-level smoke check (backlog item 18, docs/spec.md) -- .smoke-btn is
+     its OWN class, deliberately NOT reusing .deploy-btn/.team-btn's shared
+     green (#34c759): backlog item 20 already fixed that pairing's text
+     color to #111 for the two existing call sites, but a brand-new control
+     shouldn't inherit any shared button rule's color sight-unseen. Instead
+     reuses #4da6ff/#111 -- the same pairing .pill.code-pill.active already
+     ships elsewhere on this page -- independently verified here (not
+     assumed) at 7.39:1 by WCAG relative luminance, comfortably passing
+     AA's 4.5:1 minimum (see docs/implementation.md for the computed
+     figures). */
+  .smoke-check-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+  .smoke-check-row input { flex: 1; min-width: 140px; font-size: 13px; padding: 8px 10px;
+                            border-radius: 8px; border: 1px solid #333; background: #1c1c1c; color: #eee; }
+  .smoke-btn { font-size: 14px; padding: 10px 16px; border-radius: 10px; border: none;
+               background: #4da6ff; color: #111; font-weight: 600; cursor: pointer; white-space: nowrap; }
+  .smoke-check-msg { font-size: 12px; color: #888; margin: 4px 0 0; min-height: 14px; word-break: break-all; }
+  .smoke-check-msg.success { color: #34c759; }
+  .smoke-check-msg.error { color: #ff6b6b; }
   /* Minimal per-project team control (backlog item 6d, part 2a --
      docs/design.md). Follows .deploy-row/.deploy-btn/.deploy-msg's own
      shape verbatim -- a single-purpose row, not the checkbox-toggle
@@ -1742,6 +2859,17 @@ PAGE_TEMPLATE = """<!doctype html>
                          padding: 4px 8px; background: #1c1c1c; }
   .team-grounding { font-size: 12px; color: #888; }
   .team-validation-error { font-size: 12px; color: #ff6b6b; min-height: 14px; }
+  /* Past team branches panel (backlog item 13, docs/spec.md) -- read-only,
+     list-only, no action buttons. Same font-size/color tokens as
+     .team-grounding above, its closest existing precedent (a small,
+     muted, informational list already living in this same team panel
+     area). */
+  .team-branches { font-size: 12px; color: #888; margin-top: 6px;
+                    display: flex; flex-direction: column; gap: 4px; }
+  .team-branches-title { color: #aaa; }
+  .team-branch-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .team-branch-name { color: #eee; font-family: monospace; }
+  .team-branch-commit { font-family: monospace; }
   /* Live event feed + escalation inbox (backlog item 6f part 2, docs/
      design.md) -- status strip replaces the old plain "Status: [label]"
      line the non-idle branch used to render; escalation panel and the
@@ -1760,11 +2888,26 @@ PAGE_TEMPLATE = """<!doctype html>
   .team-escalation-form { display: flex; flex-direction: column; gap: 8px; }
   .team-escalation-header { font-size: 12px; color: #aaa; }
   .team-escalation-question { font-size: 13px; color: #eee; }
+  .team-escalation-options { border: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  legend.team-escalation-question { padding: 0; display: block; }
   .team-escalation-option { font-size: 13px; color: #eee; display: flex; align-items: flex-start; gap: 6px; }
   .team-escalation-option-desc { font-size: 12px; color: #888; }
   .team-escalation-form textarea { font-size: 13px; padding: 8px 10px; border-radius: 8px;
                                     border: 1px solid #333; background: #1c1c1c; color: #eee;
                                     resize: vertical; min-height: 44px; font-family: inherit; }
+  /* Board-write proposal panel (backlog item 7 part 2, docs/design.md
+     "Escalation Panel: set_status/amend_description/append_comment Verb")
+     -- reuses .team-escalation's own wrapper/gap/padding above; only the
+     inner layout differs (verb summary + current/proposed comparison
+     blocks + buttons, no radio/checkbox form). */
+  .team-escalation-proposal { display: flex; flex-direction: column; gap: 8px; }
+  .team-escalation-proposal-summary { font-size: 13px; color: #eee; }
+  .team-escalation-proposal-label { font-size: 12px; color: #aaa; }
+  .team-escalation-proposal-box { font-size: 12px; color: #ccc; background: #0a0a0a;
+                                   border: 1px solid #333; border-radius: 6px; padding: 0.5em;
+                                   max-height: 200px; overflow-y: auto; font-family: monospace;
+                                   line-height: 1.2; width: 100%; resize: vertical; box-sizing: border-box; }
+  .team-escalation-proposal-note { font-size: 12px; color: #888; }
   .team-feed-toggle-row { margin-top: 2px; }
   .team-feed-toggle { color: #4da6ff; cursor: pointer; font-size: 12px;
                        background: none; border: none; padding: 0; text-decoration: underline; }
@@ -1785,16 +2928,50 @@ PAGE_TEMPLATE = """<!doctype html>
   .team-feed-event { padding: 2px 0; color: #eee; }
   .team-feed-event.kind-error { color: #ff6b6b; }
   .team-feed-event.kind-terminal-escalation { color: #ffb648; }
+  .team-feed-event.kind-pending-classification { color: #888; font-style: italic; }
   .team-feed-ts { color: #888; }
   .team-feed-agent { font-weight: 600; }
   .team-feed-match { padding-left: 14px; }
   .team-feed-nomatch { color: #ff6b6b; }
+  /* Compose box for interjecting into a running team (backlog item 19 part
+     2, docs/design.md) -- reuses .team-textarea's own shape verbatim for
+     the textarea and .team-btn for Send; only the outer wrapper + counter
+     are new. Human messages in the feed get a left-border accent, not a
+     chat-bubble redesign (docs/spec.md "Proposed approach" §2). */
+  .team-interject { display: flex; flex-direction: column; gap: 8px; margin-top: 4px;
+                     padding: 10px 12px; border: 1px solid #333; border-radius: 8px; background: #181818; }
+  .team-interject-row { display: flex; gap: 8px; }
+  .team-interject-textarea { font-size: 13px; padding: 8px 10px; border-radius: 8px;
+                              border: 1px solid #333; background: #1c1c1c; color: #eee;
+                              resize: vertical; min-height: 44px; font-family: inherit; flex: 1; }
+  .team-interject-counter { font-size: 12px; color: #888; text-align: left; }
+  .team-interject-counter.over-limit { color: #ff6b6b; }
+  .team-feed-event.kind-human-message { border-left: 3px solid #4da6ff; padding-left: 12px; }
+  /* "+" add-teammate control (backlog item 21 part 2, docs/design.md) --
+     reuses .team-lead-picker select's own declaration block verbatim for
+     the <select>, and .team-sub's own muted-informational-text token
+     (#888/12px) for the two disabled-reason strings. No new color tokens. */
+  .team-add-member { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
+  .team-add-member select { font-size: 13px; padding: 6px 8px; border-radius: 8px;
+                              border: 1px solid #333; background: #1c1c1c; color: #eee; font-family: inherit; }
+  .team-add-member-reason { font-size: 12px; color: #888; }
+  .team-feed-event.kind-member-joined { border-left: 3px solid currentColor; padding-left: 12px; }
   .new-project-row { display: flex; gap: 8px; padding: 4px 0 16px; }
   .new-project-row input { flex: 1; font-size: 14px; padding: 10px 12px; border-radius: 10px;
                             border: 1px solid #333; background: #1c1c1c; color: #eee; }
   .new-project-row button { font-size: 14px; padding: 10px 16px; border-radius: 10px; border: none;
                              background: #34c759; color: #111; font-weight: 600; cursor: pointer; white-space: nowrap; }
   .new-project-err { color: #ff6b6b; font-size: 12px; margin: -10px 0 12px; min-height: 14px; }
+  .clone-form { display: flex; flex-wrap: wrap; gap: 8px; padding: 4px 0 8px; align-items: center; }
+  .clone-form-label { flex-basis: 100%; font-size: 12px; color: #aaa; font-weight: 600; }
+  .clone-form input { flex: 1; min-width: 160px; font-size: 14px; padding: 10px 12px; border-radius: 10px;
+                       border: 1px solid #333; background: #1c1c1c; color: #eee; }
+  .clone-form input#clone-name { flex: 0 1 200px; }
+  .clone-form button { font-size: 14px; padding: 10px 16px; border-radius: 10px; border: none;
+                        background: #34c759; color: #111; font-weight: 600; cursor: pointer; white-space: nowrap; }
+  .clone-form input:disabled, .clone-form button:disabled { opacity: 0.6; cursor: not-allowed; }
+  .clone-err { color: #ff6b6b; font-size: 12px; margin: -4px 0 12px; min-height: 14px; }
+  .clone-status { color: #aaa; font-size: 12px; margin: -4px 0 12px; min-height: 14px; }
   .switch { position: relative; width: 51px; height: 31px; flex-shrink: 0; }
   .switch input { opacity: 0; width: 0; height: 0; }
   .slider { position: absolute; inset: 0; background: #444; border-radius: 31px;
@@ -1829,7 +3006,12 @@ PAGE_TEMPLATE = """<!doctype html>
                         margin: 0 0 16px; text-align: center; }
   .wizard-card { max-width: 420px; max-height: 85vh; overflow-y: auto; }
   .wizard-step-indicator { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 16px; }
-  .wizard-step { font-size: 11px; padding: 4px 9px; border-radius: 12px; background: #2a2a2a; color: #666; }
+  /* #666 on #2a2a2a was a WCAG AA failure (~2.5:1, needs 4.5:1 -- backlog
+     item 20's broader audit, docs/spec.md). #aaa matches .pill's/
+     .wizard-actions .secondary's own already-passing #2a2a2a pairing
+     elsewhere in this file (~6.18:1), same PR #12 precedent-reuse approach
+     as .team-btn's own fix -- not a new color. */
+  .wizard-step { font-size: 11px; padding: 4px 9px; border-radius: 12px; background: #2a2a2a; color: #aaa; }
   .wizard-step.active { background: #16324a; color: #4da6ff; font-weight: 600; }
   .wizard-step.done { color: #34c759; }
   .wizard-step.disabled { opacity: 0.4; }
@@ -1876,6 +3058,16 @@ PAGE_TEMPLATE = """<!doctype html>
 </div>
 <div class="new-project-err" id="new-project-err"></div>
 <button class="upload-wizard-btn" onclick="openUploadWizard()">Upload folder / .zip</button>
+<button class="upload-wizard-btn" id="clone-toggle-btn" onclick="openCloneForm()">Clone from URL</button>
+<div class="clone-form" id="clone-form" style="display: none;">
+  <div class="clone-form-label">Clone from URL</div>
+  <input id="clone-url" placeholder="https://github.com/user/repo or ssh://host/path" maxlength="2048"
+         onkeypress="event.key==='Enter' && startClone()">
+  <input id="clone-name" placeholder="(optional — derived from URL)" maxlength="60"
+         onkeypress="event.key==='Enter' && startClone()">
+  <button onclick="startClone()">Clone</button>
+</div>
+<div class="clone-err" id="clone-err"></div>
 <div id="rows"></div>
 
 <div id="upload-overlay" class="overlay">
@@ -2058,6 +3250,9 @@ async function refresh() {
   const s = await r.json();
   ENGINE_LABELS = s.engines || {};
   ROSTER = s.roster || [];
+  // "+" add-teammate control (backlog item 21 part 2) -- live override of
+  // the hardcoded default, same idiom as ROSTER itself above.
+  if (s.team_max_members) TEAM_MAX_MEMBERS_CLIENT = s.team_max_members;
   DEPLOY_TARGETS = {};
   TEAM_BY_NAME = {};
   let html = '';
@@ -2144,6 +3339,32 @@ function deployRow(name, deploy) {
     "'" + name + "'" + ')">Deploy</button></div>' +
     '<div class="deploy-msg" id="deploy-msg-' + esc(name) + '"></div>';
 }
+// Per-project client state for the optional expect_contains text field
+// (backlog item 18, docs/spec.md) -- survives refresh()'s own full-row
+// re-render the same way teamTaskText already does below, since the input
+// would otherwise be wiped every 4-second poll while the operator is still
+// typing.
+let smokeCheckExpect = {};
+// HTTP-level smoke check (backlog item 18, docs/spec.md). Rendered only
+// when this project currently has a captured hosted URL (inst.url
+// non-null) -- mirrors deployRow()'s own "return '' if not present" shape
+// -- since a direct POST with no captured URL is still handled cleanly
+// server-side, but there is nothing useful to click otherwise. Reused-
+// message slot (.smoke-check-msg) is always rendered empty here;
+// doSmokeCheck() (via handleActionResult()'s own kind === 'smoke-check'
+// branch) fills it in after the POST resolves, and it's gone again on the
+// next refresh() (no persisted history — docs/spec.md non-goals).
+function smokeCheckRow(name, url) {
+  if (!url) return '';
+  const text = smokeCheckExpect[name] || '';
+  return '<div class="smoke-check-row">' +
+    '<input id="smoke-expect-' + esc(name) + '" maxlength="500" ' +
+    'placeholder="optional: text that should appear in the response" value="' + esc(text) + '" ' +
+    'oninput="smokeCheckExpect[' + "'" + name + "'" + '] = this.value">' +
+    '<button class="smoke-btn" onclick="doSmokeCheck(' + "'" + name + "'" + ')">Smoke check</button>' +
+    '</div>' +
+    '<div class="smoke-check-msg" id="smoke-check-msg-' + esc(name) + '"></div>';
+}
 // Per-project client state for the in-progress task text (backlog item 6d,
 // part 2a) -- survives refresh()'s own full-row re-render the same way
 // engineChoice already does for the engine picker, since the team row's
@@ -2158,6 +3379,13 @@ let teamPickerInitialized = {}; // name -> bool, true once seeded from inst.team
 let teamPickerLead = {};        // name -> {kind, name} | null
 let teamPickerMembers = {};     // name -> Set<string> (engine names)
 let teamGroundingCache = {};    // name -> {files, skipped} | null (fetch failed) | undefined (not fetched yet)
+// Past team branches panel (backlog item 13, docs/spec.md) -- name -> branch[]
+// | null (fetch failed) | undefined (not fetched yet). Fetched once per
+// project the first time its row renders (see renderTeamBranches() below),
+// NOT joined to the existing 4s /status poll cycle -- this data only
+// changes when a team run stops, so a single fetch per project per page
+// load is enough (docs/spec.md).
+let teamBranchesCache = {};
 
 // Live event feed + escalation inbox (backlog item 6f part 2, docs/spec.md
 // / docs/design.md) -- per-project client state, all keyed by project name
@@ -2172,6 +3400,39 @@ let teamFeedPolling = {};       // name -> bool, true while pollTeamFeed()'s own
 let teamInboxCache = {};        // run_id -> inbox response | 'pending' | null (fetch failed)
 let teamEscalationSelected = {}; // name -> Set<number> (indices into the cached inbox's own options[])
 let teamEscalationOther = {};   // name -> string, the free-text "Other" answer in progress
+// board_write escalation panel (backlog item 7 part 2, docs/spec.md §5) --
+// which action ("approve"/"reject") the operator just clicked, set by
+// doTeamBoardResolve() BEFORE toggle()'s first (optimistic, no-code) POST
+// fires and read back by actionBody()'s 'team-board-resolve' branch -- same
+// "small client-side map keyed by name, surviving a TOTP retry" pattern
+// teamEscalationOther already establishes above, so a 428-then-retry re-
+// reads the SAME action the operator originally clicked rather than
+// something sourced from the (possibly-already-gone) pendingToggle context.
+let teamBoardResolveAction = {};
+// Chat-UI compose surface (backlog item 19 part 2, docs/spec.md "Proposed
+// approach" §1) -- per-project draft-text mirror, same "survives a full-row
+// refresh() re-render and a 428 TOTP retry" idiom teamTaskText already
+// establishes above. TEAM_INTERJECT_MAX_CHARS_CLIENT hardcodes the server's
+// documented default (teams.TEAM_INTERJECT_MAX_CHARS) rather than fetching
+// it live -- mirrors doTeamResolve()'s own existing hardcoded-2000
+// precedent; see docs/spec.md "Non-goals" for the accepted drift risk if
+// the env var is ever overridden.
+let teamInterjectText = {};  // name -> string draft
+const TEAM_INTERJECT_MAX_CHARS_CLIENT = 2000;
+
+// "+" add-teammate control (backlog item 21 part 2, docs/spec.md "Proposed
+// approach" §5) -- teamAddMemberChoice mirrors teamInterjectText's own
+// "survives a mid-flow re-render/428 retry" idiom: the selected agent name
+// is saved BEFORE toggle()'s POST fires, so a 428-then-retry resends the
+// SAME agent rather than re-reading a possibly-already-redrawn <select>.
+// TEAM_MAX_MEMBERS_CLIENT is a `let` (not `const`, unlike
+// TEAM_INTERJECT_MAX_CHARS_CLIENT above) -- hardcoded default matching the
+// server's own default, but overwritten from s.team_max_members on every
+// /status poll (refresh()), since this cap is cheap to fetch live and
+// unlike the interject char limit is directly gating a control's disabled
+// state, not just advisory copy.
+let teamAddMemberChoice = {};  // name -> agent name
+let TEAM_MAX_MEMBERS_CLIENT = 6;
 
 // Agent-identity colour palette (docs/design.md "ui-ux-pro-max choices") --
 // deliberately distinct from the four semantic status colors
@@ -2200,6 +3461,11 @@ function clearTeamFeedState(name) {
   delete teamFeedFilter[name];
   delete teamEscalationSelected[name];
   delete teamEscalationOther[name];
+  // Chat-UI compose surface (backlog item 19 part 2) -- an unsent draft is
+  // discarded the moment a project falls back to the idle branch, same
+  // "no attempt to persist/restore" treatment every other per-status-scoped
+  // input in this app already gets (docs/spec.md "Edge cases").
+  delete teamInterjectText[name];
 }
 
 // Client-side mirror of teams.validate_composition()'s rules (docs/spec.md
@@ -2229,6 +3495,56 @@ async function fetchTeamGrounding(name) {
     teamGroundingCache[name] = null;
   }
   refresh();
+}
+// Past team branches panel (backlog item 13, docs/spec.md) -- fetched once
+// per project, the first time renderTeamBranches() below finds no cache
+// entry for it yet. Deliberately does NOT call refresh() itself once
+// resolved (unlike fetchTeamGrounding()/fetchTeamInbox() above, both of
+// which are triggered by a direct operator action expecting immediate
+// feedback): this fetch fires passively as a side effect of a normal row
+// render, and docs/spec.md itself says this data "does NOT need to join
+// the existing 4s /status poll cycle" -- the already-running setInterval(
+// refresh, 4000) picks up the now-cached result on its own next tick
+// regardless, so forcing an extra immediate refresh() here would only add
+// an unnecessary redundant render for every project on every page load.
+async function fetchTeamBranches(name) {
+  try {
+    const r = await fetch('/projects/' + encodeURIComponent(name) + '/team/branches');
+    teamBranchesCache[name] = r.ok ? await r.json() : null;
+  } catch (e) {
+    teamBranchesCache[name] = null;
+  }
+}
+// List-only, no action buttons (docs/spec.md scope). Always rendered (idle
+// or not) since a project's past branches are independent of any run
+// currently in progress. committer_date is shown as its own YYYY-MM-DD date
+// (the ISO-strict string's own date portion) -- no relative-time formatting
+// dependency added for a small, informational, once-per-load list.
+function renderTeamBranches(name) {
+  const id = 'team-branches-' + esc(name);
+  if (teamBranchesCache[name] === undefined) {
+    fetchTeamBranches(name);  // picked up by the next normal refresh() poll
+    return '<div class="team-branches" id="' + id + '">Loading past team branches…</div>';
+  }
+  const branches = teamBranchesCache[name];
+  if (branches === null) {
+    return '<div class="team-branches" id="' + id + '">Past team branches unavailable</div>';
+  }
+  if (branches.length === 0) {
+    return '<div class="team-branches" id="' + id + '">No past team branches</div>';
+  }
+  const rows = branches.map(b => {
+    const shortCommit = (b.commit || '').slice(0, 7);
+    const dateLabel = b.committer_date ? b.committer_date.slice(0, 10) : '';
+    return '<div class="team-branch-row">' +
+      '<span class="team-branch-name">' + esc(b.branch) + '</span>' +
+      '<span class="team-branch-commit">' + esc(shortCommit) + '</span>' +
+      '<span class="team-branch-subject">' + esc(b.subject || '') + '</span>' +
+      '<span class="team-branch-date">' + esc(dateLabel) + '</span>' +
+      '</div>';
+  }).join('');
+  return '<div class="team-branches" id="' + id + '">' +
+    '<div class="team-branches-title">Past team branches</div>' + rows + '</div>';
 }
 function toggleTeamPicker(name) {
   teamPickerOpen[name] = !teamPickerOpen[name];
@@ -2347,6 +3663,14 @@ function renderTeamStatusStrip(team) {
   }
   if (team.status === 'blocked') {
     if (team.waiting_on_you) {
+      // escalation_kind (backlog item 7 part 2, docs/spec.md §1 / docs/
+      // design.md "Status Strip: Board Write Pending Approval") -- same
+      // orange "blocked"/waiting-on-you visual weight either way, only the
+      // copy distinguishes a pending board-write proposal from an ask_user
+      // question, so the strip is legible without opening the panel below.
+      if (team.escalation_kind === 'board_write') {
+        return '<div class="team-status-strip status-blocked waiting-on-you">⚠ Board write pending approval' + idSuffix + '</div>';
+      }
       return '<div class="team-status-strip status-blocked waiting-on-you">⚠ Waiting on you' + idSuffix + '</div>';
     }
     return '<div class="team-status-strip status-blocked">Blocked — Max rounds reached' + idSuffix + '</div>';
@@ -2402,6 +3726,59 @@ function computeTeamResolveAnswer(name) {
   if (cached && cached.multi_select) return labels.join(', ');
   return labels[0] || '';
 }
+// Shared long-text truncation (docs/spec.md "Edge cases": "Very long
+// value/note/current_value.description text ... truncate/scroll, same
+// general long-text handling ... 200-char truncation with an ellipsis is
+// the existing precedent" -- teamFeedEventBody()'s own fact-check-match
+// rendering below). Used for the board-write panel's one-line proposal
+// summary and lead's note (docs/design.md recommends the longer
+// current/proposed description-or-comment BLOCKS instead rely on the
+// scrollable max-height box itself -- see .team-escalation-proposal-box).
+function truncateText(text, max) {
+  const s = text || '';
+  return s.length > max ? s.slice(0, max) + '…' : s;
+}
+// Verb-specific board-write proposal panel (backlog item 7 part 2, docs/
+// spec.md §5 / docs/design.md "Escalation Panel: set_status/
+// amend_description/append_comment Verb") -- fetched/cached the same way
+// renderEscalationPanel()'s ask_user branch already is (caller passes the
+// already-resolved `cached` inbox response); only the render step differs.
+function renderBoardWriteEscalationPanel(name, cached) {
+  const subject = cached.subject ? esc(cached.subject) : ('#' + esc(cached.ref));
+  const note = cached.note ? '<div class="team-escalation-proposal-note">Lead\\'s note: ' +
+    esc(truncateText(cached.note, 200)) + '</div>' : '';
+  let summary, blocks;
+  if (cached.verb === 'set_status') {
+    const cur = (cached.current_value && cached.current_value.status_name) || '(unknown)';
+    summary = 'Move <strong>' + subject + '</strong> from <strong>' + esc(cur) +
+      '</strong> to <strong>' + esc(cached.value || '') + '</strong>.';
+    blocks = '';
+  } else if (cached.verb === 'amend_description') {
+    summary = 'Replace <strong>' + subject + '</strong>\\'s description';
+    const curDesc = (cached.current_value && cached.current_value.description);
+    blocks =
+      '<div class="team-escalation-proposal-label">Current:</div>' +
+      '<textarea class="team-escalation-proposal-box" readonly rows="6">' +
+      esc(curDesc || '(description not available)') + '</textarea>' +
+      '<div class="team-escalation-proposal-label">Proposed:</div>' +
+      '<textarea class="team-escalation-proposal-box" readonly rows="6">' +
+      esc(cached.value || '(description not available)') + '</textarea>';
+  } else { // append_comment
+    summary = 'Add a comment to <strong>' + subject + '</strong>';
+    blocks =
+      '<div class="team-escalation-proposal-label">Comment text:</div>' +
+      '<textarea class="team-escalation-proposal-box" readonly rows="4">' +
+      esc(cached.value || '(comment not available)') + '</textarea>';
+  }
+  return '<div class="team-escalation" id="team-escalation-' + esc(name) + '">' +
+    '<div class="team-escalation-proposal">' +
+    '<div class="team-escalation-proposal-summary">' + summary + '</div>' +
+    blocks + note +
+    '<div class="team-actions">' +
+    '<button class="team-btn" onclick="doTeamBoardResolve(' + "'" + name + "'" + ", 'approve')" + '">Approve</button>' +
+    '<button class="team-btn" onclick="doTeamBoardResolve(' + "'" + name + "'" + ", 'reject')" + '">Reject</button>' +
+    '</div></div></div>';
+}
 function renderEscalationPanel(name, team) {
   if (!team.waiting_on_you) return '';
   const runId = team.run_id;
@@ -2421,10 +3798,15 @@ function renderEscalationPanel(name, team) {
     // A narrow race, not a fetch failure: this project's own last /status
     // snapshot still says waiting_on_you (team.waiting_on_you is a
     // moment-in-time read), but /team/inbox -- fetched a beat later --
-    // already reports no pending question (e.g. another tab/operator just
-    // answered it). The next 4s poll will pick up the resolved status.
-    return '<div class="team-escalation" id="team-escalation-' + esc(name) + '">' +
-      'This question was already answered.</div>';
+    // already reports no pending question/proposal (e.g. another tab/
+    // operator just resolved it). The next 4s poll will pick up the
+    // resolved status.
+    const already = team.escalation_kind === 'board_write' ?
+      'This proposal was already approved or rejected.' : 'This question was already answered.';
+    return '<div class="team-escalation" id="team-escalation-' + esc(name) + '">' + already + '</div>';
+  }
+  if (team.escalation_kind === 'board_write') {
+    return renderBoardWriteEscalationPanel(name, cached);
   }
   const selected = teamEscalationSelected[name] || new Set();
   const inputType = cached.multi_select ? 'checkbox' : 'radio';
@@ -2438,11 +3820,26 @@ function renderEscalationPanel(name, team) {
       desc + '</label>';
   }).join('');
   const otherText = teamEscalationOther[name] || '';
+  // <fieldset>/<legend> around the option group (docs/design.md
+  // "Accessibility & platform notes": "Escalation form: <fieldset> for
+  // radio/checkbox groups with <legend> for the question"; docs/spec.md
+  // part B: legend text is the pending question's own question/header
+  // text). The fieldset's <legend> IS the previously-separate
+  // ".team-escalation-question" div -- reusing the same class/text there
+  // rather than rendering the question twice (once as a plain div, once
+  // as the legend) keeps the visible layout unchanged (still one question
+  // line, right above the options) while giving screen readers the
+  // group-to-question association <fieldset>/<legend> is for. Wraps the
+  // native radio/checkbox inputs specifically -- not the header chip, not
+  // the free-text "Other" field (which has its own <label>, per design.md,
+  // and isn't part of the option group being grouped).
+  const optionsFieldset = '<fieldset class="team-escalation-options">' +
+    '<legend class="team-escalation-question">' + esc(cached.question) + '</legend>' +
+    optionsHtml + '</fieldset>';
   return '<div class="team-escalation" id="team-escalation-' + esc(name) + '">' +
     '<div class="team-escalation-form">' +
     (cached.header ? '<div class="team-escalation-header">' + esc(cached.header) + '</div>' : '') +
-    '<div class="team-escalation-question">' + esc(cached.question) + '</div>' +
-    optionsHtml +
+    optionsFieldset +
     '<label>Other (free text)<br><textarea id="escalation-other-' + esc(name) + '" rows="3" ' +
     'oninput="teamEscalationOther[' + "'" + name + "'" + '] = this.value;">' + esc(otherText) + '</textarea></label>' +
     '<div class="team-actions"><button class="team-btn" onclick="doTeamResolve(' + "'" + name + "'" +
@@ -2470,24 +3867,93 @@ function findNextLeadEvent(e, leadEvents) {
   if (idx === -1) return null;
   return leadEvents[idx + 1] || null;
 }
-function teamFeedEventKindClass(e, leadEvents) {
+// `status` (team.status) is only consulted for the tool_use/empty-meta
+// branch below (backlog item 12, part C) -- every other kind/meta
+// combination disambiguates purely from the event's own shape and its
+// position in leadEvents, same as before.
+function teamFeedEventKindClass(e, leadEvents, status) {
   const meta = e.meta || {};
   if (e.kind === 'error') return 'error';
+  // Chat-UI compose surface (backlog item 19 part 2, docs/spec.md "Proposed
+  // approach" §2) -- a human-authored interjection gets its own row
+  // classification (a left-border accent, not a chat-bubble redesign);
+  // kind==='message' never matches any of the other branches below, so
+  // this is safe placed early, before the final `return e.kind;` fallback.
+  if (e.kind === 'message' && e.agent === 'human') return 'human-message';
+  // "+" add-teammate control (backlog item 21 part 2, docs/spec.md
+  // "Proposed approach" §3) -- kind==='member_joined' is structurally
+  // disjoint from every other branch here (none of them check that kind
+  // value), so placement doesn't matter beyond being before the final
+  // `return e.kind;` fallback.
+  if (e.kind === 'member_joined') return 'member-joined';
+  // Board-write proposal/resolution (backlog item 7 part 2, docs/spec.md
+  // §6 / docs/design.md) -- checked BEFORE the generic 'tool_result' +
+  // meta.resolved -> 'resolved' branch below, since a board_write_resolved
+  // transcript entry's own meta ALSO sets meta.resolved: true (part 1,
+  // resolve_board_write()'s own transcript_entries -- see docs/spec.md
+  // "Background") on both approve and reject. meta.verb/meta.approved are
+  // never set on an ask_user transcript entry, so these two checks are
+  // strictly narrower and never widen what the existing checks below match.
+  if (e.kind === 'tool_use' && meta.verb !== undefined) return 'board-write-proposal';
+  if (e.kind === 'tool_result' && meta.approved !== undefined) return 'board-write-resolved';
   if (e.kind === 'tool_result' && meta.found !== undefined) return 'fact-check-result';
   if (e.kind === 'tool_result' && meta.resolved) return 'resolved';
   if (e.kind === 'handoff') return 'handoff';
   if (e.kind === 'tool_use' && meta.header !== undefined) return 'ask-user';
   if (e.kind === 'tool_use' && Object.keys(meta).length === 0) {
     const next = findNextLeadEvent(e, leadEvents);
-    return (next && next.kind === 'tool_result' && next.meta && next.meta.found !== undefined) ?
-      'fact-check-claim' : 'finish';
+    if (next && next.kind === 'tool_result' && next.meta && next.meta.found !== undefined) {
+      return 'fact-check-claim';
+    }
+    // Poll-boundary self-healing refinement (docs/spec.md "Background"
+    // item C / docs/design.md is silent -- new for this cycle; widened from
+    // status === 'running' to the full non-terminal set in a later cycle,
+    // docs/spec.md item 12 piece C): `e` is the event buffer's own LAST
+    // lead-agent event (no next lead event yet) AND the run hasn't reached
+    // a genuinely terminal status yet ('idle'/'running'/'blocked' are all
+    // non-terminal -- a still-in-flight ask_user escalation can flip status
+    // to 'blocked' for a DIFFERENT in-flight round while this event's own
+    // paired tool_result hasn't arrived yet, the same poll-boundary gap
+    // 'running' alone was guarding against) -- the paired tool_result
+    // (fact_check) or the terminal status (finish) simply hasn't arrived on
+    // a poll yet, so render neither assumption and wait for the next poll
+    // instead of guessing "finish". Once a terminal status arrives
+    // ('finished'/'error') or the paired tool_result shows up (next is no
+    // longer null), this branch stops matching and the disambiguation above
+    // resolves normally.
+    if (!next && e.agent === 'lead' && status !== 'finished' && status !== 'error') return 'pending-classification';
+    return 'finish';
   }
   if (e.kind === 'status' && meta.forced && meta.final_status) return 'terminal-escalation';
   return e.kind;
 }
-function teamFeedEventBody(e, leadEvents) {
+function teamFeedEventBody(e, leadEvents, status) {
   const meta = e.meta || {};
-  const cls = teamFeedEventKindClass(e, leadEvents);
+  const cls = teamFeedEventKindClass(e, leadEvents, status);
+  // "+" add-teammate control (backlog item 21 part 2) -- the agent name
+  // itself is already rendered by renderTeamFeedEvent()'s own existing
+  // <span class="team-feed-agent">, no need to repeat it in the body text.
+  if (cls === 'member-joined') return '→ joined the team';
+  if (cls === 'board-write-proposal') {
+    return 'board_write (' + esc(meta.verb || '') + '): ref #' + esc(meta.ref || '') + ' — ' + esc(e.text || '');
+  }
+  if (cls === 'board-write-resolved') {
+    // Parses resolve_board_write()'s own literal outcome_summary/
+    // full_result_text strings (docs/spec.md §6 -- "stable enough to
+    // branch on") rather than reusing the generic 'Answer: ' + text copy.
+    const text = e.text || '';
+    if (meta.approved === false) {
+      return '✕ Change rejected by human';
+    }
+    if (text.startsWith('approved and applied')) {
+      return '✓ Change approved and applied';
+    }
+    const failMatch = /^approved but Taiga rejected the write: (.*)$/.exec(text);
+    if (failMatch) {
+      return '⚠ Change approved but Taiga rejected the write: ' + esc(failMatch[1]);
+    }
+    return '✓ Change approved';
+  }
   if (cls === 'fact-check-claim') {
     return 'fact_check: ' + esc(e.text || '');
   }
@@ -2507,6 +3973,7 @@ function teamFeedEventBody(e, leadEvents) {
   if (cls === 'resolved') return 'Answer: ' + esc(e.text || '');
   if (cls === 'handoff') return 'Delegating to ' + esc(meta.agent || '');
   if (cls === 'ask-user') return 'ask_user: ' + esc(meta.header || e.text || '');
+  if (cls === 'pending-classification') return '⋯ pending…';
   if (cls === 'finish') return '[Finish summary] ' + esc(e.text || '');
   if (cls === 'terminal-escalation') {
     return '✕ Escalated: max rounds reached (' + esc(meta.final_status || '') + ')';
@@ -2515,12 +3982,23 @@ function teamFeedEventBody(e, leadEvents) {
   if (e.kind === 'message' || e.kind === 'status') return esc(e.text || '');
   return '[' + esc(e.kind || '') + '] ' + esc(e.text || '');
 }
-function renderTeamFeedEvent(e, leadEvents) {
+function renderTeamFeedEvent(e, leadEvents, status) {
   const color = teamAgentColor(e.agent);
   const ts = (e.ts || '').length >= 19 ? e.ts.slice(11, 19) : (e.ts || '');
-  const kindClass = teamFeedEventKindClass(e, leadEvents);
-  const body = teamFeedEventBody(e, leadEvents);
-  return '<div class="team-feed-event kind-' + esc(kindClass) + '">' +
+  const kindClass = teamFeedEventKindClass(e, leadEvents, status);
+  const body = teamFeedEventBody(e, leadEvents, status);
+  // kind-member-joined's CSS border-left uses `currentColor` (docs/design.md
+  // "the joined agent's own color"), which resolves against the element the
+  // rule is DECLARED on -- the outer div below -- not a descendant's inline
+  // style. Setting color only on the .team-feed-agent span (as this row
+  // already does, for the name text) leaves the outer div's own color
+  // unset/inherited, so the border renders neutral instead of per-agent
+  // (docs/test-review.md, BACKLOG item 21 part 2 review, finding 1). Set the
+  // inline style on the outer div itself for this one kind only -- every
+  // other kind is untouched, matching kind-human-message's own hardcoded
+  // (not currentColor-based) border color, which never had this problem.
+  const borderStyle = kindClass === 'member-joined' ? ' style="border-left-color:' + color + '"' : '';
+  return '<div class="team-feed-event kind-' + esc(kindClass) + '"' + borderStyle + '>' +
     '<span class="team-feed-ts">' + esc(ts) + '</span> ' +
     '<span class="team-feed-agent" style="color:' + color + '">' + esc(e.agent) + '</span> ' +
     '<span class="team-feed-text">' + body + '</span></div>';
@@ -2529,20 +4007,38 @@ function renderTeamFeed(name, team) {
   if (!teamFeedOpen[name]) return '';
   const events = teamFeedEvents[name] || [];
   const filter = teamFeedFilter[name] || 'all';
-  const agents = ['lead'].concat((team.composition && team.composition.members) || []);
+  // 'human' (backlog item 19 part 2, docs/spec.md "Proposed approach" §2)
+  // is shown unconditionally, right after 'lead', matching lead's own
+  // "always present" behavior -- no filtering code change needed, the
+  // existing generic filter below already isolates human.jsonl's own
+  // events once selected.
+  // Backlog item 21 part 2, docs/spec.md "Proposed approach" §4 -- sourced
+  // from the LIVE roster (team.members, /status's own live field) instead
+  // of the stale team.composition.members (a saved/default PICKER
+  // preference, never updated by add_team_member()); without this a newly
+  // -added teammate never gets its own clickable filter pill.
+  const agents = ['lead', 'human'].concat(team.members || []);
   const pills = ['all'].concat(agents).map(a => {
     const label = a === 'all' ? 'All' : a;
-    const active = filter === a ? ' active' : '';
-    return '<button class="team-feed-pill' + active + '" onclick="setTeamFeedFilter(' +
-      "'" + name + "','" + a + "'" + ')">' + esc(label) + '</button>';
+    const isActive = filter === a;
+    const active = isActive ? ' active' : '';
+    return '<button class="team-feed-pill' + active + '" aria-pressed="' + (isActive ? 'true' : 'false') +
+      '" onclick="setTeamFeedFilter(' + "'" + name + "','" + a + "'" + ')">' + esc(label) + '</button>';
   }).join('');
   const filtered = filter === 'all' ? events : events.filter(e => e.agent === filter);
   const leadEvents = events.filter(e => e.agent === 'lead').sort((a, b) => (a.seq || 0) - (b.seq || 0));
   const listHtml = filtered.length === 0 ? '<div class="team-feed-empty">No events yet.</div>' :
-    filtered.map(e => renderTeamFeedEvent(e, leadEvents)).join('');
+    filtered.map(e => renderTeamFeedEvent(e, leadEvents, team.status)).join('');
+  // role="log"/aria-live="polite" (docs/design.md "Accessibility &
+  // platform notes": "Event list items should be in an <article> or
+  // similar container with role="log" and aria-live="polite" to announce
+  // new events to screen readers") -- on the scrollable list container
+  // itself (the element that actually gains new child rows on each poll),
+  // not the outer .team-feed wrapper (which also holds the non-live filter
+  // row).
   return '<div class="team-feed">' +
     '<div class="team-feed-filter">' + pills + '</div>' +
-    '<div class="team-feed-list">' + listHtml + '</div></div>';
+    '<div class="team-feed-list" role="log" aria-live="polite">' + listHtml + '</div></div>';
 }
 // Reopening always starts fresh from cursor={} (docs/spec.md "Edge cases":
 // "reopening it starts from cursor {} again ... rather than trying to
@@ -2636,6 +4132,137 @@ function doTeamResolve(name) {
   }
   toggle('team-resolve', name, true, null);
 }
+// Board-write proposal approve/reject (backlog item 7 part 2, docs/spec.md
+// §5 / docs/design.md "Frontend: New doTeamBoardResolve() function") --
+// parallel to doTeamResolve() above, no free-text client-side validation
+// needed (resolve_board_write() takes no free text). teamBoardResolveAction
+// is set BEFORE toggle()'s first optimistic (no-code) POST fires, so
+// actionBody() can read it back on both that first attempt and any TOTP-
+// retry attempt via submitActionCode() -- see its own declaration comment.
+function doTeamBoardResolve(name, action) {
+  const msgEl = document.getElementById('team-msg-' + name);
+  if (msgEl) { msgEl.textContent = ''; msgEl.className = 'team-msg'; }
+  teamBoardResolveAction[name] = action;
+  toggle('team-board-resolve', name, true, null);
+}
+// Chat-UI compose surface (backlog item 19 part 2, docs/spec.md "Proposed
+// approach" §1) -- single source of truth for compose-box visibility, used
+// both by renderTeamInterjectBox() below and by teamRow()'s own idle/
+// non-idle branching indirectly (via team.status), matching exactly which
+// statuses teams.interject() itself accepts server-side (running,
+// blocked_ask_user, blocked_board_write -- i.e. team.status==='blocked' &&
+// team.waiting_on_you), never escalated_max_rounds.
+function teamAcceptsInterject(team) {
+  return !!team && (team.status === 'running' ||
+                     (team.status === 'blocked' && team.waiting_on_you));
+}
+// Narrow, direct-DOM update on oninput (matches updateTeamStartButton()'s
+// own idiom above) -- no refresh() call here, so typing in the textarea
+// never re-renders the row or loses focus/cursor position.
+function updateTeamInterjectControls(name) {
+  const btn = document.getElementById('interject-send-' + name);
+  if (!btn) return;
+  const text = teamInterjectText[name] || '';
+  const len = text.length;
+  const over = len > TEAM_INTERJECT_MAX_CHARS_CLIENT;
+  btn.disabled = !text.trim() || over;
+  const counterEl = document.getElementById('interject-counter-' + name);
+  if (counterEl) {
+    counterEl.textContent = len + '/' + TEAM_INTERJECT_MAX_CHARS_CLIENT;
+    counterEl.className = 'team-interject-counter' + (over ? ' over-limit' : '');
+  }
+}
+// Returns '' -- and proactively discards any stale draft -- whenever the
+// current status doesn't accept an interjection (docs/spec.md "Edge cases":
+// a status transition away from compose-eligible discards the unsent
+// draft, no persist/restore). Placeholder copy is context-aware (docs/
+// spec.md "Proposed approach" §3): when the escalation panel is also
+// showing, the longer copy makes clear this box does NOT answer the
+// pending question above.
+function renderTeamInterjectBox(name, team) {
+  if (!teamAcceptsInterject(team)) { delete teamInterjectText[name]; return ''; }
+  const text = teamInterjectText[name] || '';
+  const len = text.length;
+  const over = len > TEAM_INTERJECT_MAX_CHARS_CLIENT;
+  const disabled = !text.trim() || over;
+  const placeholder = team.waiting_on_you ?
+    'Send a message to the team (this will not answer the pending question above)…' :
+    'Send a message to the team…';
+  return '<div class="team-interject">' +
+    '<div class="team-interject-row">' +
+    '<textarea class="team-interject-textarea" id="interject-' + esc(name) + '" rows="2" ' +
+    'placeholder="' + esc(placeholder) + '" oninput="teamInterjectText[' + "'" + name + "'" +
+    '] = this.value; updateTeamInterjectControls(' + "'" + name + "'" + ');">' + esc(text) + '</textarea>' +
+    '<button class="team-btn" id="interject-send-' + esc(name) + '"' + (disabled ? ' disabled' : '') +
+    ' onclick="doTeamInterject(' + "'" + name + "'" + ')">Send</button>' +
+    '</div>' +
+    '<div class="team-interject-counter' + (over ? ' over-limit' : '') + '" id="interject-counter-' + esc(name) + '">' +
+    len + '/' + TEAM_INTERJECT_MAX_CHARS_CLIENT + '</div></div>';
+}
+// Client-side validation only (docs/spec.md "Proposed approach" §1) -- the
+// route's own 400 (app/app.py POST .../team/interject) is the authoritative
+// check either way, same discipline doTeamResolve()/doTeamStart() already
+// follow. Reuses toggle()'s TOTP-retry/code-overlay plumbing exactly like
+// every other team-* action above.
+function doTeamInterject(name) {
+  const msgEl = document.getElementById('team-msg-' + name);
+  if (msgEl) { msgEl.textContent = ''; msgEl.className = 'team-msg'; }
+  const text = (teamInterjectText[name] || '').trim();
+  if (!text || text.length > TEAM_INTERJECT_MAX_CHARS_CLIENT) {
+    if (msgEl) {
+      msgEl.textContent = 'Message must be non-empty and at most ' + TEAM_INTERJECT_MAX_CHARS_CLIENT + ' characters';
+      msgEl.className = 'team-msg error';
+    }
+    return;
+  }
+  toggle('team-interject', name, true, null);
+}
+// "+" add-teammate control (backlog item 21 part 2, docs/spec.md "Proposed
+// approach" §5) -- pure, no I/O. `e.kind === 'engine'` mirrors
+// add_team_member()'s own server-side rejection of the Ollama lead-only
+// roster entry -- same rule, restated client-side for fast feedback, same
+// "client mirrors server, server stays authoritative" discipline
+// teamCompositionError() already documents for the Start-time picker.
+function teamAddMemberEligible(team) {
+  const already = new Set((team && team.members) || []);
+  const leadName = team && team.lead && team.lead.kind === 'engine' ? team.lead.name : null;
+  return ROSTER.filter(e => e.kind === 'engine' && e.name !== leadName && !already.has(e.name));
+}
+// Visibility gate reuses teamAcceptsInterject(team) as-is (docs/spec.md
+// "Background": interject() and add_team_member() were both built to
+// accept the identical status set -- running/blocked_ask_user/
+// blocked_board_write) -- intentional reuse, not incidental.
+function renderTeamAddMemberControl(name, team) {
+  if (!teamAcceptsInterject(team)) return '';
+  const members = (team && team.members) || [];
+  const atCap = members.length >= (TEAM_MAX_MEMBERS_CLIENT || 6);
+  if (atCap) {
+    return '<div class="team-add-member"><span class="team-add-member-reason">' +
+      'Team is at the maximum of ' + (TEAM_MAX_MEMBERS_CLIENT || 6) + ' teammates.</span></div>';
+  }
+  const eligible = teamAddMemberEligible(team);
+  if (eligible.length === 0) {
+    return '<div class="team-add-member"><span class="team-add-member-reason">' +
+      'No more roster engines available to add.</span></div>';
+  }
+  const options = eligible.map(e =>
+    '<option value="' + esc(e.name) + '">' + esc(e.name) + ' (' + tierLabel(e.tier) + ')</option>').join('');
+  return '<div class="team-add-member">' +
+    '<select id="team-add-member-select-' + esc(name) + '">' + options + '</select>' +
+    '<button class="team-btn" onclick="doTeamAddMember(' + "'" + name + "'" + ')">+ Add</button></div>';
+}
+// Reuses toggle()'s TOTP-retry/code-overlay plumbing exactly like every
+// other team-* action above -- teamAddMemberChoice[name] is set BEFORE
+// toggle() fires so a 428-then-retry resends the same agent (docs/spec.md
+// "Proposed approach" §5).
+function doTeamAddMember(name) {
+  const sel = document.getElementById('team-add-member-select-' + name);
+  if (!sel || !sel.value) return;
+  teamAddMemberChoice[name] = sel.value;
+  const msgEl = document.getElementById('team-msg-' + name);
+  if (msgEl) { msgEl.textContent = ''; msgEl.className = 'team-msg'; }
+  toggle('team-add-member', name, true, null);
+}
 function teamRow(name, team) {
   const msgSlot = '<div class="team-msg" id="team-msg-' + esc(name) + '"></div>';
   if (!team || team.status === 'idle') {
@@ -2659,7 +4286,7 @@ function teamRow(name, team) {
         '<div class="team-msg error">✕ No roster members available. Add an engine to engines.d ' +
         'or configure TEAM_LLM_BASE_URL/TEAM_LLM_MODEL.</div>' +
         '<div class="team-actions"><button class="team-btn" id="start-btn-' + esc(name) + '" disabled>' +
-        'Start team</button></div>' + msgSlot + '</div>';
+        'Start team</button></div>' + msgSlot + renderTeamBranches(name) + '</div>';
     }
     const open = composition !== undefined && !!teamPickerOpen[name];
     const configureRow = composition !== undefined ?
@@ -2671,7 +4298,7 @@ function teamRow(name, team) {
       '<div class="team-actions"><button class="team-btn" id="start-btn-' + esc(name) + '"' +
       (startDisabled ? ' disabled' : '') +
       ' onclick="doTeamStart(' + "'" + name + "'" + ')">Start team</button></div>' +
-      msgSlot + '</div>';
+      msgSlot + renderTeamBranches(name) + '</div>';
   }
   // Overwatch feed + escalation inbox (backlog item 6f part 2, docs/
   // spec.md / docs/design.md) -- 4-state status strip, an escalation-answer
@@ -2686,13 +4313,25 @@ function teamRow(name, team) {
     '<div class="team-sub">Escalated — max rounds reached. No pending question to answer. ' +
     'Review the feed below or Stop team and start a new run.</div>' : '';
   const escalationPanel = team.waiting_on_you ? renderEscalationPanel(name, team) : '';
+  // Chat-UI compose surface (backlog item 19 part 2, docs/spec.md "Proposed
+  // approach" §1) -- positioned between the escalation panel and the feed
+  // toggle: escalation resolution (answering a specific pending question)
+  // stays visually first when present; the always-available free-form
+  // channel sits directly below it; both sit above the passive, scrollable
+  // log feed.
+  const interjectBox = renderTeamInterjectBox(name, team);
+  // "+" add-teammate control (backlog item 21 part 2, docs/spec.md
+  // "Proposed approach" §5) -- its own visual block, between the compose
+  // box and the feed toggle (not inside .team-actions, which stays
+  // reserved for the single "Stop team" button per existing convention).
+  const addMemberControl = renderTeamAddMemberControl(name, team);
   const feedToggle = renderTeamFeedToggle(name);
   const feedPanel = renderTeamFeed(name, team);
   return '<div class="team-row">' + statusStrip + escalatedNote + escalationPanel +
-    feedToggle + feedPanel +
+    interjectBox + addMemberControl + feedToggle + feedPanel +
     '<div class="team-actions"><button class="team-btn" onclick="doTeamStop(' +
     "'" + name + "'" + ')">Stop team</button></div>' +
-    msgSlot + '</div>';
+    msgSlot + renderTeamBranches(name) + '</div>';
 }
 function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverride, showBadge, gitSync, deploy, team) {
   // subOverride lets a singleton-toggle row (Taiga/Gitea — see refresh())
@@ -2711,6 +4350,7 @@ function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverr
     (desc ? '<div class="desc">' + esc(desc) + '</div>' : '') +
     '<div class="sub">' + sub + '</div>' +
     (kind === 'inst' ? codeRow(name, codeOn, codeUrl) : '') +
+    (kind === 'inst' ? smokeCheckRow(name, url) : '') +
     (kind === 'inst' ? deployRow(name, deploy) : '') +
     (kind === 'inst' ? teamRow(name, team) : '') +
     '</div>' +
@@ -2724,10 +4364,15 @@ function actionPath(kind, name, on) {
   if (kind in singletonToggleState) return '/' + kind + '/' + (on ? 'on' : 'off');
   if (kind === 'code') return '/instance/' + encodeURIComponent(name) + '/code/' + (on ? 'on' : 'off');
   if (kind === 'newproject') return '/projects/new';
+  if (kind === 'clone') return '/projects/clone';
   if (kind === 'deploy') return '/instance/' + encodeURIComponent(name) + '/deploy';
   if (kind === 'team-start') return '/projects/' + encodeURIComponent(name) + '/team/start';
   if (kind === 'team-stop') return '/projects/' + encodeURIComponent(name) + '/team/stop';
   if (kind === 'team-resolve') return '/projects/' + encodeURIComponent(name) + '/team/resolve';
+  if (kind === 'team-board-resolve') return '/projects/' + encodeURIComponent(name) + '/team/board-resolve';
+  if (kind === 'team-interject') return '/projects/' + encodeURIComponent(name) + '/team/interject';
+  if (kind === 'team-add-member') return '/projects/' + encodeURIComponent(name) + '/team/add-member';
+  if (kind === 'smoke-check') return '/projects/' + encodeURIComponent(name) + '/smoke-check';
   return '/instance/' + encodeURIComponent(name) + '/' + (on ? 'on' : 'off');
 }
 function actionBody(kind, name, on, code) {
@@ -2735,6 +4380,16 @@ function actionBody(kind, name, on, code) {
   if (code) body.code = code;
   if (on && kind === 'inst') body.engine = engineChoice[name] || Object.keys(ENGINE_LABELS)[0];
   if (kind === 'newproject') body.name = name;
+  // Clone-from-URL (backlog item 16, docs/spec.md/docs/design.md) -- reads
+  // straight from the still-live inputs, same "survives a TOTP retry"
+  // discipline team-start's own task/lead/members fields already rely on
+  // above, rather than threading url/name through toggle()'s own
+  // name/on/checkboxEl parameters (which don't have a slot for a second
+  // string like this).
+  if (kind === 'clone') {
+    body.url = document.getElementById('clone-url').value.trim();
+    body.name = (document.getElementById('clone-name').value || '').trim();
+  }
   // Team start's task text isn't shaped like any other kind's body field --
   // read directly from the still-live textarea (or the client-side
   // teamTaskText[] mirror, in case a TOTP retry's own submitActionCode()
@@ -2763,6 +4418,35 @@ function actionBody(kind, name, on, code) {
   // convention, also used by doTeamResolve()'s own client-side validation,
   // so the two can never diverge.
   if (kind === 'team-resolve') body.answer = computeTeamResolveAnswer(name);
+  // Board-write proposal approve/reject (backlog item 7 part 2, docs/
+  // spec.md §5) -- sourced from the client-side map doTeamBoardResolve()
+  // populates BEFORE dispatching, same "survives a TOTP retry" discipline
+  // team-start's own task/lead/members fields already rely on above.
+  if (kind === 'team-board-resolve') body.action = teamBoardResolveAction[name];
+  // Chat-UI compose surface (backlog item 19 part 2, docs/spec.md "Proposed
+  // approach" §1) -- reads the live textarea first, falls back to the
+  // teamInterjectText[] mirror, same "survives a mid-flow re-render/428
+  // retry" reasoning team-start's own task-text field already relies on.
+  if (kind === 'team-interject') {
+    const el = document.getElementById('interject-' + name);
+    body.text = (el ? el.value : (teamInterjectText[name] || '')).trim();
+  }
+  // "+" add-teammate control (backlog item 21 part 2, docs/spec.md
+  // "Proposed approach" §5) -- sourced from the client-side map
+  // doTeamAddMember() populates BEFORE dispatching (same "survives a TOTP
+  // retry" discipline team-board-resolve's own action field already relies
+  // on above), never a re-read of the (possibly-already-redrawn) <select>.
+  if (kind === 'team-add-member') body.agent = teamAddMemberChoice[name];
+  // HTTP-level smoke check (backlog item 18, docs/spec.md) -- reads the
+  // still-live input first, falls back to the smokeCheckExpect[] mirror,
+  // same "survives a mid-flow re-render/428 retry" reasoning team-start's
+  // own task-text field already relies on above. Always sent (possibly
+  // empty) -- an empty string is the documented "don't check content" case,
+  // not an omitted field.
+  if (kind === 'smoke-check') {
+    const el = document.getElementById('smoke-expect-' + name);
+    body.expect_contains = (el ? el.value : (smokeCheckExpect[name] || '')).trim();
+  }
   return body;
 }
 async function performAction(kind, name, on, code) {
@@ -2795,6 +4479,11 @@ async function handleActionResult(r, ctx) {
       kind === 'team-start' ? 'Starting team: ' + (name || 'this') :
       kind === 'team-stop' ? 'Stopping team: ' + (name || 'this') :
       kind === 'team-resolve' ? 'Submitting answer: ' + (name || 'this') :
+      kind === 'team-board-resolve' ? 'Resolving board write: ' + (name || 'this') :
+      kind === 'team-interject' ? 'Sending message: ' + (name || 'this') :
+      kind === 'team-add-member' ? 'Adding teammate: ' + (name || 'this') :
+      kind === 'smoke-check' ? 'Smoke checking: ' + (name || 'this') :
+      kind === 'clone' ? 'Cloning from URL' :
       (on ? 'Turning on: ' : 'Turning off: ') + (name || 'this');
     document.getElementById('action-code').value = '';
     document.getElementById('err-code').textContent = '';
@@ -2855,6 +4544,103 @@ async function handleActionResult(r, ctx) {
     }
     return;
   }
+  if (kind === 'team-board-resolve') {
+    // Its own inline result slot (docs/design.md "Frontend:
+    // handleActionResult() extension"), same pattern as team-resolve above
+    // -- handled before the generic 400 branch below for the same reason
+    // (a wrong-status/invalid-action/two-tab-race 400 belongs in THIS
+    // row's own team-msg slot, not the new-project error field).
+    hideCodeOverlay();
+    const data = await r.json().catch(() => ({}));
+    const msgEl = document.getElementById('team-msg-' + name);
+    if (msgEl) {
+      if (r.ok && data.ok) {
+        msgEl.textContent = '✓ Board write resolved';
+        msgEl.className = 'team-msg success';
+        const team = TEAM_BY_NAME[name];
+        if (team && team.run_id) delete teamInboxCache[team.run_id];
+        delete teamBoardResolveAction[name];
+      } else {
+        msgEl.textContent = '✕ Error: ' + (data.error || 'could not resolve board write');
+        msgEl.className = 'team-msg error';
+      }
+    }
+    return;
+  }
+  if (kind === 'team-interject') {
+    // Its own inline result slot (docs/design.md "Compose box: Success" /
+    // "Compose box: Error"), same pattern as team-resolve/team-board-resolve
+    // above -- handled before the generic 400 branch below for the same
+    // reason (an over-length/empty-message 400 belongs in THIS row's own
+    // team-msg slot, not the new-project error field).
+    hideCodeOverlay();
+    const data = await r.json().catch(() => ({}));
+    const msgEl = document.getElementById('team-msg-' + name);
+    if (msgEl) {
+      if (r.ok && data.ok) {
+        msgEl.textContent = '✓ Message sent';
+        msgEl.className = 'team-msg success';
+        delete teamInterjectText[name];
+        const ta = document.getElementById('interject-' + name);
+        if (ta) ta.value = '';
+        updateTeamInterjectControls(name);
+      } else {
+        // Draft text is deliberately NOT cleared on failure -- the operator
+        // can fix and resend without retyping.
+        msgEl.textContent = '✕ Error: ' + (data.error || 'could not send message');
+        msgEl.className = 'team-msg error';
+      }
+    }
+    return;
+  }
+  if (kind === 'team-add-member') {
+    // Its own inline result slot (docs/design.md "Success Feedback" /
+    // "Error Feedback"), same pattern as team-interject above -- handled
+    // before the generic 400 branch below for the same reason (a
+    // cap-reached/already-a-member/race 400 belongs in THIS row's own
+    // team-msg slot, not the new-project error field). Deliberately says
+    // "will join... at its next round," never "has joined" -- the new
+    // teammate isn't actually reachable until team_step()'s own membership
+    // drain runs at the run's next round boundary (docs/spec.md's own
+    // "accurate, non-oversold feedback" goal).
+    hideCodeOverlay();
+    const data = await r.json().catch(() => ({}));
+    const msgEl = document.getElementById('team-msg-' + name);
+    if (msgEl) {
+      if (r.ok && data.ok) {
+        msgEl.textContent = '✓ \\'' + esc(data.agent) + '\\' will join the team at its next round';
+        msgEl.className = 'team-msg success';
+        delete teamAddMemberChoice[name];
+      } else {
+        msgEl.textContent = '✕ Error: ' + (data.error || 'could not add teammate');
+        msgEl.className = 'team-msg error';
+      }
+    }
+    return;
+  }
+  if (kind === 'clone') {
+    // Its own inline result slot (docs/design.md "Error States" /
+    // "Success State"), same pattern as team-start/deploy above -- handled
+    // before the generic 400 branch below for the same reason (a
+    // clone-specific 400 belongs in THIS row's own clone-err slot, not the
+    // new-project error field).
+    hideCodeOverlay();
+    setCloneFormBusy(false);
+    const data = await r.json().catch(() => ({}));
+    const errEl = document.getElementById('clone-err');
+    if (r.ok && data.ok) {
+      errEl.textContent = '';
+      errEl.className = 'clone-err';
+      document.getElementById('clone-url').value = '';
+      document.getElementById('clone-name').value = '';
+      closeCloneForm();
+      setTimeout(refresh, 1500);
+    } else {
+      errEl.className = 'clone-err';
+      errEl.textContent = data.error || 'Clone failed.';
+    }
+    return;
+  }
   if (r.status === 400) {
     const err = await r.json().catch(() => ({}));
     hideCodeOverlay();
@@ -2873,6 +4659,35 @@ async function handleActionResult(r, ctx) {
     if (msgEl) {
       msgEl.textContent = r.ok ? 'Deployed successfully' : 'Deploy failed: ' + (data.message || 'unknown error');
       msgEl.className = 'deploy-msg ' + (r.ok ? 'success' : 'error');
+    }
+    return;
+  }
+  if (kind === 'smoke-check') {
+    // Its own inline result slot (docs/spec.md "Proposed approach") --
+    // never the generic setTimeout(refresh, 1500) below, same "persist
+    // until the next refresh() re-render, not wiped almost immediately"
+    // reasoning the deploy branch above already follows. Reads data.ok,
+    // NOT r.ok -- the route answers HTTP 200 for both a successful AND a
+    // target-side-failed completed check (docs/spec.md: "a completed
+    // check (success or target-side failure alike)... 200"); only a
+    // locked-out (409) or unknown-project (404) dispatch has r.ok false
+    // here, and those still carry a plain {ok: false, error} body this
+    // same branch renders correctly either way.
+    hideCodeOverlay();
+    const data = await r.json().catch(() => ({}));
+    const msgEl = document.getElementById('smoke-check-msg-' + name);
+    if (msgEl) {
+      if (data.ok) {
+        let text = data.status_code + ' · ' + data.elapsed_ms + 'ms';
+        if (data.content_ok !== null && data.content_ok !== undefined) {
+          text += data.content_ok ? ' · content: found' : ' · content: NOT found';
+        }
+        msgEl.textContent = text;
+        msgEl.className = 'smoke-check-msg success';
+      } else {
+        msgEl.textContent = data.error || 'Smoke check failed.';
+        msgEl.className = 'smoke-check-msg error';
+      }
     }
     return;
   }
@@ -2930,6 +4745,18 @@ function doDeploy(name) {
   if (msgEl) { msgEl.textContent = 'Deploying…'; msgEl.className = 'deploy-msg'; }
   toggle('deploy', name, true, null);
 }
+// Manual, one-click HTTP-level smoke check (backlog item 18, docs/spec.md)
+// -- same toggle()/performAction()/handleActionResult() plumbing doDeploy()
+// above uses (including the shared TOTP code-overlay retry path), but with
+// NO confirm() dialog: unlike Deploy (mutates a remote target) or Stop team
+// (kills processes and removes worktrees), a GET request against the
+// project's own already-running dev server has no side effect worth a
+// confirmation interruption.
+function doSmokeCheck(name) {
+  const msgEl = document.getElementById('smoke-check-msg-' + name);
+  if (msgEl) { msgEl.textContent = 'Checking…'; msgEl.className = 'smoke-check-msg'; }
+  toggle('smoke-check', name, true, null);
+}
 // Minimal per-project team control (backlog item 6d, part 2a; extended with
 // a composition picker in 6e -- docs/design.md). Client-side validation
 // only (the route's own 400 is the real, authoritative check either way)
@@ -2975,6 +4802,41 @@ function startNewProject() {
   }
   toggle('newproject', name, true, null);
 }
+// Clone from URL (backlog item 16, docs/design.md "Component reuse") --
+// same inline-form/actionPath()/actionBody()/toggle() plumbing as
+// startNewProject() above, extended with a disabled/"Cloning…" loading
+// state (docs/design.md "Loading State") since a clone can legitimately
+// take up to CLONE_TIMEOUT_SECONDS (180s default), unlike + New project's
+// near-instant response.
+function openCloneForm() {
+  document.getElementById('clone-form').style.display = 'flex';
+  document.getElementById('clone-err').textContent = '';
+  document.getElementById('clone-url').focus();
+}
+function closeCloneForm() {
+  document.getElementById('clone-form').style.display = 'none';
+}
+function setCloneFormBusy(busy) {
+  document.getElementById('clone-url').disabled = busy;
+  document.getElementById('clone-name').disabled = busy;
+  document.querySelectorAll('#clone-form button').forEach(b => { b.disabled = busy; });
+  const btn = document.querySelector('#clone-form button');
+  if (btn) btn.textContent = busy ? 'Cloning…' : 'Clone';
+}
+function startClone() {
+  const url = document.getElementById('clone-url').value.trim();
+  const errEl = document.getElementById('clone-err');
+  errEl.textContent = '';
+  errEl.className = 'clone-err';
+  if (!url) {
+    errEl.textContent = 'Enter a repository URL.';
+    return;
+  }
+  setCloneFormBusy(true);
+  errEl.textContent = 'Cloning… this can take a while for large repositories (up to a few minutes).';
+  errEl.className = 'clone-status';
+  toggle('clone', url, true, null);
+}
 function hideCodeOverlay() {
   document.getElementById('code-overlay').classList.remove('show');
   pendingToggle = null;
@@ -3000,6 +4862,14 @@ function cancelActionCode() {
     // toggle() set before the code overlay ever showed up.
     singletonToggleState[pendingToggle.kind].pending = null;
     singletonToggleState[pendingToggle.kind].wasRunning = false;
+  }
+  if (pendingToggle && pendingToggle.kind === 'clone') {
+    // Nothing actually started server-side either (same reasoning as
+    // above) -- re-enable the form so the operator can retry.
+    setCloneFormBusy(false);
+    const errEl = document.getElementById('clone-err');
+    errEl.textContent = '';
+    errEl.className = 'clone-err';
   }
   hideCodeOverlay();
 }
@@ -3915,6 +5785,12 @@ class Handler(BaseHTTPRequestHandler):
             # this is a cheap no-op on every tick that isn't due yet (see
             # docs/spec.md "The poll mechanism").
             _gitea_poll_if_due(gitea_on)
+            # GitHub's own poll-loop-doubling-as-item-8-dispatch counterpart
+            # (item 17 part 2, docs/spec.md) -- internally throttled to its
+            # own GITHUB_POLL_INTERVAL_SECONDS interval, and a guaranteed
+            # no-op unless AI_REVIEWER_ENABLED, GITHUB_TOKEN, and a non-empty
+            # AI_REVIEWER_GITHUB_REPOS_FILE are all set.
+            _github_poll_if_due()
             # Reverse-indexed by name, small N -- same "just iterate it"
             # style instance_names() itself already uses -- to attach an
             # optional gitea_sync field to each row below, when present.
@@ -3945,6 +5821,7 @@ class Handler(BaseHTTPRequestHandler):
                 run = teams.latest_run_for_project(n)
                 team_status = ("idle" if run is None else
                               {"running": "running", "blocked_ask_user": "blocked",
+                               "blocked_board_write": "blocked",
                                "escalated_max_rounds": "blocked", "finished": "finished",
                                "error": "error", "stopped": "idle"}.get(run["status"], "idle"))
                 # Roster & composition UI (backlog item 6e, docs/spec.md) --
@@ -3999,9 +5876,34 @@ class Handler(BaseHTTPRequestHandler):
                 # inbox.json and nothing to resume (docs/spec.md "Open
                 # questions"), which stays under the coarser "blocked"
                 # team_status bucket above instead.
-                waiting_on_you = run is not None and run["status"] == "blocked_ask_user"
+                waiting_on_you = run is not None and run["status"] in (
+                    "blocked_ask_user", "blocked_board_write")
+                # escalation_kind (backlog item 7 part 2, docs/spec.md §1) --
+                # a direct string comparison against run["status"], already
+                # loaded above for team_status/waiting_on_you; distinguishes
+                # the two escalation kinds so the frontend can render
+                # different status-strip copy/panel without an extra round
+                # trip to GET .../team/inbox.
+                escalation_kind = (
+                    "ask_user" if run is not None and run["status"] == "blocked_ask_user" else
+                    "board_write" if run is not None and run["status"] == "blocked_board_write" else
+                    None)
                 inst["team"] = {"status": team_status, "run_id": run["run_id"] if run else None,
-                                "composition": composition, "waiting_on_you": waiting_on_you}
+                                "composition": composition, "waiting_on_you": waiting_on_you,
+                                "escalation_kind": escalation_kind,
+                                # Backlog item 21 part 2, docs/spec.md
+                                # "Proposed approach" §1 -- the run's LIVE
+                                # roster/lead, read directly off the
+                                # persisted state dict rather than
+                                # re-derived from `composition` above
+                                # (a saved/default PICKER preference, never
+                                # updated by add_team_member()). Grows the
+                                # moment team_step()'s membership drain
+                                # runs, never earlier -- matching part 1's
+                                # own "next round boundary" delivery
+                                # semantics.
+                                "members": run.get("members", []) if run is not None else [],
+                                "lead": run.get("lead") if run is not None else None}
                 sync_entry = gitea_sync_by_name.get(n)
                 if sync_entry is not None:
                     inst["gitea_sync"] = {"state": sync_entry.get("sync_state"),
@@ -4019,6 +5921,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"instances": instances,
                        "engines": {name: e.label for name, e in engines.items()},
                        "roster": roster,
+                       # Backlog item 21 part 2, docs/spec.md "Proposed
+                       # approach" §1 -- a single process-wide constant, not
+                       # per-project, same "computed once, shipped once per
+                       # /status call" treatment `roster` itself gets above.
+                       "team_max_members": teams.TEAM_MAX_MEMBERS,
                        "host_enabled": HOST_CONTROL_ENABLED, "host_label": HOST_LABEL,
                        "host": host_on, "host_url": host_url,
                        "taiga_enabled": TAIGA_ENABLED, "taiga_label": TAIGA_LABEL,
@@ -4053,6 +5960,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._handle_team_events(parts[1], query)
             if len(parts) == 4 and parts[0] == "projects" and parts[2] == "team" and parts[3] == "inbox":
                 return self._handle_team_inbox(parts[1], query)
+            if len(parts) == 4 and parts[0] == "projects" and parts[2] == "team" and parts[3] == "branches":
+                # Backlog item 13, docs/spec.md -- read-only surviving-
+                # branch discoverability. Same gating as /team/grounding
+                # above: no TOTP needed (_authed() only, already checked at
+                # the top of do_GET), same project-scoping 404.
+                name = parts[1]
+                if name not in instance_names():
+                    return self._json({"error": "unknown project"}, 404)
+                return self._json(teams.list_team_branches(os.path.join(PROJECTS_DIR, name)))
             self.send_response(404)
             self.end_headers()
 
@@ -4072,6 +5988,17 @@ class Handler(BaseHTTPRequestHandler):
             return None, ({"error": "unknown project"}, 404)
         run_id = (query.get("run_id") or [None])[0]
         if run_id:
+            # docs/BACKLOG.md item 11(b): validated against teams._RUN_ID_RE
+            # -- the exact shape teams._run_id() actually generates -- here,
+            # at the client-supplied-run_id intake point, BEFORE it ever
+            # reaches teams.load_state_for_project()/_load_state()/
+            # _run_dir() and a path-join. Same "unknown run_id" 404 as a
+            # syntactically-valid-but-nonexistent run_id already gets, so a
+            # malformed/traversal run_id (e.g. "../../outside/evilrun")
+            # never opens any file outside _leads_root() and never gets a
+            # distinguishable error shape.
+            if not teams._RUN_ID_RE.match(run_id):
+                return None, ({"error": "unknown run_id for this project"}, 404)
             state = teams.load_state_for_project(run_id, name)
             if state is None:
                 return None, ({"error": "unknown run_id for this project"}, 404)
@@ -4093,7 +6020,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"run_id": None, "events": [], "cursors": {}})
         run_id = state["run_id"]
         cursor = _parse_events_cursor((query.get("cursor") or [None])[0])
-        files = [("lead", teams._transcript_path(run_id))]
+        # "human" (backlog item 19 part 1, docs/spec.md "Proposed approach"
+        # §4): a run's own human.jsonl, merged in exactly like a teammate's
+        # own log -- no other change to this function, the existing
+        # per-file cursor/byte-cap/truncation-flag/chronological-merge-sort
+        # logic below is already generic over the file list.
+        # "membership" (backlog item 21 part 2, docs/spec.md "Proposed
+        # approach" §2) -- merges add_team_member()'s own member_joined
+        # envelopes in. The "membership" label here is only used for the
+        # malformed-line fallback and this file's own cursors-dict key; it
+        # does NOT override the `agent` field already embedded in each
+        # membership.jsonl line (the newly-joined agent's own name), so a
+        # member_joined event surfaces tagged with that agent's name/color,
+        # not a generic "membership" pseudo-agent.
+        files = [("lead", teams._transcript_path(run_id)), ("human", teams._human_log_path(run_id)),
+                 ("membership", teams._membership_log_path(run_id))]
         files += [(m, teams._agent_log_path(run_id, m)) for m in state.get("members", [])]
         all_events = []
         cursors = {}
@@ -4112,14 +6053,19 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_team_inbox(self, name: str, query: dict):
         """
         GET /projects/<name>/team/inbox (backlog item 6f part 1, docs/
-        spec.md §2) -- "is there a pending question right now", without the
-        caller having to scan the merged event feed for the latest
-        ask_user entry itself.
+        spec.md §2; extended by backlog item 7 part 2, docs/spec.md §2 for
+        the board_write branch below) -- "is there a pending question/
+        proposal right now", without the caller having to scan the merged
+        event feed for the latest ask_user/board_write entry itself.
         """
         state, err = self._team_events_run_and_ownership(name, query)
         if err is not None:
             return self._json(*err)
-        if state is None or state.get("status") != "blocked_ask_user":
+        if state is None:
+            return self._json({"pending": False})
+        if state.get("status") == "blocked_board_write":
+            return self._handle_team_inbox_board_write(state)
+        if state.get("status") != "blocked_ask_user":
             return self._json({"pending": False})
         run_id = state["run_id"]
         question = header = None
@@ -4143,6 +6089,61 @@ class Handler(BaseHTTPRequestHandler):
             header, options, multi_select = "", [], False
         self._json({"pending": True, "run_id": run_id, "question": question,
                    "header": header, "options": options, "multi_select": multi_select})
+
+    def _handle_team_inbox_board_write(self, state: dict):
+        """
+        The blocked_board_write branch of GET .../team/inbox (backlog item
+        7 part 2, docs/spec.md §2). Reads inbox.json's own board_write shape
+        (same fields resolve_board_write() itself reads) and adds a
+        best-effort, failure-tolerant "subject" enrichment via one
+        taiga_board.get_userstory() read -- current_value never carries the
+        card's title, only a status/description snapshot (docs/spec.md
+        "Background") -- so this is the one place that fetches it for
+        display. Never touches `version` and never affects approve/reject,
+        which stays fully functional even if this read fails.
+        """
+        run_id = state["run_id"]
+        verb = ref = value = note = proposed_at = None
+        current_value = {}
+        try:
+            with open(teams._inbox_path(run_id)) as f:
+                inbox = json.load(f)
+            verb = inbox.get("verb")
+            ref = inbox.get("ref")
+            value = inbox.get("value")
+            note = inbox.get("note")
+            current_value = inbox.get("current_value") or {}
+            proposed_at = inbox.get("proposed_at")
+        except (OSError, ValueError):
+            verb = None
+        if verb is None:
+            # inbox.json missing/unreadable/malformed despite status ==
+            # "blocked_board_write" (docs/spec.md "Edge cases") -- still
+            # "pending": true, with a safe fallback note the panel can
+            # render without crashing; approve/reject still work blind via
+            # the CLI's own team-board-resolve in this rare case.
+            self._json({
+                "pending": True, "run_id": run_id, "kind": "board_write",
+                "verb": None, "ref": None, "value": None,
+                "note": ("The team is waiting on a board-write approval, but the details could "
+                         "not be read -- check `tmux attach` or use the CLI's "
+                         "`team-board-resolve` to approve/reject blind."),
+                "current_value": {}, "proposed_at": None})
+            return
+        payload = {"pending": True, "run_id": run_id, "kind": "board_write",
+                  "verb": verb, "ref": ref, "value": value, "note": note,
+                  "current_value": current_value, "proposed_at": proposed_at}
+        try:
+            base_url, token, project_id = teams.taiga_board.resolve_session()
+            userstory = teams.taiga_board.get_userstory(base_url, token, project_id, ref)
+            payload["subject"] = userstory.get("subject") or None
+        except teams.taiga_board.TaigaPushError:
+            # Best-effort/read-only (docs/spec.md §2, "Edge cases": "Taiga
+            # unreachable") -- every inbox.json-sourced field above is still
+            # returned, "subject" is simply omitted, Approve/Reject remain
+            # fully functional.
+            pass
+        self._json(payload)
 
     def do_POST(self):
         if self.path == "/login":
@@ -4208,6 +6209,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True})
         elif parts[0] == "projects" and len(parts) == 2 and parts[1] == "new":
             ok, err = create_project((body.get("name") or "").strip())
+            if not ok:
+                return self._json({"error": err}, 400)
+            self._json({"ok": True})
+        elif parts[0] == "projects" and len(parts) == 2 and parts[1] == "clone":
+            # Backlog item 16, docs/spec.md "New route -- POST /projects/
+            # clone" -- an ordinary JSON-body POST (no special early-branch
+            # the way /projects/upload needs for its raw-bytes body), so it
+            # goes through the shared TOTP gate exactly like /projects/new.
+            ok, err = clone_project_from_url(body.get("url") or "", (body.get("name") or "").strip())
             if not ok:
                 return self._json({"error": err}, 400)
             self._json({"ok": True})
@@ -4306,7 +6316,15 @@ class Handler(BaseHTTPRequestHandler):
             if name not in instance_names():
                 return self._json({"error": "unknown project"}, 404)
             run = teams.latest_run_for_project(name)
-            if run is None or run["status"] not in ("running", "blocked_ask_user"):
+            # "blocked_board_write" added (backlog item 7 part 2, docs/
+            # spec.md §4) -- previously this tuple only named
+            # "blocked_ask_user", so a run blocked on a pending board-write
+            # proposal fell into the early-return "no team currently
+            # running" branch below and Stop silently did nothing (disclosed
+            # gap, docs/implementation.md "Known limitations"). stop_team()
+            # itself already handles any non-terminal status generically, so
+            # this one-tuple extension is the entire fix.
+            if run is None or run["status"] not in ("running", "blocked_ask_user", "blocked_board_write"):
                 return self._json({"ok": True, "message": "no team currently running for this project"})
             entry = _team_threads_get(name)
             if entry is not None and entry.get("run_id") == run["run_id"]:
@@ -4325,6 +6343,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "unknown project"}, 404)
             run_id = (body.get("run_id") or "").strip() or None
             if run_id:
+                # docs/BACKLOG.md item 11(b): same validation, same intake-
+                # point placement, as _team_events_run_and_ownership() above
+                # -- reject before _load_state()/_run_dir() ever join this
+                # into a path. Same "no run found" 400 a syntactically-
+                # valid-but-nonexistent run_id already gets via the except
+                # clause below, so this adds no new error shape.
+                if not teams._RUN_ID_RE.match(run_id):
+                    return self._json({"error": "no run found for this project"}, 400)
                 try:
                     state = teams._load_state(run_id)
                 except (OSError, ValueError):
@@ -4362,6 +6388,161 @@ class Handler(BaseHTTPRequestHandler):
             _team_threads_set(name, {"run_id": run_id, "thread": t, "cancel_event": cancel_event})
             t.start()
             self._json({"ok": True, "run_id": run_id})
+        elif (parts[0] == "projects" and len(parts) == 4 and parts[2] == "team"
+              and parts[3] == "board-resolve"):
+            # Board-write proposal approve/reject (backlog item 7 part 2,
+            # docs/spec.md §3) -- a NEW, dedicated route (not an overload of
+            # POST .../team/resolve above): resolve_board_write()'s own
+            # input shape (run_id + action enum, no free text) differs
+            # enough from resolve_ask_user()'s (run_id + free-text answer)
+            # that branching one route on two body shapes wasn't worth it.
+            # Mirrors the CLI's own team-board-resolve naming exactly.
+            # Reached through the same shared TOTP gate above -- no new
+            # gating code, same as /team/start|stop|resolve.
+            name = parts[1]
+            if name not in instance_names():
+                return self._json({"error": "unknown project"}, 404)
+            run_id = (body.get("run_id") or "").strip() or None
+            if run_id:
+                # docs/BACKLOG.md item 11(b): same validation, same intake-
+                # point placement, as /team/resolve above.
+                if not teams._RUN_ID_RE.match(run_id):
+                    return self._json({"error": "no run found for this project"}, 400)
+                try:
+                    state = teams._load_state(run_id)
+                except (OSError, ValueError):
+                    return self._json({"error": "no run found for this project"}, 400)
+                if state.get("project_name") != name:
+                    return self._json({"error": "this run belongs to a different project"}, 400)
+            else:
+                state = teams.latest_run_for_project(name)
+                if state is None:
+                    return self._json({"error": "no run found for this project"}, 400)
+                run_id = state["run_id"]
+            if state.get("status") != "blocked_board_write":
+                return self._json({"error": "no pending board write for this project"}, 400)
+            action = body.get("action")
+            if action not in ("approve", "reject"):
+                return self._json({"error": "action must be 'approve' or 'reject'"}, 400)
+            result = teams.resolve_board_write(run_id, action)
+            if not result["ok"]:
+                return self._json({"error": result["error"]}, 400)
+            # Same defensive, should-be-unreachable check /team/resolve
+            # already has above -- cheap to keep consistent.
+            if _team_threads_get(name) is not None:
+                return self._json({"error": "a team thread is already running for this project"}, 400)
+            cancel_event = threading.Event()
+            t = threading.Thread(target=_run_team_in_background,
+                                 args=(name, run_id, cancel_event), daemon=True)
+            _team_threads_set(name, {"run_id": run_id, "thread": t, "cancel_event": cancel_event})
+            t.start()
+            self._json({"ok": True, "run_id": run_id})
+        elif (parts[0] == "projects" and len(parts) == 4 and parts[2] == "team"
+              and parts[3] == "interject"):
+            # Queue a free-text human message for a running lead's next
+            # round (backlog item 19 part 1, docs/spec.md "Proposed
+            # approach" §5) -- a materially different action from
+            # /team/resolve|board-resolve above: this does NOT resume a
+            # stopped loop, so unlike those two routes it never spins up a
+            # background driving thread. Reached through the same shared
+            # TOTP gate above -- no new gating code.
+            name = parts[1]
+            if name not in instance_names():
+                return self._json({"error": "unknown project"}, 404)
+            run_id = (body.get("run_id") or "").strip() or None
+            if run_id:
+                # docs/BACKLOG.md item 11(b): same validation, same intake-
+                # point placement, as /team/resolve|board-resolve above.
+                if not teams._RUN_ID_RE.match(run_id):
+                    return self._json({"error": "no run found for this project"}, 400)
+                try:
+                    state = teams._load_state(run_id)
+                except (OSError, ValueError):
+                    return self._json({"error": "no run found for this project"}, 400)
+                if state.get("project_name") != name:
+                    return self._json({"error": "this run belongs to a different project"}, 400)
+            else:
+                state = teams.latest_run_for_project(name)
+                if state is None:
+                    return self._json({"error": "no run found for this project"}, 400)
+                run_id = state["run_id"]
+            # Length/emptiness validation happens at THIS route layer, not
+            # inside teams.interject() -- mirroring /team/resolve's own
+            # TEAM_ASK_USER_ANSWER_MAX_CHARS check above exactly.
+            text = (body.get("text") or "").strip()
+            if not text or len(text) > teams.TEAM_INTERJECT_MAX_CHARS:
+                return self._json(
+                    {"error": f"message must be non-empty and at most "
+                              f"{teams.TEAM_INTERJECT_MAX_CHARS} characters"}, 400)
+            result = teams.interject(run_id, text)
+            if not result["ok"]:
+                return self._json({"error": result["error"]}, 400)
+            self._json({"ok": True, "run_id": run_id})
+        elif (parts[0] == "projects" and len(parts) == 4 and parts[2] == "team"
+              and parts[3] == "add-member"):
+            # Add one more teammate engine to an already-running team
+            # (backlog item 21 part 1, docs/spec.md "Proposed approach" §5)
+            # -- same shape/order/run_id-resolution as /team/interject
+            # above; the allowed-status set is identical to interject()'s
+            # own and is more naturally owned by teams.add_team_member()
+            # itself, not duplicated at this route layer (unlike /team/
+            # resolve's own status check). No background thread spun up
+            # here either -- same reasoning /team/interject already
+            # documents: this never resumes a stopped loop, so there is
+            # nothing to (re-)drive. Reached through the same shared TOTP
+            # gate every other /team/* route already sits behind.
+            name = parts[1]
+            if name not in instance_names():
+                return self._json({"error": "unknown project"}, 404)
+            run_id = (body.get("run_id") or "").strip() or None
+            if run_id:
+                # docs/BACKLOG.md item 11(b): same validation, same intake-
+                # point placement, as /team/interject|resolve|board-resolve above.
+                if not teams._RUN_ID_RE.match(run_id):
+                    return self._json({"error": "no run found for this project"}, 400)
+                try:
+                    state = teams._load_state(run_id)
+                except (OSError, ValueError):
+                    return self._json({"error": "no run found for this project"}, 400)
+                if state.get("project_name") != name:
+                    return self._json({"error": "this run belongs to a different project"}, 400)
+            else:
+                state = teams.latest_run_for_project(name)
+                if state is None:
+                    return self._json({"error": "no run found for this project"}, 400)
+                run_id = state["run_id"]
+            agent = (body.get("agent") or "").strip()
+            if not agent:
+                return self._json({"error": "agent is required"}, 400)
+            result = teams.add_team_member(run_id, agent)
+            if not result["ok"]:
+                return self._json({"error": result["error"]}, 400)
+            self._json({"ok": True, "run_id": run_id, "agent": agent})
+        elif (parts[0] == "projects" and len(parts) == 3 and parts[2] == "smoke-check"):
+            # HTTP-level smoke check (backlog item 18, docs/spec.md) -- new
+            # /projects/<name>/... sub-resource route (not the older
+            # /instance/<name>/deploy shape), reached through the same
+            # shared TOTP gate above. Body: {"expect_contains": "<string,
+            # may be empty>"}. 404 for an unknown project (checked here,
+            # same as every other per-project route); smoke_check_run()
+            # itself never 404s -- an unknown/URL-less project it can't
+            # reach still completes as a clean {"ok": False, ...} result,
+            # since _session_urls can change between page load and click.
+            name = parts[1]
+            if name not in instance_names():
+                return self._json({"error": "unknown project"}, 404)
+            raw_expect = body.get("expect_contains")
+            expect_contains = raw_expect.strip() if isinstance(raw_expect, str) else ""
+            result = smoke_check_run(name, expect_contains)
+            # "locked" is smoke_check_run()'s own internal-only marker for
+            # lock contention (see its docstring) -- popped here so it
+            # never reaches the client, and mapped to 409, mirroring
+            # deploy_run()'s own 409 contract. Every other completed check
+            # (success or target-side failure alike) is HTTP 200.
+            if result.pop("locked", False):
+                self._json(result, 409)
+            else:
+                self._json(result, 200)
         else:
             self.send_response(404)
             self.end_headers()

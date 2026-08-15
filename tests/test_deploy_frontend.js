@@ -184,6 +184,21 @@ async function setupCase(instances) {
   const p = c.call('refresh');
   c.resolveFetch((f) => f.url === '/status', 200, statusWith(instances));
   await p;
+  await tick();
+  // renderTeamBranches() (backlog item 13) fires an unrelated, unconditional
+  // one-time-per-project /projects/<name>/team/branches fetch as a side
+  // effect of rendering ANY kind='inst' row, regardless of on/url/deploy --
+  // drained here so it doesn't pollute this file's own pendingFetches
+  // assertions below (a pre-existing interaction between item 13 and every
+  // kind='inst'-row frontend test file predating this one -- not something
+  // this cycle's own code introduces or is in scope to fix elsewhere).
+  for (const inst of instances) {
+    const url = '/projects/' + inst.name + '/team/branches';
+    if (c.pendingFetches.some((f) => f.url === url)) {
+      c.resolveFetch((f) => f.url === url, 200, []);
+    }
+  }
+  await tick();
   return c;
 }
 

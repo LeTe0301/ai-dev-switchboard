@@ -9,7 +9,7 @@ action() against every §9 category, _parse_tier1_action()/_parse_tier3_
 action(), _round_context()/_assemble_prompt()'s final cap against a
 pathological every-sub-budget-maxed-at-once case, the tier-1 transport-
 retry wrapper against a monkeypatched _lead_tier1_call()/urlopen,
-_write_inbox()'s shape/truncation, persistence/crash-recovery
+_write_ask_user_inbox()'s shape/truncation, persistence/crash-recovery
 reconstruction, and team_step()/team_run() driven with _call_lead()/
 agent_run() monkeypatched out (no tmux needed to test the LOOP's own
 bookkeeping).
@@ -504,7 +504,8 @@ class LeadToolsTests(unittest.TestCase):
     def test_enum_reflects_team_members(self):
         tools = teamsmod._lead_tools(["claude", "aider"])
         names = [t["function"]["name"] for t in tools]
-        self.assertEqual(names, ["delegate", "fact_check", "ask_user", "finish"])
+        self.assertEqual(names, ["delegate", "fact_check", "ask_user", "board_read",
+                                 "board_write", "finish"])
         delegate = tools[0]
         self.assertEqual(delegate["function"]["parameters"]["properties"]["agent"]["enum"],
                          ["claude", "aider"])
@@ -513,6 +514,21 @@ class LeadToolsTests(unittest.TestCase):
         tools = teamsmod._lead_tools([])
         delegate = tools[0]
         self.assertEqual(delegate["function"]["parameters"]["properties"]["agent"]["enum"], [])
+
+    # ─── backlog item 7 part 1: board_read/board_write native schema ──────
+    def test_board_read_args_all_optional(self):
+        tools = teamsmod._lead_tools(["claude"])
+        board_read = next(t for t in tools if t["function"]["name"] == "board_read")
+        self.assertEqual(board_read["function"]["parameters"]["required"], [])
+        self.assertEqual(set(board_read["function"]["parameters"]["properties"]), {"ref", "query"})
+
+    def test_board_write_verb_enum_and_required_args(self):
+        tools = teamsmod._lead_tools(["claude"])
+        board_write = next(t for t in tools if t["function"]["name"] == "board_write")
+        params = board_write["function"]["parameters"]
+        self.assertEqual(set(params["required"]), {"verb", "ref", "value"})
+        self.assertEqual(set(params["properties"]["verb"]["enum"]),
+                         {"set_status", "amend_description", "append_comment"})
 
 
 # ─── Tier 1: _validate_lead_action() -- every §9 category ─────────────────
@@ -707,14 +723,17 @@ class SystemFramingTests(unittest.TestCase):
             text = teamsmod._system_framing(self.projdir, ["claude"], tier)
             self.assertIn("phrase the claim as a short quotation of exact", text)
             self.assertIn("treat the claim as unverified, not", text)
+            # backlog item 19 part 1, docs/spec.md "Acceptance criteria":
+            # _INTERJECT_MITIGATION present every tier, same loop.
+            self.assertIn("human_interject is an unsolicited", text)
 
     def test_tier1_omits_prose_tool_descriptions_tier2_3_include_them(self):
         t1 = teamsmod._system_framing(self.projdir, ["claude"], 1)
         t2 = teamsmod._system_framing(self.projdir, ["claude"], 2)
         t3 = teamsmod._system_framing(self.projdir, ["claude"], 3)
-        self.assertNotIn("You have exactly four tools", t1)
-        self.assertIn("You have exactly four tools", t2)
-        self.assertIn("You have exactly four tools", t3)
+        self.assertNotIn("You have exactly six tools", t1)
+        self.assertIn("You have exactly six tools", t2)
+        self.assertIn("You have exactly six tools", t3)
 
     def test_tier3_asks_for_a_fenced_block_tier2_does_not(self):
         t2 = teamsmod._system_framing(self.projdir, ["claude"], 2)
@@ -886,9 +905,10 @@ class WriteInboxTests(_StateTestCase):
         args = {"question": "Should we do X?", "header": "ThisHeaderIsWayTooLong",
                "options": [{"label": "Yes", "description": "do it"},
                           {"label": "No", "description": "don't"}], "multi_select": False}
-        teamsmod._write_inbox(state, args)
+        teamsmod._write_ask_user_inbox(state, args)
         with open(teamsmod._inbox_path("run-inbox")) as f:
             inbox = json.load(f)
+        self.assertEqual(inbox["kind"], "ask_user")
         self.assertLessEqual(len(inbox["header"]), 12)
         self.assertEqual(inbox["question"], "Should we do X?")
         self.assertEqual(len(inbox["options"]), 2)
@@ -1210,6 +1230,395 @@ class CallLeadDispatchTests(_StateTestCase):
         finally:
             teamsmod.agent_run = orig
         self.assertEqual(raw, {"tool": "finish", "args": {"summary": "done"}})
+
+
+# ─── Tier 1: interject() -- backlog item 19 part 1 ─────────────────────────
+class InterjectTests(_StateTestCase):
+    def test_running_run_appends_envelope_and_never_touches_run_json(self):
+        state = teamsmod._new_state("run-interject", self.projdir, self._lead(), [], "task")
+        teamsmod._persist(state)
+        run_json_path = teamsmod._run_json_path("run-interject")
+        with open(run_json_path, "rb") as f:
+            before = f.read()
+
+        result = teamsmod.interject("run-interject", "some text")
+
+        self.assertEqual(result, {"ok": True, "run_id": "run-interject"})
+        with open(teamsmod._human_log_path("run-interject")) as f:
+            lines = f.readlines()
+        self.assertEqual(len(lines), 1)
+        envelope = json.loads(lines[0])
+        self.assertEqual(envelope["agent"], "human")
+        self.assertEqual(envelope["kind"], "message")
+        self.assertEqual(envelope["text"], "some text")
+        self.assertEqual(envelope["meta"], {})
+        self.assertIn("ts", envelope)
+        self.assertIn("seq", envelope)
+        # run.json itself is byte-for-byte unchanged -- no _persist() call
+        # reachable from interject() (docs/spec.md "Acceptance criteria").
+        with open(run_json_path, "rb") as f:
+            after = f.read()
+        self.assertEqual(before, after)
+
+    def test_unknown_run_id_returns_shaped_error(self):
+        result = teamsmod.interject("does-not-exist", "hi")
+        self.assertEqual(result, {"ok": False, "error": "no such run_id: does-not-exist"})
+
+    def test_terminal_statuses_rejected_no_file_written(self):
+        for status in ("finished", "error", "escalated_max_rounds", "stopped"):
+            run_id = f"run-term-{status}"
+            state = teamsmod._new_state(run_id, self.projdir, self._lead(), [], "task")
+            state["status"] = status
+            teamsmod._persist(state)
+            result = teamsmod.interject(run_id, "hi")
+            self.assertFalse(result["ok"], status)
+            self.assertIn(status, result["error"])
+            self.assertFalse(os.path.exists(teamsmod._human_log_path(run_id)), status)
+
+    def test_blocked_ask_user_and_blocked_board_write_allowed(self):
+        for status in ("blocked_ask_user", "blocked_board_write"):
+            run_id = f"run-blocked-{status}"
+            state = teamsmod._new_state(run_id, self.projdir, self._lead(), [], "task")
+            state["status"] = status
+            teamsmod._persist(state)
+            result = teamsmod.interject(run_id, "hi")
+            self.assertTrue(result["ok"], status)
+            self.assertTrue(os.path.isfile(teamsmod._human_log_path(run_id)), status)
+
+
+# ─── Tier 1: team_step()'s human.jsonl drain checkpoint -- backlog item 19
+# part 1 ─────────────────────────────────────────────────────────────────
+class TeamStepDrainInterjectTests(_StateTestCase):
+    def test_drain_appends_history_entry_and_never_calls_the_lead(self):
+        state = teamsmod._new_state("run-drain", self.projdir, self._lead(), [], "task")
+        teamsmod._persist(state)
+        result = teamsmod.interject("run-drain", "please pause and explain your progress")
+        self.assertTrue(result["ok"])
+
+        def fail_call_lead(*a, **kw):
+            self.fail("_call_lead() was called on a round that only drained an interjection")
+
+        orig = teamsmod._call_lead
+        teamsmod._call_lead = fail_call_lead
+        try:
+            teamsmod.team_step(state)
+        finally:
+            teamsmod._call_lead = orig
+
+        self.assertEqual(len(state["history"]), 1)
+        entry = state["history"][0]
+        self.assertEqual(entry["tool"], "human_interject")
+        self.assertEqual(entry["full_result_text"], "please pause and explain your progress")
+        self.assertGreater(state["human_cursor"], 0)
+        self.assertEqual(state["human_cursor"],
+                         os.path.getsize(teamsmod._human_log_path("run-drain")))
+
+    def test_full_text_surfaces_in_next_round_context(self):
+        state = teamsmod._new_state("run-drain2", self.projdir, self._lead(), [], "task")
+        teamsmod._persist(state)
+        teamsmod.interject("run-drain2", "switch to plan B")
+        teamsmod.team_step(state)  # round 1: drains only, lead not called
+        self.assertEqual(state["history"][0]["tool"], "human_interject")
+
+        captured = {}
+
+        def fake_call_lead(state, system, round_context, **kwargs):
+            captured["round_context"] = round_context
+            return {"tool": "finish", "args": {"summary": "done"}}, None, "..."
+
+        orig = teamsmod._call_lead
+        teamsmod._call_lead = fake_call_lead
+        try:
+            teamsmod.team_step(state)  # round 2: lead called, sees round 1's text
+        finally:
+            teamsmod._call_lead = orig
+
+        ctx = captured["round_context"]
+        self.assertIn("switch to plan B", ctx)
+        self.assertIn("round 1, human_interject", ctx)
+
+    def test_two_queued_messages_drained_together_in_order(self):
+        state = teamsmod._new_state("run-drain3", self.projdir, self._lead(), [], "task")
+        teamsmod._persist(state)
+        teamsmod.interject("run-drain3", "first message")
+        teamsmod.interject("run-drain3", "second message")
+
+        def fail_call_lead(*a, **kw):
+            self.fail("_call_lead() was called on a round that only drained interjections")
+
+        orig = teamsmod._call_lead
+        teamsmod._call_lead = fail_call_lead
+        try:
+            teamsmod.team_step(state)
+        finally:
+            teamsmod._call_lead = orig
+
+        self.assertEqual(len(state["history"]), 2)
+        self.assertEqual([h["tool"] for h in state["history"]], ["human_interject", "human_interject"])
+        self.assertEqual(state["history"][0]["full_result_text"], "first message")
+        self.assertEqual(state["history"][1]["full_result_text"], "second message")
+        self.assertEqual(state["human_cursor"],
+                         os.path.getsize(teamsmod._human_log_path("run-drain3")))
+
+
+# ─── CLI: team-interject -- backlog item 19 part 1 ─────────────────────────
+class CliTeamInterjectTests(_StateTestCase):
+    def test_parses_run_id_and_text_positionals(self):
+        args = teamsmod._parse_args(["team-interject", "abc", "hello there"])
+        self.assertEqual(args.command, "team-interject")
+        self.assertEqual(args.run_id, "abc")
+        self.assertEqual(args.text, "hello there")
+
+    def test_success_prints_queued_message_exit_0_without_driving_the_run(self):
+        state = teamsmod._new_state("run-cli-interject", self.projdir, self._lead(), [], "task")
+        teamsmod._persist(state)
+        call_count = {"n": 0}
+
+        def fake_call_lead(*a, **kw):
+            call_count["n"] += 1
+            return {"tool": "finish", "args": {"summary": "done"}}, None, "..."
+
+        orig = teamsmod._call_lead
+        teamsmod._call_lead = fake_call_lead
+        self.addCleanup(setattr, teamsmod, "_call_lead", orig)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = teamsmod.main(["team-interject", "run-cli-interject", "hello"])
+        self.assertEqual(rc, 0)
+        self.assertIn("queued for run run-cli-interject", buf.getvalue())
+        # no side effect drives the run -- the mocked lead adapter's own
+        # call count is unchanged (docs/spec.md "Acceptance criteria").
+        self.assertEqual(call_count["n"], 0)
+        with open(teamsmod._human_log_path("run-cli-interject")) as f:
+            envelope = json.loads(f.readline())
+        self.assertEqual(envelope["text"], "hello")
+
+    def test_unresolvable_run_id_exits_nonzero(self):
+        rc = teamsmod.main(["team-interject", "no-such-run", "hello"])
+        self.assertEqual(rc, 1)
+
+
+# ─── Tier 1: add_team_member()'s own validation (backlog item 21 part 1) --
+# every case here is REJECTED before add_team_member() ever reaches
+# _create_worktree()/tmux, so no real git/tmux is needed to exercise it (the
+# accept-and-actually-create-worktree-and-window path is Tier 3, real tmux,
+# tests/test_teams_lifecycle.py) ─────────────────────────────────────────
+class _AddTeamMemberTestCase(_StateTestCase):
+    """_StateTestCase's own projdir/state_dir scratch, extended with a
+    scratch ENGINES_DIR so add_team_member()'s own roster()-backed
+    validation (docs/spec.md 'Proposed approach' §1 step 3) has real
+    engines.d entries to validate against -- same combined-fixture
+    technique tests/test_teams_composition.py's ValidateCompositionTests
+    already establishes for validate_composition()'s own roster()-backed
+    checks."""
+
+    def setUp(self):
+        super().setUp()
+        self.engines_dir = tempfile.mkdtemp(prefix="switchboard-addmember-engines-")
+        self._orig_engines_dir = appmod.ENGINES_DIR
+        self._orig_base = teamsmod.TEAM_LLM_BASE_URL
+        self._orig_model = teamsmod.TEAM_LLM_MODEL
+        self._orig_max_members = teamsmod.TEAM_MAX_MEMBERS
+        appmod.ENGINES_DIR = self.engines_dir
+        teamsmod.TEAM_LLM_BASE_URL = "http://x:11434/v1"
+        teamsmod.TEAM_LLM_MODEL = "qwen3:8b"
+        _write_engine_file(self.engines_dir, "codex.engine", """\
+            LABEL=Codex
+            CMD=unused
+            HEADLESS_CMD=codex -p {resume}
+            HEADLESS_FORMAT=plain
+            HEADLESS_PROMPT=arg
+            """)
+        _write_engine_file(self.engines_dir, "aider.engine", """\
+            LABEL=Aider
+            CMD=unused
+            HEADLESS_CMD=aider -p {resume}
+            HEADLESS_FORMAT=plain
+            HEADLESS_PROMPT=arg
+            """)
+
+    def tearDown(self):
+        appmod.ENGINES_DIR = self._orig_engines_dir
+        teamsmod.TEAM_LLM_BASE_URL = self._orig_base
+        teamsmod.TEAM_LLM_MODEL = self._orig_model
+        teamsmod.TEAM_MAX_MEMBERS = self._orig_max_members
+        shutil.rmtree(self.engines_dir, ignore_errors=True)
+        super().tearDown()
+
+
+class AddTeamMemberValidationTests(_AddTeamMemberTestCase):
+    def test_unknown_run_id_returns_shaped_error(self):
+        result = teamsmod.add_team_member("does-not-exist", "codex")
+        self.assertEqual(result, {"ok": False, "error": "no such run_id: does-not-exist"})
+
+    def test_terminal_statuses_rejected(self):
+        for status in ("finished", "error", "escalated_max_rounds", "stopped"):
+            run_id = f"run-term-{status}"
+            state = teamsmod._new_state(run_id, self.projdir, self._lead(), ["codex"], "task")
+            state["status"] = status
+            teamsmod._persist(state)
+            result = teamsmod.add_team_member(run_id, "aider")
+            self.assertFalse(result["ok"], status)
+            self.assertFalse(
+                os.path.exists(teamsmod._membership_log_path(run_id)), status)
+
+    def test_unknown_engine_name_rejected(self):
+        state = teamsmod._new_state("run-unknown", self.projdir, self._lead(), [], "task")
+        teamsmod._persist(state)
+        result = teamsmod.add_team_member("run-unknown", "nosuchengine")
+        self.assertFalse(result["ok"])
+        self.assertIn("nosuchengine", result["error"])
+
+    def test_ollama_entry_rejected_not_delegate_capable(self):
+        state = teamsmod._new_state(
+            "run-ollama", self.projdir, {"kind": "engine", "name": "codex", "tier": 3}, [], "task")
+        teamsmod._persist(state)
+        result = teamsmod.add_team_member("run-ollama", "qwen3:8b")
+        self.assertFalse(result["ok"])
+
+    def test_agent_is_the_current_engine_lead_rejected(self):
+        state = teamsmod._new_state(
+            "run-leadeq", self.projdir, {"kind": "engine", "name": "codex", "tier": 3}, [], "task")
+        teamsmod._persist(state)
+        result = teamsmod.add_team_member("run-leadeq", "codex")
+        self.assertFalse(result["ok"])
+
+    def test_agent_already_a_member_rejected(self):
+        state = teamsmod._new_state("run-dup", self.projdir, self._lead(), ["codex"], "task")
+        teamsmod._persist(state)
+        result = teamsmod.add_team_member("run-dup", "codex")
+        self.assertFalse(result["ok"])
+        self.assertIn("already", result["error"])
+
+    def test_at_cap_rejected_naming_the_max_no_side_effects(self):
+        teamsmod.TEAM_MAX_MEMBERS = 1
+        state = teamsmod._new_state("run-cap", self.projdir, self._lead(), ["codex"], "task")
+        teamsmod._persist(state)
+        result = teamsmod.add_team_member("run-cap", "aider")
+        self.assertFalse(result["ok"])
+        self.assertIn("1", result["error"])
+        self.assertFalse(os.path.exists(teamsmod._worktree_path(self.projdir, "aider")))
+        self.assertFalse(
+            os.path.exists(teamsmod._membership_log_path("run-cap")))
+
+    def test_blocked_ask_user_and_blocked_board_write_do_not_hit_the_status_check(self):
+        # These two statuses are ALLOWED by add_team_member()'s own status
+        # gate (mirrors interject()'s accepted set) -- proven here by
+        # showing they reach a LATER validation error (unknown engine),
+        # never the status-rejection message itself, without needing any
+        # real git/tmux to reach that later check.
+        for status in ("blocked_ask_user", "blocked_board_write"):
+            run_id = f"run-blocked-{status}"
+            state = teamsmod._new_state(run_id, self.projdir, self._lead(), [], "task")
+            state["status"] = status
+            teamsmod._persist(state)
+            result = teamsmod.add_team_member(run_id, "nosuchengine")
+            self.assertFalse(result["ok"], status)
+            self.assertIn("nosuchengine", result["error"], status)
+
+
+# ─── Tier 1: team_step()'s membership.jsonl drain checkpoint (backlog item
+# 21 part 1) -- mirrors TeamStepDrainInterjectTests above exactly ─────────
+class TeamStepDrainMembershipTests(_StateTestCase):
+    def _queue_member_joined(self, run_id, agent, worktree=None):
+        envelope = {"ts": teamsmod._now_iso(), "agent": agent,
+                   "seq": teamsmod._next_membership_seq(run_id), "kind": "member_joined",
+                   "worktree": worktree}
+        path = teamsmod._membership_log_path(run_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(envelope) + "\n")
+
+    def test_drain_appends_member_to_state_and_never_calls_the_lead(self):
+        state = teamsmod._new_state("run-mdrain", self.projdir, self._lead(), ["codex"], "task")
+        teamsmod._persist(state)
+        self._queue_member_joined("run-mdrain", "aider", worktree="/x/proj.teams/aider")
+
+        def fail_call_lead(*a, **kw):
+            self.fail("_call_lead() was called on a round that only drained membership")
+
+        orig = teamsmod._call_lead
+        teamsmod._call_lead = fail_call_lead
+        try:
+            teamsmod.team_step(state)
+        finally:
+            teamsmod._call_lead = orig
+
+        self.assertIn("aider", state["members"])
+        self.assertEqual(state["worktrees"]["aider"], "/x/proj.teams/aider")
+        self.assertEqual(len(state["history"]), 1)
+        entry = state["history"][0]
+        self.assertEqual(entry["tool"], "team_member_joined")
+        self.assertIn("aider", entry["outcome_summary"])
+        self.assertGreater(state["membership_cursor"], 0)
+        self.assertEqual(state["membership_cursor"],
+                         os.path.getsize(teamsmod._membership_log_path("run-mdrain")))
+
+    def test_membership_drain_runs_before_human_drain_same_round_poll(self):
+        state = teamsmod._new_state("run-mdrain2", self.projdir, self._lead(), [], "task")
+        teamsmod._persist(state)
+        self._queue_member_joined("run-mdrain2", "aider")
+        teamsmod.interject("run-mdrain2", "hello")
+
+        def fail_call_lead(*a, **kw):
+            self.fail("_call_lead() was called while events were still queued")
+
+        orig = teamsmod._call_lead
+        teamsmod._call_lead = fail_call_lead
+        try:
+            teamsmod.team_step(state)  # round 1: membership drain only
+            self.assertEqual(state["history"][0]["tool"], "team_member_joined")
+            teamsmod.team_step(state)  # round 2: human drain only
+            self.assertEqual(state["history"][1]["tool"], "human_interject")
+        finally:
+            teamsmod._call_lead = orig
+
+    def test_idempotent_against_a_stale_cursor_replay(self):
+        # Defensive guard mirroring _recover_in_progress()'s own shape (docs/
+        # spec.md "Proposed approach" §2): draining the SAME event twice (a
+        # theoretical crash/resume replay from a stale membership_cursor)
+        # must not append "aider" to state["members"] a second time.
+        state = teamsmod._new_state("run-mdrain3", self.projdir, self._lead(), [], "task")
+        state["members"].append("aider")
+        state["worktrees"]["aider"] = "/x/proj.teams/aider"
+        teamsmod._persist(state)
+        self._queue_member_joined("run-mdrain3", "aider", worktree="/x/proj.teams/aider")
+
+        def fail_call_lead(*a, **kw):
+            self.fail("_call_lead() was called on a round that only drained membership")
+
+        orig = teamsmod._call_lead
+        teamsmod._call_lead = fail_call_lead
+        try:
+            teamsmod.team_step(state)
+        finally:
+            teamsmod._call_lead = orig
+
+        self.assertEqual(state["members"].count("aider"), 1)
+
+
+# ─── CLI: team-add-member (backlog item 21 part 1) ─────────────────────────
+class CliTeamAddMemberTests(_AddTeamMemberTestCase):
+    def test_parses_run_id_and_agent_positionals(self):
+        args = teamsmod._parse_args(["team-add-member", "abc", "aider"])
+        self.assertEqual(args.command, "team-add-member")
+        self.assertEqual(args.run_id, "abc")
+        self.assertEqual(args.agent, "aider")
+
+    def test_unknown_run_id_prints_error_exits_nonzero(self):
+        rc = teamsmod.main(["team-add-member", "no-such-run", "aider"])
+        self.assertEqual(rc, 1)
+
+    def test_rejection_prints_error_exits_nonzero_no_side_effect(self):
+        state = teamsmod._new_state("run-cli-cap", self.projdir, self._lead(), ["codex"], "task")
+        teamsmod._persist(state)
+        teamsmod.TEAM_MAX_MEMBERS = 1
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rc = teamsmod.main(["team-add-member", "run-cli-cap", "aider"])
+        self.assertEqual(rc, 1)
+        self.assertIn("error:", buf.getvalue())
 
 
 # ─── Tier 1: persistence + crash recovery ──────────────────────────────────

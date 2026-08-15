@@ -53,7 +53,8 @@ sudo scripts/gitea-configure-api.sh
 ```
 
 This prompts for the admin username and container name (both default to the
-values above), mints a `write:repository,write:user`-scoped Personal Access
+values above), mints a
+`write:repository,write:user,read:issue,write:issue`-scoped Personal Access
 Token directly via Gitea's own CLI (**no password is ever asked for or
 stored by this script** — it only needs `docker exec` access to the
 container), writes it into `/etc/ai-dev-switchboard/switchboard.env` as

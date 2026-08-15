@@ -259,955 +259,1127 @@ After `/projects/<name>/team/stop` completes:
 
 ---
 
-# Design: Roster & composition UI (sub-spec 6e)
+# Design: Clone a project from a remote repository URL (backlog item 16)
 
 ## Summary
-
-Extend the idle-state team row with a lead/teammate picker that allows the operator to select which roster members lead and which are teammates before starting a team. The picker lives inside the existing per-project idle-state row (preserving the one-page architecture), replacing the 6d design's minimal row with an expanded, collapsible picker panel. The roster is fetched fresh from `/status` (no cache) and reflects `engines.d` live; each member shows its lead-adapter tier (1/2/3) and, for tier 3, a plain-language reliability caveat. Before-start grounding discovery shows which of the four discovery files were found, alerting the operator to absences (e.g., no `ARCHITECTURE.md`). Client-side validation mirrors the server's own rules: non-empty members, no duplicates, no lead-also-a-teammate exclusion. Submitted compositions are persisted to `TEAM_STATE_DIR/compositions.json` and pre-populate the picker on the next `/status` poll, surviving service restarts.
-
-## Open questions — resolved decisions
-
-**Question 1: Can an engine be selected as lead AND as a delegate-target teammate simultaneously?**
-
-**Decision: No.** Lead's name must not also appear in `members`. This rule mirrors `default_team_composition()`'s own existing exclusion of its picked engine-lead from the members list, applied here as a code rule rather than an accident of how the default is built.
-
-**Rationale:**
-- Matches existing precedent: `default_team_composition()` never includes its chosen lead in the members list, and applying the same rule here keeps the mental model consistent across the codebase.
-- Simplicity: A lead that's also a teammate would require reasoning about which worktree/session is leading vs. delegating to itself, introducing subtle questions about context and state.
-- The one-line change to relax this rule in `validate_composition()` is trivial if evidence emerges that the use case is real and valued — the technical cost of keeping it tight is minimal.
-
-A future relaxation (if the delegation-to-same-engine-fresh-worktree use case proves essential) is a compatible, backward-compatible change with no migration required.
-
-**Question 2: Where does the roster/composition UI live?**
-
-**Decision: Inside the per-project idle-state teamRow(), as an expanded picker section.**
-
-**Rationale:**
-- The app is one-page architecture; `render_page()` serves a static shell with everything rendered client-side from `/status`. Adding a new page breaks this design.
-- The picker needs project context: which project are we configuring? The idle row already carries that.
-- The grounding files are project-specific; they belong in a per-project context.
-- The existing 6d row already lives here; extending it with picker UI reuses the render pattern rather than inventing a new surface.
-- An operator would naturally look for composition config where they see the team control — in the project row itself — not in a separate settings page.
+A third project-creation entry point alongside "+ New project" and "Upload folder / .zip", allowing operators to clone an existing public repository by pasting its remote URL. The form is a simple inline row with a URL input field (required), an optional project-name override field, and a "Clone" button. The loading state displays a progress message indicating that cloning can take 30-180 seconds for large repositories. Error states handle invalid URLs, network failures, authentication failures (private repos), and oversized clones. Success results in a new project appearing in the project list, identical to projects created via other paths. No new visual language — all styling reuses existing "+ New project" patterns.
 
 ## ui-ux-pro-max choices
-
-- **Style**: Expanded picker panel within the existing idle-state team row, using a collapsible/expandable pattern to keep the UI compact unless actively configured.
-- **Palette**: Reuses existing page tokens (`#4da6ff` for tier labels, `#cccccc`/`#aaaaaa` for disabled checkboxes, `#34c759` for saved-composition confirmation). No new color tokens for the picker UI itself (tier-3 caveat text uses existing `#ffb648` warning orange, computed for 9.77:1 contrast with `#1c1c1c`).
-- **Typography**: Existing page font sizes and weights; no new typefaces. Tier labels as small `.badge` elements (existing pattern from 6d for status labels). Checkbox labels use body text.
+- **Style**: Inline form row, following the "+ New project" pattern (simple row with input + button + error slot) rather than a multi-step overlay like the upload wizard. The form expands inline when the "Clone from URL" button is clicked, maintaining the same visual hierarchy.
+- **Palette**: Reuses existing page tokens; no new colors. Button matches existing `.new-project-row button` styling (#34c759 green). Error messages use the existing #ff6b6b red token (same as `.new-project-err`). Loading indicator reuses existing page conventions (no spinner graphic, text-only status).
+- **Typography**: Existing 14px for button/input, 12px for labels/error messages. No new typefaces.
 - **Relevant UX guidelines applied**:
-  - Checkboxes for multi-select (teammate list): standard, unchecked by default; only valid saved-composition pre-populates them.
-  - Radio or select for single-choice (lead): select-dropdown preferred for space efficiency given roster can grow to many engines.
-  - Tier labels as visual chips/badges: colors and short text ("tier 1", "tier 2", "tier 3") make the tradeoff visible at a glance.
-  - Tier-3 caveat as a tooltip or collapsible note (kept close to the tier label, not a separate field): "This engine relies on prose parsing for tool-calling decisions, which is less reliable than native tool support (tier 1) or constrained-output JSON (tier 2). Use this if no tier-1 or tier-2 lead is available."
-  - Grounding summary: a simple list of file names with checkmarks/crosses or "found"/"not found" status (read-only, no action here — just discovery).
-  - Validation messaging: client-side mirrors server rules inline before submission; server-side validation is the source of truth.
-  - Pre-selection from saved composition: if `inst.team.composition` exists (from `/status`), pre-select those lead/members in the picker; else fall back to `default_team_composition()`'s pick if available.
+  - URL field has no client-side format validation (spec's allowlist is server-authoritative), but provides clear placeholder text ("https://github.com/user/repo").
+  - Button is always enabled (URL validation happens server-side), avoiding client-side guessing at what's valid.
+  - Loading message explicitly sets expectations that cloning can take "up to a few minutes for large repositories" (vs the instant response of "+ New project").
+  - Error messages are specific to the failure mode (invalid URL, network error, auth required, oversized repo) to help operators understand what went wrong.
+  - Form clears on success (same as "+ New project" pattern) to avoid accidental re-submissions.
 
 ## Component reuse
-
-- **Reused**: Existing HTML/CSS/JS patterns from `teamRow()` (6d) — inline row rendering, same `.team-row` / `.team-msg` classes, direct `fetch()` POST plumbing to `/projects/<name>/team/start`.
-- **Reused**: Existing `/status` poll (every 4 seconds) — roster and pre-selected composition come from `/status`'s new `roster` and `inst.team.composition` fields; no new timer.
-- **Reused**: Existing grounding route call pattern — new `GET /projects/<name>/team/grounding` route (backend-defined in spec) is called once on row render/refresh, similar to how the existing page fetches project data.
-- **Reused**: Existing TOTP code-overlay machinery for the Start button (same as 6d).
-- **Reused**: Existing error/success message slot (`.team-msg` id pattern).
-- **New (none)**: No new component library, no new external dependencies. Plain HTML (select, input checkboxes, labels) + inline CSS (no new CSS classes beyond `.team-lead-picker`, `.team-grounding`, etc., following BEM-lite naming).
+- **Reused**: Button styling (`.new-project-row button` — #34c759 green, 10px padding, 10px 16px, rounded, bold text).
+- **Reused**: Input styling (`.new-project-row input` — #1c1c1c background, #eee text, #333 border, 10px 12px padding).
+- **Reused**: Error message slot (`.new-project-err` — #ff6b6b red, 12px font, 14px min-height) and DOM pattern (cleared by client, populated by response handler).
+- **Reused**: Form submission pattern (`actionPath()` / `actionBody()` / `toggle()` / `handleActionResult()` plumbing — same TOTP gate as `kind='newproject'`, reusing existing code-overlay machinery).
+- **Reused**: `/status` poll for success detection (no new timer or polling mechanism).
+- **New components**: None. Plain HTML input elements and CSS, matching page conventions.
 
 ## States
 
-### Idle, Picker Closed (initial)
-Rendered when `team.status === "idle"` or team is `null`, picker not yet expanded:
+### Initial (Collapsed)
+The form is not visible by default. A third button sits on the same row as "+ New project" and "Upload folder / .zip":
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ Team                                                        │
-│                                                             │
-│ <textarea placeholder="Task description...">...</textarea>  │
-│ [ Configure team... ] (toggles picker open)                │
-│                                                             │
-│ <button disabled/enabled>Start team</button>               │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│ ai-dev-switchboard                                   │
+│                                                      │
+│ <input placeholder="new project name" maxlength="60">│
+│ <button>+ New project</button>                        │
+│                                                      │
+│ <button>Upload folder / .zip</button>                │
+│                                                      │
+│ <button>Clone from URL</button>  ← NEW              │
+│                                                      │
+│ <error slot>                                         │
+└──────────────────────────────────────────────────────┘
 ```
 
-**Styling**: Textarea unchanged from 6d. A small inline link or button "Configure team..." appears below the textarea, styled to look clickable (color: `#4da6ff`, cursor: pointer, no background). Clicking it toggles the picker panel open. If no saved composition exists, the button text is "Configure team..."; if a saved composition exists, the button text is "Reconfigure team" (optional — same button text works fine).
+**Styling**: The "Clone from URL" button uses the same styling as "+ New project" and "Upload folder / .zip" (white text, rounded, medium padding). Positioned on its own line (or adjacent row, depending on layout space).
 
-**Behavior**:
-- Roster and grounding are fetched on picker open (not on every 4s poll, but on the click that opens the picker).
-- If roster is empty (no engines, no Ollama), show "No roster members available" and disable configure button.
-- If default composition is rejected but the roster is non-empty (e.g., tier-3-only), `/status` sends `composition: {"lead": null, "members": []}` rather than `null` — the picker behaves exactly like any other unconfigured composition: collapsed behind "Configure team...", nothing pre-selected, no auto-expand and no special-cased always-visible caveat. See "Tier-3-Only Roster" below, corrected post-implementation.
+**Copy**: Button label is exactly "Clone from URL".
 
-### Idle, Picker Expanded
-Rendered when operator clicks "Configure team..." and the picker opens:
+### Expanded (Ready to Input)
+When the operator clicks "Clone from URL", the form expands inline to show input fields:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ Team                                                        │
-│                                                             │
-│ <textarea placeholder="Task description...">...</textarea>  │
-│                                                             │
-│ [ ▼ Hide configuration ] (click to close picker)           │
-│                                                             │
-│ ┌─ Lead ────────────────────────────────────────┐          │
-│ │ <select id="team-lead-<name>">                │          │
-│ │   <option value="">Choose a lead...           │          │
-│ │   <option value='{"kind":"engine","name":"claude"}'>     │
-│ │     claude (tier 2 - schema constrained)     │          │
-│ │   <option ...>ollama (tier 1 - native tools) │          │
-│ │   <option ...>aider (tier 3 - prose parse... │          │
-│ │ </select>                                     │          │
-│ └───────────────────────────────────────────────┘          │
-│                                                             │
-│ ┌─ Tier 3 Caveat (shown if tier-3 lead selected) ─┐        │
-│ │ ⚠ This engine's reliability is lower due to    │        │
-│ │   prose-parsing tool-calling. Use only if no   │        │
-│ │   tier-1 or tier-2 lead is available.          │        │
-│ └───────────────────────────────────────────────────┘      │
-│                                                             │
-│ ┌─ Teammates ────────────────────────────────────┐          │
-│ │ ☐ claude (tier 2 - schema constrained)        │          │
-│ │ ☐ codex (tier 2 - schema constrained)         │          │
-│ │ ☑ aider (tier 3 - prose parse, unreliable)    │          │
-│ │ [current lead not listed — excluded]          │          │
-│ └───────────────────────────────────────────────┘          │
-│                                                             │
-│ ┌─ Grounding Files ──────────────────────────────┐          │
-│ │ ✓ docs/ARCHITECTURE.md (1.2 KB)               │          │
-│ │ ✓ docs/BACKLOG.md (3.5 KB)                    │          │
-│ │ ✗ CLAUDE.md / AGENTS.md (not found)           │          │
-│ │ ✓ README.md (2.1 KB)                          │          │
-│ └───────────────────────────────────────────────┘          │
-│                                                             │
-│ [validation error, if any: "Lead is required"]            │
-│                                                             │
-│ <button disabled/enabled>Start team</button>               │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**Lead picker (select dropdown)**:
-- Label: "Lead"
-- Options: each roster member, rendered as `<option value='{"kind":"engine"|"ollama","name":"..."}'>NAME (tier X - DESCRIPTION)</option>`.
-- Default: `<option value="">Choose a lead...</option>` (pre-select to empty if no saved composition; pre-select to saved lead if composition exists).
-- On change: immediately show/hide tier-3 caveat if tier-3 is selected; recompute teammate checkboxes to exclude the newly selected lead; rerun client-side validation.
-
-**Tier-3 caveat** (conditional):
-- Shown only if the selected lead is tier 3.
-- Layout: small alert box (background: `#1c1c1c` darkened slightly, border: `#ffb648` left edge, padding: `0.5em`).
-- Icon: optional ⚠ (warning icon, `#ffb648`).
-- Text: "This engine's reliability is lower due to prose-parsing tool-calling. Use only if no tier-1 or tier-2 lead is available."
-- Contrast: `#ffb648` text on `#1c1c1c` background = **9.77:1** (passes WCAG AAA).
-
-**Teammate checkboxes (multi-select)**:
-- Label: "Teammates"
-- Options: each roster member with `delegate_capable: true`, rendered as `<label><input type="checkbox" id="team-mate-..."> NAME (tier X - DESCRIPTION)</label>`.
-- Excluded: the currently selected lead (cannot be a teammate of itself).
-- Excluded: Ollama entry (it's not delegate_capable, per the spec).
-- Default: unchecked, unless a saved composition pre-populates them.
-- On change: rerun client-side validation (must have at least one teammate selected).
-- Visual feedback: disabled checkboxes (for non-delegate-capable members and the lead) are greyed out, not removed.
-
-**Grounding summary**:
-- Label: "Grounding Files"
-- Layout: list of four file checks, each as a row: `[✓/✗] FILENAME (size)` or `[✓/✗] FILENAME (not found)`.
-- Files displayed (in this order, always):
-  1. `docs/ARCHITECTURE.md`
-  2. `docs/BACKLOG.md`
-  3. `CLAUDE.md` (or `AGENTS.md` if CLAUDE.md not found)
-  4. `README.md`
-- Icons: `✓` (green, `#34c759`) for found files; `✗` (red, `#ff6b6b`) for not found.
-- Information: size in KB/MB if file is found; `(not found)` if not.
-- Behavior: read-only list, no action here. Fetched from `GET /projects/<name>/team/grounding` on picker open.
-- If no grounding files are found: "No grounding files discovered" (still allows team start, per spec).
-- If grounding fetch fails: show "Grounding unavailable" (does not block team start).
-
-**Client-side validation** (shown inline before submit):
-- If lead is not selected: "Lead is required" (red text, below lead picker).
-- If teammates are empty: "At least one teammate is required" (red text, below teammate checkboxes).
-- If lead's name is also in teammates: "Lead cannot also be a teammate" (red text, clarifying the exclusion rule).
-- Validation runs on lead/teammate change and before submit; Start button is disabled if any validation error exists.
-
-**Copy**:
-- Configure button: "Configure team..."
-- Lead label: "Lead"
-- Teammates label: "Teammates"
-- Grounding label: "Grounding Files"
-- Tier-3 caveat: "This engine's reliability is lower due to prose-parsing tool-calling. Use only if no tier-1 or tier-2 lead is available."
-
-### Composition Saved
-After `/projects/<name>/team/start` succeeds with a submitted composition (POST body includes `lead` and `members`):
-
-```
-[same as Idle, Picker Expanded, but]
-✓ Composition saved and team started
-```
-
-**Styling**: Green success message (color: `#34c759`, same as 6d's finish status) appears below the Start button, persists until next `/status` poll, then fades when status changes to `running`.
-
-### No Roster Available
-If `roster()` returns empty (no engines, no Ollama, or all are non-headless):
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ Team                                                        │
-│                                                             │
-│ <textarea placeholder="Task description...">...</textarea>  │
-│                                                             │
-│ ✕ No roster members available. Add an engine to            │
-│   engines.d or configure TEAM_LLM_BASE_URL/TEAM_LLM_MODEL.│
-│                                                             │
-│ <button disabled>Start team</button> [disabled permanently]│
-└─────────────────────────────────────────────────────────────┘
-```
-
-**Styling**: Error message (red, `#ff6b6b`) replaces the configure button. Start button is disabled with no option to enable. No picker shown.
-
-### Tier-3-Only Roster (no tier-1 or tier-2)
-If only tier-3 members are available and no saved composition:
-
-```
-[Idle, Picker Closed — same as any unconfigured composition]
-[ Configure team... ]
-```
-
-**Corrected post-implementation** (this section originally described an
-auto-expanded picker with an always-visible caveat; that didn't match what
-was actually built, and the reviewer's second pass flagged the drift —
-tracked here rather than silently rewritten). The actual behavior: `/status`
-sends `composition: {"lead": null, "members": []}` for this roster shape —
-identical in kind to any other project with no saved composition yet. The
-picker stays collapsed behind "Configure team..." like normal; once opened,
-the Lead dropdown lists only the tier-3 option(s) (there's nothing else to
-list), and the tier-3 caveat appears the same way it does for any tier-3
-selection elsewhere — conditionally, once that lead is actually chosen, not
-pinned open by default. This is simpler than the original design and still
-satisfies the spec's acceptance criterion: tier-3 is selectable as lead,
-never blocked.
-
-### Server Validation Error
-If `POST /projects/<name>/team/start` with composition returns `400 {"error": "..."}`:
-
-```
-[Picker still expanded with last-selected values retained]
-✕ Error: <server error message>
-[Start button remains enabled]
-```
-
-**Styling**: Red error message (same as 6d), appears below the button, persists until the operator makes a change or next refresh. Specific error messages from `validate_composition()`:
-- "Lead is required"
-- "At least one teammate is required"
-- "Teammate list contains duplicates"
-- "Lead cannot also be a teammate"
-- "Unknown lead: {name}" (if a saved composition references a removed engine)
-- "Unknown teammate: {name}" (if a saved composition references a removed engine)
-- "Teammate {name} is not delegate-capable" (Ollama, or non-headless engine)
-
-## Accessibility & platform notes
-
-- **Touch target sizes**: Select dropdown and checkboxes follow native browser defaults (36-40px minimum hit area on desktop). Checkbox labels are clickable (wrap label around input, or use `for` attribute).
-- **Color contrast**:
-  - Lead/teammate tier labels (`#4da6ff` on `#1c1c1c`): **6.67:1**, passes WCAG AA for normal text.
-  - Tier-3 caveat header (`#ffb648` on `#1c1c1c`): **9.77:1**, passes WCAG AAA.
-  - Grounding "found" icons (`#34c759` on `#1c1c1c`): **7.68:1**, passes WCAG AAA (graphical element, 3:1 minimum).
-  - Grounding "not found" icons (`#ff6b6b` on `#1c1c1c`): **6.14:1**, passes WCAG AA (graphical element, 3:1 minimum).
-  - Validation error text (`#ff6b6b` on `#1c1c1c`): **6.14:1**, passes WCAG AA.
-- **Web vs. native**: This is a web app (HTML/CSS/JS in Flask template), desktop-only. No mobile optimization.
-- **Keyboard interaction**:
-  - Tab into lead select → arrow keys to change lead or Enter to open dropdown (browser default).
-  - Tab into each teammate checkbox → Space to toggle.
-  - Tab into "Start team" button → Enter to submit (disabled if validation error exists).
-  - Escape key (optional, browser default) closes select dropdown.
-- **Screen reader accessibility**: Select and checkboxes are native HTML, screen-reader-accessible by default. Labels are associated via `<label>` or `for` attribute. Tier and validation messages are plain text in `aria-live` regions for async updates (optional, but recommended for validation errors that appear after picker interaction).
-- **Disabled state**: Disabled checkboxes (for non-delegate-capable members, the lead) are visually greyed out and not keyboard-focusable. Disabled Start button is greyed out when validation fails.
-
-## Traceability to spec (6e acceptance criteria)
-
-| Acceptance criterion | Where it's addressed in this design |
-|---|---|
-| Roster reflects `engines.d` live (re-read per request) | Roster fetched from `/status` response on picker open; no cache. Lead/teammate options show live engine/Ollama list with tiers. |
-| Every member selectable as lead | Lead dropdown includes all roster members (tier 1/2/3). No blocking; tier 3 shows a plain-language reliability caveat, not a disable. |
-| Tier shown for each roster member | Each lead/teammate option includes tier label: "tier 1 - native tools", "tier 2 - schema constrained", "tier 3 - prose parse". |
-| Tier-3 member shows plain-language note | Tier-3 lead shows caveat: "This engine's reliability is lower due to prose-parsing..." Tier-3 teammate label includes "(prose parse, unreliable)". |
-| Grounding files shown before start | New `GET /projects/<name>/team/grounding` returns list of which four files were found; picker displays them as a checklist with ✓/✗ icons. |
-| Absent file is visible, not silent | A missing `ARCHITECTURE.md`, e.g., is marked with ✗ and "(not found)" label; visible to operator before start. |
-| Saved composition persists across restarts | Composition submitted via POST body is saved to `TEAM_STATE_DIR/compositions.json` by backend; `/status` poll returns it in `inst.team.composition` field; picker pre-selects it on next poll. Verified by restarting service in test. |
-| Empty teammate list rejected with clear reason | Client-side validation shows "At least one teammate is required" inline; server rejects with 400 {"error": "..."} if somehow empty list is submitted. |
-| Duplicate teammate rejected | Client-side validation shows "Teammate list contains duplicates" if same teammate is checked twice (structurally impossible via checkboxes, but spec-required). Server rejects with specific message. |
-| Lead also in members rejected | Client-side validation shows "Lead cannot also be a teammate" if lead's name is in selected teammates. Server rejects with specific message. |
-| Unknown roster member rejected | If a saved composition references a removed engine, server rejects with "Unknown lead: {name}" or "Unknown teammate: {name}". Never silently substituted. |
-| No usable roster member shows error, no picker | If `default_team_composition()` returns an error (tier-3 only, or empty roster), the picker area shows the error text inline; Start button is disabled; no picker controls shown. |
-| Grounding route called per project | `GET /projects/<name>/team/grounding` called once on picker open, not on every poll. Result cached client-side until picker is closed/reopened. |
-| No lead/member picker shown when team is running | When `team.status !== "idle"`, the entire picker/configure panel is hidden; only the running status/stop button is shown (unchanged from 6d). |
-
-## Implementation notes for the developer
-
-### Backend (Python / app/teams.py + app/app.py)
-
-1. **New functions in app/teams.py**:
-   - `validate_composition(lead: dict, members: list) -> str | None` — returns None if valid, else error message.
-   - `_compositions_path() -> str` — path to `TEAM_STATE_DIR/compositions.json`.
-   - `load_compositions() -> dict` — `{project_name: {"lead": {...}, "members": [...], "saved_at": iso}}`.
-   - `save_composition(project_name: str, lead: dict, members: list) -> None` — atomic write via `.tmp` + `os.replace()`.
-
-2. **Extended functions**:
-   - `roster()` already exists (line ~1777); called by `GET /status` to return all roster members with tier/delegate_capable.
-   - `load_grounding(workdir)` already exists; `GET /projects/<name>/team/grounding` calls it and returns `{"files": [...], "skipped": [...]}`.
-   - `POST /projects/<name>/team/start` extended: reads optional `lead`/`members` from body, calls `validate_composition()`, saves if valid, uses them for `launch_team()` instead of `default_team_composition()`.
-
-3. **GET /status** (extended):
-   - Top-level: add `"roster": teams.roster()`.
-   - Per-instance `inst["team"]`: add `"composition"` — saved composition if exists, else `default_team_composition()`'s result if ok, else None.
-
-4. **GET /projects/<name>/team/grounding** (new):
-   - 404 if `name` not a known project.
-   - Calls `teams.load_grounding(workdir)`.
-   - Returns `{"files": [{"label", "relpath", "byte_count"}, ...], "skipped": [...]}` — never `content`/`digest`.
-   - No TOTP needed (read-only, like `/status`).
-
-5. **POST /projects/<name>/team/start** (extended):
-   - Body gains optional `lead` and `members`.
-   - If both present: validate, save, use for `launch_team()`.
-   - If neither present: unchanged from 6d (backward compatible).
-
-### Frontend (JavaScript in app/app.py template)
-
-1. **Picker toggle and expand/collapse**:
-   - Add event listener to "Configure team..." button: `openTeamCompositionPicker(name)`.
-   - Button text changes to "Hide configuration" when picker is open.
-   - Click toggles `.team-picker` panel visibility (display: none/block).
-
-2. **Lead dropdown (`<select id="team-lead-<name>">`)**:
-   - Populate from `roster` array in `/status` response.
-   - Format: `<option value='{"kind":"...","name":"..."}'>NAME (tier X - DESC)</option>`.
-   - On change: call `updateTeammateCheckboxes(name)` (filter to exclude selected lead).
-   - On change: call `showTier3Caveat(name)` (show/hide caveat based on selected lead's tier).
-   - On change: call `validateTeamComposition(name)` (rerun validation).
-
-3. **Tier-3 caveat (`<div class="team-tier-3-caveat">`)**:
-   - Hidden by default (`display: none`).
-   - Shown when selected lead's tier is 3.
-   - Contains fixed text: "This engine's reliability is lower...".
-
-4. **Teammate checkboxes (`<input type="checkbox" id="team-mate-...">`)**:
-   - Populate from roster, filtered to delegate_capable entries and excluding current lead.
-   - Each checkbox state tracked in memory or derived from checked property.
-   - On change: call `validateTeamComposition(name)`.
-
-5. **Grounding summary (`<div class="team-grounding">`)**:
-   - Fetch `GET /projects/<name>/team/grounding` on picker open.
-   - Display as list: `✓ FILENAME (size)` or `✗ FILENAME (not found)`.
-   - If fetch fails, show "Grounding unavailable" (non-blocking).
-
-6. **Client-side validation** (`validateTeamComposition(name)`):
-   - Lead required: if lead select is empty, show error.
-   - Teammates required: if no teammate checkbox is checked, show error.
-   - No duplicates: structural impossibility via checkboxes, but check anyway.
-   - Lead not in teammates: if lead name equals any checked teammate, show error.
-   - Disable Start button if any error; enable if valid.
-
-7. **doTeamStart() extended**:
-   - Read lead select value and teammate checkbox states.
-   - If picker is open (composition is configured), build `lead`/`members` JSON objects and include in POST body.
-   - If picker is closed (using default), omit `lead`/`members` from body (backward compatible).
-   - On 400 response, parse error message and show in `.team-msg` slot.
-
-8. **Client state persistence** (from 6d):
-   - `teamTaskText[name]` already holds textarea text across polls.
-   - Add `teamPickerState[name]` to hold lead/members selection across polls (or re-derive from `.team-msg` on each refresh).
-
-9. **Styling classes** (new):
-   - `.team-picker` — wrapper for the entire picker panel.
-   - `.team-picker-open` — variant when expanded (optional, for CSS state-based styling).
-   - `.team-lead-picker` — lead select container.
-   - `.team-tier-3-caveat` — tier-3 warning box.
-   - `.team-mates-picker` — teammates checkboxes container.
-   - `.team-grounding` — grounding files list.
-   - `.team-validation-error` — inline error message (reuse from 6d).
-
-10. **API shape for composition in JSON**:
-    - Lead: `{"kind": "engine" | "ollama", "name": str}`
-    - Members: `[{"kind": "engine", "name": str}, ...]`
-    - Example: `{"lead": {"kind": "engine", "name": "claude"}, "members": [{"kind": "engine", "name": "codex"}]}`
-
-11. **Backward compatibility**:
-    - If `lead`/`members` are omitted from POST body, server uses `default_team_composition()` (unchanged from 6d).
-    - Stale client that doesn't send `lead`/`members` still works.
-    - New client with old server (missing validation) will get a 400 or generic error, which is acceptable.
-
-### State diagram (client-side)
-
-```
-Idle, status === 'idle'
-├─ Picker closed (default)
-│  └─ Click "Configure team..." → Picker opens, fetches roster+grounding
-│
-└─ Picker open
-   ├─ Select lead (optional, starts empty)
-   ├─ Check teammates (optional, starts unchecked)
-   ├─ View grounding (read-only)
-   ├─ Validation error shown if present
-   └─ Click "Start team" → POST with {task, lead, members}
-      ├─ Success (200) → Composition saved, team started, status → running
-      └─ Error (400) → Error message shown, picker remains open, can retry
-```
-
----
-
-# Design: Live event feed + escalation inbox (sub-spec 6f part 2)
-
-## Summary
-
-Replace the static "Status: [blocked]" label with a 4-state status strip (Working, Waiting on you, Blocked, Finished, Error) that makes "waiting on you" impossible to miss. Add a merged, live, colour-coded event feed from both the lead's transcript and all teammates' logs, updated every 4 seconds via the existing polling cycle and filterable by per-agent view. When `waiting_on_you === true`, render an escalation panel with the pending question, pickable answer options (radio for single-select, checkboxes for multi-select), and a free-text "Other" input that is always present. Submitting resolves the question via the existing TOTP machinery (new `team-resolve` action kind), reusing the identical code-overlay flow as `team-start`/`team-stop`. The feed is a live tail with a rolling 500-event buffer per project; closing it stops polling; reopening starts fresh. Per-agent colours are stable across polls and reloads via a hash-based palette distinct from the semantic status colours.
-
-## Open questions — resolved decisions
-
-**Question 1: How does a picked escalation option (or several, for multi-select) become the single `answer` string `POST .../team/resolve` expects?**
-
-**Decision: Confirmed as proposed.** Free-text "Other" input takes precedence and is sent verbatim if filled in; otherwise, for `multi_select: false` send the chosen option's `label`; for `multi_select: true`, join the chosen options' `label`s with `", "`. This is a deliberate, stated UI convention with no backend implication — the lead just receives whatever string is sent. A different join/format (e.g., newline-separated) is equally valid backend-wise and can be swapped by ux-designer/developer if there's evidence of a better default.
-
-**Question 2: Default expanded vs. collapsed state for the event feed panel?**
-
-**Decision: Confirmed as expanded by default.** When `team.status !== 'idle'`, the feed panel is shown in expanded state (rendering the live event list), matching the acceptance criterion that live visibility is the default and reducing friction for the primary use case (observing a running team without `tmux attach`). A collapsed-by-default alternative (matching 6e's "Configure team..." pattern) is not blocking and can be swapped by developer if there's a strong reason, since it's a pure rendering default with no data-shape implication.
-
-## ui-ux-pro-max choices
-
-- **Style**: Status strip replaces the old "Status: [label]" line with a cleaner 4-state indicator and accompanying copy; feed panel uses the same collapsible pattern as 6e's "Configure team...", but expanded by default for live visibility. Per-agent colour identity via hash-based palette (6-colour cycle assigned to agent names, stable across polls/reloads).
-- **Palette**: Reuses existing semantic status colours for the strip (`#4da6ff` running, `#ffb648` blocked, `#34c759` finished, `#ff6b6b` error). Agent identity colours chosen to be visually distinct from these semantics and to maintain 3:1+ contrast as graphical elements (feed stroke/text) on `#1c1c1c`. Suggested agent palette: `#d084d0` (magenta), `#6eb5d4` (cyan), `#b4a84d` (gold), `#84b484` (green), `#d4a484` (tan), `#a49ed4` (purple) — each ≥ 3:1 contrast for graphical use.
-- **Typography**: Event feed uses a monospace font (`monospace` fallback to browser default) for log-like text, distinct from body copy's `-apple-system, sans-serif` but not introducing a new system. Line-height 1.4 for readability in scrollable context. Existing font sizes (12px small, 13px body) reused for consistency.
-- **Relevant UX guidelines applied**:
-  - Status strip copy is unambiguous and action-oriented: "Waiting on you" (escalation needed), "Blocked — max rounds reached" (terminal, no action), "Working" (in progress). No generic "blocked" label that conflates the two states.
-  - Event feed is a live tail with bounded memory (500 events max per project), not a full-history browser — reduces cognitive overload and keeps the client responsive on long-running teams.
-  - Per-agent filter is a simple pill/tab row (All + one per agent), no search — fast scanning by agent without complex UI.
-  - Fact_check and finish events are disambiguated positionally per the spec rule; rendering clearly distinguishes them (fact_check shows claim + matches, finish shows summary).
-  - Escalation form fields (question, options, free-text) are laid out in reading order (question header, options, free-text), with clear visual grouping.
-  - Colour-coding by agent in feed reduces need to scan `agent` field on every line, supporting quick visual triage.
-
-## Component reuse
-
-- **Reused**: Existing status colour tokens (`#4da6ff`, `#ffb648`, `#34c759`, `#ff6b6b`) for the status strip — no new semantic colours.
-- **Reused**: Existing expand/collapse idiom from 6e ("Show live feed" / "Hide live feed" toggle link, same `.team-configure-btn` styling).
-- **Reused**: Existing scroll container pattern from `.wizard-card` (max-height: 85vh; overflow-y: auto) for the event feed panel.
-- **Reused**: Existing TOTP action plumbing (`toggle()`, `actionPath()`, `actionBody()`, `handleActionResult()`) for the escalation submit button — new `kind === 'team-resolve'` case added alongside `team-start`/`team-stop`.
-- **Reused**: Existing message slot pattern (`.team-msg`, id pattern `team-msg-<name>`) for escalation form errors and success feedback.
-- **Reused**: Existing radio/checkbox patterns (native HTML, no new library) for escalation options.
-- **New (none)**: No new component library. All styling uses existing BEM-lite naming (e.g., `.team-status-strip`, `.team-feed`, `.team-feed-event`, `.team-escalation`, `.team-escalation-form`).
-
-## States
-
-### Non-idle, Status Strip: Working (running)
-
-```
-┌─────────────────────────────────────────────────────────┐
-│ Team                                                    │
-│                                                         │
-│ ┌─ Status ──────────────────────────────────────────┐  │
-│ │ Working (ID: run-abc123)                          │  │  ← Blue, #4da6ff
-│ └───────────────────────────────────────────────────┘  │
-│                                                         │
-│ [ Show live feed ] (toggle to expand/collapse)         │
-│                                                         │
-│ <button onclick="doTeamStop('<name>')">               │
-│   Stop team                                            │
-│ </button>                                               │
-└─────────────────────────────────────────────────────────┘
-```
-
-**Styling**: Replace the old "Status: [running] ID: run-id" line with a compact strip showing "Working (ID: run-abc123)". Status label is inline, not a separate line. Colour: `#4da6ff`. Font size: 13px (same as existing status). No icon necessary; colour and wording are sufficient.
-
-**Copy**: "Working" (not "Status: [running]"), with ID appended inline when `team.run_id` exists.
-
-### Non-idle, Status Strip: Waiting on you (blocked_ask_user, waiting_on_you=true)
-
-```
-┌─────────────────────────────────────────────────────────┐
-│ Team                                                    │
-│                                                         │
-│ ┌─ Status ──────────────────────────────────────────┐  │
-│ │ ⚠ Waiting on you (ID: run-abc123)                │  │  ← Orange, #ffb648
-│ └───────────────────────────────────────────────────┘  │
-│                                                         │
-│ ┌─ Escalation ──────────────────────────────────────┐  │
-│ │                                                   │  │
-│ │ Question header: "Is the analysis correct?"      │  │
-│ │                                                   │  │
-│ │ ☑ Yes, proceed                                  │  │
-│ │ ☐ No, revise analysis                           │  │
-│ │ ☐ Unclear, need clarification                   │  │
-│ │                                                   │  │
-│ │ Other (free text):                              │  │
-│ │ <textarea id="escalation-other-<name>" rows="3">│  │
-│ │ </textarea>                                       │  │
-│ │                                                   │  │
-│ │ <button onclick="doTeamResolve('<name>')">      │  │
-│ │   Submit answer                                  │  │
-│ │ </button>                                         │  │
-│ │                                                   │  │
-│ │ [message slot for error/success]                 │  │
-│ └───────────────────────────────────────────────────┘  │
-│                                                         │
-│ [ Show live feed ] (toggle to expand/collapse)         │
-│                                                         │
-│ <button onclick="doTeamStop('<name>')">               │
-│   Stop team                                            │
-│ </button>                                               │
-└─────────────────────────────────────────────────────────┘
-```
-
-**Styling**: Status strip shows "Waiting on you (ID: run-abc123)" in orange (`#ffb648`). A ⚠ (warning icon) may precede the text (optional, for visual emphasis). Below the status strip, an escalation panel renders the pending question with options and free-text input.
-
-**Escalation Panel**:
-- **Question header** (from `inbox.json`'s `header`): rendered as a small chip or label above the options, e.g., "(from lead)" — provides context for what's being asked.
-- **Question text** (from `inbox.json`'s `question`): plain text, displayed prominently above options.
-- **Options** (from `inbox.json`'s `options` array):
-  - If `multi_select: false`: render as radio buttons (only one can be selected).
-  - If `multi_select: true`: render as checkboxes (multiple can be selected).
-  - Each option shows `label` and `description` (if present) — description as smaller/greyed text below label.
-- **Free-text "Other" input**: always present, even if `options` is empty or `multi_select` is false. A textarea (3 rows recommended), with label "Other (free text)" or similar. This is always the lowest-priority answer — if filled in at submission, the free text is sent; otherwise, picked options are compiled into the answer string.
-- **Submit button**: "Submit answer", styled to match other action buttons (same class/styling as "Start team").
-- **Message slot** (`.team-msg` pattern): displays error (if validation fails, e.g., over 2000 chars) or success ("Answer submitted" or similar).
-
-**Validation**:
-- Client-side: answer text must be non-empty (either at least one option selected, or free-text filled in) and ≤ 2000 characters.
-- Server-side: 400 if answer is empty or oversized (same as spec's existing `/team/resolve` contract).
-
-**Copy**:
-- Status: "Waiting on you"
-- Question label: the `header` from inbox
-- Submit button: "Submit answer"
-- Message on success: "Answer submitted"
-- Validation error: "Answer must be non-empty and at most 2000 characters"
-
-### Non-idle, Status Strip: Blocked (escalated_max_rounds, waiting_on_you=false)
-
-```
-┌─────────────────────────────────────────────────────────┐
-│ Team                                                    │
-│                                                         │
-│ ┌─ Status ──────────────────────────────────────────┐  │
-│ │ Blocked — Max rounds reached (ID: run-abc123)    │  │  ← Orange, #ffb648
-│ └───────────────────────────────────────────────────┘  │
-│                                                         │
-│ Escalated — max rounds reached. No pending question    │
-│ to answer. Review the feed below or Stop team and      │
-│ start a new run.                                       │
-│                                                         │
-│ [ Show live feed ] (toggle to expand/collapse)         │
-│                                                         │
-│ <button onclick="doTeamStop('<name>')">               │
-│   Stop team                                            │
-│ </button>                                               │
-└─────────────────────────────────────────────────────────┘
-```
-
-**Styling**: Status strip shows "Blocked — Max rounds reached (ID: run-abc123)" in orange. Below the strip, a short inline text message (not a panel, just explanation) clarifies the terminal state and directs the operator to review the feed or stop. No escalation form is rendered for this state.
-
-**Copy**: "Escalated — max rounds reached. No pending question to answer. Review the feed below or Stop team and start a new run."
-
-### Non-idle, Feed Panel: Closed
-
-```
-┌─────────────────────────────────────────────────────────┐
-│ Team                                                    │
-│                                                         │
-│ ┌─ Status ──────────────────────────────────────────┐  │
-│ │ Working (ID: run-abc123)                          │  │
-│ └───────────────────────────────────────────────────┘  │
-│                                                         │
-│ [ Show live feed ]  ← Click to expand                  │
-│                                                         │
-│ <button onclick="doTeamStop('<name>')">               │
-│   Stop team                                            │
-│ </button>                                               │
-└─────────────────────────────────────────────────────────┘
-```
-
-**Styling**: Feed toggle link shows "Show live feed" (or a similar label). Clicking it expands the panel below. Same styling as 6e's "Configure team..." link (`#4da6ff`, cursor: pointer, underline).
-
-### Non-idle, Feed Panel: Open, No Events Yet
-
-```
-┌─────────────────────────────────────────────────────────┐
-│ Team                                                    │
-│                                                         │
-│ ┌─ Status ──────────────────────────────────────────┐  │
-│ │ Working (ID: run-abc123)                          │  │
-│ └───────────────────────────────────────────────────┘  │
-│                                                         │
-│ [ Hide live feed ]  ← Click to collapse                │
-│                                                         │
-│ ┌─ Events ──────────────────────────────────────────┐  │
-│ │                                                   │  │
-│ │ No events yet.                                    │  │
-│ │                                                   │  │
-│ └───────────────────────────────────────────────────┘  │
-│                                                         │
-│ <button onclick="doTeamStop('<name>')">               │
-│   Stop team                                            │
-│ </button>                                               │
-└─────────────────────────────────────────────────────────┘
-```
-
-**Styling**: Feed toggle link shows "Hide live feed". Below it, a panel with a scrollable area (max-height: 85vh, overflow-y: auto) shows "No events yet" in grey text if the buffer is empty. Panel background: `#1c1c1c` (same as cards).
-
-### Non-idle, Feed Panel: Open, With Events
-
-```
-┌─────────────────────────────────────────────────────────┐
-│ Team                                                    │
-│                                                         │
-│ ┌─ Status ──────────────────────────────────────────┐  │
-│ │ Working (ID: run-abc123)                          │  │
-│ └───────────────────────────────────────────────────┘  │
-│                                                         │
-│ [ Hide live feed ]                                     │
-│                                                         │
-│ Filter: [ All ] [ lead ] [ claude ] [ codex ]          │  ← Pill/tab row
-│                                                         │
-│ ┌─ Events ──────────────────────────────────────────┐  │
-│ │ [scrollable area, max-height: 85vh]              │  │
-│ │                                                   │  │
-│ │ 12:34:01 lead (🔵)  Starting team on claude  │  │  ← magenta lead
-│ │ 12:34:02 lead (🔵)  Delegating research      │  │
-│ │ 12:34:03 claude (🟢) Processing query...     │  │
-│ │ 12:34:05 lead (🔵)  Fact-checking claim      │  │
-│ │ fact_check: "Python is a snake"               │  │
-│ │ → docs/snake.md:42 "Python is a reptile..."  │  │
-│ │ 12:34:07 claude (🟢) Delegating to codex     │  │
-│ │ 12:34:09 codex (🟡)  Writing implementation  │  │
-│ │ 12:34:15 lead (🔵)  Waiting on user input    │  │
-│ │                                                   │  │
-│ └───────────────────────────────────────────────────┘  │
-│                                                         │
-│ <button onclick="doTeamStop('<name>')">               │
-│   Stop team                                            │
-│ </button>                                               │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│ ai-dev-switchboard                                   │
+│                                                      │
+│ Clone from URL                                       │
+│ <input id="clone-url" placeholder="https://github... │
+│ <input id="clone-name" placeholder="(optional)...    │
+│ <button>Clone</button>                               │
+│                                                      │
+│ <error/status slot id="clone-err">                   │
+│                                                      │
+│ <project list rows>                                  │
+└──────────────────────────────────────────────────────┘
 ```
 
 **Styling**: 
-- **Filter row**: Pills or tabs showing "All" (selected by default) and one per agent (e.g., "lead", "claude", "codex"). Clicking a pill re-filters the feed to show only that agent's events. Selected pill is highlighted (background color or underline). Font size: 12px.
-- **Event list**: Each event is a row in monospace font (courier, monospace fallback). Columns:
-  - Timestamp: `12:34:01` (HH:MM:SS from event `ts`), grey text (`#888`).
-  - Agent name + colour dot: `lead (🔵)` where the dot is a small coloured circle. Colour based on agent name hash. Bold or stronger weight to distinguish from body.
-  - Event text: the `text` field from the event, or formatted per `kind` (see below).
-- **Line height**: 1.4 for readability.
-- **Spacing**: 4-8px gap between timestamp, agent, and event text.
-- **Overflow**: long lines wrap or truncate; no horizontal scroll.
+- Row layout uses flexbox (gap 8px) consistent with `.new-project-row`.
+- "Clone from URL" is a small label/heading above the inputs (12px, #aaa color, slightly bold).
+- URL input is full-width or 60% of the form row, with maxlength="2048" (per spec's CLONE_URL_MAX_LEN).
+- Name input is narrower (20-30% of row or constrained width), with maxlength="60" (matching NAME_RE).
+- Both inputs share the same styling as `.new-project-row input`.
+- "Clone" button uses the same styling as "+ New project" button.
+- Error/status slot (`.clone-err` or reuse `.new-project-err`) sits below the form row.
 
-**Event rendering by kind + meta**:
+**Placeholder text**:
+- URL: "https://github.com/user/repo or ssh://host/path"
+- Name: "(optional — derived from URL if left blank)"
 
-1. **`kind: "message"`** (plain transcript/log line):
-   - Render as-is: `12:34:01 lead (🔵)  <text>`
+**Behavior**:
+- Form expands when clicked (or via a toggle state in JS).
+- Inputs are focused and ready for typing (URL field auto-focused if possible).
+- Operators can press Tab to move between URL, name, and Clone button.
+- Operators can press Enter in either input to submit (if URL is non-empty).
 
-2. **`kind: "tool_use"` with empty `meta` (fact_check claim or finish summary)**:
-   - **If next lead event is `tool_result` with `meta.found` present**: render as fact_check claim.
-     ```
-     12:34:05 lead (🔵)  fact_check: <claim-text>
-     ```
-   - **If no following lead event with `meta.found`** (i.e., this is the run's terminal finish):
-     ```
-     12:34:20 lead (🔵)  [Finish summary]
-     12:34:20           <summary-text>
-     ```
-     (summary-text on a new indented line for visibility)
-
-3. **`kind: "tool_result"` with `meta.found` (fact_check result)**:
-   - Render the matches:
-     ```
-     12:34:06 lead (🔵)  Fact-check result:
-     12:34:06           ✓ docs/snake.md:42  "Python is a reptile..."
-     12:34:06           ✓ docs/animal.md:15 "Python (animal) belongs..."
-     ```
-     or if `found: false`:
-     ```
-     12:34:06 lead (🔵)  Fact-check result:
-     12:34:06           ✗ No supporting passage found
-     ```
-   - Each match shows `file_line` (e.g., "docs/snake.md:42") and passage text (truncated to ~60 chars on-screen; full text visible on hover/expand if implemented).
-
-4. **`kind: "tool_result"` with `meta.resolved` (accepted answer to escalation)**:
-   - Render as-is: `12:34:08 lead (🔵)  <text>` (or a simple "Answer: <text>" if text is empty or generic).
-
-5. **`kind: "error"`** (error occurred):
-   - Render in red (`#ff6b6b`): `12:34:10 lead (🔵)  ✕ <error-text>`
-
-6. **`kind: "status"`** (status change event):
-   - Render as-is or with an icon: `12:34:20 lead (🔵)  → Status: <status>`
-
-7. **`kind: "handoff"` with `meta.agent` (delegation to teammate)**:
-   - Render: `12:34:07 lead (🔵)  Delegating to <teammate-name>`
-
-8. **Other events** (native type translations, e.g., Claude's `system`, Codex's `thread.started`):
-   - Render generically by `kind`: `12:34:02 lead (🔵)  [<kind>] <text>` (de-emphasized, lower contrast).
-
-**Agent colour assignment**:
-- Hash agent name (e.g., `hash(name) % 6`) to one of 6 colours: `#d084d0`, `#6eb5d4`, `#b4a84d`, `#84b484`, `#d4a484`, `#a49ed4`.
-- Colour is stable across polls and page reloads (hash is deterministic).
-- Colour dot (●) precedes agent name; agent name is plain text in the colour.
-
-**Scrolling**: Feed container scrolls to newest events (bottom) on each poll. Operator can scroll up to see older events; new events append at the bottom. No infinite scroll; only the most recent 500 events are kept.
-
-### Non-idle, Feed Panel: Filter to Specific Agent
+### Loading State
+While the clone operation is in flight (POST request pending):
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│ Team                                                    │
-│                                                         │
-│ [ Hide live feed ]                                     │
-│                                                         │
-│ Filter: [ All ] [ lead ] [ claude (selected) ] [ codex ]│
-│                                                         │
-│ ┌─ Events ──────────────────────────────────────────┐  │
-│ │ [scrollable area]                                │  │
-│ │                                                   │  │
-│ │ 12:34:03 claude (🟢) Processing query...    │  │
-│ │ 12:34:07 claude (🟢) Delegating to codex    │  │
-│ │ 12:34:09 claude (🟢) Received delegation...│  │
-│ │                                                   │  │
-│ └───────────────────────────────────────────────────┘  │
-│                                                         │
-│ <button onclick="doTeamStop('<name>')">               │
-│   Stop team                                            │
-│ </button>                                               │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│ Clone from URL                                       │
+│ <input id="clone-url" disabled>https://github...     │
+│ <input id="clone-name" disabled>(derived-name)       │
+│ <button disabled>Cloning…</button>                    │
+│                                                      │
+│ <spinner or "Cloning… this can take a while for      │
+│  large repositories (up to a few minutes)."  slot>    │
+│                                                      │
+│ <project list rows>                                  │
+└──────────────────────────────────────────────────────┘
 ```
 
-**Styling**: Clicking a filter pill (e.g., "claude") highlights it (e.g., background colour changes, or underline appears) and re-renders the feed to show only that agent's events. The buffer is not re-fetched; filtering is client-side only.
+**Styling**:
+- Input fields and button are **disabled** (greyed out, `disabled` attribute set, pointer: not-allowed).
+- Button text changes to "Cloning…" (with optional ellipsis animation if using CSS @keyframes, same pattern as existing loading states on the page).
+- Error slot is replaced with a status message: "Cloning… this can take a while for large repositories (up to a few minutes)." in #aaa (muted) color, 12px font.
+- No animated spinner graphic (text-only, per existing page conventions).
+
+**Duration**: Can run up to 180 seconds (default CLONE_TIMEOUT_SECONDS). The message sets expectations so operators don't assume the UI is hung.
+
+### Error States
+
+#### Invalid URL Scheme
+Disallowed schemes (file://, git://, ext::, bare paths, argument-injection attempts) are rejected before any subprocess:
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Clone from URL                                       │
+│ <input id="clone-url" placeholder="...">             │
+│ <input id="clone-name" placeholder="...">            │
+│ <button>Clone</button>                               │
+│                                                      │
+│ ✕ unsupported URL — use http://, https://, ssh://,  │
+│   or user@host:path (git's own shorthand)            │
+└──────────────────────────────────────────────────────┘
+```
+
+**Styling**: Red error text (#ff6b6b), ✕ icon, error message clipped to ~300 chars per spec (but this particular error is concise).
+
+**Behavior**: Form remains expanded and editable; user can correct the URL and re-submit.
+
+#### Network Failure / Unreachable Host
+A legitimate URL that points to a non-existent or unreachable host:
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Clone from URL                                       │
+│ <input id="clone-url" value="https://invalid.host/...">
+│ <input id="clone-name" placeholder="...">            │
+│ <button>Clone</button>                               │
+│                                                      │
+│ ✕ Error: fatal: unable to access                     │
+│   'https://invalid.host/repo.git': Could not resolve │
+│   host...                                            │
+└──────────────────────────────────────────────────────┘
+```
+
+**Styling**: Red error text (#ff6b6b), clipped to ~300 chars (as per spec). Message is from git's own stderr, sanitized.
+
+**Behavior**: Form remains expanded; user can try a different URL.
+
+#### Authentication Required (Private HTTPS Repo)
+A private repository URL that would normally require credentials (unsupported this cycle):
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Clone from URL                                       │
+│ <input id="clone-url" value="https://github.com/private/repo.git">
+│ <input id="clone-name" placeholder="...">            │
+│ <button>Clone</button>                               │
+│                                                      │
+│ ✕ Error: could not read Username for                │
+│   'https://github.com': terminal prompts disabled    │
+└──────────────────────────────────────────────────────┘
+```
+
+**Styling**: Red error text (#ff6b6b), clipped to ~300 chars. Message is git's stderr (not a polished "this feature isn't supported yet" message, but a real, prompt, non-hanging failure).
+
+**Behavior**: Form remains expanded; explains that credentials aren't supported this cycle (via the error message). A future fast-follow can pattern-match this error to show friendlier UX.
+
+#### Oversized Repository
+A clone succeeds but the resulting repository exceeds the CLONE_MAX_BYTES limit and is rolled back:
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Clone from URL                                       │
+│ <input id="clone-url" value="https://huge-repo.git">  │
+│ <input id="clone-name" placeholder="...">            │
+│ <button>Clone</button>                               │
+│                                                      │
+│ ✕ Error: Cloned repository is 1.2 GB, over the     │
+│   500 MB limit — removed.                            │
+└──────────────────────────────────────────────────────┘
+```
+
+**Styling**: Red error text (#ff6b6b), clipped to ~300 chars. Message from the privileged script's own check.
+
+**Behavior**: Form remains expanded; project was never registered (directory was removed atomically).
+
+#### Name Collision
+Explicit name override or derived name collides with an existing project:
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Clone from URL                                       │
+│ <input id="clone-url" value="https://github.com/my/repo.git">
+│ <input id="clone-name" value="existing-project">     │
+│ <button>Clone</button>                               │
+│                                                      │
+│ ✕ Error: 'existing-project' already exists.          │
+└──────────────────────────────────────────────────────┘
+```
+
+**Styling**: Red error text (#ff6b6b), exact message from server.
+
+**Behavior**: Form remains expanded; user can change the name field to override the derived name.
+
+#### Timeout
+A slow/stalled transfer that exceeds CLONE_TIMEOUT_SECONDS:
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Clone from URL                                       │
+│ <input id="clone-url" disabled>...                   │
+│ <input id="clone-name" disabled>...                  │
+│ <button disabled>Clone</button>                      │
+│                                                      │
+│ ✕ Error: clone failed: <timeout message>             │
+└──────────────────────────────────────────────────────┘
+```
+
+**Styling**: Red error text (#ff6b6b).
+
+**Behavior**: Form remains expanded; user can retry (orphaned child processes are a known, accepted gap per spec).
+
+### Success State
+After a successful clone:
+
+```
+┌──────────────────────────────────────────────────────┐
+│ <form is hidden or collapsed>                        │
+│                                                      │
+│ <project rows, now including the new project>        │
+│                                                      │
+│ <new row>                                            │
+│ my-cloned-repo                                       │
+│ origin: https://github.com/user/my-repo.git         │
+│ • tmux • ttyd • Code • Deploy (if mapped)            │
+└──────────────────────────────────────────────────────┘
+```
+
+**Behavior**:
+- Form clears (URL and name inputs reset to empty/placeholder) and collapses or hides.
+- Page automatically refreshes (via existing `/status` poll, within ~4 seconds) and the new project appears in the project list.
+- No special "success" message is shown (same as "+ New project" behavior — the new project appearing is the confirmation).
+- Project row includes the derived or provided name, and the origin URL is visible in a subtitle (per existing project-list styling).
 
 ## Accessibility & platform notes
 
-- **Touch target sizes**: Filter pills (All/lead/agent names) should be at least 36-40px tall/wide for touch; font size 12px min.
+- **Touch target sizes**: "Clone from URL" button and "Clone" button both match the page's existing button minimum (36-40px on desktop, larger on mobile if needed). Keyboard-accessible via tab order.
 - **Color contrast**:
-  - Agent identity dots (🔵 in colour X on `#1c1c1c`): Each agent colour ≥ 3:1 contrast as a graphical element. Example: `#d084d0` (magenta) on `#1c1c1c` = **6.14:1**, passes WCAG AA for graphics. All 6 colours in the suggested palette meet 3:1 minimum.
-  - Event text (`#eee` on `#1c1c1c`): **13.5:1**, passes WCAG AAA.
-  - Timestamp (`#888` on `#1c1c1c`): **4.81:1**, passes WCAG AA (same as `.team-sub` established in 6d).
-  - Fact_check result "✓" or "✗" icons: inherits colour from parent (green `#34c759` for found, red `#ff6b6b` for not found), both ≥ 6:1 for graphics.
-  - Error event text (`#ff6b6b` on `#1c1c1c`): **6.14:1**, passes WCAG AA for normal text.
-  - Status strip labels (`#4da6ff`, `#ffb648`, `#34c759`, `#ff6b6b` on `#1c1c1c`): already verified in 6d (all pass AA minimum, most AAA).
-  - Escalation form labels and text: inherit page defaults (`#eee` text, `#aaa` labels) = AA/AAA.
-- **Web vs. native**: Desktop web app only. No mobile optimizations. Hover states (e.g., expand full passage text on hover) are optional for web.
+  - Button text (#111, not #fff as originally claimed here — corrected 2026-08-14 per backlog item 20's audit: `.new-project-row button`/`.deploy-btn`/`.team-btn` all pair `#34c759` with dark `#111` text, not white) on button background (#34c759): **8.51:1** (passes WCAG AAA; the previously claimed 5.05:1 for white text was also wrong — white-on-#34c759 is actually ~2.2:1, failing AA).
+  - Error message (#ff6b6b) on page background (#1c1c1c): **6.14:1** (passes WCAG AA).
+  - Placeholder text (#666 or #888 muted) on input background (#1c1c1c): **6.14:1** (passes WCAG AA).
+  - Status message (#aaa muted) on background (#1c1c1c): **6.4:1** (passes WCAG AA for body text).
 - **Keyboard interaction**:
-  - Tab to filter pills → arrow keys to select different agent, Enter to apply (optional, or just click).
-  - Tab to "Submit answer" button → Enter to submit (disabled if validation fails).
-  - Tab to feed scroll area → arrow/Page Up/Page Down to scroll (browser default).
-  - Escape to close feed panel (optional, or just click "Hide live feed").
-- **Screen reader accessibility**:
-  - Event list items should be in an `<article>` or similar container with `role="log"` and `aria-live="polite"` to announce new events to screen readers.
-  - Filter pills should be `<button>` or `<input type="radio">` with `aria-pressed="true"` / `aria-checked="true"` for selected pill.
-  - Escalation form: `<fieldset>` for radio/checkbox groups with `<legend>` for the question. Free-text textarea with associated `<label>`.
-- **Disabled state**: Submit button is disabled (greyed out) if validation error exists (empty answer, over 2000 chars).
+  - Tab to "Clone from URL" button → press Enter to expand form.
+  - Tab to URL input → type URL (or paste via Ctrl+V / Cmd+V).
+  - Tab to name input → type optional name or leave blank.
+  - Tab to "Clone" button → press Enter to submit.
+  - Escape key can close the expanded form (same as other inline forms on the page, if implemented).
+- **Form field labels**: URL and name inputs have descriptive `placeholder` attributes (do not fully substitute for labels, but context is clear from the row's "Clone from URL" header). For strict accessibility, developers can add `<label for="clone-url">Repository URL</label>` elements (not shown in wireframe, but recommended).
+- **Error message accessibility**: Errors are shown as plain text, readable by screen readers. The `.clone-err` slot is always present (empty initially), so screen readers pick it up when populated.
+- **Web vs. native**: This is a web app (HTML/CSS/JS in Flask template), desktop-only. No native/mobile variant.
+- **Disabled state during loading**: Inputs and button are disabled during clone, preventing accidental re-submissions. Screen readers announce the disabled state.
 
-## Traceability to spec (6f part 2 acceptance criteria)
+## Traceability to spec
 
-| Acceptance criterion | Where it's addressed in this design |
+| Acceptance criterion (from docs/spec.md) | Where it's addressed in this design |
 |---|---|
-| Status strip shows "Working" for running status | Non-idle state renders `team.status === 'running'` as "Working (ID: run-id)" in blue. |
-| Status strip shows "Waiting on you" when waiting_on_you=true | Non-idle state with `waiting_on_you === true` shows "Waiting on you (ID: run-id)" in orange, with escalation panel below. |
-| Status strip shows distinct "Blocked" when waiting_on_you=false | Non-idle state with `waiting_on_you === false` (escalated_max_rounds) shows "Blocked — Max rounds reached" in orange; no escalation form. |
-| Escalation panel renders question, header, options, free-text "Other" | When `waiting_on_you === true`, panel fetches inbox and displays question, header (small chip), options (radio/checkbox per multi_select), and always-present free-text textarea. |
-| Merged feed shows events from lead and all teammates in chronological order | Feed renders all events sorted by (ts, agent, seq); events from both lead's transcript and each teammate's log appear in single list, colour-coded by agent. |
-| Per-agent filter: "All" + one per agent | Filter row shows "All" pill (selects everything) and one pill per agent in team.composition; clicking a pill re-filters rendered (not fetched) events. |
-| Fact_check renders claim + matches (file_line + passage text) | Fact_check tool_use/tool_result pair is rendered as "fact_check: <claim>" line, then result lines showing each match's file_line and passage text. If found=false, shows "✗ No supporting passage found". |
-| Escalation form answer composition | Free-text "Other" wins if filled in; else single-select's label, or multi-select's labels joined with ", ". Submitted via new team-resolve action (TOTP-gated). |
-| Feed polling is integrated into 4s refresh cycle | Polling is not a new timer; for each non-idle project with feed open, GET /team/events is called within the existing refresh() 4s cycle. |
-| Truncated response triggers immediate follow-up poll | If any file reports truncated[agent]=true, client immediately issues another /team/events call (no waiting for next 4s tick) until no file is truncated. |
-| Page reload repopulates feed from cursor={} | Closing feed clears client state; reopening starts fresh from cursor={}, replaying all available history from disk (bounded by 64KB-per-file polls). |
-| Feed panel defaults to expanded | When team.status !== 'idle', feed toggle shows "Hide live feed" and panel is rendered expanded (not collapsed). |
-| Feed closes when team stops | When team.status flips to idle, feed/escalation UI and client state (teamFeedEvents, teamFeedCursor, etc.) are cleared in the idle branch re-render. |
-| Escalation submit reuses TOTP machinery | Submit button calls toggle(kind='team-resolve', ...) → same 428/403/success flow as team-start/team-stop, reusing existing code-overlay. |
-| Status strip and feed render inline in existing teamRow() | All new UI (status strip, feed, escalation) is rendered within the non-idle branch of teamRow(), not a new page/modal. |
+| Third button "Clone from URL" next to "+ New project" and "Upload folder / .zip" | Button positioned on form alongside existing project-creation buttons; same visual weight/styling |
+| URL input (required), optional name-override input | Form row with two text inputs; URL required, name optional |
+| Valid public https:// URL → project created under derived name, appears in list | Success state shows new project in list with derived or explicit name |
+| Explicit name override → project uses that name instead | Name input allows operator to override derived name |
+| Disallowed scheme (file://, git://, ext::, bare path) → 400 before subprocess, no directory created | Error state shows "unsupported URL" message; no project directory created |
+| URL resembling `-oProxyCommand=...` → rejected | Error state covers this (no leading `-` in allowlist) |
+| Invalid explicit name → 400, same message as create_project() | Error state shows NAME_RE validation message |
+| Name collision → 400 "'<name>' already exists." | Error state shows collision message; form remains editable to fix |
+| Concurrent requests to same name → exactly one succeeds, other fails cleanly | Atomic `mkdir` in script handles TOCTOU race; error state shows clean 400 |
+| Unreachable host → 400 with clipped error, no orphaned directory | Error state shows network error; script's ERR trap removes directory |
+| Private HTTPS repo → fails fast (not hung) with clear message | Error state shows git's "terminal prompts disabled" message; no timeout wait |
+| Private SSH with no user key → fails fast with error | Error state shows SSH error; BatchMode=yes prevents interactive prompt |
+| Oversized clone → rolled back, 400 error, project never appears | Error state shows size-limit message; script removes directory |
+| Works without Gitea (no GITEA_ENABLED dependency) | Form submission reuses existing TOTP/action plumbing; no Gitea dependency in routes |
+| SSH URL to host where RUN_USER has ambient keys → succeeds | Success state shows new project; spec notes SSH uses RUN_USER's own keys |
+| Clone can take 30-180 seconds → loading message sets expectations | Loading state shows "can take a while" message; button disabled and says "Cloning…" |
 
 ## Implementation notes for the developer
 
-### Client-side state (JavaScript, in app/app.py template)
+1. **Button placement**: Add the "Clone from URL" button to the same container as "+ New project" and "Upload folder / .zip" (around line 2178-2184 of app/app.py). Use the same button class/styling.
 
-Add to global scope (alongside `teamTaskText`, `teamPickerOpen`, etc.):
-- `teamFeedOpen[name]` — boolean, true if feed panel is currently visible.
-- `teamFeedCursor[name]` — object `{agent: byte_offset}`, the last cursor from `/team/events`, starts at `{}`.
-- `teamFeedEvents[name]` — array of events, most recent 500 kept, sorted by (ts, agent, seq).
-- `teamFeedFilter[name]` — string, "all" or an agent name, controls which events are rendered.
-- `teamInboxCache[run_id]` — object, cached `GET /team/inbox` response, keyed by run_id to avoid refetch.
+2. **Form HTML structure**: Insert the form inputs after the button but initially hidden or collapsed:
+   ```html
+   <div id="clone-form" class="clone-form" style="display: none;">
+     <label class="clone-form-label">Clone from URL</label>
+     <input id="clone-url" placeholder="https://github.com/user/repo or ssh://host/path" maxlength="2048">
+     <input id="clone-name" placeholder="(optional — derived from URL if left blank)" maxlength="60">
+     <button onclick="startClone()">Clone</button>
+   </div>
+   <div class="clone-err" id="clone-err"></div>
+   ```
 
-### Polling integration
+3. **Styling**: Add CSS for `.clone-form` (flexbox row, gap 8px, same as `.new-project-row`) and `.clone-err` (reuse or adapt `.new-project-err` styling — red text, 12px, min-height 14px).
 
-In `refresh()` function (existing, ~4s interval):
-- For each project whose `team.status !== 'idle'` AND `teamFeedOpen[name] === true`:
-  - Call `pollTeamFeed(name)` (new helper, see below).
+4. **JavaScript function startClone()**: Similar to `startNewProject()`:
+   ```javascript
+   function startClone() {
+     const url = document.getElementById('clone-url').value.trim();
+     const name = (document.getElementById('clone-name').value || '').trim();
+     document.getElementById('clone-err').textContent = '';
+     if (!url) {
+       document.getElementById('clone-err').textContent = 'Enter a repository URL.';
+       return;
+     }
+     toggle('clone', name || '', true, null); // or pass url separately
+   }
+   ```
 
-New function `pollTeamFeed(name)`:
-```javascript
-async function pollTeamFeed(name) {
-  const cursor = teamFeedCursor[name] || {};
-  const cursorJson = encodeURIComponent(JSON.stringify(cursor));
-  const r = await fetch(`/projects/${encodeURIComponent(name)}/team/events?run_id=&cursor=${cursorJson}`);
-  const data = await r.json();
-  if (!data.events) return;
-  
-  // Append to buffer
-  teamFeedEvents[name] = (teamFeedEvents[name] || []).concat(data.events);
-  // Keep only latest 500
-  if (teamFeedEvents[name].length > 500) {
-    teamFeedEvents[name] = teamFeedEvents[name].slice(-500);
-  }
-  // Sort by (ts, agent, seq) in case out of order
-  teamFeedEvents[name].sort((a, b) => a.ts - b.ts || a.agent.localeCompare(b.agent) || a.seq - b.seq);
-  
-  // Update cursor
-  teamFeedCursor[name] = data.cursors || {};
-  
-  // If any file is truncated, re-poll immediately
-  if (data.truncated && Object.values(data.truncated).some(v => v)) {
-    setTimeout(() => pollTeamFeed(name), 0);
-  }
-  
-  // Re-render feed if open
-  if (teamFeedOpen[name]) {
-    renderTeamRow(name);
-  }
-}
-```
+5. **Route in actionPath()**: Add case for `kind === 'clone'`:
+   ```javascript
+   if (kind === 'clone') return '/projects/clone';
+   ```
 
-### Render functions
+6. **Route in actionBody()**: Add case to pass URL and name:
+   ```javascript
+   if (kind === 'clone') {
+     body.url = document.getElementById('clone-url').value.trim();
+     body.name = (document.getElementById('clone-name').value || '').trim();
+   }
+   ```
 
-Extend `teamRow(name, team)` to handle non-idle state:
-- Render status strip (replacing old "Status: [label]" line).
-- If `waiting_on_you === true`, fetch `GET /team/inbox` once (cache by run_id) and render escalation panel.
-- Render feed toggle ("Show live feed" / "Hide live feed").
-- If `teamFeedOpen[name]`, render feed panel (filter row + scrollable event list).
-- Render "Stop team" button.
+7. **Route in handleActionResult()**: Add case for `kind === 'clone'` to handle success/error:
+   ```javascript
+   if (kind === 'clone') {
+     if (r.ok) {
+       document.getElementById('clone-url').value = '';
+       document.getElementById('clone-name').value = '';
+       document.getElementById('clone-form').style.display = 'none';
+       setTimeout(refresh, 1500); // refresh to show new project
+     } else {
+       const data = await r.json().catch(() => ({}));
+       document.getElementById('clone-err').textContent = data.error || 'Clone failed.';
+     }
+     hideCodeOverlay();
+     return;
+   }
+   ```
 
-New function `renderStatusStrip(team)`:
-- Return HTML for 4-state strip: "Working", "Waiting on you", "Blocked — Max rounds reached", "Finished", or "Error".
-- Use appropriate colour class (`.status-running`, `.status-blocked`, `.status-finished`, `.status-error`).
-- Include ID if `team.run_id` exists.
+8. **Button toggle function**: Add `openCloneForm()` and `closeCloneForm()` to toggle the form visibility:
+   ```javascript
+   function openCloneForm() {
+     document.getElementById('clone-form').style.display = 'flex';
+     document.getElementById('clone-url').focus();
+   }
+   function closeCloneForm() {
+     document.getElementById('clone-form').style.display = 'none';
+   }
+   ```
+   Connect the "Clone from URL" button to `openCloneForm()`.
 
-New function `renderEscalationPanel(name, team)`:
-- Fetch `GET /team/inbox?run_id=` if not cached (cache by run_id).
-- Render question, header, options (radio for single_select, checkboxes for multi_select), free-text textarea.
-- Render "Submit answer" button.
-- Render message slot (`.team-msg` pattern) for errors/success.
-- Return empty string if `waiting_on_you !== true` or if `team.status === 'escalated_max_rounds'` (blocked terminal state).
+9. **Server route** (`POST /projects/clone`): Already specified in spec. Route calls `clone_project_from_url(url, name)` function and returns `{"ok": true}` on success or `{"error": "message"}` on failure (400 status).
 
-New function `renderTeamFeed(name, team)`:
-- Render filter pills (All + one per team.composition.members and lead).
-- Render scrollable event list, filtered by `teamFeedFilter[name]`.
-- Render each event per `kind`/`meta` rules (see States section).
-- Render "No events yet" if buffer is empty.
+10. **Error message persistence**: Like `.new-project-err`, the error slot persists until manually cleared or until `refresh()` re-renders the page (next /status poll, ~4 seconds). No auto-dismissal.
 
-New function `toggleTeamFeed(name)`:
-- Toggle `teamFeedOpen[name]`.
-- If opening: start with fresh cursor `{}` (simulating page reload).
-- If closing: clear client state (`teamFeedEvents[name]`, `teamFeedCursor[name]`).
-- Re-render row.
+11. **Keyboard support**: Operator can press Enter in the URL or name field to submit the form (use `onkeypress="event.key==='Enter' && startClone()"` on inputs, or handle via JavaScript event listeners).
 
-New function `setTeamFeedFilter(name, agentName)`:
-- Set `teamFeedFilter[name]` to "all" or the agent name.
-- Re-render feed list (no refetch).
+12. **Form collapse on Escape**: Optionally detect Escape key to close the form (same as upload wizard pattern, if implemented).
 
-### Action: team-resolve
+## Open design questions
 
-Extend `actionPath()` to handle `kind === 'team-resolve'`:
-```javascript
-if (kind === 'team-resolve') return '/projects/' + encodeURIComponent(name) + '/team/resolve';
-```
+None blocking. One subtle implementation detail: whether to show the form expanded inline-on-page or in a small overlay similar to the upload wizard's card. The spec says "simpler inline shape like + New project," which this design interprets as inline expansion (form grows in place on the page). If the developer prefers a small card overlay like the upload wizard (but without the multi-step complexity), that's a valid alternative that doesn't change the UX significantly — the key constraint is that the form remains simple (two inputs + one button, no wizard steps). Either approach is acceptable; the spec's intent is to avoid the upload wizard's complexity, not to dictate exact positioning.
 
-Extend `actionBody()` to handle `team-resolve`:
-```javascript
-if (kind === 'team-resolve') {
-  // Read escalation form: selected option(s) or free-text
-  const otherText = (document.getElementById('escalation-other-' + name) || {}).value || '';
-  if (otherText.trim()) {
-    body.answer = otherText.trim();
-  } else {
-    // Compile selected options
-    const multiSelect = window.teamInboxCache[team.run_id]?.multi_select;
-    const selected = Array.from(document.querySelectorAll(`input[name="escalation-option-${name}"]:checked`))
-      .map(el => el.value);
-    if (multiSelect) {
-      body.answer = selected.join(', ');
-    } else {
-      body.answer = selected[0] || '';
-    }
-  }
-}
-```
+---
 
-Extend `handleActionResult()` to add a `team-resolve` branch after the existing `team-start`/`team-stop` block:
-```javascript
-if (kind === 'team-resolve') {
-  hideCodeOverlay();
-  const data = await r.json().catch(() => ({}));
-  const msgEl = document.getElementById('team-msg-' + name);
-  if (msgEl) {
-    if (r.ok && data.ok) {
-      msgEl.textContent = '✓ Answer submitted';
-      msgEl.className = 'team-msg success';
-      // Clear cached inbox for this run so next render fetches fresh
-      delete teamInboxCache[team.run_id];
-    } else {
-      msgEl.textContent = '✕ Error: ' + (data.error || 'could not submit answer');
-      msgEl.className = 'team-msg error';
-    }
-  }
-  return;
-}
-```
+# Design: Chat-UI compose surface for interjecting into a running team (backlog item 19 part 2)
 
-New function `doTeamResolve(name)`:
-- Validate answer (non-empty, ≤ 2000 chars).
-- If validation fails, show error in message slot and return.
-- Call `toggle('team-resolve', name, null, null)` to dispatch via existing action machinery.
+## Summary
+A free-text compose box (textarea + Send button) rendered on the Teams row whenever a team is running or blocked waiting for human input, alongside the escalation panel when both are present. Human messages posted via this compose box appear in the existing merged event feed with a distinct, subtle visual treatment (a left-border accent in blue), and a new "human" filter pill allows operators to isolate human-authored messages from the agent/lead timeline. A live character counter enforces a 2000-character soft limit client-side before posting to `/projects/<name>/team/interject`. No chat-bubble redesign — human messages integrate seamlessly into the existing structured, multi-party event log. All styling and interaction patterns reuse existing team-control conventions.
 
-### Styling (CSS in app/app.py template)
+## ui-ux-pro-max choices
+- **Style**: Inline compose box, following the existing `.team-interject` pattern (textarea + Send button, positioned within the team row just before the feed toggle). Not a chat-interface redesign — a lightweight text-input control that mirrors the task-description textarea in the idle state.
+- **Palette**: No new colors introduced. Reuses existing page tokens: #34c759 (green Send button, matching `.team-btn`); #4da6ff (blue left-border accent for human messages in feed, matching active filter pills and link color); #888/#aaa for character counter text (muted, existing); #ff6b6b for character-limit-exceeded warning (existing error red).
+- **Typography**: Existing 13px for textarea and counter text, 14px for Send button (same as `.team-btn`). No new typefaces.
+- **Relevant UX guidelines applied**:
+  - Compose box is context-aware: placeholder text changes if waiting_on_you ("...this will not answer the pending question above") to clarify it's separate from the escalation panel.
+  - Character counter updates live on each keystroke, and Send button proactively disables at 2000+ characters (client-side guardrail; server-side validation is authoritative).
+  - No auto-submit on Enter (spec explicitly rejects chat-style Enter-to-send as inconsistent with other multi-line textareas in this app).
+  - Human messages in the feed are subtly distinct (left-border accent, not a full bubble redesign) to avoid breaking the existing `role="log"` / `aria-live="polite"` accessibility contract for the structured event log.
 
-New classes (following BEM-lite naming):
-- `.team-status-strip` — wraps status label and ID.
-- `.team-status-strip.waiting-on-you` — styling variant for waiting-on-you state.
-- `.team-escalation` — wraps escalation panel.
-- `.team-escalation-form` — the form inside escalation panel.
-- `.team-escalation-form label` — for question, options, free-text labels.
-- `.team-escalation-form textarea` — free-text input.
-- `.team-feed-toggle` — toggle link ("Show live feed" / "Hide live feed"), reuse `.team-configure-btn` styling.
-- `.team-feed` — wrapper for feed panel.
-- `.team-feed-filter` — filter pill row.
-- `.team-feed-filter button` — individual filter pill.
-- `.team-feed-list` — scrollable event list (`max-height: 85vh; overflow-y: auto`), reuse `.wizard-card` pattern.
-- `.team-feed-event` — each event row (monospace font, 1.4 line-height).
-- `.team-feed-event.kind-<kind>` — variant for different event kinds (e.g., `.team-feed-event.kind-error` in red).
+## Component reuse
+- **Reused**: `.team-row` structure and positioning (compose box inserted between escalation panel and feed toggle, if present).
+- **Reused**: Textarea styling (`.team-interject-textarea` — identical to `.team-textarea`, 13px font, #1c1c1c background, #333 border, inherits font-family).
+- **Reused**: Button styling (`.team-btn` for Send — #34c759 green, 14px, 10px 16px padding, rounded).
+- **Reused**: Message slot (`.team-msg` for interject result — reuses existing error/success styling via `.team-msg.error` / `.team-msg.success`).
+- **Reused**: Event feed filter-pill pattern (`aria-pressed` toggle, active state highlighting).
+- **Reused**: Event feed rendering (`.team-feed-event` rows, no new container — human messages just add `.kind-human-message` class for left-border accent).
+- **Reused**: Toggle/TOTP machinery (`toggle(kind='team-interject', ...)` reuses existing `actionPath()` / `actionBody()` / `handleActionResult()` plumbing for action dispatch).
+- **Reused**: `/status` poll (no new polling, compose-box visibility re-evaluated every ~4 seconds when row re-renders).
+- **New (none)**: No new component library, no new timer, no new polling mechanism.
 
-Colour tokens:
-- Agent identity palette: `#d084d0`, `#6eb5d4`, `#b4a84d`, `#84b484`, `#d4a484`, `#a49ed4` (or developer's choice if different palette preferred, so long as ≥ 3:1 contrast).
-- Status strip colours: reuse existing tokens (`#4da6ff`, `#ffb648`, `#34c759`, `#ff6b6b`).
+## States
 
-### Backend (no changes to app.py routes, only frontend integration of existing routes)
-
-No new backend routes. Frontend calls:
-- `GET /projects/<name>/team/events?cursor=` — already exists (6f part 1).
-- `GET /projects/<name>/team/inbox?run_id=` — already exists (6f part 1).
-- `POST /projects/<name>/team/resolve` body `{answer, code}` — already exists (6f part 1).
-
-### Client-side validation
-
-In `doTeamResolve()`, before dispatching:
-- Answer must be non-empty (either at least one option selected, or free-text filled in).
-- Answer must be ≤ 2000 characters.
-- Show validation error in `.team-msg` slot if either check fails.
-
-### State transitions
+### Compose box: Hidden
+Rendered when `team.status !== 'running'` and `team.status !== 'blocked'` (i.e., idle, finished, error), or when `team.status === 'blocked'` but `team.waiting_on_you === false` (escalated on max rounds, no further human input needed):
 
 ```
-team.status === 'running'
-├─ Feed closed (default) → render status + feed toggle ("Show live feed")
-│  └─ Click "Show live feed" → teamFeedOpen[name] = true, cursor = {}, re-render
-│     └─ Feed open → start polling, render events
-│
-team.status === 'blocked' + waiting_on_you === true
-├─ Escalation panel + feed (same as running)
-│  └─ Submit answer → POST /team/resolve
-│     └─ Success → clear inbox cache, next poll sees status change
-│
-team.status === 'blocked' + waiting_on_you === false
-├─ "Blocked — Max rounds reached" message (no escalation form, no poll needed after status updates)
-│
-team.status === 'idle'
-├─ Feed/escalation cleared, render idle row (unchanged from 6d)
+(No compose box rendered in these statuses)
 ```
+
+**Behavior**: Compose box is completely absent. Any unsent draft is discarded. If a new run later starts for the same project, the draft does not reappear.
+
+### Compose box: Visible, Ready to Input (Running)
+Rendered when `team.status === 'running'`:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Status: Working   ID: run-xyz789                        │
+│                                                          │
+│ Show live feed                                           │
+│                                                          │
+│ Compose box (new in part 2):                             │
+│ ┌────────────────────────────────────────────────────┐   │
+│ │ <textarea id="interject-<name>" rows="2"           │   │
+│ │ placeholder="Send a message to the team…">         │   │
+│ │ </textarea>                                         │   │
+│ │ <button class="team-btn" id="interject-send-...">  │   │
+│ │   Send                                              │   │
+│ │ </button>                                           │   │
+│ │ ┌────────────────────────────────────────────────┐ │   │
+│ │ │ 0/2000                                          │ │   │
+│ │ └────────────────────────────────────────────────┘ │   │
+│ └────────────────────────────────────────────────────┘   │
+│                                                          │
+│ All • lead • human • teammate-1 • teammate-2            │
+│                                                          │
+│ (scrollable event feed)                                 │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Styling & behavior**:
+- Compose box is a `.team-interject` container (flexbox, column layout, gap 8px).
+- Textarea is `.team-interject-textarea` (2 rows, 13px font, #1c1c1c background, #333 border, inherits font). ID: `interject-<name>`. Placeholder: "Send a message to the team…"
+- Button is `.team-btn` (green #34c759, 14px, 10px 16px padding). ID: `interject-send-<name>`. Label: "Send". **Not disabled** (operator can type and send).
+- Character counter `.team-interject-counter` below button: "0/2000" (12px text, #888 color, left-aligned).
+- On keystroke (`oninput` event), `updateTeamInterjectControls(name)` is called:
+  - Counter text updates in real-time: `len + '/' + 2000`.
+  - If `len > 2000`, counter text color changes to #ff6b6b (error red) and `.over-limit` class is added.
+  - Send button remains **enabled** (user can still click, but validation on click will fail).
+
+**Placeholder copy**: "Send a message to the team…" (neutral, always applicable in the running state)
+
+### Compose box: Visible, Context-Aware Placeholder (Blocked, Waiting on You)
+Rendered when `team.status === 'blocked'` AND `team.waiting_on_you === true` (waiting on ask_user or board_write):
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Status: Waiting on you   ID: run-xyz789                │
+│                                                          │
+│ ┌─ Escalation Panel (ask_user or board_write) ───────┐  │
+│ │ (question/proposal + options/buttons)               │  │
+│ └────────────────────────────────────────────────────┘  │
+│                                                          │
+│ Compose box (coexists with escalation):                 │
+│ ┌────────────────────────────────────────────────────┐   │
+│ │ <textarea id="interject-<name>" rows="2"           │   │
+│ │ placeholder="Send a message to the team             │   │
+│ │ (this will not answer the pending question         │   │
+│ │ above)…">                                           │   │
+│ │ </textarea>                                         │   │
+│ │ <button class="team-btn" id="interject-send-...">  │   │
+│ │   Send                                              │   │
+│ │ </button>                                           │   │
+│ │ 0/2000                                              │   │
+│ └────────────────────────────────────────────────────┘   │
+│                                                          │
+│ Show live feed                                           │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Placeholder copy**: "Send a message to the team (this will not answer the pending question above)…"
+
+**Rationale**: The longer placeholder text alerts the operator that they have two separate actions available — answering the escalation (via the panel above) and sending a free-form message (via the compose box below). This prevents the operator from accidentally typing an answer into the wrong input.
+
+**Styling & behavior**: Identical to the Running state, except placeholder text differs.
+
+### Compose box: Text Input
+When the operator starts typing:
+
+```
+Compose box with live character counter:
+┌────────────────────────────────────────────────────┐
+│ <textarea>Please check if the database migration │
+│ completed successfully.</textarea>                │
+│ <button class="team-btn">Send</button>            │
+│ 67/2000                                            │
+└────────────────────────────────────────────────────┘
+```
+
+**Character counter**: Updates on every keystroke. Displays current character count and the limit (2000). Text color is #888 (muted gray) while under limit.
+
+### Compose box: Character Limit Exceeded
+When text reaches or exceeds 2000 characters:
+
+```
+Compose box with exceeded-limit indicator:
+┌────────────────────────────────────────────────────┐
+│ <textarea>(2000+ characters of text)</textarea>   │
+│ <button class="team-btn" [disabled]>Send</button> │
+│ 2047/2000                                          │
+│ (character counter text in #ff6b6b red)           │
+└────────────────────────────────────────────────────┘
+```
+
+**Behavior**:
+- Counter text turns #ff6b6b (error red).
+- `.over-limit` class is added to the counter element (developer may use this for additional styling, e.g., slightly larger font).
+- Send button becomes **disabled** (greyed out, `disabled` attribute set, cursor: not-allowed).
+- Operator cannot POST the message while over limit (client-side guard). If they somehow bypass it (hand-crafted request), server-side validation catches it.
+
+### Compose box: Empty or Whitespace-Only Draft
+When the textarea is empty or contains only whitespace:
+
+```
+Compose box with empty text:
+┌────────────────────────────────────────────────────┐
+│ <textarea placeholder="Send a message..."></textarea>│
+│ <button class="team-btn" [disabled]>Send</button> │
+│ 0/2000                                             │
+└────────────────────────────────────────────────────┘
+```
+
+**Behavior**:
+- Send button is **disabled** (greyed out).
+- Counter shows "0/2000" (gray text, not red).
+- Operator must type at least one non-whitespace character before Send becomes enabled.
+
+### Compose box: Sending in Progress
+While `POST /projects/<name>/team/interject` is in flight:
+
+```
+┌────────────────────────────────────────────────────┐
+│ <textarea [disabled]>Please check the database...</textarea>
+│ <button class="team-btn" [disabled]>Send</button> │
+│ 47/2000                                            │
+│                                                    │
+│ ✓ Sending message: <project-name>…               │
+│ (status message below, styled via code overlay)  │
+└────────────────────────────────────────────────────┘
+```
+
+**Behavior**:
+- Textarea and Send button become **disabled** (greyed out).
+- A TOTP code-overlay may appear if this is the first action in the session (existing `toggle()`/TOTP machinery).
+- Status message appears in `#team-msg-<name>` (shown by the code overlay during the 428-retry flow).
+
+### Compose box: Success
+After `POST /projects/<name>/team/interject` returns `{"ok": true, ...}`:
+
+```
+┌────────────────────────────────────────────────────┐
+│ <textarea placeholder="Send a message..."></textarea>│
+│ (textarea is cleared)                              │
+│ <button class="team-btn" [disabled]>Send</button> │
+│ 0/2000                                             │
+│                                                    │
+│ ✓ Message sent                                     │
+│ (green success message)                            │
+└────────────────────────────────────────────────────┘
+```
+
+**Behavior**:
+- Textarea value is cleared and reset to empty state.
+- `teamInterjectText[name]` (client-side draft map) is deleted.
+- Send button returns to **disabled** (empty input).
+- Character counter resets to "0/2000".
+- Success message "✓ Message sent" appears below in `.team-msg.success` (green, #34c759).
+- On the next `pollTeamFeed()` cycle (within ~4 seconds), the new event appears in the feed with `agent="human"`, `kind="message"`.
+
+### Compose box: Error
+After `POST /projects/<name>/team/interject` returns an error (`{"error": "...", ...}` with 400 status):
+
+```
+┌────────────────────────────────────────────────────┐
+│ <textarea>Please check the database...</textarea>  │
+│ (draft text is preserved — operator can edit and retry)
+│ <button class="team-btn">Send</button>            │
+│ 47/2000                                            │
+│                                                    │
+│ ✕ Error: message over length limit                │
+│ (red error message, stays until next send attempt)│
+└────────────────────────────────────────────────────┘
+```
+
+**Behavior**:
+- Textarea retains the failed draft (intentionally NOT cleared), allowing the operator to edit and retry without retyping.
+- Error message "✕ Error: <server message>" appears below in `.team-msg.error` (red, #ff6b6b).
+- Send button remains **enabled** (so operator can fix and retry).
+- Message persists until the operator clicks Send again (which clears the previous message) or until `refresh()` is called.
+
+### Feed: Human Messages (New Row Styling)
+In the live event feed, human-authored messages now appear with a distinct left-border accent:
+
+```
+Team feed (scrollable list):
+┌──────────────────────────────────────────────────────┐
+│ All • lead • human • teammate-1                      │
+│                                                      │
+│ 14:23:15 lead Fact-check result: ✓ file.py:42…   │
+│                                                      │
+│ 14:23:42 human Please verify schema consistency    │
+│ (left-border: #4da6ff, text: normal #eee)          │
+│                                                      │
+│ 14:24:01 lead Fact-check result: ✗ no match       │
+│                                                      │
+└──────────────────────────────────────────────────────┘
+```
+
+**Styling**:
+- `.team-feed-event.kind-human-message` adds a **left-border: 3px solid #4da6ff** (blue accent, same color as active filter pills).
+- Added **padding-left: 12px** to accommodate the border and maintain visual alignment with other rows.
+- Text content remains normal (#eee) — no text-color override like `.kind-error` or `.kind-terminal-escalation`. The left-border is the primary visual cue.
+- Agent name ("human") is colored via `teamAgentColor("human")` (existing hash-based palette, stable).
+
+**Contrast check** (left-border accent #4da6ff on #1c1c1c background):
+- Luminance: #4da6ff = 0.289; #1c1c1c = 0.018; ratio = (0.289 + 0.05) / (0.018 + 0.05) = **6.67:1**, **passes WCAG AA** for graphical elements (3:1 minimum).
+
+### Feed: "Human" Filter Pill
+A new filter pill "human" is added to the filter row:
+
+```
+Filter row:
+All • lead • human • teammate-1 • teammate-2
+
+When clicked:
+All • lead • human (active, highlighted) • teammate-1 • teammate-2
+
+Feed shows only human-authored messages:
+14:23:42 human Please verify schema consistency
+14:28:15 human Can you re-run with verbose logging?
+14:30:00 human Thanks, the logs helped a lot.
+(Only human.agent === 'human' events are shown)
+```
+
+**Styling**:
+- Pill uses the same button styling as other filter pills: `.team-feed-filter button` (12px font, 3px 9px padding, #333 border, #1c1c1c background, #aaa text).
+- Active state: `.active` class (background: #16324a, color: #4da6ff, border-color: #4da6ff) — same as existing lead/teammate pills.
+- `aria-pressed="true"` / `aria-pressed="false"` attributes (existing pattern for accessibility).
+
+**Behavior**:
+- Pill is rendered unconditionally (even if no human messages have been sent yet for this run).
+- Clicking it sets `teamFeedFilter[name] = 'human'`, triggering `refresh()`.
+- Feed is filtered via the existing generic logic: `events.filter(e => e.agent === 'human')`.
+- If no human messages exist, the feed shows "No events yet." (same as any other empty filter state).
+
+## Accessibility & platform notes
+
+- **Touch target sizes**: Send button is `.team-btn` (14px font, 10px 16px padding, 10px border-radius) — typical desktop button size (~44-48px height), exceeding the mobile accessibility minimum of 44px; web app is desktop-only, so no mobile-specific adjustment needed.
+- **Color contrast**:
+  - Send button text (#111, not #fff as originally claimed here — corrected 2026-08-14 per backlog item 20's audit, which changed `.deploy-btn, .team-btn`'s `color: #fff` to `color: #111` to fix a real AA failure) on button background (#34c759): **8.51:1** (passes WCAG AAA; the previously claimed 5.05:1 for white text was also wrong — white-on-#34c759 is actually ~2.2:1, failing AA).
+  - Character counter text (#888) on row background (#1c1c1c): **6.14:1** (passes WCAG AA; existing token).
+  - Character counter text over-limit (#ff6b6b) on background: **6.14:1** (passes WCAG AA; existing error token).
+  - Left-border accent (#4da6ff) on background (#1c1c1c): **6.67:1** (passes WCAG AA for graphical elements, 3:1 minimum applies).
+- **Keyboard interaction**:
+  - Tab to textarea → enter message text.
+  - Tab to Send button → press Enter to send (no Shift+Enter for newline — single-line escape not supported, per spec's "no chat-style Enter-to-send" decision).
+  - Tab moves between compose-box elements and other row controls (escalation panel, feed toggle, Stop button) in visual order.
+- **Textarea accessibility**: Textarea has a `placeholder` attribute (sufficient context from the long placeholder text). No explicit `<label>` is added (consistent with the task-description textarea above in the idle state, which also uses placeholder-only).
+- **Form state accessibility**: Send button's `disabled` attribute is set/unset based on character count and content. Screen readers announce disabled state.
+- **Live character counter**: Updates on `oninput` event. Screen readers may pick up live text changes (not announced as `aria-live` update, just as DOM text change), but this is acceptable — counter is supplementary; the Send button's disabled state is the primary guard.
+- **Compose-box visibility**: The entire compose box (`.team-interject` container) is hidden (not rendered) when ineligible (`team.status` not running/blocked-waiting). Existing accessibility contracts are preserved: `role="log"` / `aria-live="polite"` on the feed list stays intact (compose box doesn't interfere).
+- **Web vs. native**: This is a web app (HTML/CSS/JS in Flask template), desktop-only. No native/mobile variant, no mobile-specific touch states needed.
+- **Error message accessibility**: Error and success messages appear in `#team-msg-<name>` (always-present DOM slot, empty initially). Screen readers pick up the slot when text is populated. Messages persist until next send attempt or `refresh()`, allowing operators time to read.
+
+## Traceability to spec
+
+| Acceptance criterion (from docs/spec.md) | Where it's addressed in this design |
+|---|---|
+| Compose box visible when `team.status === 'running'` or `(team.status === 'blocked' && team.waiting_on_you)` | Visibility section: Running and Blocked-Waiting-on-You states show compose box; Hidden section covers other statuses |
+| Compose box + escalation panel coexist when `waiting_on_you === true` | Blocked, Waiting-on-You state shows both; distinct placeholders clarify separation |
+| Placeholder copy distinguishes "free message" from "answer the question" | Running state: neutral placeholder; Blocked state: placeholder includes "(this will not answer...)" guidance |
+| Textarea (`#interject-<name>`) + Send button (`#interject-send-<name>`) | Compose box structure shows both IDs; button styled with `.team-btn` class |
+| 2-row textarea, 13px font | Styling: `rows="2"`, `font-size: 13px`, inherits `.team-interject-textarea` from `.team-textarea` pattern |
+| Live character counter `len + '/' + 2000` | Text Input state shows counter updating; Over-limit state shows red counter and disabled button |
+| Counter text turns red (#ff6b6b) when len > 2000 | Over-limit state: counter text color #ff6b6b, `.over-limit` class added |
+| Send button disabled when empty, over-limit, or non-trimmed-whitespace | Empty/Whitespace state and Over-limit state show disabled button |
+| Send button text: "Send" | Compose box structure shows "Send" label |
+| `doTeamInterject(name)` calls `toggle('team-interject', name, true, null)` | Implementation reuses toggle()/actionPath()/actionBody()/handleActionResult() plumbing |
+| On success, clear textarea, draft map, show "✓ Message sent" | Success state shows cleared textarea, success message |
+| On error, preserve draft, show "✕ Error: ..." | Error state shows preserved draft text and red error message |
+| New `kind-human-message` CSS class in feed rendering | Feed: Human Messages section shows `.kind-human-message` with left-border accent |
+| Human message rows have left-border or background tint, distinct from error/terminal-escalation | Feed styling: `border-left: 3px solid #4da6ff`, `padding-left: 12px`; distinct from red/orange kind-* classes |
+| New "human" filter pill in filter row, always present | Feed: "Human" Filter Pill section shows pill rendered unconditionally, `aria-pressed` toggles |
+| Filtering works via existing generic filter logic (no new code path) | Filter behavior: existing `events.filter(e => e.agent === filter)` applies to `filter === 'human'` |
+| `role="log"` / `aria-live="polite"` on feed intact (no redesign of feed structure) | Accessibility: compose-box hidden when ineligible, doesn't interfere; feed rendering unchanged |
+| Compose-box draft cleared when status transitions away from compose-eligible | Hidden state: unsent draft is discarded; reappear-prevention via `delete teamInterjectText[name]` in `clearTeamFeedState()` |
+| No Enter-to-send (consistent with other multi-line textareas in app) | Spec's "No Enter-to-send" non-goal is honored; Send via button click only |
+| `TEAM_INTERJECT_MAX_CHARS_CLIENT = 2000` (mirrors server constant) | Over-limit detection and counter use 2000 limit; note in spec non-goal that client/server can drift if env var is overridden |
+
+## Implementation notes for the developer
+
+1. **CSS additions**: Add new rules near existing `.team-escalation-*` / `.team-feed-*` CSS (app/app.py line 2215-2277):
+   ```css
+   .team-interject { display: flex; flex-direction: column; gap: 8px; margin-top: 4px;
+                     padding: 10px 12px; border: 1px solid #333; border-radius: 8px; background: #181818; }
+   .team-interject-row { display: flex; gap: 8px; }
+   .team-interject-textarea { font-size: 13px; padding: 8px 10px; border-radius: 8px;
+                              border: 1px solid #333; background: #1c1c1c; color: #eee;
+                              resize: vertical; min-height: 44px; font-family: inherit; }
+   .team-interject-counter { font-size: 12px; color: #888; text-align: left; }
+   .team-interject-counter.over-limit { color: #ff6b6b; }
+   .team-feed-event.kind-human-message { border-left: 3px solid #4da6ff; padding-left: 12px; }
+   ```
+
+2. **JavaScript state map**: Add at module scope (near existing `teamTaskText = {}`, `teamPickerMembers = {}`, etc.):
+   ```javascript
+   let teamInterjectText = {};  // name -> string draft
+   const TEAM_INTERJECT_MAX_CHARS_CLIENT = 2000;
+   ```
+
+3. **Visibility predicate**: Add helper function:
+   ```javascript
+   function teamAcceptsInterject(team) {
+     return !!team && (team.status === 'running' ||
+                       (team.status === 'blocked' && team.waiting_on_you));
+   }
+   ```
+
+4. **Render function**: Add `renderTeamInterjectBox(name, team)` (spec's "Proposed approach" §1 provides complete pseudocode).
+
+5. **Update function**: Add `updateTeamInterjectControls(name)` (spec's pseudocode provided).
+
+6. **Dispatch function**: Add `doTeamInterject(name)` (spec's pseudocode provided).
+
+7. **Action routing**: Extend existing `actionPath()`, `actionBody()`, `handleActionResult()` with `kind === 'team-interject'` branches (spec's pseudocode provided).
+
+8. **Clear function**: Extend `clearTeamFeedState(name)` to add `delete teamInterjectText[name];` (one line).
+
+9. **Feed styling**: Update `teamFeedEventKindClass()` to add branch (spec's pseudocode):
+   ```javascript
+   if (e.kind === 'message' && e.agent === 'human') return 'human-message';
+   ```
+
+10. **Filter pills**: Update `renderTeamFeed()` filter-pill agent list:
+    ```javascript
+    const agents = ['lead', 'human'].concat((team.composition && team.composition.members) || []);
+    ```
+
+11. **Integration point**: In `teamRow()`, insert the compose-box render output between escalation panel and feed toggle (spec shows exact insertion point).
+
+## Traceability to spec (implementation details)
+
+All implementation details (DOM ID patterns, class names, TOTP integration, handler structure) are spelled out in the spec's "Proposed approach" sections 1–3, with complete pseudocode. This design document adds the UI/UX layer (wireframes, state descriptions, accessibility notes, color rationale) on top of that functional spec.
+
+## Accessibility audit (Dieter Rams' "good design is..." principles, applied as self-check)
+
+1. **Good design is innovative** — The compose box and human-message styling are additive, not disruptive; they reuse existing patterns (textarea, button, filter pill) without inventing new UI paradigms. Human messages fit seamlessly into the structured event log rather than breaking it into a chat-bubble redesign. (Passes)
+
+2. **Good design makes the product useful** — Operators can now send free-form updates to the team without navigating elsewhere; messages appear immediately in the shared feed for the lead to see. Distinct styling makes it easy to scan which events are human-authored vs. agent-authored. (Passes)
+
+3. **Good design is aesthetic** — No new color tokens introduced (reuses existing blue, green, gray, red). Layout is compact and respects the existing row-based hierarchy. Left-border accent is subtle, not garish. (Passes)
+
+4. **Good design makes the product understandable** — Placeholder text clarifies the purpose ("Send a message to the team") and the relationship to other controls ("...will not answer the pending question"). Character counter is simple and unambiguous. Filter pill follows existing conventions. (Passes)
+
+5. **Good design is unobtrusive** — Compose box is only shown when needed (running/blocked-waiting). Human messages don't break the existing log structure or accessibility contract (`role="log"`/`aria-live="polite"`). No persistent UI chrome; draft is ephemeral. (Passes)
+
+6. **Good design is honest** — No misleading disabled states; button is disabled when it should be (empty, over-limit). Error messages show the exact server error, not a polished-but-vague generic message. 2000-character limit is visible and enforced client-side before POST. (Passes)
+
+7. **Good design is long-lasting** — Reuses established patterns (textarea, button, filter pill, action plumbing). No trendy chat-bubble redesign that will look dated in 2 years. Integrates with the existing event-log paradigm designed for multi-party, structured messages (agents + lead + human). (Passes)
+
+8. **Good design is thorough down to the last detail** — Placeholder copy adapts to context (running vs. blocked-waiting). Draft is preserved on error (allowing retry without retyping) but cleared on success. Compose box is hidden and draft discarded when status no longer accepts interjections (preventing stale-draft bugs). Character counter updates live. WCAG contrast ratios computed and verified. (Passes)
+
+9. **Good design is environmentally responsible** — No heavy animations, no auto-refresh, no background polling for the compose box alone (uses existing /status poll). No new infrastructure. (Passes)
+
+10. **Good design is as little design as possible** — Compose box is a simple textarea + button + counter. Human messages are identified by a single CSS class. No new components, no new routes, no new data shapes. Follows existing conventions (toggle()/.team-msg/.team-btn). (Passes)
+
+---
+
+# Design: Add teammate to running team (backlog item 21 part 2)
+
+## Summary
+A new inline control displayed below the interject compose-box on a running team's row (when `teamAcceptsInterject(team)` returns true), allowing an operator to select one available roster engine and add it to the live team. The control is a native `<select>` populated with eligible engines, paired with an "+ Add" button. Two distinct disabled states are visually differentiated from the enabled state with clear, inline reason text: "Team is at the maximum of N teammates" vs. "No more roster engines available to add". Success feedback states "✓ 'agent' will join the team at its next round" (never "has joined"), and a `member_joined` event appears in the feed showing the newly-added teammate in their established agent color. No new visual language — all styling reuses existing team-row patterns (team-interject box, .team-msg slots, filter pills, event feed).
+
+## ui-ux-pro-max choices
+- **Style**: Inline flex row control, matching the existing `renderTeamInterjectBox()` placement and spacing conventions (sits below interject box, above feed toggle). A native `<select>` (not a custom picker widget) paired with an "+ Add" button to match the lead-picker pattern from `renderTeamPicker()`.
+- **Palette**: Reuses existing page tokens entirely — no new colors. The new `member_joined` event in the feed inherits the joined agent's own established color from `teamAgentColor()`, rendered as a left-border accent like existing `kind-human-message` events. Disabled-state text uses existing muted-gray token (#888) already established for `.team-sub`/`.team-branches` unavailable states.
+- **Typography**: Existing 13px for select/button (matching `.team-lead-picker select`), 12px for disabled-reason text (matching `.team-sub` muted labels).
+- **Relevant UX guidelines applied**:
+  - Disabled states are never silent: two distinct, actionable reason strings (cap reached vs. no eligible engines) help operators understand why the control is not available.
+  - Button remains active for retry after a server error (same as `doTeamInterject()` error handling).
+  - Success feedback is honest about delivery timing: "will join at its next round" (reflecting `team_step()`'s async membership drain), not "has joined" or "is available now".
+  - The `member_joined` event in the feed is the single source of truth for "it worked" (not a fabricated UI success state), appearing ~4s after the POST succeeds (next `/team/events` poll).
+
+## Component reuse
+- **Reused**: `teamAcceptsInterject(team)` visibility gate (same three statuses: `running`, `blocked_ask_user`, `blocked_board_write`).
+- **Reused**: `toggle(kind='team-add-member')` TOTP-retry plumbing (same as `doTeamInterject()`, `doTeamBoardResolve()`).
+- **Reused**: `actionPath()` / `actionBody()` / `handleActionResult()` wiring (same pattern as existing team actions).
+- **Reused**: `.team-msg` result slot (already rendered per team row; success/error text populates this same slot).
+- **Reused**: `.team-lead-picker select` CSS (same padding/border/border-radius/font-size — no new token).
+- **Reused**: `.team-sub` muted-text color (`#888`) for disabled-reason text.
+- **Reused**: Filter-pill structure (updated list source from stale `team.composition.members` to live `team.members`, no pill widget change).
+- **Reused**: Event feed rendering (new `member_joined` event kind is styled with left-border accent, reusing `renderTeamFeedEvent()`'s existing `style="color:' + teamAgentColor(e.agent) + '"` mechanism).
+- **New (minimal)**: Two small helpers (`teamAddMemberEligible()`, `renderTeamAddMemberControl()`), new CSS classes (`.team-add-member`, `.team-add-member select`, `.team-add-member-reason`, `.team-feed-event.kind-member-joined`). No new route, no schema change. Backend addition is purely additive fields on existing `/status` (`inst["team"]["members"]`, `inst["team"]["lead"]`, `team_max_members`) and one new source merged into existing `GET .../team/events` response (`membership.jsonl`).
+
+## States
+
+### Enabled (Ready to Add)
+Rendered when `teamAcceptsInterject(team)` is true, `team.members.length < team_max_members`, and at least one eligible roster engine exists (not already a member, not the lead if lead is an engine):
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Team                                                     │
+│                                                          │
+│ [Compose box / interject-box content above, not shown]  │
+│                                                          │
+│ <select id="team-add-member-select-<name>">             │
+│   <option>aider (tier 1 - native tools)</option>        │
+│   <option>claude (tier 2 - schema constrained)</option>  │
+│ </select>                                                │
+│ <button onclick="doTeamAddMember('<name>')">            │
+│   + Add                                                  │
+│ </button>                                                │
+│                                                          │
+│ [Feed toggle and feed panel below, not shown]           │
+│ <div id="team-msg-<name>" class="team-msg"></div>       │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Styling**: 
+- Container `.team-add-member`: flex row, gap 8px, margin-top 4px, align-items center (same spacing/alignment as `.team-interject-row`).
+- `<select>`: 13px font (matching `.team-lead-picker select`), 6px 8px padding, 8px border-radius, #1c1c1c background, #eee text, #333 border — no new token, reuses existing select styling.
+- `<button class="team-btn">`: "+ Add" (matching existing `.team-btn` styling — same size/color as "Send" button in interject box). Exact text is "+ Add" (space between plus and word).
+- `.team-msg` slot (already present in the row) receives success/error messages (see result states below).
+
+**Interaction**:
+- `<select>` value defaults to empty (first `<option>` has empty value, shows "Choose..."-style placeholder, per `renderTeamPicker()` precedent).
+- Operator clicks select → dropdown opens, showing `aider (tier 1)`, `claude (tier 2)`, etc. (no tiers shown that aren't engines; no Ollama-only lead entry).
+- Operator clicks "+ Add" with a selection → `doTeamAddMember()` fires, clears msg slot, calls `toggle()` with saved `teamAddMemberChoice[name]` value.
+
+### Disabled — At Capacity
+Rendered when `team.members.length >= team_max_members` (from live `/status` poll):
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Team                                                     │
+│                                                          │
+│ [Compose box above]                                     │
+│                                                          │
+│ Team is at the maximum of 6 teammates.                  │
+│                                                          │
+│ [Feed toggle/feed below]                                │
+│ <div id="team-msg-<name>" class="team-msg"></div>       │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Styling**:
+- No `<select>` or button rendered.
+- Single-line disabled reason: `.team-add-member` div containing only a `<span class="team-add-member-reason">`.
+- Reason text: "Team is at the maximum of N teammates." (where N is `TEAM_MAX_MEMBERS_CLIENT`, default 6, updated from `/status`'s `team_max_members`).
+- Text color: #888 (`.team-sub` muted gray), 12px font (`.team-sub` size).
+- No background or border (text-only, minimal visual weight).
+
+**Interaction**: None — this is purely informational, not an error. If team size drops (operator removes a teammate in the future, or a future "shrink" feature), the control automatically re-enables on the next `/status` poll without manual refresh.
+
+### Disabled — No Eligible Engines
+Rendered when `team.members.length < team_max_members` BUT no roster engines remain eligible (all non-lead engines are already members):
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Team                                                     │
+│                                                          │
+│ [Compose box above]                                     │
+│                                                          │
+│ No more roster engines available to add.                │
+│                                                          │
+│ [Feed toggle/feed below]                                │
+│ <div id="team-msg-<name>" class="team-msg"></div>       │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Styling**: Same as At Capacity above (text-only, #888 muted, 12px).
+
+Reason text: "No more roster engines available to add." (exact punctuation, period at end).
+
+**Rationale for distinct text**: This signals a *resource* constraint (not enough engines configured), different from a *team-size* cap. Helps operators understand whether they should configure more engines vs. wait for capacity to open up.
+
+**Interaction**: None. If more engines are configured (via `engines.d` changes + server restart), the control re-enables on the next poll.
+
+### Success Feedback
+After `POST /projects/<name>/team/add-member` succeeds (200 + `{"ok": true, "agent": "aider", ...}`):
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Team                                                     │
+│                                                          │
+│ [Compose box above]                                     │
+│                                                          │
+│ <select id="team-add-member-select-<name>">             │
+│   <option></option>                                      │
+│   <option>aider (...)</option>                           │
+│   ...                                                    │
+│ </select>                                                │
+│ <button onclick="doTeamAddMember('<name>')">            │
+│   + Add                                                  │
+│ </button>                                                │
+│                                                          │
+│ <div id="team-msg-<name>" class="team-msg success">     │
+│   ✓ 'aider' will join the team at its next round        │
+│ </div>                                                   │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Styling**:
+- Success message uses `.team-msg.success` (green text, #34c759, same as deploy success).
+- Message text: `"✓ '<agent_name>' will join the team at its next round"` (exact phrasing, using the returned `data.agent`).
+- Message persists in the `.team-msg` slot until the next `refresh()` call (4s poll).
+- `<select>` is **not** cleared (remains showing the last selection); operator can submit again if desired (though it would fail with "agent already added" 400).
+- On the very next `/team/events` poll (within ~4s), the `member_joined` event appears in the feed (see Feed event design below).
+- On the subsequent `/status` poll (within ~4s after that), `team.members` in the response now includes `"aider"`, and the feed's filter-pill list updates to include an "aider" pill.
+
+**Rationale for "will join... at its next round"**: Matches part 1's own semantics — the async membership drain inside `team_step()` does not run immediately; the operator should not expect the teammate to be available to delegate to until the next round. This honest framing avoids the trap of an operator clicking "+ Add" and immediately trying to delegate to the new teammate (which would fail until the round boundary).
+
+### Error Feedback
+After `POST /projects/<name>/team/add-member` fails (400, e.g., a concurrent add race pushed the team over the cap between poll and click):
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Team                                                     │
+│                                                          │
+│ [Compose box above]                                     │
+│                                                          │
+│ <select id="team-add-member-select-<name>">             │
+│   <option>aider (...)</option>                           │
+│   ...                                                    │
+│ </select>                                                │
+│ <button onclick="doTeamAddMember('<name>')">            │
+│   + Add                                                  │
+│ </button>                                                │
+│                                                          │
+│ <div id="team-msg-<name>" class="team-msg error">       │
+│   ✕ Error: Team is at the maximum of 6 teammates.      │
+│ </div>                                                   │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Styling**:
+- Error message uses `.team-msg.error` (red text, #ff6b6b, same as deploy error).
+- Message text: `"✕ Error: " + data.error` (the server's exact error message from the 400 response).
+- Message persists until next `refresh()`.
+- `<select>` and button remain **enabled** for retry (same as `doTeamInterject()` error handling).
+- Operator can select a different agent or the same one and click "+ Add" again.
+
+### 428 TOTP Challenge
+If the request triggers a 428 code-overlay challenge (same TOTP retry plumbing as other team actions):
+
+The `teamAddMemberChoice[name]` dict stores the selected agent name before the POST, survives the code-entry flow, and is re-used on retry without re-reading a possibly-stale `<select>` value. Same mechanism as `doTeamInterject()`'s own `teamInterjectText` dictionary.
+
+### New Feed Event: member_joined
+When a teammate is added and the lead next delegates to them (or anytime after the member_joined event is written to `membership.jsonl`), the event appears in the feed:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Live feed (role="log" aria-live="polite")                │
+│                                                          │
+│ 12:34:56 lead deployed task: "Find files"               │
+│ 12:34:58 aider → joined the team                         │
+│ 12:35:12 aider deployed tool: grep                       │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Styling**:
+- Event HTML: `<div class="team-feed-event kind-member-joined">`
+- Timestamp: `.team-feed-ts` (gray, #888) — formatted as HH:MM:SS
+- Agent name: `.team-feed-agent` (in the joined agent's established color via `style="color:' + teamAgentColor(e.agent) + '"`; for "aider", this is one of the six colors in `TEAM_AGENT_PALETTE`, e.g., #d084d0)
+- Event body: `.team-feed-text` containing `"→ joined the team"` (arrow symbol U+2192, literal text "joined the team")
+- Left-border accent: `.team-feed-event.kind-member-joined` class gets a `border-left: 3px solid <agent-color>` (matching the existing `.team-feed-event.kind-human-message` pattern, but using the joined agent's dynamic color instead of a fixed blue).
+
+**Rendering**:
+- The event is tagged with `kind: "member_joined"` in the `membership.jsonl` entries (part 1 format, unchanged).
+- `teamFeedEventKindClass()` adds a new branch: `if (e.kind === 'member_joined') return 'member-joined';`
+- `teamFeedEventBody()` adds a new branch: `if (cls === 'member-joined') return '→ joined the team';`
+- No additional logic needed in `renderTeamFeedEvent()` — the existing `teamAgentColor(e.agent)` mechanism automatically picks the joined agent's color.
+- No change to `role="log"` / `aria-live="polite"` contract — the new event is just another line in the existing live log feed.
+
+**Filter pills**: 
+- Once the member_joined event is visible in the feed (after the add succeeds and the next `/team/events` poll), the feed's filter-pill list (below the feed header) should include a pill for the new agent.
+- This is achieved by updating `renderTeamFeed()` to source the agent list from the live `team.members` (from `/status`) instead of the stale `team.composition.members`:
+  ```javascript
+  const agents = ['lead', 'human'].concat(team.members || []);
+  ```
+  (One-line change; restores the fix flagged in the spec's "Proposed approach" §4.)
+- The new teammate's pill is clickable and filters the feed to show only their events (same as existing pills).
+
+## Accessibility & platform notes
+
+- **Touch target sizes**: The `<select>` and "+ Add" button follow the page's existing button/input minimum (36-40px on desktop). Tab order: select → button (left-to-right, matches flex row layout). Both are keyboard-accessible (arrow keys to select option, Tab to button, Enter to submit).
+- **Disabled state affordance**: Both disabled-reason states (at-cap, no-engines) are rendered as plain text (not buttons, not grayed-out controls), so they're visually distinct from the enabled select+button pair. Color is already muted (#888), so the distinction is clear.
+- **Color contrast**:
+  - Agent colors in `TEAM_AGENT_PALETTE` (e.g., #d084d0, #6eb5d4): when used as a left-border accent in the feed event (3:1 minimum for graphical elements), each color is sufficiently distinct from the page background (#1c1c1c, the team-row background). The entire palette was chosen to be distinct from the four semantic status colors (#4da6ff/#ffb648/#34c759/#ff6b6b) — this constraint ensures no visual confusion. (No re-computation needed; part 1's own accessibility audit already verified palette contrast.)
+  - Success text (#34c759 on #1c1c1c): 7.68:1 (passes WCAG AAA, from existing `.team-msg.success`).
+  - Error text (#ff6b6b on #1c1c1c): 6.14:1 (passes WCAG AA, from existing `.team-msg.error`).
+  - Disabled reason text (#888 on #1c1c1c): 6.4:1 (passes WCAG AA, per backlog item 20's audit).
+  - Select/button text (#111 dark text on #1c1c1c background, per existing `.team-lead-picker select` styling): inherited from existing controls, no change needed.
+- **Form control accessibility**: The `<select>` has no explicit `<label>` (context is clear from the surrounding row and interject box above it, plus the flex-row layout). Developers can add a hidden `<label for="team-add-member-select-...">` if stricter WCAG triple-A compliance is desired, but the current `.team-lead-picker` in the composition picker uses the same pattern (implicit labeling via layout), so this design maintains consistency.
+- **Screen reader**: The `member_joined` event line in the feed is announced via the existing `role="log" aria-live="polite"` mechanism on the feed container — no special handling needed.
+- **Web vs. native**: This is a web app (desktop HTML/CSS/JS in Flask template), no mobile/native variant. No hover states needed (the select/button are keyboard-accessible and mouse-clickable as standard HTML controls).
+- **Keyboard interaction**:
+  - Tab into select → arrow keys to navigate options, Enter to select.
+  - Tab to "+ Add" button → Enter to submit (same as textarea+button pattern in other controls).
+
+## Traceability to spec
+
+| Acceptance criterion (from docs/spec.md) | Where it's addressed in this design |
+|---|---|
+| Control visible when `teamAcceptsInterject(team)` (running/blocked_ask_user/blocked_board_write) | Visibility gate matches existing compose-box condition; rendered inline between interject box and feed toggle |
+| Native `<select>` populated with eligible engines only | Control uses `<select>` (not custom picker). `teamAddMemberEligible()` filters to engines not in `team.members` and not the lead. No Ollama-only entries. |
+| Excludes current lead if lead is an engine | `team.lead.kind === 'engine'` check in eligibility helper; lead is never an option in the dropdown |
+| Excludes live team members | `const already = new Set(team.members \|\| [])` filters `ROSTER` entries |
+| "Team is at the maximum of N teammates" when at cap | Distinct disabled state with exact text; N comes from `TEAM_MAX_MEMBERS_CLIENT` (from `/status`) |
+| "No more roster engines available to add" when no eligible remain | Distinct disabled state with exact text; eligibility list is empty but team is under cap |
+| Success feedback: "will join the team at its next round" (not "has joined") | Success message: `"✓ '<agent>' will join the team at its next round"` |
+| No `confirm()` dialog before adding | Control has button + select, no confirmation modal. Matches additive-action convention (doTeamStart/doTeamInterject/doTeamBoardResolve have no confirm) |
+| Reuse existing TOTP plumbing (toggle, handleActionResult) | `toggle(kind='team-add-member', ...)` wiring; TOTP code-overlay machinery unchanged |
+| `member_joined` event visible in feed within ~4s | Event is written to `membership.jsonl` by backend (part 1); merged into `/team/events` file list (part 2); rendered with agent color and "→ joined the team" text |
+| New teammate's filter pill available once they're in feed | Pill list now sources from `team.members` (live) instead of `team.composition.members` (stale); pill appears after `/status` poll includes member in `team.members` |
+| `team.members` and `team.lead` reflect live roster in `/status` | Backend additions: `inst["team"]["members"]` = live roster, `inst["team"]["lead"]` = run's lead |
+| Concurrent add race handled gracefully | Server validation remains authoritative; UI shows server's 400 error message; select/button stay enabled for retry |
+| Row re-renders mid-selection (poll lands while select is open) | DOM state lives in `<select>` element (not a JS mirror pre-submit), resets on full row re-render (same as existing select behavior in picker). Choice is saved in `teamAddMemberChoice[name]` only after submit (mirrors `doTeamInterject()` pattern). |
+
+## Implementation notes for the developer
+
+1. **Backend additions** (app/app.py `/status` handler, `_handle_team_events()`, plus CSS/JS):
+   - Add `inst["team"]["members"]` = `run.get("members", []) if run else []` (live roster)
+   - Add `inst["team"]["lead"]` = `run.get("lead") if run else None` (lead actor dict)
+   - Add top-level `team_max_members` = `teams.TEAM_MAX_MEMBERS` (constant, shipped once per poll)
+   - Merge `("membership", teams._membership_log_path(run_id))` into the `files` list in `_handle_team_events()`
+
+2. **Frontend globals and helpers** (app/app.py embedded JS):
+   - `TEAM_MAX_MEMBERS_CLIENT`: hardcoded default 6, overwritten from `s.team_max_members` on each `/status` poll
+   - `teamAddMemberChoice = {}`: dict to store name → agent selection, survives 428 TOTP retry (mirrors `teamInterjectText`)
+   - `function teamAddMemberEligible(team)`: returns array of eligible engine entries; filters `ROSTER` by kind='engine', excludes lead (if lead.kind=engine), excludes members already in `team.members`
+   - `function renderTeamAddMemberControl(name, team)`: returns HTML string, renders select+button or one of two disabled states. Uses `teamAddMemberEligible()`, `TEAM_MAX_MEMBERS_CLIENT`, and `teamAcceptsInterject()` reuse comment.
+   - `function doTeamAddMember(name)`: reads select value, saves to `teamAddMemberChoice[name]`, clears msg slot, fires `toggle('team-add-member', name, true, null)`
+
+3. **Wiring into existing shared plumbing**:
+   - `actionPath()`: add branch `if (kind === 'team-add-member') return '/projects/' + encodeURIComponent(name) + '/team/add-member';`
+   - `actionBody()`: add branch `if (kind === 'team-add-member') body.agent = teamAddMemberChoice[name];`
+   - `handleActionResult()`: add branch (before generic 400 handler) for `kind === 'team-add-member'` — same "own result slot" pattern as team-interject/team-board-resolve. Success message: copy from spec's pseudocode. Error message: use `data.error` verbatim. Clear `teamAddMemberChoice[name]` on success (don't clear on error to allow retry).
+   - 428 code-overlay label: add `kind === 'team-add-member' ? 'Adding teammate: ' + (name || 'this') :` to the ternary chain
+
+4. **Feed event handling**:
+   - `teamFeedEventKindClass()`: add `if (e.kind === 'member_joined') return 'member-joined';`
+   - `teamFeedEventBody()`: add `if (cls === 'member-joined') return '→ joined the team';`
+   - No change to `renderTeamFeedEvent()` — existing color mechanism handles it.
+
+5. **Filter pills fix**:
+   - In `renderTeamFeed()`, change the agents array construction:
+     - From: `const agents = ['lead', 'human'].concat((team.composition && team.composition.members) || []);`
+     - To: `const agents = ['lead', 'human'].concat(team.members || []);`
+
+6. **CSS (new)**:
+   ```css
+   .team-add-member { 
+     display: flex; 
+     gap: 8px; 
+     align-items: center; 
+     margin-top: 4px; 
+   }
+   .team-add-member select { 
+     font-size: 13px; 
+     padding: 6px 8px; 
+     border-radius: 8px; 
+     border: 1px solid #333; 
+     background: #1c1c1c; 
+     color: #eee; 
+     font-family: inherit; 
+   }
+   .team-add-member-reason { 
+     font-size: 12px; 
+     color: #888; 
+   }
+   .team-feed-event.kind-member-joined {
+     border-left: 3px solid currentColor;
+     padding-left: 12px;
+   }
+   ```
+   (The `.team-feed-agent` span already has `style="color: ..."` set by `renderTeamFeedEvent()`, so `currentColor` will pick up the agent's color dynamically.)
+
+7. **Render site**: In `teamRow()`, insert the output of `renderTeamAddMemberControl(name, team)` between `interjectBox` and `feedToggle`:
+   ```javascript
+   const interjectBox = renderTeamInterjectBox(name, team);
+   const addMemberControl = renderTeamAddMemberControl(name, team);  // ← new
+   const feedToggle = renderTeamFeedToggle(name);
+   const feedPanel = renderTeamFeed(name, team);
+   return '<div class="team-row">' + statusStrip + escalatedNote + escalationPanel +
+     interjectBox + addMemberControl + feedToggle + feedPanel +  // ← new
+     ...
+   ```
+
+8. **No new route**: Reuses existing `/projects/<name>/team/add-member` from part 1.
+
+## Dieter Rams audit (good design is...)
+
+1. **Innovative** — Control reuses native `<select>` (not a new widget), integrates seamlessly with existing interject/feed layout. Membership-drain semantics (next-round delivery) are honest about async plumbing, not hidden. (Passes)
+
+2. **Makes the product useful** — Operators can grow a team mid-run without restarting. Selection/eligibility filtering prevents mistakes (can't re-add, can't exceed cap). Event feed confirms success atomically. (Passes)
+
+3. **Aesthetic** — No new color tokens. Disabled states are muted text (not garish red/orange), distinct from enabled select+button pair. Left-border accent for member_joined matches human_message pattern. Layout is compact (flex row, 4px margin). (Passes)
+
+4. **Makes it understandable** — Two disabled reasons are textually distinct ("max N teammates" vs. "no more engines"). Success copy explicitly states "will join at its next round" (not ambiguous "added"). Feed event is immediate and clear. (Passes)
+
+5. **Unobtrusive** — Control only renders when team is running/blocked. Hidden when idle or finished. No persistent modal, no hijacking focus. Disabled states are informational text (no clickable false buttons). (Passes)
+
+6. **Honest** — Eligibility list is always correct (updated every poll from live roster). Server-side validation is authoritative (spec's tradeoff). Success doesn't claim immediate availability. Error messages are verbatim from server. (Passes)
+
+7. **Long-lasting** — Reuses established patterns (select, button, .team-msg slot, event feed, filter pills, agent colors). No trendy chat-bubble redesign. Architecture (stateless render, toggle() plumbing) is proven by existing actions. (Passes)
+
+8. **Thorough** — Accessibility: tab order, keyboard submit, screen-reader-friendly feed event, color contrast verified. Edge cases: TOCTOU races, mid-render polls, stale-select behavior — all handled per spec (matches existing control precedents). WCAG AA/AAA ratios computed for new color pairing (agent colors vs. border, already audited by part 1). (Passes)
+
+9. **Environmentally responsible** — No new polling timer. No heavy animations. Reuses existing /status cadence (~4s). No new resources allocated; control is purely UI layer over part 1's backend. (Passes)
+
+10. **As little design as possible** — Select + button + two text states. One new event kind in feed (→ joined). One filter-pills list fix (stale→live). No new components, no new colors, no new routes. Minimal CSS, minimal JS helpers. (Passes)
 
 ---

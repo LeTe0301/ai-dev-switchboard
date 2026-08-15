@@ -173,6 +173,92 @@ class ValidateCompositionTests(unittest.TestCase):
             {"kind": "ollama", "name": "qwen3:8b"}, self._members("lead2", "helper"))
         self.assertIsNone(err)
 
+    # ── TEAM_MAX_MEMBERS cap (backlog item 21 part 1, docs/spec.md
+    # "Proposed approach" §4) ────────────────────────────────────────────
+
+    def test_composition_at_the_cap_accepted(self):
+        orig = teamsmod.TEAM_MAX_MEMBERS
+        teamsmod.TEAM_MAX_MEMBERS = 2
+        self.addCleanup(setattr, teamsmod, "TEAM_MAX_MEMBERS", orig)
+        err = teamsmod.validate_composition(
+            {"kind": "ollama", "name": "qwen3:8b"}, self._members("lead2", "helper"))
+        self.assertIsNone(err)
+
+    def test_composition_over_the_cap_rejected_naming_count_and_max(self):
+        orig = teamsmod.TEAM_MAX_MEMBERS
+        teamsmod.TEAM_MAX_MEMBERS = 2
+        self.addCleanup(setattr, teamsmod, "TEAM_MAX_MEMBERS", orig)
+        err = teamsmod.validate_composition(
+            {"kind": "ollama", "name": "qwen3:8b"},
+            self._members("lead2", "helper", "broken2"))
+        self.assertIsNotNone(err)
+        self.assertIn("3", err)
+        self.assertIn("2", err)
+
+
+# ─── default_team_composition() truncation to TEAM_MAX_MEMBERS (backlog
+# item 21 part 1, docs/spec.md "Proposed approach" §4) ─────────────────────
+class DefaultTeamCompositionTruncationTests(unittest.TestCase):
+    """Same roster fixture shape ValidateCompositionTests uses, extended
+    with enough engines to exceed a lowered TEAM_MAX_MEMBERS -- 'lead2' is
+    the only tier-2, schema-healthy engine, so it is always picked as the
+    default lead, leaving every OTHER engine (sorted by name) as candidate
+    members to truncate."""
+
+    def setUp(self):
+        self.engines_dir = tempfile.mkdtemp(prefix="switchboard-composition-engines-")
+        self._orig_engines_dir = appmod.ENGINES_DIR
+        self._orig_base = teamsmod.TEAM_LLM_BASE_URL
+        self._orig_model = teamsmod.TEAM_LLM_MODEL
+        self._orig_max_members = teamsmod.TEAM_MAX_MEMBERS
+        appmod.ENGINES_DIR = self.engines_dir
+        teamsmod.TEAM_LLM_BASE_URL = None
+        teamsmod.TEAM_LLM_MODEL = None
+        teamsmod.TEAM_MAX_MEMBERS = 2
+        _write_engine_file(self.engines_dir, "lead2.engine", """\
+            LABEL=Lead2
+            CMD=unused
+            HEADLESS_CMD=lead2 -p {resume} {schema}
+            HEADLESS_FORMAT=plain
+            HEADLESS_PROMPT=arg
+            HEADLESS_SCHEMA_FLAG=--schema {schema}
+            """)
+        for name in ("aider", "codex", "helper", "zeta"):
+            _write_engine_file(self.engines_dir, f"{name}.engine", f"""\
+                LABEL={name.title()}
+                CMD=unused
+                HEADLESS_CMD={name} -p {{resume}}
+                HEADLESS_FORMAT=plain
+                HEADLESS_PROMPT=arg
+                """)
+
+    def tearDown(self):
+        appmod.ENGINES_DIR = self._orig_engines_dir
+        teamsmod.TEAM_LLM_BASE_URL = self._orig_base
+        teamsmod.TEAM_LLM_MODEL = self._orig_model
+        teamsmod.TEAM_MAX_MEMBERS = self._orig_max_members
+        shutil.rmtree(self.engines_dir, ignore_errors=True)
+
+    def test_members_truncated_to_the_cap(self):
+        comp = teamsmod.default_team_composition()
+        self.assertTrue(comp["ok"], comp)
+        self.assertEqual(comp["lead"]["name"], "lead2")
+        self.assertEqual(len(comp["members"]), 2)
+
+    def test_truncation_is_deterministic_across_calls(self):
+        first = teamsmod.default_team_composition()
+        second = teamsmod.default_team_composition()
+        self.assertEqual(first["members"], second["members"])
+        # sorted by name (roster()'s own ordering) -- "aider", "codex" are
+        # the first two non-lead engine names alphabetically.
+        self.assertEqual(first["members"], ["aider", "codex"])
+
+    def test_under_the_cap_not_truncated(self):
+        teamsmod.TEAM_MAX_MEMBERS = 100
+        comp = teamsmod.default_team_composition()
+        self.assertTrue(comp["ok"], comp)
+        self.assertEqual(sorted(comp["members"]), ["aider", "codex", "helper", "zeta"])
+
 
 # ─── load_compositions() / save_composition() ──────────────────────────────
 class CompositionPersistenceTests(unittest.TestCase):

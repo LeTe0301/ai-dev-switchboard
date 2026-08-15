@@ -385,16 +385,16 @@ a working mechanism rather than a greenfield feature:
   expect the AST scan to need an explicit, narrow allowance rather than a
   removal.
 
-**Scope decision that must be settled before building:** this is a genuine
-expansion of what an agent may mutate unattended. Every comparable decision
-in this project so far has landed on the cautious side — deploy is
-manual-click-only, a push landing never itself deploys, and no agent
-mutates the project's source of truth unattended. A lead silently rewriting
-the backlog is the same class of question. Options worth putting to the
-user: (a) full autonomous write, (b) write limited to cards the current run
-created or was assigned, (c) proposed changes queued for one-click human
-approval, reusing 6f's escalation inbox. Do not assume (a) just because the
-item says "read-write" — ask.
+**Scope decision — settled (2026-08-14):** option (c). The lead's board
+writes are proposals only — queued in 6f's existing escalation inbox and
+applied to Taiga only after a one-click human approval, never written
+directly. This is the user's explicit choice, made when this item came up
+for scoping, consistent with every other unattended-write decision in this
+project (manual-click-only deploy, no unattended writes to the project's
+own source of truth). `board_write`'s tool contract should therefore return
+a *pending proposal*, not perform the Taiga call itself — the actual API
+write happens only from the approval action, mirroring how `resolve_ask_user()`
+gates a lead's `ask_user` block on a human response today.
 
 **Open for the future session:** whether board writes are audited to a log
 the human can review after the fact; whether one shared board covers all
@@ -404,11 +404,16 @@ changed by the human concurrently.
 
 ---
 
-## 8. AI merge-request reviewer, triggered by a Gitea tag
+## 8. AI merge-request reviewer, triggered by a Gitea tag (and GitHub)
 
 **Intent, as stated:** an AI reviewer for merge requests, checking **code
 consistency**, with a **selectable model**, firing **as soon as a "ready for
-review" tag/label is set** on the MR in Gitea.
+review" tag/label is set** on the MR. **Updated 2026-08-14: also wanted for
+GitHub-hosted repos, not just local Gitea** — see item 17 below, which
+covers tracking a project's real (non-Gitea) origin generally; this item's
+reviewer should work against whichever host a project's origin actually is
+once 17 exists. Until 17 lands, this item's own scope is still Gitea-only,
+per the shipped polling precedent below.
 
 **Already-settled decision this must respect — do not relitigate it:**
 **no webhook.** Item 2c part 1 originally proposed a webhook-based design
@@ -443,17 +448,30 @@ plainly rather than an implementation shortfall.
   substrate for "consistent with the project's own documented conventions"
   and should be reused rather than rebuilt.
 
-**Scope decisions to settle before building:** whether the reviewer may ever
-block or approve a merge, or only ever comment (comment-only is the
-consistent default for this project, and matches "deploy is manual-click
-only"); whether a re-review fires when the tag is removed and re-added, or
-on every new commit while the tag is present; what happens on a large diff
-that exceeds the selected model's context.
+**Scope decisions — settled (2026-08-14):** comment-only — the reviewer
+never blocks, approves, or merges, matching "deploy is manual-click only."
+Re-review fires only when the "ready for review" tag is explicitly removed
+and re-added (not on every new commit while the tag is present) — a
+deliberate, low-cost trigger the operator controls. Still open: what
+happens on a large diff that exceeds the selected model's context.
 
 **Open for the future session:** whether this shares the escalation inbox
 (item 6/6f) or gets its own surface; whether review output is persisted
 locally as well as posted to Gitea; token/rate cost of reviewing every
 tagged PR against a hosted model versus the local Ollama one.
+
+**Status: shipped, Gitea-only (2026-08-14).** Standalone poll-triggered
+mechanism (not a lead-loop tool) hooked into item 2c's existing Gitea poll.
+Reviewer-approved with one non-blocking follow-up, not yet fixed: the
+per-PR lock is keyed only on `pr_key`, not episode, so if a label is
+removed and re-added while the *previous* episode's review is still
+in-flight, the old thread's later completion can overwrite state as if the
+new episode's own review had run, silently dropping the new trigger with
+no error surfaced. Narrow (needs a review to still be running when a
+human re-toggles the label) but real. Shape of the fix: key the lock (or
+the state file's in-flight marker) on `(pr_key, episode)` so a stale
+thread's completion can't clobber a newer episode's state. GitHub support
+remains deferred to item 17, per this item's original scope note.
 
 ---
 
@@ -625,6 +643,26 @@ touches this area: render an explicit transient state for a `tool_use`
 event that's the buffer's own last lead event while `team.status` is
 still `running`, rather than assuming finish.
 
+**Status: A and B shipped, C partially shipped (2026-08-14).** A permanent
+regression test now covers the "already answered" escalation race branch;
+the ARIA attributes `docs/design.md` already specified (`role="log"`/
+`aria-live="polite"` on the event feed, `aria-pressed` on filter pills,
+`<fieldset>`/`<legend>` on the escalation options) are implemented and
+verified against real rendered markup. The transient-classification
+rendering for C was added but scoped narrowly to `team.status ===
+"running"`, matching this backlog item's own literal wording — the
+reviewer found and confirmed (adversarially tested, not just read) a
+structurally similar poll-boundary gap for `team.status === "blocked"`
+(a trailing empty-meta `tool_use` from the lead, no paired `tool_result`
+yet, while a **different** in-flight round's `ask_user` escalation has
+already flipped status to `blocked`): it still falls through to
+`'finish'`, the exact assumed-finish bug this cycle was meant to
+eliminate, just for a status this cycle didn't cover. Non-blocking (same
+"deliberately narrow scope, not an implementation defect" reasoning as
+the original C). **Shape of the follow-up fix:** widen the transient gate
+from `status === 'running'` to a general non-terminal check (e.g.
+`status !== 'finished' && status !== 'error'`) in a future cycle.
+
 ---
 
 ## 13. No in-app discoverability for a finished team's committed-but-unmerged branches
@@ -663,3 +701,481 @@ team's work after it stops" section to `docs/ARCHITECTURE.md` or
 `README.md` documenting the plain `git log`/`git merge`/`git branch -D`
 commands to review, merge, or discard one. Non-blocking: no data-loss risk
 exists today, this is pure discoverability polish.
+
+---
+
+## 14. Update path for an already-installed container when `main` moves
+
+**Added 2026-08-14**, user-requested: "migration scripts of container
+already exists and a new update to master is there." Read as: an operator
+who already ran `install.sh` on a container needs a way to pull in a newer
+switchboard release from `main`/`master` — including any config or state
+migration a given update requires — rather than the current implicit
+assumption that `install.sh` is a one-time, fresh-install-only operation.
+
+**Settled 2026-08-14 (asked directly this session): this is a new
+`install.sh --update`/`--upgrade` flag, parallel to the existing
+`--with-*` optional-feature flags — not a separate script.** The rest of
+this item's scoping (what needs migrating, whether an update can ever
+restart a running session) is in `docs/spec.md`.
+
+---
+
+## 15. Install wizard UI
+
+**Added 2026-08-14**, user-requested: "install should be an install wizard
+like this picture" — **the referenced image was not attached to the
+request**. Needs the actual reference before this can be scoped at all;
+follow up with the user for the image (or a link/description of the
+wizard UI they have in mind) before writing a spec.
+
+**What's known without the image:** today, `install.sh` is a single
+non-interactive-by-default script (`--yes` flag) with a series of
+`prompt()`-driven optional `--with-*` blocks, run over SSH/terminal — there
+is no browser-based or step-by-step graphical installer. If the picture
+turns out to depict a web-based multi-step wizard (name/logo suggests
+something in the shape of a typical "welcome → configure → confirm →
+install" flow), this would be a materially different delivery mechanism
+than the current shell script and deserves its own architecture
+discussion — don't assume it's a small tweak to `install.sh` until the
+picture clarifies what's actually wanted.
+
+---
+
+## 16. Create a new project by `git clone <url>` directly
+
+**Added 2026-08-14**, user-requested: "container should be possible to
+create new projects with git clone and url."
+
+**Context — what exists today:** item 3 (folder upload) covers uploading
+an existing local folder and auto-detecting repo(s) inside it. Item 2b
+covers creating a *new*, empty repo through Gitea's own API
+(`create_project()`). Neither covers the third case this item asks for:
+handing the switchboard a URL to an **existing remote repo** (which may or
+may not already be on this switchboard's own Gitea) and having it clone
+that URL directly into `PROJECTS_DIR` as a new project — no upload, no
+Gitea-side repo creation, just "here's a URL, clone it and add it to my
+project list."
+
+**Shape of the work (not yet fully scoped):**
+- A new "add project from URL" entry point in the web UI, parallel to the
+  existing "new project" and "upload" flows.
+- Needs the same kind of privileged clone hand-off item 2b already built
+  for Gitea-originated clones (`scripts/new-project-from-gitea.sh`) — a
+  script that runs as (or hands off to) the correct system user, not the
+  request-handling process directly, following that established pattern
+  rather than reinventing clone privilege-separation.
+- Directly related to item 17 below: a project cloned from an arbitrary
+  URL is exactly the case where the project's real origin is *not* this
+  switchboard's own local Gitea, so this item and item 17 should likely be
+  scoped and built together, or in the order 16 → 17.
+- Open question: authentication for cloning a private remote repo (SSH
+  key, token) — needs a decision on where that credential lives and how
+  it's scoped, following this project's existing `switchboard.env`-style
+  credential-storage convention.
+
+**Status: shipped (2026-08-14).** `POST /projects/clone` + a new
+privileged `scripts/new-project-from-url.sh`, following item 2b's
+established clone-privilege-separation pattern. Private-repo auth
+settled, not left open: SSH-based private clones work at zero new cost
+(ride `RUN_USER`'s own pre-existing SSH access); HTTPS+token auth is
+explicitly deferred to a fast-follow, since a `switchboard.env`-style
+single-secret convention doesn't map cleanly onto "arbitrary host,
+project doesn't exist yet."
+
+Reviewer-approved after **three** review rounds on the same must-fix — an
+argument-injection vector via a crafted URL (e.g.
+`ssh://-oProxyCommand=...`) reaching the `RUN_USER`-privileged clone
+subprocess. Round 1 found the gap (regex allowlist alone didn't close it,
+only the installed git's own CVE-2017-1000117 hardening did). Round 2's
+fix (regex negative-lookaheads anchored right after the scheme/`@`) was
+itself proven bypassable via `user@-oProxyCommand=...` and scp-shorthand
+`user@host:-oProxyCommand=...`, both of which hide the malicious host
+behind an optional grammar segment the lookahead didn't cover. Round 3
+replaced lookahead-anchoring entirely with real host-component isolation
+(`urllib.parse.urlsplit().hostname` for `scheme://` URLs; explicit
+last-`@`/first-`:` parsing for scp-shorthand, empirically verified against
+git's/OpenSSH's actual double-`@` splitting behavior, not assumed) plus a
+dedicated `_clone_url_host_is_safe()` charset/IPv6 check, mirrored in
+`scripts/new-project-from-url.sh`. Approved after independent adversarial
+testing (double-`@`, bracketed IPv6, empty host/port, trailing colon) via
+real `sudo` runs against the privileged script.
+
+**Should-fix follow-up, not yet fixed:** neither validation layer checks
+that a `scheme://host:port` URL's port component is actually numeric
+(e.g. `ssh://127.0.0.1:-oProxyCommand=...` is currently accepted).
+Verified not currently exploitable — git doesn't split a non-numeric port
+into its own argv token, so this doesn't reach the actual
+leading-`-`-as-argv-token mechanism the must-fix targeted, and OpenSSH
+itself rejects the malformed combined hostname before any connection
+attempt — but it's the same "relying on downstream hardening" pattern
+this fix arc was meant to eliminate. Shape of the fix: validate the port
+substring (if present) is `^[0-9]+$` at both layers.
+
+---
+
+## 17. Track and remotely interact with a project's real (non-Gitea) origin
+
+**Added 2026-08-14**, user-requested: "if there is a cloned GitHub repo
+which is not a local Gitea repo it should be traced to origin. All the
+pull requests, comments, branches should be remotely fetchable."
+
+**Context:** items 2b/2c built deep integration with this switchboard's
+*own*, locally-hosted Gitea instance — repo creation via Gitea's REST API,
+polling Gitea for push/PR activity. This item asks for the same class of
+remote-repo-awareness (PRs, comments, branches, fetchable/visible from the
+switchboard UI) but for a project whose actual `origin` remote is
+somewhere else entirely — GitHub is the concrete example given, but the
+underlying need is "detect what origin actually is, and if it's not our
+own Gitea, talk to that host's own API instead."
+
+**Shape of the work (not yet fully scoped):**
+- Detect, per project, whether `origin` points at this switchboard's own
+  Gitea instance or somewhere external — `git remote get-url origin` plus
+  a hostname comparison is the obvious mechanism.
+- For an external origin, this needs its own API client per host type
+  (GitHub REST/GraphQL API to start, since that's the concrete case
+  named) — parallel to, not a replacement for, the existing Gitea client
+  code from 2c.
+  This is real new integration surface, not a small extension: auth
+  (a GitHub token, following the existing credential-storage convention),
+  rate-limit handling (GitHub's API has real limits unlike a
+  self-hosted Gitea instance), and a decision on whether polling (2c's
+  established no-webhook precedent) is the right model here too or
+  whether GitHub's own webhook support changes that calculus — needs a
+  real discussion, don't assume the Gitea polling precedent transfers
+  unmodified.
+- Directly feeds item 8's now-broadened GitHub scope (an AI reviewer
+  reacting to a "ready for review" label on a GitHub PR needs exactly
+  this remote-fetch capability to read the diff/comments) and item 16
+  (a project cloned from an arbitrary URL is the primary case this
+  applies to).
+
+**Scope decision — settled (2026-08-14, asked directly this session):**
+read-write actions against a project's external origin (e.g. posting a
+comment on a real GitHub PR) are allowed the SAME WAY they're already
+allowed against the switchboard's own local Gitea — no extra confirmation
+gate. This resolves the open scope question above; item 8's own
+comment-only, non-blocking write verb (posting a PR review as a comment)
+extends to GitHub unchanged once this item's GitHub client exists — no
+separate propose-then-approve step (that pattern belongs to item 7's board
+writes specifically, a different write target with its own settled
+reasoning, not a general policy this item needed to re-litigate).
+
+**Status: part 1 speced (2026-08-14), not yet built.** Given the size (new
+external API integration + auth + rate-limiting + host-detection + item 8
+integration spans what would otherwise be one oversized cycle), this item
+is split the same way items 6d/19/2c were — **part 1** (this session's
+buildable `docs/spec.md`): unprivileged per-project origin detection
+(`git remote get-url origin` + loopback-vs-`github.com`-vs-other host
+classification, no new privilege boundary needed) plus a GitHub REST API
+client (`_github_api`/`_github_api_raw`, mirroring `_gitea_api`'s own
+contract) covering list-open-PRs/PR-diff/list-branches/post-PR-comment,
+real concrete rate-limit handling (a global in-memory cooldown gate driven
+by `X-RateLimit-Remaining`/`X-RateLimit-Reset`/`Retry-After`), and a real
+(not deferred) polling-vs-webhook decision: **polling, no webhook** — the
+original no-webhook reasoning (2c part 1, reaffirmed by item 8) was never
+about implementation convenience, it was "no new inbound listener," which
+applies at least as strongly to a GitHub webhook (a genuinely
+internet-facing endpoint, not a LAN-local Gitea container) as it did to
+the original proposal. Part 1 deliberately ships no poll-loop wiring, no
+UI, and no item 8 integration — those, plus `GITHUB_POLL_INTERVAL_SECONDS`
+and the host-agnostic dispatch layer for item 8's
+`_ai_reviewer_poll_repo()`, are **part 2**, to be speced once part 1 has
+shipped and been reviewed.
+
+---
+
+## 18. Cross-agent capability parity — investigate `garrytan/gstack`
+
+**Added 2026-08-14**, user-requested: "possible to add these possibilities
+for all agents not just Claude Code on my LXC:
+https://github.com/garrytan/gstack" — the user wants whatever capability
+`gstack` provides extended to every engine/agent this switchboard already
+supports (Claude Code, Codex, aider, etc.), not just Claude Code
+specifically.
+
+**Investigated (2026-08-14) — blocked pending user input, not buildable
+without it.** `gstack` turns out to be a Markdown slash-command skill
+library (23 skills + 5 standalone CLIs) that only runs inside a Claude
+Code session via that tool's own skill-loading mechanism — it is not a
+service, protocol, or per-engine config surface, and neither `aider` nor
+a raw Ollama chat loop has an equivalent skills/custom-command extension
+point. "Extend it to every engine" therefore doesn't map onto this
+project's `engines.d/*.engine` pattern at all. It also overlaps heavily
+with capability this project already shipped, built to be genuinely
+engine-agnostic from day one: items 6/6c/6d/6f/7/8's roster + three-tier
+lead-loop (`delegate`/`fact_check`/`ask_user`/`finish`) + kanban
+read/write + AI PR reviewer + escalation inbox. `gstack` also brings new
+runtime dependencies (Bun, Chromium for browser automation, optionally
+ngrok/Supabase) that aren't currently part of this project's install
+surface.
+
+**Questions only the user can answer before this can be scoped:**
+1. Which specific `gstack` capability is actually wanted — the whole
+   workflow, or a named subset (browser QA, cross-model review, security
+   audit, "office hours" scoping)?
+2. Given the overlap with items 6/6c/6f/7/8, is this really "close one
+   specific named gap" rather than "port gstack wholesale"?
+3. Is it acceptable that `aider`/local-LLM engines can only ever get this
+   via the existing lead-loop abstraction, never `gstack`'s literal
+   slash-command form?
+4. Are `gstack`'s own new runtime dependencies acceptable to add to the
+   LXC, and via what install mechanism?
+
+**Answered directly by the user (2026-08-14):**
+1. All three named capabilities are wanted: browser QA/testing
+   automation, cross-model code review, AND a security audit skill (not
+   "whole workflow," not "not sure," not a single pick).
+2. gstack's own new runtime dependencies (Bun runtime, Chromium for
+   browser automation, optionally ngrok/Supabase) are **not** acceptable
+   to add to the LXC.
+
+**Reconciled (2026-08-14) — resolved per-capability, not treated as one
+bundled decision, since the two answers pull in different directions for
+different pieces of the ask:**
+
+- **Cross-model code review: already fully shipped, no new code needed.**
+  Verified directly against the actual implementation: `app/teams.py`'s
+  `review_pr_diff()` (backlog item 8) already takes any roster
+  model/engine — an Ollama model or any `engines.d/*.engine` entry, i.e.
+  genuinely cross-model and cross-engine, not Claude-Code-specific —
+  grounds it in the project's own documented conventions
+  (`load_grounding()`), runs it against a PR diff, and the result gets
+  posted as a PR comment via `app/app.py`'s `AI_REVIEWER_*` poll
+  mechanism. This is a closer, more integrated match to "cross-model code
+  review" than anything `gstack` itself offers (gstack has no equivalent
+  cross-model selection — it runs whatever single model the invoking
+  Claude Code session happens to be). The user's request almost certainly
+  predates knowing item 8 — built earlier in this very session — already
+  delivers this. **No second, parallel review mechanism should be built.**
+  Nothing to do here beyond this note.
+
+- **Security audit skill: already covered, at a different layer, no new
+  code needed in this repo.** Verified: the `claude-security` plugin
+  (`claude-plugins-official` marketplace, already installed in the local
+  Claude Code plugin registry — `~/.claude/plugins/marketplaces/
+  claude-plugins-official/plugins/claude-security/`) ships a
+  `skills/claude-security/SKILL.md` with concrete jobs
+  (`scan-codebase.md`, `scan-changes.md`) plus scan/patch/verify
+  sub-agents and report rendering. This is exactly the kind of
+  review-only, audit-only capability this project's own CLAUDE.md already
+  says to route directly to a matching skill rather than build inside a
+  project's own pipeline ("Use a dedicated skill instead of the full
+  pipeline for review-only or audit-only work... Route these to the
+  matching skill (e.g. `security-review`) directly"). It's invocable
+  against `ai-dev-switchboard`'s own codebase, or any other project on
+  this box, today, with zero new code in this repo. Same
+  Claude-Code-only limitation as gstack itself (it's a plugin skill, not
+  a per-engine hook) — but that's an inherent property of "skill" as an
+  extension mechanism, not something worth rebuilding a parallel in-repo
+  audit tool to work around, especially given the user just declined new
+  install-surface dependencies. **Nothing to build here either.**
+
+- **Browser QA/testing automation: the one genuinely novel ask, and
+  genuinely in tension with answer 2.** Real browser QA (JS execution,
+  DOM rendering, click/type interaction, screenshots) fundamentally needs
+  a headless browser engine — there is no way around that; it is not an
+  implementation-detail choice. The user declined exactly that dependency
+  class. **Decision: real browser QA is blocked, full stop, and is not
+  being built as a diminished or misleadingly-named substitute.** What
+  IS honestly buildable without any new dependency: an **HTTP-level smoke
+  check** — status code, response timing, an optional response-body
+  substring assertion — against a project's already-running dev server.
+  Confirmed buildable with zero new install-surface cost: `curl` and
+  `python3` are already installed by `install.sh`'s existing baseline
+  `apt-get install` line (`install.sh:214`), and this codebase's
+  established in-process HTTP convention is already stdlib
+  `urllib.request` (`_gitea_api()`, `_github_api()`, the login/
+  description-LLM calls), so this needs no `curl` subprocess and no
+  third-party library either — genuinely free to add. **This is
+  explicitly NOT "browser QA"** and is named and documented as a smoke
+  check throughout, precisely so it is never confused with, or presented
+  as satisfying, the actual browser-QA ask. Speced this session:
+  `docs/spec.md` — a per-project "Smoke check" button (rendered only when
+  `/status`'s already-captured `url` field is present for that project),
+  one GET request, reports status code + elapsed ms + optional substring
+  match, manual-trigger only, no persisted history, no new runtime
+  dependency.
+
+**Status: reconciled 2026-08-14.** Two of the three requested capabilities
+(cross-model review, security audit) require **no new code in this repo**
+— both are already fully covered, one by this project's own item 8, one
+by an existing Claude Code plugin at a different layer entirely. The
+third (real browser QA) remains genuinely blocked by the user's own
+no-new-runtime-dependencies answer, and is not being faked. The one real,
+honest, buildable increment this reconciliation produced — an HTTP-level
+smoke check, deliberately NOT branded as browser QA — is speced in the
+current `docs/spec.md`, ready to build next.
+
+---
+
+## 19. Interactive chat UI for the AI team — watch, interrupt anytime, approve inline
+
+**Added 2026-08-14**, user-requested: "build a chatbot UI for the AI team
+so you can watch them talk to each other, interrupt at any point, approve
+ask_user questions."
+
+**Context — what already exists (item 6f, shipped):** a merged, per-agent-
+colored, cursor-polled live event feed with a status strip, and an
+escalation inbox that lets a human answer a blocked lead's `ask_user`
+call. This already covers "watch them talk" and "approve ask_user
+questions" in a read-mostly, log-styled form.
+
+**What this item asks for beyond 6f — genuinely new capability:**
+**"interrupt at any point"** is not the same as answering a pending
+`ask_user` block. Today, a human's only two levers on a running team are
+(a) wait for the lead to itself call `ask_user` and then answer it, or (b)
+stop the whole team outright (`stop_team()`). There is no way to inject a
+free-form message into a *running* team without either of those — no
+"interject/redirect" capability exists in `app/teams.py`'s lead loop today.
+This is the real scope of this item, not just a UI restyle from log-feed
+to chat-bubble.
+
+**Not yet scoped — real architecture questions for a future
+product-manager pass:**
+- Does an interjected message go to the lead only, or can a human message
+  a specific teammate directly? The four-tool lead loop (`delegate`/
+  `fact_check`/`ask_user`/`finish`) has no concept of an unsolicited
+  inbound human message today — this needs real design, not just a new
+  route.
+- Does interjecting pause the lead's current in-flight tool call, or queue
+  the message for the lead's next turn? Silently dropping/racing with an
+  in-flight call would be a real correctness bug in the same class 6f's
+  own concurrent-resolve races were.
+- Is "chatbot UI" purely a visual/interaction-model change on top of 6f's
+  existing event feed (chat bubbles instead of a log list), or does it
+  also imply a differently-shaped event envelope? Reuse 6f's existing
+  `{ts, agent, seq, kind, text, meta}` envelope and cursor-polling
+  mechanism rather than inventing a second live-feed mechanism, unless a
+  concrete gap is found.
+- Relationship to item 7 (kanban write access) and item 8 (AI reviewer):
+  both of those already settled on a propose-then-approve /
+  comment-only model specifically to avoid unattended writes — an
+  "interrupt at any point" capability is a *human*-initiated write into a
+  running agent's context, which is a different trust direction (human →
+  agent, not agent → external system) and likely doesn't need the same
+  caution, but state that explicitly in the eventual spec rather than
+  assuming it transfers.
+
+**Status: shipped, in two parts (2026-08-14).** **Part 1** (backend +
+CLI): `teams.interject(run_id, message)` appends to a new per-run,
+append-only `human.jsonl` — never touches `run.json` directly, so it
+can't race the driving thread's own in-memory state / round-end
+`_persist()` overwrite. `team_step()` drains it via a persisted
+`human_cursor` at the top of its own round, folding messages into the
+lead's next round via a new `_INTERJECT_MITIGATION` prompt clause —
+delivery is at the next round boundary, not mid-in-flight-call (an
+explicit, reasoned non-goal). New `POST /team/interject` route +
+`team-interject` CLI subcommand, non-blocking (the team keeps running).
+`human.jsonl` merges into the existing event feed as
+`agent="human"`/`kind="message"`, reusing the existing envelope — no new
+shape, resolving the backlog's own third open question above. Lead-only,
+not addressable to a specific teammate, resolving the first open question
+above. Trust direction resolved (second-to-last open question above):
+human→agent injection has no external side effect, doesn't need items
+7/8's propose-then-approve caution. Reviewer independently verified the
+concurrency-safety design with real multi-threaded repro scripts (mid-
+round stall + concurrent interject; crash/restart cursor persistence),
+not just a design read. **Part 2** (chat UI): a compose box on the Teams
+page, visible whenever a team is `running` or `blocked` and
+`waiting_on_you` (exact mirror of what part 1 accepts server-side); a
+deliberate decision AGAINST a full chat-bubble redesign of the feed
+(reasoning: ~10 structurally different event kinds across more than two
+participants doesn't fit a two-party bubble layout, and a redesign risked
+breaking 6f part 2's `role="log"`/`aria-live="polite"` accessibility
+contract for no functional gain) — human messages instead get a new
+`.kind-human-message` row style within the existing log-list, plus a new
+`human` filter pill. Live character counter + proactively-disabled Send
+for the 2000-char limit. Both parts reviewer-approved with no must-fix
+findings.
+
+**Should-fix follow-up surfaced twice now, not yet fixed — see new item
+20 below**: `.team-btn`'s white-text-on-`#34c759`-green styling fails
+WCAG AA contrast (actual ~2.2:1, not the ~5:1 `docs/design.md` has
+claimed across at least two separate design-doc sections). Pre-existing,
+not introduced by either part of this item, but flagged again here since
+it's now been independently confirmed twice.
+
+---
+
+## 20. `.team-btn` fails WCAG AA contrast (white text on `#34c759` green)
+
+**Found independently by the reviewer twice** — first during item 16's
+review (`docs/test-review.md`), again during item 19 part 2's review —
+both times marked non-blocking since the styling is pre-existing and
+unmodified by the diff under review at the time. Recording as its own
+item now since two independent confirmations is enough to stop treating
+it as a footnote.
+
+**What's wrong:** `.team-btn`'s white (`#fff`) text on its green
+(`#34c759`) background computes to **≈2.2:1** contrast — well under
+WCAG AA's 4.5:1 minimum for normal text (3:1 even for large/bold text).
+`docs/design.md` has, across at least two separate sections written by
+two different ux-designer dispatches, claimed this pairing passes AA at
+figures like 5.05:1/9.15:1 — both wrong when recomputed from the actual
+hex values, and worth correcting in the doc alongside the real fix so a
+future design pass doesn't inherit the same wrong number a third time.
+
+**Shape of the fix:** darken the green (or lighten/bolden the text) until
+the pairing actually clears 4.5:1 — e.g. a darker `#1e7e34`-class green
+with white text typically clears AA; verify the actual chosen pair with a
+real contrast calculation, not a plausible-sounding guess, given this
+exact class of doc-vs-reality drift is what caused the problem twice
+already. `.team-btn` is used widely (team start/stop/resolve/board-
+resolve/interject, deploy) — a single shared CSS rule change fixes every
+call site at once, no per-button rework needed.
+
+**Open for the future session:** whether other button/control color
+pairings in `app/app.py` have the same undetected drift — a quick
+contrast audit of the page's full CSS palette might be worth doing in the
+same pass rather than fixing `.team-btn` in isolation and finding a third
+instance later.
+
+---
+
+## 21. Spawn an arbitrary number of AI instances per project via a "+" button
+
+**Added 2026-08-14**, user-requested: "add to backlog that it should be
+possible to spawn any amount of ai instances via a plus button in the
+repos."
+
+**Context — what exists today:** a project currently runs at most one
+engine session at a time (`app/app.py`'s `_session_urls` is keyed by
+project name — one tmux session, one engine, one hosted URL per project;
+item 6's own backlog text flags this exact single-engine assumption).
+Item 6's team feature generalizes this to N tmux **windows** inside one
+team session, but the roster/composition is picked once at team-start
+time and is otherwise fixed for that run's lifetime — there is no "add
+one more" control today, only start-with-a-fixed-roster or stop-the-whole-
+team. Item 19 added the ability to interject a message into an already-
+running team, but not to grow the team itself mid-run.
+
+**Not yet scoped — the request is genuinely ambiguous between two
+different shapes, and picking the right one is a real product-manager
+judgment call for a future session, not something to guess at here:**
+1. **Grow a running team**: a "+" button on an already-started team adds
+   one more teammate engine to the live roster (a new tmux window, a new
+   `agent_run()` participant the lead can `delegate` to) — extends item
+   6/6c's roster machinery rather than replacing it.
+2. **Independent parallel instances, no team framework**: a "+" button
+   spins up additional free-standing, non-team engine sessions against
+   the same project working copy (or separate worktrees, following item
+   6's own worktree-per-agent precedent) — each one a human drives
+   directly, no lead, no delegation, closer to "open another terminal
+   tab" than to growing a team.
+
+**Open questions for whichever shape is picked:**
+- If (1): does the lead need to be told a new teammate just joined
+  mid-round, and does that reuse item 19 part 1's `human.jsonl`-style
+  drain-at-round-boundary delivery mechanism, or does it need its own
+  path?
+- If (2): does each spawned instance get its own git worktree (avoiding
+  concurrent-write conflicts on the same checkout, per item 6's existing
+  per-agent-worktree precedent) or share the project's single working
+  copy?
+- Either way: any real ceiling on "any amount" — host resource limits
+  (CPU/RAM per tmux pane, concurrent engine processes) probably need a
+  configured cap, not literally unbounded spawning from a single button.
+- UI: where does the "+" live — on the existing Teams page, the plain
+  per-project row, or both, depending on which shape (1 vs 2) is chosen?

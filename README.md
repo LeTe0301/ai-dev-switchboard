@@ -150,6 +150,24 @@ that need a human; editing it and running `systemctl restart
 ai-dev-switchboard` picks up any change (engine files under `engines.d/`
 don't even need that — they're re-read live).
 
+## Updating
+
+```bash
+sudo ./install.sh --update    # or --upgrade, an exact synonym
+```
+
+Run from wherever the switchboard's own source lives on this box — the
+existing checkout at `/opt/ai-dev-switchboard-src` for a curl-based
+install, or wherever you cloned it yourself. Fast-forwards that checkout to
+`origin/main` (refusing on local edits, a branch mismatch, or a real
+divergence — never a destructive reset), re-runs the same idempotent
+copy/config steps a plain re-run of `install.sh` already does, and restarts
+`ai-dev-switchboard` to pick it up — but only if nobody is running a live
+`RUN_USER` tmux session right now. If one is, the code is still updated but
+the restart is deferred (with instructions printed on how to finish once
+it's safe) rather than risk interrupting a running engine/team session —
+see `docs/ARCHITECTURE.md` for why a plain restart can take that down.
+
 ## Repo layout
 
 ```
