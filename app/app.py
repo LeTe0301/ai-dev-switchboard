@@ -4956,7 +4956,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"run_id": None, "events": [], "cursors": {}})
         run_id = state["run_id"]
         cursor = _parse_events_cursor((query.get("cursor") or [None])[0])
-        files = [("lead", teams._transcript_path(run_id))]
+        # "human" (backlog item 19 part 1, docs/spec.md "Proposed approach"
+        # §4): a run's own human.jsonl, merged in exactly like a teammate's
+        # own log -- no other change to this function, the existing
+        # per-file cursor/byte-cap/truncation-flag/chronological-merge-sort
+        # logic below is already generic over the file list.
+        files = [("lead", teams._transcript_path(run_id)), ("human", teams._human_log_path(run_id))]
         files += [(m, teams._agent_log_path(run_id, m)) for m in state.get("members", [])]
         all_events = []
         cursors = {}
@@ -5358,6 +5363,47 @@ class Handler(BaseHTTPRequestHandler):
                                  args=(name, run_id, cancel_event), daemon=True)
             _team_threads_set(name, {"run_id": run_id, "thread": t, "cancel_event": cancel_event})
             t.start()
+            self._json({"ok": True, "run_id": run_id})
+        elif (parts[0] == "projects" and len(parts) == 4 and parts[2] == "team"
+              and parts[3] == "interject"):
+            # Queue a free-text human message for a running lead's next
+            # round (backlog item 19 part 1, docs/spec.md "Proposed
+            # approach" §5) -- a materially different action from
+            # /team/resolve|board-resolve above: this does NOT resume a
+            # stopped loop, so unlike those two routes it never spins up a
+            # background driving thread. Reached through the same shared
+            # TOTP gate above -- no new gating code.
+            name = parts[1]
+            if name not in instance_names():
+                return self._json({"error": "unknown project"}, 404)
+            run_id = (body.get("run_id") or "").strip() or None
+            if run_id:
+                # docs/BACKLOG.md item 11(b): same validation, same intake-
+                # point placement, as /team/resolve|board-resolve above.
+                if not teams._RUN_ID_RE.match(run_id):
+                    return self._json({"error": "no run found for this project"}, 400)
+                try:
+                    state = teams._load_state(run_id)
+                except (OSError, ValueError):
+                    return self._json({"error": "no run found for this project"}, 400)
+                if state.get("project_name") != name:
+                    return self._json({"error": "this run belongs to a different project"}, 400)
+            else:
+                state = teams.latest_run_for_project(name)
+                if state is None:
+                    return self._json({"error": "no run found for this project"}, 400)
+                run_id = state["run_id"]
+            # Length/emptiness validation happens at THIS route layer, not
+            # inside teams.interject() -- mirroring /team/resolve's own
+            # TEAM_ASK_USER_ANSWER_MAX_CHARS check above exactly.
+            text = (body.get("text") or "").strip()
+            if not text or len(text) > teams.TEAM_INTERJECT_MAX_CHARS:
+                return self._json(
+                    {"error": f"message must be non-empty and at most "
+                              f"{teams.TEAM_INTERJECT_MAX_CHARS} characters"}, 400)
+            result = teams.interject(run_id, text)
+            if not result["ok"]:
+                return self._json({"error": result["error"]}, 400)
             self._json({"ok": True, "run_id": run_id})
         else:
             self.send_response(404)

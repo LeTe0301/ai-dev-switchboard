@@ -879,15 +879,36 @@ https://github.com/garrytan/gstack" — the user wants whatever capability
 supports (Claude Code, Codex, aider, etc.), not just Claude Code
 specifically.
 
-**Not yet investigated.** This repo hasn't been read yet — a future
-session picking this up should start by actually reading
-`https://github.com/garrytan/gstack` (README, structure) to understand
-what capability is actually being requested before scoping anything,
-rather than guessing from the name alone. Once that's understood, check
-whether it's a per-engine capability (fits this project's existing
-`engines.d/*.engine` per-engine-config pattern) or a switchboard-level
-capability (fits the roster/lead-loop machinery from item 6) before
-proposing a shape.
+**Investigated (2026-08-14) — blocked pending user input, not buildable
+without it.** `gstack` turns out to be a Markdown slash-command skill
+library (23 skills + 5 standalone CLIs) that only runs inside a Claude
+Code session via that tool's own skill-loading mechanism — it is not a
+service, protocol, or per-engine config surface, and neither `aider` nor
+a raw Ollama chat loop has an equivalent skills/custom-command extension
+point. "Extend it to every engine" therefore doesn't map onto this
+project's `engines.d/*.engine` pattern at all. It also overlaps heavily
+with capability this project already shipped, built to be genuinely
+engine-agnostic from day one: items 6/6c/6d/6f/7/8's roster + three-tier
+lead-loop (`delegate`/`fact_check`/`ask_user`/`finish`) + kanban
+read/write + AI PR reviewer + escalation inbox. `gstack` also brings new
+runtime dependencies (Bun, Chromium for browser automation, optionally
+ngrok/Supabase) that aren't currently part of this project's install
+surface.
+
+**Questions only the user can answer before this can be scoped:**
+1. Which specific `gstack` capability is actually wanted — the whole
+   workflow, or a named subset (browser QA, cross-model review, security
+   audit, "office hours" scoping)?
+2. Given the overlap with items 6/6c/6f/7/8, is this really "close one
+   specific named gap" rather than "port gstack wholesale"?
+3. Is it acceptable that `aider`/local-LLM engines can only ever get this
+   via the existing lead-loop abstraction, never `gstack`'s literal
+   slash-command form?
+4. Are `gstack`'s own new runtime dependencies acceptable to add to the
+   LXC, and via what install mechanism?
+
+Do not re-litigate this finding by re-reading the repo from scratch in a
+future session — start from the questions above.
 
 ---
 

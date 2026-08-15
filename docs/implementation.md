@@ -1386,3 +1386,225 @@ components directly.
 
 The WCAG-contrast should-fix remains untouched — out of scope for this
 round per the reviewer's own instruction.
+
+# Implementation: Backlog item 19 part 1 -- interject a free-form message into a running team (backend)
+
+## Summary
+A human's third lever on a live team run, alongside answering a pending
+`ask_user`/`board_write` and stopping the run outright: an unsolicited
+free-text message queued for the **lead**, delivered at the top of its own
+next round. Backend + CLI only, per docs/spec.md's own explicit scope --
+the chat-bubble UI is a separate part 2 cycle.
+
+- `teams.interject(run_id, text)` -- appends one envelope to a new per-run,
+  append-only `human.jsonl` file; never touches `run.json`, so there is
+  nothing for the driving thread's own end-of-round `_persist(state)` call
+  to race or clobber.
+- `team_step()` drains `human.jsonl` via a persisted `human_cursor` at the
+  very top of its own round (before the lead is ever called) and appends
+  one `human_interject` history entry per queued message.
+- A new `_INTERJECT_MITIGATION` prompt clause, present in `_system_framing()`
+  for all three tiers.
+- `POST /projects/<name>/team/interject` and `team-interject <run_id>
+  <text>` (CLI) -- thin wrappers; neither starts/resumes a driving thread.
+- `human.jsonl` merges into `GET .../team/events` as one more `files` list
+  entry, tagged `agent="human"`, `kind="message"` -- the existing
+  `{ts, agent, seq, kind, text, meta}` envelope shape, unchanged.
+
+## Changes by file
+- `app/teams.py`:
+  - `_human_log_path(run_id)` -- new, next to `_transcript_path()`.
+  - `TEAM_INTERJECT_MAX_CHARS` (default 2000) and
+    `TEAM_HUMAN_MSG_MAX_BYTES_PER_ROUND` (default 65536) -- new constants,
+    next to `TEAM_ASK_USER_ANSWER_MAX_CHARS`/`TEAM_BOARD_WRITE_VALUE_MAX_CHARS`.
+  - `_new_state()` -- adds `"human_cursor": 0` (additive; existing runs
+    persisted before this field existed read it back as `0` via
+    `state.get("human_cursor", 0)`).
+  - `_next_human_seq(run_id)` -- new, next to `_next_transcript_seq()`, same
+    "count existing lines" idiom scoped to `human.jsonl`.
+  - `interject(run_id, text)` -- new, placed immediately before
+    `resolve_ask_user()`. Reloads state fresh, rejects a terminal status
+    (`finished`/`error`/`escalated_max_rounds`/`stopped`, the same tuple
+    `stop_team()`/`sweep_dead_teams()` already treat as terminal) with
+    `f"run {run_id} is not accepting messages (status={status})"`, else
+    appends `{"ts", "agent": "human", "seq", "kind": "message", "text",
+    "meta": {}}` to `human.jsonl` via `os.makedirs` + `open(path, "a")` +
+    one `write()` call. Returns `{"ok": True, "run_id": run_id}` /
+    `{"ok": False, "error": ...}`. Never calls `_persist()`.
+  - `team_step()` -- new drain checkpoint at the very top (before
+    `round_n`/`system`/`round_context` are computed, earlier than the
+    existing `cancel_event` checkpoints): calls `tail_jsonl_events()`
+    against `human.jsonl` from `state.get("human_cursor", 0)`, capped at
+    `TEAM_HUMAN_MSG_MAX_BYTES_PER_ROUND`; for each new event, appends a
+    `tool="human_interject"` history entry (`transcript_entries=[]` --
+    already durably recorded in `human.jsonl` itself, no second copy in
+    `transcript.jsonl`), advances and persists `human_cursor`, and returns
+    without ever calling `_call_lead()`. Docstring extended in place; no
+    other branch of the function changed.
+  - `_INTERJECT_MITIGATION` -- new constant, next to
+    `_BOARD_WRITE_MITIGATION`, required-verbatim text describing what a
+    `human_interject` round means and does not mean. Appended to
+    `_system_framing()`'s `parts` list, every tier.
+  - `_cli_team_interject(args)` -- new, next to `_cli_team_board_resolve()`.
+    Calls `interject()`; prints `queued for run <run_id>` and exits 0 on
+    success, `error: <reason>` to stderr and exit 1 on failure. Does NOT
+    call `_drive_and_report()` -- queuing a message is not the same action
+    as resuming a stopped run.
+  - `team-interject <run_id> <text>` subparser (two positionals, matching
+    docs/spec.md's own literal CLI shape) + dispatch arm in `main()`.
+- `app/app.py`:
+  - `_handle_team_events()` -- `files` list extended by exactly one tuple,
+    `("human", teams._human_log_path(run_id))`. No other change; the
+    existing per-file cursor/byte-cap/truncation-flag/merge-sort logic is
+    already generic over the file list.
+  - New `POST /projects/<name>/team/interject` branch in `do_POST`,
+    alongside `/team/resolve`/`/team/board-resolve`, same shared TOTP gate.
+    `run_id` validated against `teams._RUN_ID_RE` before any load/path-join
+    (item 11(b)); loads state and checks
+    `state.get("project_name") == name`; defaults to
+    `teams.latest_run_for_project(name)` when `run_id` is omitted. Length/
+    emptiness validation (`text = (body.get("text") or "").strip()`, 400 if
+    empty or over `TEAM_INTERJECT_MAX_CHARS`) happens at this route layer,
+    mirroring `/team/resolve`'s own `TEAM_ASK_USER_ANSWER_MAX_CHARS` check
+    exactly -- `teams.interject()` is never reached for either rejection.
+    Calls `teams.interject(run_id, text)`; `{"error": ...}, 400` on
+    failure, else `{"ok": True, "run_id": run_id}`. Deliberately does NOT
+    spin up a background thread (unlike `/team/resolve`/`/team/board-
+    resolve`, which resume an already-exited loop) -- a running team
+    already has a live driving thread that will pick the message up on its
+    own next round; a blocked run's message waits for whichever future
+    resolve action restarts driving.
+- `config/switchboard.env.example`: documents `TEAM_INTERJECT_MAX_CHARS`
+  and `TEAM_HUMAN_MSG_MAX_BYTES_PER_ROUND`, new "interject a message into a
+  running team" section right after the existing `TEAM_ASK_USER_ANSWER_MAX_CHARS`
+  entry.
+- New tests:
+  - `tests/test_teams_lead.py`: `InterjectTests` (4), `TeamStepDrainInterjectTests`
+    (3), `CliTeamInterjectTests` (3) -- 10 new pure-unit tests, placed right
+    after `CallLeadDispatchTests` (same section as the rest of the
+    `_call_lead()`/`team_step()` pure-unit coverage). `SystemFramingTests
+    .test_mitigation_clauses_present_every_tier` extended with one more
+    assertion for `_INTERJECT_MITIGATION`'s own distinctive phrase (see
+    "Deviations from spec" below for why this test, not a new dedicated
+    class, was extended).
+  - `tests/test_team_routes.py`: `TeamInterjectEndpointTests` (12) --
+    real-HTTP-server tests mirroring `TeamResolveEndpointTests`'s own
+    structure/naming (unknown project, no run at all, cross-project
+    ownership, path-traversal `run_id`, malformed non-traversal `run_id`,
+    empty/oversized text with a call-count double on `teams.interject`,
+    the success path with no thread started, `run_id` omitted defaults to
+    `latest_run_for_project`, `blocked_ask_user` accepted, terminal status
+    rejected, and the message appearing in a real `GET .../team/events`
+    poll) -- placed right after `TeamResolveEndpointTests`.
+
+## Key decisions / tradeoffs
+- **`interject()` never calls `_persist(state)` and never mutates
+  `state["history"]`** -- this is the entire fix for the race docs/spec.md
+  "Background" describes. A naive "load state, append to history, persist"
+  implementation would very likely be clobbered by the driving thread's own
+  next round-end `_persist(state)` call (this codebase's already-accepted
+  "no lock on `run.json`, last writer wins" tradeoff). Writing to a file
+  the driving thread does not otherwise touch during a round leaves
+  nothing for that race to clobber; `team_step()`'s own drain checkpoint is
+  what actually delivers the message into `state["history"]`, on the
+  driving thread itself, at the next round boundary.
+- **The drain checkpoint sits before `cancel_event`'s own checkpoints, not
+  after** -- matching docs/spec.md's own "cheapest possible checkpoint"
+  rationale (team_run()'s max-rounds check already follows the same
+  principle): draining can short-circuit an entire round (no lead call at
+  all) before any other work happens.
+- **`team_step()`'s loop variable inside the drain branch is named
+  `drain_round_n`, not `round_n`** -- a small, deliberate naming choice
+  (not in docs/spec.md's own pseudocode, which reused `round_n`) to avoid
+  any risk of the drain loop's local binding being confused with the
+  function's own `round_n` computed later in the non-drain path; the two
+  never coexist in the same execution (the function returns early from the
+  drain branch), but the distinct name makes that non-overlap obvious on
+  read without relying on control-flow tracing.
+- **Reused the existing `("finished", "escalated_max_rounds", "error",
+  "stopped")` terminal-status tuple** (already used verbatim by
+  `stop_team()`/`sweep_dead_teams()`) rather than introducing a new literal
+  or a shared module-level constant -- matches this codebase's existing
+  precedent of repeating the tuple at each call site rather than factoring
+  it out; not introduced as a new abstraction for this one additional use.
+
+## Deviations from spec
+- **`_BOARD_WRITE_MITIGATION` acceptance criterion, extended interpretation:**
+  docs/spec.md's acceptance criteria say to "extend the existing per-tier
+  framing test the same way `_BOARD_WRITE_MITIGATION` was covered."
+  Checked first (per skill 2, "not testable is a claim to verify"): no
+  dedicated test class or assertion actually exists anywhere in the test
+  suite asserting `_BOARD_WRITE_MITIGATION`'s own text is present in
+  `_system_framing()`'s output -- only `_FACT_CHECK_MITIGATION`'s two
+  distinctive phrases are checked, in `SystemFramingTests
+  .test_mitigation_clauses_present_every_tier`, and
+  `_DELEGATION_HISTORY_MITIGATION` has its own dedicated
+  `DelegationHistoryMitigationTests.test_mitigation_clause_present_every_tier`.
+  Read this as the spec author intending "cover it the same general way
+  every other required-verbatim clause is covered" rather than pointing at
+  a literal precedent that turned out not to exist for board_write
+  specifically -- extended the existing `test_mitigation_clauses_present_
+  every_tier` (the more general, still per-tier-looped test) with one more
+  `assertIn` for `_INTERJECT_MITIGATION`'s own distinctive phrase, rather
+  than inventing a new dedicated class this repo's own precedent doesn't
+  actually establish for the sibling clause the spec named.
+- Everything else implemented per docs/spec.md's own literal
+  function/route/CLI shapes, error strings, and constant defaults --
+  `interject()`'s error text, the route's validation order and error
+  strings, the CLI's exact `queued for run <run_id>` output, and the
+  `_INTERJECT_MITIGATION` clause text are all copied verbatim from
+  docs/spec.md "Proposed approach".
+
+## Known limitations
+Every "Non-goal"/"Edge case" docs/spec.md itself already documents as an
+accepted, narrow tradeoff is carried forward unchanged by this
+implementation (not re-litigated here): round-boundary-only delivery (no
+true mid-tool-call interruption), lead-only addressing (no direct-to-
+teammate messaging), no edit/withdraw of an already-queued message, a
+message posted in the exact instant a run exhausts `max_rounds` is
+stranded (never drained, not data-destructive), and two genuinely
+simultaneous posts could in principle compute the same cosmetic `seq`
+once (display/sort tiebreaker only, `ts` plus insertion order in the
+merged feed is still correct). No new limitation was introduced beyond
+what docs/spec.md already scoped.
+
+## How to verify locally
+```
+# This cycle's new backend tests:
+python3 -m unittest tests.test_teams_lead.InterjectTests \
+  tests.test_teams_lead.TeamStepDrainInterjectTests \
+  tests.test_teams_lead.CliTeamInterjectTests \
+  tests.test_team_routes.TeamInterjectEndpointTests -v
+# Ran 22 tests ... OK
+
+# Full test_teams_lead.py / test_team_routes.py / test_teams_board.py,
+# including this cycle's new tests and the extended mitigation-clause
+# assertion:
+python3 -m unittest tests.test_teams_lead tests.test_team_routes tests.test_teams_board
+# Ran 296 tests ... OK
+
+# Full existing suite:
+python3 -m unittest discover -s tests
+# Ran 1034 tests (1012 baseline + 22 new) ... OK, except one pre-existing,
+# unrelated flaky concurrency test
+# (TeamStartEndpointTests.test_two_near_simultaneous_starts_exactly_one_succeeds,
+# a real-tmux two-thread timing race under full-suite load) -- reproduced
+# only under the full 1034-test run, passes in isolation and in every
+# targeted run above; not touched by this change (no file this cycle
+# edited is imported by that test path beyond app.py/teams.py themselves,
+# and it fails/passes identically with this cycle's changes stashed out).
+
+# Manual smoke test against a real project (no lead/teammate subprocess
+# needed for any of these):
+#   1. Start the app.py server, log in, start a team run against a project.
+#   2. `curl` (with a valid session cookie + TOTP code)
+#      `-d '{"text": "focus on X first", "code": "<code>"}'
+#      /projects/<name>/team/interject` -> {"ok": true, "run_id": "..."}.
+#   3. `python3 app/teams.py team-status <run_id>` -- once the driving
+#      thread completes its current round, a new "human_interject" entry
+#      appears in state["history"] with the posted text.
+#   4. `curl /projects/<name>/team/events?run_id=<run_id>` -- the same
+#      message appears as one event, agent="human", kind="message".
+#   5. `python3 app/teams.py team-interject <run_id> "another message"` --
+#      prints "queued for run <run_id>", exits 0, does not block.
+```
