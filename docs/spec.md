@@ -1,267 +1,189 @@
-# Spec: install.sh fixes from Proxmox E2E test round 1 (items 22-27)
+# Spec: app/teams.py + app/taiga_board.py + app/app.py fixes from Proxmox E2E test round 2 (items 28, 29, 33)
 
 ## Summary
-Six real, precisely-diagnosed bugs found by a live Proxmox end-to-end test
-(`docs/BACKLOG.md` items 22-27), all in `install.sh` (item 25 also touches
-`scripts/gitea-sync-project.sh`). Bundled into one cycle since all six are
-small, independent, install.sh-only fixes with exact repro steps and
-verified-locally-working fixes already established by the E2E tester — no
-open design questions remain. Two of the six (22, 27) mean the product is
-currently completely broken (service won't start at all / flagship
-multi-agent-teams feature can't start at all) — this is the highest-priority
-fix cycle from that report.
+Three more bugs from the same Proxmox E2E test (`docs/BACKLOG.md` items 28,
+29, 33). Item 28 is the second of the two bugs that together made
+multi-agent teams completely non-functional on a fresh install (item 27,
+fixed in PR #27, closes the first blocker; this closes the second — with
+both fixed, teams actually work). Item 29 breaks item 7's `board_read`/
+`board_write` tools identically on every fresh install, even after
+following the documented setup exactly. Item 33 is a one-line cosmetic
+error-message fix. All three are fully diagnosed with verified-locally-
+working fixes already established by the E2E tester.
 
 ## Orchestrator note
-No product-manager/ux-designer dispatch — every fix's shape is already
-fully diagnosed with exact repro, exact root cause, and (for 22/24/25/26/27)
-a verified-locally-working fix, by the E2E tester. Matches this project's
-own "skip full triage for a fully-diagnosed follow-up" precedent used
-repeatedly this session.
+No product-manager/ux-designer dispatch — same "fully-diagnosed follow-up"
+precedent as round 1 (PR #27). All three fixes below have exact before/
+after code.
 
 ---
 
-## Fix 1 — Item 22: copy `app/taiga_board.py` during install
+## Fix 1 — Item 28: `rundir` permission wall blocks every worktree creation and every headless engine turn
 
-**Where**: `install.sh:283-285` (the "-- App + engines --" step).
+**Where**: `app/teams.py:1095` (`_run_headless_session()`) and
+`app/teams.py:3462` (`_run_run_user_command()`).
+
+**Problem**: both functions create `rundir` as `SVC_USER` via
+`os.makedirs(rundir, exist_ok=True); os.chmod(rundir, 0o711)`, but the
+actual command inside it is dispatched via `sudo -u RUN_USER tmux
+new-session ...` — i.e. it runs as a *different* user, which has no write
+bit on `0o711` (owner rwx, group/other read+execute only, no write for
+anyone but the owner) at all. The command's own redirect-and-background
+line (`... >out 2>err & echo $! >pid; wait $!; echo $? >rc`) fails at its
+very first redirect, before even backgrounding — nothing is ever written,
+so the generic "vanished with no rc" fallback fires, looking exactly like
+a fast-command race but actually a 100%-reproducible permission wall.
+
+**Fix**: change both `os.chmod(rundir, 0o711)` calls to
+`os.chmod(rundir, 0o733)` (owner rwx, group -wx, other -wx — i.e. everyone
+gets write+execute, matching what `RUN_USER` actually needs to create
+files in this directory). Verified by the E2E tester: this exact change,
+applied at both sites, makes team-start, worktree creation, and headless
+delegation all work correctly. Files written into `rundir` by `RUN_USER`
+inherit a normal `022`-umask mode (world-readable), so `SVC_USER` reading
+them back afterward is unaffected — only the directory's own write bit for
+"other" was ever the problem.
+
+```python
+# app/teams.py:1095, inside _run_headless_session()
+os.chmod(rundir, 0o733)   # was 0o711
+
+# app/teams.py:3462, inside _run_run_user_command()
+os.chmod(rundir, 0o733)   # was 0o711
+```
+
+**Also worth adding (same fix, diagnostic improvement, not required for
+correctness but directly requested by the E2E tester)**: the
+`subprocess.run(TMUX + ["new-session", ...])` calls at both these sites
+(`app/teams.py:1139` inside `_run_headless_session()`, and
+`app/teams.py:3473` inside `_run_run_user_command()`) don't capture or
+check their own return code/stderr at all — this is exactly what made
+diagnosing item 28 slow (the generic "vanished" message is
+indistinguishable from a dozen other real causes). Add
+`capture_output=True, text=True` to both calls, and if the returncode is
+non-zero, fold `result.stderr` into the existing failure-path error
+message at each site instead of silently proceeding to the vanished-
+session fallback. Read each function's surrounding code first to thread
+this through correctly — do not just add the kwarg without using the
+result, and do not change either function's existing return contract
+(`{"ok": bool, ...}` shape) beyond making the error message more specific
+when this particular failure mode occurs.
+
+**Acceptance**: after this fix (and item 27's from PR #27), a real
+`POST /projects/<name>/team/start` succeeds, creates real worktrees, and a
+real headless delegate call to a teammate completes — not just "doesn't
+throw," an actual file edit lands on disk (matching the E2E report's own
+positive-result confirmation).
+
+---
+
+## Fix 2 — Item 29: `board_read`/`board_write` always report "Taiga isn't configured" — `~` expands per-process, not per-install
+
+**Where**: `app/taiga_board.py:33` (`DEFAULT_CONFIG_PATH`).
+
+**Problem**: both `scripts/taiga_push_spec.py` (invoked as `RUN_USER` via
+the CLI) and `app/taiga_board.py` (invoked as `SVC_USER`, from inside the
+lead loop running as part of `ai-dev-switchboard.service`) independently
+compute:
+```python
+DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/ai-dev-switchboard/taiga-push.env")
+```
+`~` expands relative to *whichever user's process evaluates it* —
+`/home/dev/...` for the CLI script, `/home/switchboard-svc/...` for the
+board tools. `scripts/taiga-configure-push.sh`'s own documented usage
+("Run once, by RUN_USER") writes the file to `/home/dev/...`, but
+`taiga_board.py` reads from `/home/switchboard-svc/...` — two entirely
+separate files. Every team lead that ever calls `board_read`/
+`board_write` on a fresh install reports "not configured," even after
+following the docs exactly.
+
+**Fix**: resolve the path relative to `RUN_USER`'s home explicitly in
+`taiga_board.py`, matching where the setup script and its own docs
+already point, instead of each side independently calling
+`os.path.expanduser("~/...")` in its own process context.
+`taiga_board.py` needs to know `RUN_USER`'s value — the canonical
+resolution is `app/app.py:69`: `RUN_USER = os.environ.get("RUN_USER",
+"dev")`. **Do not import this from `app.py`** — `taiga_board.py` is
+imported by `teams.py` (`import taiga_board`, `app/teams.py:55`), which is
+in turn imported by `app.py` partway through its own module body
+(`import teams`, confirmed as the exact line that crashed in item 22's
+bug report); `taiga_board.py` importing `app` back would create a real
+circular import (`app → teams → taiga_board → app`) that breaks at module
+load time, not just a style nit. `taiga_board.py`'s own docstring already
+states its design goal of not importing anything privileged of its own —
+keep that property. Instead, replicate the same `os.environ.get(...)`
+read independently, matching `app.py:69`'s exact default value:
+```python
+RUN_USER = os.environ.get("RUN_USER", "dev")
+DEFAULT_CONFIG_PATH = f"/home/{RUN_USER}/.config/ai-dev-switchboard/taiga-push.env"
+```
+
+**Non-goal**: do not change `scripts/taiga_push_spec.py`'s own
+`DEFAULT_CONFIG_PATH` (it's correctly `~`-relative already, since it
+always runs as `RUN_USER` via the CLI — this bug is specific to
+`taiga_board.py` being invoked from a different user context). Do not
+attempt to fix the underlying read-permission question (the E2E tester's
+own report notes `taiga-configure-push.sh` writes 600-mode/`RUN_USER`-
+owned, so `SVC_USER` reading the *correct* path still needs either a
+narrowly-scoped read grant or `install.sh` creating the file's directory
+with shared permissions up front) — that's a separate, not-yet-fully-
+specified follow-up the E2E report itself flags as needing a decision,
+not something to guess at in this cycle. This fix only corrects *which
+path* is computed; if `SVC_USER` still can't read a `RUN_USER`-600-owned
+file at that corrected path, that's the next thing to fix, tracked
+separately.
+
+**Acceptance**: `python3 -c "import sys; sys.path.insert(0, 'app'); import
+taiga_board; print(taiga_board.DEFAULT_CONFIG_PATH)"` (with `RUN_USER=dev`
+in the environment) prints `/home/dev/.config/ai-dev-switchboard/taiga-push.env`
+— matching exactly where `taiga-configure-push.sh`'s own documented usage
+writes the file.
+
+---
+
+## Fix 3 — Item 33: `/team/interject`'s error message names the wrong field
+
+**Where**: `app/app.py:6472-6476`.
 
 **Current**:
-```bash
-echo "-- App + engines --"
-cp "$REPO_DIR/app/app.py" "$INSTALL_DIR/app.py"
-cp "$REPO_DIR/app/teams.py" "$INSTALL_DIR/teams.py"
+```python
+text = (body.get("text") or "").strip()
+if not text or len(text) > teams.TEAM_INTERJECT_MAX_CHARS:
+    return self._json(
+        {"error": f"message must be non-empty and at most "
+                  f"{teams.TEAM_INTERJECT_MAX_CHARS} characters"}, 400)
 ```
+The route reads `body.get("text")` (correct — this is genuinely the field
+name the frontend sends and the field name documented in `docs/spec.md`)
+but the error string says "message," not "text" — misleading anyone
+constructing the request by hand or from the error text alone (the E2E
+tester's own first, reasonable guess based on the error string and the
+feature's name — "interject a message" — was `{"message": "..."}`, which
+the route silently treats as absent and returns this same misleading
+error).
 
-**Fix**: add the missing third file. Confirmed via `ls app/*.py` that
-`app/` contains exactly three `.py` files (`app.py`, `taiga_board.py`,
-`teams.py`) — no other stragglers to find.
-```bash
-echo "-- App + engines --"
-cp "$REPO_DIR/app/app.py" "$INSTALL_DIR/app.py"
-cp "$REPO_DIR/app/teams.py" "$INSTALL_DIR/teams.py"
-cp "$REPO_DIR/app/taiga_board.py" "$INSTALL_DIR/taiga_board.py"
+**Fix**: correct the error string to name the real field:
+```python
+text = (body.get("text") or "").strip()
+if not text or len(text) > teams.TEAM_INTERJECT_MAX_CHARS:
+    return self._json(
+        {"error": f"text must be non-empty and at most "
+                  f"{teams.TEAM_INTERJECT_MAX_CHARS} characters"}, 400)
 ```
-
-**Acceptance**: after a fresh install, `ai-dev-switchboard.service` starts
-successfully (no `ModuleNotFoundError: No module named 'taiga_board'` in
-`journalctl -u ai-dev-switchboard`).
-
----
-
-## Fix 2 — Item 23: drop `-it` from the printed Gitea admin-bootstrap command
-
-**Where**: `install.sh:937` (inside the end-of-run `--with-git-hosting`
-summary block).
-
-**Current**:
-```bash
-echo "       docker exec -it --user git ai-dev-switchboard-gitea gitea admin user create \\"
-```
-
-**Fix**: remove `-it` (the command passes every value as a flag, nothing
-about it is actually interactive — `-it` is the only thing that breaks it
-when run without an attached TTY, e.g. via `pct exec` or a provisioning
-script).
-```bash
-echo "       docker exec --user git ai-dev-switchboard-gitea gitea admin user create \\"
-```
-
-**Acceptance**: the printed command, copy-pasted verbatim and run via
-`pct exec <ctid> -- bash -c '<command>'` (no TTY), succeeds.
-
----
-
-## Fix 3 — Item 24: chown `$STATE_DIR` itself, not just its `uploads` subdirectory
-
-**Where**: `install.sh:112-113` (STATE_DIR creation) and `install.sh:455-456`
-(the existing narrower chown).
-
-**Current** (`install.sh:112-113`):
-```bash
-STATE_DIR=/var/lib/ai-dev-switchboard
-mkdir -p "$CONFIG_DIR" "$INSTALL_DIR" "$STATE_DIR"
-```
-(no chown anywhere for `$STATE_DIR` itself — only `install.sh:456`'s
-`chown "$SVC_USER:$SVC_USER" "$STATE_DIR/uploads"` touches one specific
-subdirectory, created later in the run.)
-
-**Fix**: add a chown for `$STATE_DIR` itself, right after it's created.
-Since `$SVC_USER` doesn't exist yet at line 113 (it's created later, at
-`install.sh:243`), this specific chown must be added *after* that point —
-place it immediately after `install.sh:243`'s `useradd` line, alongside
-this fix's own comment:
-```bash
-id "$SVC_USER" &>/dev/null || { useradd -r -m -d "/home/$SVC_USER" -s /usr/sbin/nologin "$SVC_USER"; echo "Created $SVC_USER"; }
-chown "$SVC_USER:$SVC_USER" "$STATE_DIR"
-```
-The existing narrower `chown "$SVC_USER:$SVC_USER" "$STATE_DIR/uploads"`
-at line 456 stays — harmless, idempotent, and `uploads` doesn't exist yet
-at line 243 (it's `mkdir -p`'d later at line 455) so it still needs its
-own explicit chown once created.
-
-**Acceptance**: `sudo -u switchboard-svc touch
-/var/lib/ai-dev-switchboard/testwrite` succeeds after a fresh install
-(then remove the test file). A new Gitea-hosted project's repo-map entry
-(`GITEA_REPO_MAP_FILE`) is actually written on `create_project()`.
-
----
-
-## Fix 4 — Item 25: `gitea-sync-project.sh` reads a world-readable runtime file, not the 600-mode secrets file
-
-**Where**: `install.sh` (new file write, near where `$ENV_FILE` itself is
-finalized — `install.sh:472-473`) and `scripts/gitea-sync-project.sh:37-40`.
-
-**Problem**: `gitea-sync-project.sh` runs as `RUN_USER` (dispatched via
-`sudo -u $RUN_USER`, confirmed in the script's own header comment) but
-sources `/etc/ai-dev-switchboard/switchboard.env`, which is
-`600`/`SVC_USER`-owned (`install.sh:472-473`). `dev` can't read it,
-`source` fails under `set -euo pipefail`, and the whole script exits 1
-silently (the poll's own non-zero-exit handling just retries next
-interval forever, never surfacing the failure).
-
-**Fix**: the script only actually needs two static, non-secret values —
-`RUN_USER` and `PROJECTS_DIR` — both already known at `install.sh` time.
-Write them into a small, dedicated, world-readable file instead of routing
-through the secrets file.
-
-In `install.sh`, right after `install.sh:472-473`'s existing
-`chown`/`chmod 600` on `$ENV_FILE`, add a second, deliberately
-world-readable file:
-```bash
-chown "$SVC_USER:$SVC_USER" "$ENV_FILE"
-chmod 600 "$ENV_FILE"
-
-# Item 25 fix: a small, deliberately world-readable (644) sibling file
-# holding ONLY non-secret, install-time-static values -- gitea-sync-
-# project.sh runs as RUN_USER (not SVC_USER) and cannot read the 600
-# switchboard.env, but needs RUN_USER/PROJECTS_DIR to locate the project
-# it's syncing. Never write a secret into this file.
-RUNTIME_ENV_FILE="$CONFIG_DIR/runtime.env"
-cat > "$RUNTIME_ENV_FILE" <<EOF
-RUN_USER=$RUN_USER
-PROJECTS_DIR=$PROJECTS_DIR
-EOF
-chmod 644 "$RUNTIME_ENV_FILE"
-```
-(Placed after `$PROJECTS_DIR` is set — confirm `$PROJECTS_DIR` is already
-in scope at this point in the file; it's set at `install.sh:245`, well
-before line 472, so it is.)
-
-In `scripts/gitea-sync-project.sh:37-40`, change:
-```bash
-CONFIG=/etc/ai-dev-switchboard/switchboard.env
-[ -f "$CONFIG" ] && source "$CONFIG"
-RUN_USER="${RUN_USER:-dev}"
-PROJECTS_DIR="${PROJECTS_DIR:-/home/${RUN_USER}/projects}"
-```
-to:
-```bash
-CONFIG=/etc/ai-dev-switchboard/runtime.env
-[ -f "$CONFIG" ] && source "$CONFIG"
-RUN_USER="${RUN_USER:-dev}"
-PROJECTS_DIR="${PROJECTS_DIR:-/home/${RUN_USER}/projects}"
-```
-(Same fallback-default shape, just pointed at the new file — a missing
-`runtime.env` on an old install that hasn't re-run `install.sh` yet still
-degrades to the same `dev`/`/home/dev/projects` defaults it has today, not
-a hard failure.)
-
-**Non-goal**: do not loosen `switchboard.env` itself to 644 — that would
-leak `GITEA_API_TOKEN`/`SIMPLE_PASSWORD`/`TOTP_SECRET` to every local
-account, including `RUN_USER`'s own coding-agent sessions. The whole point
-of this fix is a separate, deliberately-narrow file.
-
-**Acceptance**: `sudo -u dev cat /etc/ai-dev-switchboard/runtime.env`
-succeeds and shows correct `RUN_USER`/`PROJECTS_DIR` values. A real push to
-a Gitea-hosted project's repo fast-forwards `PROJECTS_DIR/<name>` within
-one poll interval (`GITEA_POLL_INTERVAL_SECONDS`).
-
----
-
-## Fix 5 — Item 26: chown the top-level `~RUN_USER/.local`, not just the code-server subtree
-
-**Where**: `install.sh:279` (inside the `WITH_CODE_SERVER` block).
-
-**Current**:
-```bash
-        chown -R "$RUN_USER:$RUN_USER" "$CODE_SERVER_DIR"
-```
-(`$CODE_SERVER_DIR` = `/home/$RUN_USER/.local/share/code-server` —
-two levels below `.local` itself. `mkdir -p` at line 271 created every
-intermediate directory, including `.local` and `.local/share`, as
-`root:root`, and this chown never reaches back up to them.)
-
-**Fix**: chown the top-level `.local` directory instead, recursively (it
-covers `.local/share/code-server` as a subset, so this is strictly a
-superset fix, not a narrower one):
-```bash
-        chown -R "$RUN_USER:$RUN_USER" "/home/$RUN_USER/.local"
-```
-
-**Acceptance**: after a fresh `--with-code-server` install,
-`sudo -u dev mkdir /home/dev/.local/testdir` succeeds (then remove it), and
-`sudo -u dev pipx install --quiet some-real-package` (or `pip install
---user`) no longer fails with a `PermissionError` under `.local`.
-
----
-
-## Fix 6 — Item 27: configure `safe.directory` for `SVC_USER` (the most severe fix in this cycle)
-
-**Where**: `install.sh`, right after `install.sh:243`'s `SVC_USER` creation
-(same insertion point as Fix 3 above — both land in the same spot, so
-implement them together, in this order: `useradd` → `chown $STATE_DIR` →
-`safe.directory` config, or any order between the two additions, as long
-as both come after the `useradd` line).
-
-**Problem**: `_check_git_repo_state()` (`app/teams.py`) runs
-`git -C workdir rev-parse --is-inside-work-tree` as `SVC_USER`, read-only.
-Every project directory is `RUN_USER`-owned — a different user — and git
-≥2.35.2's "dubious ownership" protection (CVE-2022-24765 mitigation)
-refuses to operate on a repo owned by a different user unless that exact
-path is in the caller's own `safe.directory` list. `install.sh` never
-configures this at all, so `team/start` fails on every single project with
-a flatly wrong `"not a git repository"` error (the check's own
-non-"true"-means-not-a-repo error mapping can't distinguish "genuinely not
-a repo" from "blocked by this safety check").
-
-**Fix**: add, once, right after `SVC_USER` is created:
-```bash
-id "$SVC_USER" &>/dev/null || { useradd -r -m -d "/home/$SVC_USER" -s /usr/sbin/nologin "$SVC_USER"; echo "Created $SVC_USER"; }
-# Item 27 fix: SVC_USER (running app.py) needs to run read-only git
-# inspection commands (_check_git_repo_state()) against every RUN_USER-
-# owned project directory. Git's "dubious ownership" protection
-# (CVE-2022-24765) refuses this by default across a user boundary. `*`
-# (not a glob against a fixed path) is required -- git's own
-# safe.directory only matches literal paths or the literal string `*`,
-# and projects are created dynamically after install, so a fixed list of
-# literal paths can't work here. Bounded, deliberate trade-off: SVC_USER
-# only ever runs read-only inspection git commands directly (writes
-# already cross into RUN_USER via sudo -u), so this doesn't hand out any
-# privilege beyond what the account already effectively has.
-sudo -u "$SVC_USER" git config --global --add safe.directory '*'
-```
-
-**Acceptance**: `sudo -u switchboard-svc git -C <any RUN_USER-owned
-project dir> rev-parse --is-inside-work-tree` prints `true` (not the
-"dubious ownership" fatal error) after a fresh install. `POST
-/projects/<name>/team/start` no longer 400s with `"not a git repository"`
-against a genuinely valid git repo.
+Check `tests/test_team_routes.py` (or wherever this route's tests live)
+for any existing assertion on the literal old error string and update it
+to match.
 
 ## Affected areas
-`install.sh` (all six fixes), `scripts/gitea-sync-project.sh` (fix 4 only).
-No Python/JS code touched, no test suite changes expected (these are
-install-time shell logic — the existing `tests/test_install_*.py` files
-test `install.sh`'s bash logic directly via subprocess; check whether any
-existing test asserts the exact `cp`/`chown` lines being changed here and
-update it if so, but do not invent new install.sh test infrastructure
-beyond what already exists in this repo for similar prior fixes — e.g.
-`tests/test_install_set_env.py` from item 10 is the precedent for how this
-project tests install.sh logic).
+`app/teams.py` (fix 1), `app/taiga_board.py` (fix 2), `app/app.py` (fix 3).
+No frontend/JS changes needed for any of these three.
 
 ## Risk / rollback notes
-All six changes are small, additive-or-corrective single-purpose edits to
-already-idempotent install.sh steps (every one of them is safe to re-run).
-None touch application logic. Plain `git revert` on `install.sh`/
-`scripts/gitea-sync-project.sh` if anything regresses. Fix 6's `*`
-safe.directory trade-off is the one worth a second look at review time
-given it's a real (if bounded, per the reasoning above) security-relevant
-change — not a rubber-stamp.
+Fix 1 is the highest-value fix in this cycle (unblocks the entire
+multi-agent-teams feature) but is a narrow, well-understood permission-bit
+change with a verified-working fix already established — low risk. Fix 2
+is a path-computation change with no behavior change for any already-
+working case (the config was never being found correctly before this fix,
+so there's no working case to regress). Fix 3 is a one-line string
+change. Plain `git revert` on `app/teams.py`/`app/taiga_board.py`/
+`app/app.py` if anything regresses.

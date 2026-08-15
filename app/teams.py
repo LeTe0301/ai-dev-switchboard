@@ -1092,7 +1092,7 @@ def agent_run(engine: str, workdir: str, prompt: str, *,
     # inside this one try, cleaned up unconditionally by the finally below.
     try:
         os.makedirs(rundir, exist_ok=True)
-        os.chmod(rundir, 0o711)
+        os.chmod(rundir, 0o733)
 
         out_path = os.path.join(rundir, "out.jsonl")
         err_path = os.path.join(rundir, "out.err")
@@ -1136,8 +1136,8 @@ def agent_run(engine: str, workdir: str, prompt: str, *,
             os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
 
         try:
-            subprocess.run(TMUX + ["new-session", "-d", "-s", session, "-c", workdir,
-                                   "bash", "-l", script_path])
+            tmux_result = subprocess.run(TMUX + ["new-session", "-d", "-s", session, "-c", workdir,
+                                   "bash", "-l", script_path], capture_output=True, text=True)
         except OSError as e:
             # Defense in depth beyond _validate_prompt_size()'s own
             # shlex.quote()'d-length check -- e.g. an unusually long
@@ -1149,6 +1149,17 @@ def agent_run(engine: str, workdir: str, prompt: str, *,
             return _result(ok=False, text="", session_id=None, exit_code=None, cancelled=False,
                           cancel_reason=None, event_count=0, truncated=False, log_path=log_path,
                           stderr_tail="", error=f"failed to start headless session: {e}")
+        if tmux_result.returncode != 0:
+            # tmux itself refused to start the session (e.g. the rundir
+            # permission wall this fix addresses, or any other RUN_USER-
+            # side failure before bash ever gets to write out.pid) -- surface
+            # its stderr directly instead of falling through to the generic
+            # "vanished with no rc" fallback below, which is indistinguishable
+            # from a dozen other causes.
+            return _result(ok=False, text="", session_id=None, exit_code=None, cancelled=False,
+                          cancel_reason=None, event_count=0, truncated=False, log_path=log_path,
+                          stderr_tail="",
+                          error=f"failed to start headless session: {tmux_result.stderr.strip()}")
 
         return _run_headless_session(
             session=session, out_path=out_path, err_path=err_path, pid_path=pid_path,
@@ -3459,7 +3470,7 @@ def _run_run_user_command(argv: list, cwd: str, timeout: float = None) -> dict:
     session = f"switchboard-worktree-op-{op_id}"
     try:
         os.makedirs(rundir, exist_ok=True)
-        os.chmod(rundir, 0o711)
+        os.chmod(rundir, 0o733)
         out_path = os.path.join(rundir, "out")
         err_path = os.path.join(rundir, "err")
         pid_path = os.path.join(rundir, "pid")
@@ -3470,11 +3481,19 @@ def _run_run_user_command(argv: list, cwd: str, timeout: float = None) -> dict:
         script += f" & echo $! >{shlex.quote(pid_path)}; wait $!; echo $? >{shlex.quote(rc_path)}"
 
         try:
-            subprocess.run(TMUX + ["new-session", "-d", "-s", session, "-c", cwd,
-                                   "bash", "-lc", script])
+            tmux_result = subprocess.run(TMUX + ["new-session", "-d", "-s", session, "-c", cwd,
+                                   "bash", "-lc", script], capture_output=True, text=True)
         except OSError as e:
             return {"ok": False, "rc": None, "stdout": "", "stderr": "",
                     "timed_out": False, "error": f"failed to start command: {e}"}
+        if tmux_result.returncode != 0:
+            # tmux itself refused to start the session (e.g. the rundir
+            # permission wall this fix addresses) -- surface its stderr
+            # directly instead of falling through to the generic "vanished
+            # with no rc" fallback below.
+            return {"ok": False, "rc": None, "stdout": "", "stderr": "",
+                    "timed_out": False,
+                    "error": f"failed to start command: {tmux_result.stderr.strip()}"}
 
         def _finish_if_rc_ready(rc):
             if rc is None:

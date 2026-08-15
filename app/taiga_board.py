@@ -30,7 +30,19 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/ai-dev-switchboard/taiga-push.env")
+# Resolved relative to RUN_USER's home explicitly, NOT via
+# os.path.expanduser("~/...") -- `~` expands relative to whichever user's
+# process evaluates it, and this module runs as SVC_USER (from the lead
+# loop, part of ai-dev-switchboard.service), while
+# scripts/taiga-configure-push.sh's documented usage writes the file as
+# RUN_USER. Matches app/app.py:69's exact RUN_USER resolution, replicated
+# independently here rather than imported -- taiga_board.py is imported by
+# teams.py, which is in turn imported by app.py partway through its own
+# module body, so taiga_board.py importing app back would create a real
+# circular import (app -> teams -> taiga_board -> app) that breaks at
+# module load time.
+RUN_USER = os.environ.get("RUN_USER", "dev")
+DEFAULT_CONFIG_PATH = f"/home/{RUN_USER}/.config/ai-dev-switchboard/taiga-push.env"
 
 
 class TaigaPushError(Exception):

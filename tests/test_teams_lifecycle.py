@@ -665,6 +665,38 @@ class RunRunUserCommandRealTmuxTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIsNone(result["rc"])
 
+    def test_tmux_new_session_nonzero_returncode_surfaces_stderr_not_generic_vanished(self):
+        # docs/spec.md fix 1 (backlog item 28) diagnostic addition, mirrored
+        # for _run_run_user_command()'s own tmux new-session call: a real
+        # `tmux new-session -d` failure (rc != 0) must return early with
+        # `result.stderr` folded into "failed to start command: ...", not
+        # fall through to the generic vanished-with-no-rc fallback below.
+        # Forced via a genuine tmux failure (duplicate session name), same
+        # technique already proven against agent_run() in
+        # tests/test_teams_headless.py, adapted here because op_id has no
+        # fixed-run-id seam -- secrets.token_hex() is pinned instead so the
+        # session name this call computes is predictable.
+        orig_token_hex = teamsmod.secrets.token_hex
+        teamsmod.secrets.token_hex = lambda n: "deadbeefcafe"[:n * 2]
+        self.addCleanup(lambda: setattr(teamsmod.secrets, "token_hex", orig_token_hex))
+        orig_time = teamsmod.time.time
+        teamsmod.time.time = lambda: 1234567890.0
+        self.addCleanup(lambda: setattr(teamsmod.time, "time", orig_time))
+        session = "switchboard-worktree-op-1234567890-deadbeefcafe"
+
+        r = subprocess.run(["tmux", "new-session", "-d", "-s", session, "-c", self.tmp, "sleep", "30"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, f"failed to pre-occupy session: {r.stderr}")
+        self.addCleanup(lambda: subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True))
+
+        result = teamsmod._run_run_user_command(["echo", "hi"], cwd=self.tmp)
+        self.assertFalse(result["ok"])
+        self.assertIsNone(result["rc"])
+        self.assertFalse(result["timed_out"])
+        self.assertIn("failed to start command:", result["error"])
+        self.assertIn("duplicate session", result["error"])
+        self.assertEqual(result["stdout"], "")
+
     def test_no_leftover_session_or_rundir(self):
         # Baseline BEFORE our own call, not a blind post-hoc scan -- op_id
         # (app/teams.py's own _run_run_user_command()) has no per-process

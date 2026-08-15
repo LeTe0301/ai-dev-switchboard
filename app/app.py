@@ -6472,7 +6472,7 @@ class Handler(BaseHTTPRequestHandler):
             text = (body.get("text") or "").strip()
             if not text or len(text) > teams.TEAM_INTERJECT_MAX_CHARS:
                 return self._json(
-                    {"error": f"message must be non-empty and at most "
+                    {"error": f"text must be non-empty and at most "
                               f"{teams.TEAM_INTERJECT_MAX_CHARS} characters"}, 400)
             result = teams.interject(run_id, text)
             if not result["ok"]:
