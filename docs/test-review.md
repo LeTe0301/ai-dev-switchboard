@@ -1,120 +1,146 @@
-# Test & Review: Proxmox E2E round-2 fixes (backlog items 28, 29, 33)
+# Test & Review: ct/create.sh fixes from Proxmox E2E test round 3 (items 31, 32)
 
 ## Scope
-Three independent bugfixes from `docs/spec.md`: (1) `app/teams.py`'s
-`rundir` permission wall (`0o711` → `0o733`, both call sites) plus new
-tmux-`new-session` stderr surfacing in `agent_run()` and
-`_run_run_user_command()`; (2) `app/taiga_board.py`'s `DEFAULT_CONFIG_PATH`
-now resolved against `RUN_USER`'s home explicitly instead of
-`os.path.expanduser("~/...")`; (3) `/team/interject`'s 400 error string
-corrected from "message" to "text". Item 28 is explicitly the second of two
-bugs that together made multi-agent teams non-functional on a fresh
-install (item 27 shipped in PR #27), so it got the deepest independent
-verification per the dispatch instructions.
+Two independent fixes to `ct/create.sh` from `docs/spec.md`: (1) item 31,
+`DEFAULT_DISK_GB` raised `"8"` → `"20"`; (2) item 32, a `case` filter added
+to `_enumerate_bridges()`'s kernel-bridge loop to exclude Proxmox's own
+auto-created `fwbrNNNiM` per-container firewall bridges from the live
+bridge-selection menu. Verified against the actual working-tree diff
+(`git diff HEAD -- ct/create.sh`), not developer self-report.
 
 ## Test cases
 
 | # | Criterion / case | Method | Result | Evidence |
 |---|---|---|---|---|
-| 1 | Both `rundir` chmod call sites in `app/teams.py` changed `0o711`→`0o733`; zero remaining `0o711` at those two sites | Automated: `grep -n "0o711\|0o733" app/teams.py`, manually classified every hit | pass | Lines 1095, 3473 now `0o733`. Two other `0o711` hits remain: line 1106 is a **comment** (now stale — see Findings), line 1917 is `os.chmod(TEAM_STATE_DIR, ...)`, an unrelated directory, not one of the two sites this fix targets |
-| 2 | `agent_run()`'s success path (tmux `new-session` rc=0) is byte-for-byte unchanged | Manual read of full function (lines 1085-1179) + existing `RealTmuxHeadlessTests` (real tmux, real subprocesses) rerun | pass | Code: rc==0 falls through unchanged to `_run_headless_session(...)`. Test: `test_success_stream_end_to_end`, `test_shape_crash_line_through_the_real_agent_run_path_does_not_raise`, `test_ordinary_20kb_plain_text_prompt_actually_runs_arg_mode`, etc. all still pass against real tmux |
-| 3 | `agent_run()`'s new failure path (tmux `new-session` rc≠0) actually gets exercised and returns early with the new stderr-including message, not a fall-through | Automated, new test, real tmux (no mock): forced a genuine `tmux new-session` failure via a pre-occupied duplicate session name, then reverted the fix and re-ran to confirm it fails pre-fix | pass | New test `tests/test_teams_headless.py::RealTmuxHeadlessTests::test_tmux_new_session_nonzero_returncode_surfaces_stderr_not_generic_vanished`. Post-fix: `ok`. Pre-fix (`git stash push -- app/teams.py`): **fails** — assertion `'failed to start headless session:' not found in 'headless session failed to start'`, i.e. pre-fix it silently degrades to the generic vanished-session message exactly as the bug report describes |
-| 4 | `_run_run_user_command()`'s success path unchanged | Manual read of full function (lines 3441-3524) + existing `RunRunUserCommandRealTmuxTests.test_success` rerun | pass | Code: rc==0 falls through unchanged to the rc-polling loop. Test passes |
-| 5 | `_run_run_user_command()`'s new failure path actually gets exercised and returns early with the new stderr-including message | Automated, new test, real tmux (no mock): pinned `secrets.token_hex`/`time.time` to make `op_id` predictable, pre-occupied that exact session name, forced a real duplicate-session tmux failure; reverted and re-ran to confirm pre-fix failure | pass | New test `tests/test_teams_lifecycle.py::RunRunUserCommandRealTmuxTests::test_tmux_new_session_nonzero_returncode_surfaces_stderr_not_generic_vanished`. Post-fix: `ok`. Pre-fix: **fails** — `'failed to start command:' not found in 'command session ended unexpectedly'` (and took the full ~30s vanished-fallback poll/timeout path, matching the bug report) |
-| 6 | The `chmod(rundir, ...)` site the developer touched (spec said "inside `_run_headless_session()`", code has it inside `agent_run()`) is still the *correct* rundir — the one `_run_headless_session()`'s own redirect-and-background script actually writes into | Manual trace, not developer self-assessment: `agent_run()` computes `rundir` (line 1086), builds `script_path = rundir/run.sh` via `_build_script()` (which literally builds `... >out_path 2>err_path & echo $! >pid_path; wait $!; echo $? >rc_path`, all paths under `rundir`), spawns `bash -l script_path` as `RUN_USER` via `sudo -u`/tmux, then calls `_run_headless_session()` with those same `out_path`/`err_path`/`pid_path`/`rc_path` | pass | `_build_script()` docstring literally: "agent_run() writes the returned string to RUNDIR/run.sh; see that function" — confirms it's the same directory regardless of which function's source contains the literal `os.chmod` line |
-| 7 | `taiga_board.py`'s `RUN_USER` resolution genuinely independent — no `import app`/`from app import ...` | `grep -n "^import\|^from" app/taiga_board.py` | pass | Only `json, os, stat, sys, urllib.*` imported; no `app` import anywhere in the file |
-| 8 | `RUN_USER` default matches `app.py:69` exactly (`"dev"`) | Read `app/app.py:69` and `app/taiga_board.py:44` side by side | pass | Both: `os.environ.get("RUN_USER", "dev")`, byte-for-byte identical |
-| 9 | Spec's own acceptance command, rerun myself (not developer's reported output) | `RUN_USER=dev python3 -c "import sys; sys.path.insert(0, 'app'); import taiga_board; print(taiga_board.DEFAULT_CONFIG_PATH)"` | pass | Printed `/home/dev/.config/ai-dev-switchboard/taiga-push.env`, matching spec exactly. Also reran with `RUN_USER` unset — same output (default `"dev"` applies) |
-| 10 | No other reference to the old `expanduser`-based path anywhere in `taiga_board.py` or its callers (`app/teams.py`'s `board_read`/`board_write`) | `grep -rn "expanduser" app/ scripts/`; `grep -n "board_read\|board_write\|taiga_board\." app/teams.py` | pass | Only remaining `expanduser` hit is `scripts/taiga_push_spec.py` (explicit spec non-goal — correctly `~`-relative, runs as `RUN_USER`). All `teams.py` call sites (`board_read`, `board_write`, `resolve_board_write`) go through `taiga_board.resolve_session()`/`taiga_board.get_userstory()` etc. with no separately-computed path of their own |
-| 11 | `/team/interject`'s served error string now says "text" not "message" | Read `app/app.py:6468-6478` directly (post-diff source, not the diff hunk alone) | pass | Line 6475: `f"text must be non-empty and at most "` |
-| 12 | No test anywhere in `tests/` still asserts the old "message must be non-empty" wording | `grep -rn "message must be non-empty" tests/ app/ scripts/` (whole tree, not just the two files the developer checked) | pass | Zero hits anywhere in the repo |
-| 13 | Full existing suite (regression) | `python3 -m unittest discover -s tests` (run myself, full, twice — once before adding new tests, once after) | pass | Before: `Ran 1198 tests ... OK`. After adding the 2 new tests above: `Ran 1200 tests ... OK`. No failures, no errors |
-| 14 | Compile check | `python3 -m py_compile app/teams.py app/taiga_board.py app/app.py tests/test_teams_headless.py tests/test_teams_lifecycle.py` | pass | Clean, no output |
+| 1 | Item 31: `DEFAULT_DISK_GB` is exactly `"20"`, nothing else in the constant block changed | `grep -n 'DEFAULT_DISK_GB=' ct/create.sh`; `git diff HEAD -- ct/create.sh` read in full | pass | Line 91: `DEFAULT_DISK_GB="20"`. Full diff shows only two hunks total in the file: the item-32 filter (lines 65-72) and this one-line constant change (line 91) — no other lines touched |
+| 2 | Item 31: Advanced path's disk-size prompt still uses this as pre-filled default, still fully editable (no behavior change beyond the value) | Read `ct/create.sh` around the Advanced disk-size prompt; confirmed only the constant's assignment changed, the prompt call site is untouched | pass | No diff hunk anywhere near the prompt call site itself; only the constant declaration changed |
+| 3 | Item 32: real `fwbrNNNiM` examples from the report (`fwbr101i0`, `fwbr106i0`, `fwbr107i0`) are excluded, `vmbr0`/`vmbr1` survive | Automated: `python3 tests/test_create_enumerate_bridges.py -v` (extracts the real `_enumerate_bridges()` out of `ct/create.sh`, stubs `ip`, runs it for real) | pass | `test_real_bridges_kept_firewall_bridges_excluded` — `ok` |
+| 4 | Item 32: host with only `fwbrNNNiM` interfaces yields an empty menu (no crash, no stray entries) | Automated, same harness | pass | `test_only_firewall_bridges_yields_empty_menu` — `ok` |
+| 5 | Item 32: host with no `fwbrNNNiM` interfaces at all is unaffected (regression) | Automated, same harness | pass | `test_no_firewall_bridges_present_regression` — `ok` |
+| 6 | Item 32: near-miss names `fwbridge0` (starts with "fwbr" but no digit immediately after) and `vmbr-media0` (contains "i0" but doesn't start with "fwbr") survive the filter | Automated, same harness | pass | `test_pattern_not_too_broad_similar_looking_names_survive` — `ok` |
+| 7 | Item 32: a firewall bridge with an `@if12`-style VLAN suffix (stripped upstream by the existing `cut -d'@' -f1`) is still excluded | Automated, same harness | pass | `test_firewall_bridge_with_at_suffix_still_excluded` — `ok` |
+| 8 | Item 32: independent verification of the actual bash glob-match semantics of `fwbr[0-9]*i[0-9]*` (not trusting the developer's test suite or the code comment's paraphrase) against a wider adversarial name list | Manual/automated: wrote a standalone script exercising the exact `case`/glob pattern from the diff directly in `bash` against 27 constructed names (`vmbr0`, `vmbr1`, `vmbr-media0`, real `fwbrNNNiM` examples incl. multi-digit and single-digit forms, `fwbridge0`, `fwbr123index5`, `fwbri0`, `fwbrlan0`, `fwbr0-lan`, `fwbr0vlan15`, `fwbr10internal5`, `FWBR1I2`, `xfwbr1i2`, plus trailing-garbage forms `fwbr1i2x`/`fwbr1i2extra`/`fwbr1abci2`) | pass (see Findings for one non-blocking observation) | Full transcript below. All real Proxmox-shaped names matched; all realistic operator/near-miss names did not match; see finding #1 for the one edge case (contrived trailing garbage) that does match but has no real-world naming collision |
+| 9 | `bash -n ct/create.sh` (syntax) | Ran directly | pass | No output, exit 0 |
+| 10 | `shellcheck ct/create.sh` (lint) | Ran directly | pass | Exit 0, zero warnings |
+| 11 | Full existing suite (regression) | `python3 -m unittest discover -s tests`, run directly, full run to completion (not truncated) | pass | `Ran 1205 tests in 161.024s` / `OK`, exit code 0 |
+
+### Case 8 transcript (bash, real `case`/glob evaluation of the literal pattern from the diff)
+```
+$ pattern: fwbr[0-9]*i[0-9]*
+no-match: vmbr0
+no-match: vmbr1
+no-match: vmbr-media0
+MATCH   : fwbr101i0
+MATCH   : fwbr106i0
+MATCH   : fwbr107i0
+MATCH   : fwbr0i0
+MATCH   : fwbr1000i5
+no-match: fwbridge0
+no-match: fwbr123index5
+no-match: fwbr1i
+no-match: fwbriggle
+no-match: fwbr
+no-match: fwbri0
+MATCH   : fwbr9999999i9999999
+no-match: xfwbr1i2
+MATCH   : fwbr1i2x        <- see finding #1
+no-match: FWBR1I2
+MATCH   : fwbr1i2extra    <- see finding #1
+no-match: fwbr1iX
+no-match: fwbr10internal5
+no-match: fwbrlan0
+no-match: fwbr0-lan
+no-match: fwbr0vlan15
+MATCH   : fwbr1abci2      <- see finding #1
+no-match: fwbr1i
+no-match: fwbr0i
+```
+Reasoning for the specific case the task flagged (`fwbridge0`): bash `case`
+glob semantics, not regex. After the literal `fwbr` prefix, the string
+remaining is `idge0`. `[0-9]` requires *exactly one* digit character next —
+the very next character is `i`, not a digit, so this branch fails
+immediately; there is no other position in the string where `[0-9]`
+(prefix digit) through `i` (literal) through `[0-9]` (suffix digit) can
+all be satisfied while the whole pattern consumes the whole string. So
+`fwbridge0` correctly does **not** match — the specific false-positive
+trap the task asked me to trace through does not occur.
 
 ## Regression check
-Full suite run twice by me directly (not reused from the developer's
-report): `python3 -m unittest discover -s tests` → `Ran 1198 tests ... OK`
-(pre-existing baseline, matches developer's reported count) and, after
-adding the two new regression tests for fix 1's failure branches, `Ran 1200
-tests ... OK`. Also reran the two most relevant files directly
-(`tests.test_teams_headless tests.test_team_routes`) → `Ran 217 tests ...
-OK`, matching the developer's own focused re-run count. No regressions
-anywhere in the suite.
+Full suite run directly by me to completion: `python3 -m unittest discover
+-s tests` → `Ran 1205 tests in 161.024s` / `OK`, exit code 0. Matches the
+developer's reported count exactly. No regressions.
 
 ## Defects found
-None.
+None (testing pass is clean; proceeding to review pass).
 
 ---
 
 ## Spec coverage
-All three fixes' acceptance criteria are implemented and independently
-verified against the actual diff (not developer self-report):
-
-- **Fix 1 (item 28)**: both `0o711`→`0o733` sites confirmed by direct grep
-  and classification of every remaining `0o711` hit in the file (cases 1).
-  Both functions' success paths confirmed unchanged and failure paths
-  confirmed to actually return early with the new stderr-threaded message
-  — via new automated tests that force a *real* tmux `new-session` failure
-  (duplicate session name, no mocking) and are confirmed to genuinely
-  exercise the new branch by reverting the fix and watching them fail
-  pre-fix (cases 2-5). The spec-vs-code function-labeling mismatch the
-  developer flagged is confirmed harmless by tracing `rundir`'s actual
-  usage through `_build_script()`, independent of the developer's own
-  self-assessment (case 6).
-- **Fix 2 (item 29)**: independent-resolution (no `app` import), exact
-  default-value match with `app.py:69`, and the spec's own acceptance
-  command rerun directly by me (not trusting the developer's reported
-  output) all confirmed (cases 7-9). Confirmed no stale reference to the
-  old per-process `expanduser` path remains anywhere `taiga_board.py` or
-  its `teams.py` callers touch (case 10).
-- **Fix 3 (item 33)**: served string confirmed from the actual post-diff
-  source, and a whole-tree grep (not just the two files the developer
-  checked) confirms no test anywhere still asserts the old wording (cases
-  11-12).
-
-No acceptance criterion in `docs/spec.md` is unimplemented or untested.
+- **Item 31** acceptance criterion (`grep 'DEFAULT_DISK_GB=' ct/create.sh`
+  shows `"20"`, no other behavior change) — implemented and tested,
+  case 1-2. The working-tree diff confirms this is the *only* line touched
+  besides the item-32 filter — no scope creep.
+- **Item 32** acceptance criterion (`_enumerate_bridges()`'s
+  `BRIDGE_MENU_OPTS` contains `vmbr0` but none of the `fwbrNNNiM` entries,
+  given both present) — implemented and tested by the developer's 5-test
+  harness (cases 3-7) plus my own independent 27-name adversarial glob
+  trace directly against the real `case` pattern (case 8), run for real in
+  `bash`, not inferred. Both the developer's near-miss cases and mine agree
+  the pattern is neither too narrow (misses no real `fwbrNNNiM` shape,
+  including multi-digit and single-digit CTID/netid) nor too broad against
+  any *realistic* bridge name (`vmbr0`, `vmbr-media0`, `fwbridge0`,
+  `fwbrlan0`, `fwbr0-lan`, etc. all correctly survive).
 
 ## Findings (most severe first)
 
-### 1. Stale comment references the old `0o711` value — nit
-- File: `app/teams.py:1106`
-- Issue: the comment reads `"...same reasoning as rundir's own explicit
-  0o711."` — this is now inaccurate; `rundir`'s own chmod is `0o733` as of
-  this fix (line 1095). The comment's *reasoning* (explicit chmod rather
-  than relying on ambient umask) is still correct, only the cited literal
-  value is stale.
-- Failure scenario: none functionally — this is a doc-drift nit, not a
-  behavior bug. Worth a one-word fix (`0o711` → `0o733`) in a follow-up so
-  a future reader isn't misled about `rundir`'s actual current mode.
-
-### 2. Empty-stderr edge case produces a slightly bare error message — nit
-- File: `app/teams.py:1162` and `app/teams.py:3496`
-- Issue: `error=f"failed to start headless session: {tmux_result.stderr.strip()}"`
-  (and the `_run_run_user_command()` equivalent) — if `tmux` exits non-zero
-  with empty stderr (uncommon but not impossible, e.g. some `SIGKILL`-via-
-  ulimit or resource-exhaustion paths that don't reach tmux's own
-  error-printing code), the message ends with a trailing `": "` and no
-  detail, e.g. `"failed to start headless session: "`.
-- Failure scenario: purely cosmetic (a slightly bare, not misleading,
-  message) — the `ok=False`/early-return behavior itself is correct
-  either way. Not worth blocking on; a `or "(no stderr)"` fallback would
-  be a small future polish, not required.
+### 1. `case` pattern is looser than its own comment claims — matches arbitrary trailing/embedded characters, not just digits — should-fix
+- File: `ct/create.sh:70`
+- Issue: the inline comment says the pattern is Proxmox's "fixed
+  `fwbrNNNiM` naming convention (always `fwbr` + digits + `i` + digits)",
+  and `docs/spec.md` describes it the same way. That's not quite what
+  `fwbr[0-9]*i[0-9]*` actually matches in bash glob semantics: `[0-9]` is
+  a single-character class (exactly one digit), and each `*` that follows
+  it is an independent wildcard matching **any characters at all**, not a
+  digit-repeat quantifier (glob has no `+`/`{n,}`-style repetition; that
+  would need `extglob`'s `+([0-9])`). So the real matched shape is `fwbr`
+  + exactly one digit + *anything* + `i` + exactly one digit + *anything*.
+  Concretely: `fwbr1i2extra`, `fwbr1i2x`, and `fwbr1abci2` all match the
+  filter today, even though none of them is an actual
+  `fwbr<digits>i<digits>`-only Proxmox bridge name (verified directly in
+  `bash`, case 8 above).
+- Failure scenario: this is not a false negative (every real
+  Proxmox-generated `fwbrNNNiM` name, including edge cases like
+  single-digit or 7-digit CTID/netid, still matches and gets excluded
+  correctly — confirmed). It's a theoretical false positive: a
+  hypothetical kernel bridge whose name happens to be `fwbr<digit>` +
+  arbitrary characters + `i<digit>` + arbitrary trailing characters (e.g.
+  an operator naming a real uplink bridge `fwbr1i2-uplink`) would be
+  silently hidden from the menu by this filter even though it isn't a
+  Proxmox firewall bridge. In practice this is very low risk: `fwbr` is
+  Proxmox's own reserved prefix for auto-generated firewall bridges, no
+  operator is likely to hand-name a real uplink bridge that way, and none
+  of the acceptance criterion's real-world examples (`vmbr0`, `vmbr1`,
+  operator-named bridges) are anywhere near this shape. Does not violate
+  `docs/spec.md`'s literal acceptance criterion and does not warrant
+  blocking this round, but the comment/spec description of the pattern's
+  behavior is inaccurate and worth tightening in a follow-up (either fix
+  the comment to describe what the pattern actually does, or tighten the
+  pattern itself, e.g. with `extglob`'s `+([0-9])i+([0-9])` or an
+  explicit `[[ "$_br" =~ ^fwbr[0-9]+i[0-9]+$ ]]` regex check, so the code
+  matches its own stated intent).
 
 ## Follow-ups (non-blocking)
-- Fix Finding 1 (stale `0o711` comment reference) whenever this file is
-  next touched.
-- Optionally handle the empty-stderr edge case (Finding 2) with a fallback
-  string, low priority.
+- Consider the tightened pattern from finding #1 in a future small fix, or
+  at minimum correct the inline comment/spec wording so it accurately
+  describes "starts with `fwbr`+digit, contains `i`+digit somewhere after,
+  arbitrary characters otherwise" rather than "always digits only" — since
+  this file already reaches for `[[ =~ ]]` elsewhere it would be a small,
+  low-risk follow-up, not urgent.
+- (Carried over from `docs/spec.md`'s own non-goal, unchanged by this
+  round): `taiga-up.sh`/`gitea-up.sh` proactively `df`-checking free space
+  before `docker compose up`, and sizing the storage-pool step's suggested
+  disk default off live free space, remain real, separately-scoped
+  follow-ups.
 
 ## Overall verdict
-**Approve.** All three fixes match `docs/spec.md`'s exact before/after
-code, both fix-1 error-handling paths were independently confirmed correct
-by tracing the full functions (not just the diff hunks) and by new,
-real-tmux (no-mock) regression tests that were verified to genuinely
-exercise the new failure branches via a revert-and-watch-it-fail check.
-Fix 2's independent-resolution and default-value claims were verified from
-source, and its acceptance command was rerun directly rather than trusted
-from the developer's report. Fix 3's served string and the absence of any
-stale test assertion were confirmed via a whole-tree grep. Full existing
-suite reruns clean (1198 pre-existing, 1200 with the two new regression
-tests added by this review pass). Two nits found, neither blocking.
+Approve.

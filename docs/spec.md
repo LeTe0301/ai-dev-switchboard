@@ -1,189 +1,128 @@
-# Spec: app/teams.py + app/taiga_board.py + app/app.py fixes from Proxmox E2E test round 2 (items 28, 29, 33)
+# Spec: ct/create.sh fixes from Proxmox E2E test round 3 (items 31, 32)
 
 ## Summary
-Three more bugs from the same Proxmox E2E test (`docs/BACKLOG.md` items 28,
-29, 33). Item 28 is the second of the two bugs that together made
-multi-agent teams completely non-functional on a fresh install (item 27,
-fixed in PR #27, closes the first blocker; this closes the second — with
-both fixed, teams actually work). Item 29 breaks item 7's `board_read`/
-`board_write` tools identically on every fresh install, even after
-following the documented setup exactly. Item 33 is a one-line cosmetic
-error-message fix. All three are fully diagnosed with verified-locally-
-working fixes already established by the E2E tester.
+Two more bugs from the same Proxmox E2E test (`docs/BACKLOG.md` items 31,
+32), both in `ct/create.sh`. Both fully diagnosed with exact repro and a
+clear fix already established by the E2E tester.
 
 ## Orchestrator note
 No product-manager/ux-designer dispatch — same "fully-diagnosed follow-up"
-precedent as round 1 (PR #27). All three fixes below have exact before/
-after code.
+precedent as rounds 1/2 (PRs #27, #28).
 
 ---
 
-## Fix 1 — Item 28: `rundir` permission wall blocks every worktree creation and every headless engine turn
+## Fix 1 — Item 31: raise `DEFAULT_DISK_GB` — 8G fills completely once Gitea + Taiga + code-server are all enabled
 
-**Where**: `app/teams.py:1095` (`_run_headless_session()`) and
-`app/teams.py:3462` (`_run_run_user_command()`).
-
-**Problem**: both functions create `rundir` as `SVC_USER` via
-`os.makedirs(rundir, exist_ok=True); os.chmod(rundir, 0o711)`, but the
-actual command inside it is dispatched via `sudo -u RUN_USER tmux
-new-session ...` — i.e. it runs as a *different* user, which has no write
-bit on `0o711` (owner rwx, group/other read+execute only, no write for
-anyone but the owner) at all. The command's own redirect-and-background
-line (`... >out 2>err & echo $! >pid; wait $!; echo $? >rc`) fails at its
-very first redirect, before even backgrounding — nothing is ever written,
-so the generic "vanished with no rc" fallback fires, looking exactly like
-a fast-command race but actually a 100%-reproducible permission wall.
-
-**Fix**: change both `os.chmod(rundir, 0o711)` calls to
-`os.chmod(rundir, 0o733)` (owner rwx, group -wx, other -wx — i.e. everyone
-gets write+execute, matching what `RUN_USER` actually needs to create
-files in this directory). Verified by the E2E tester: this exact change,
-applied at both sites, makes team-start, worktree creation, and headless
-delegation all work correctly. Files written into `rundir` by `RUN_USER`
-inherit a normal `022`-umask mode (world-readable), so `SVC_USER` reading
-them back afterward is unaffected — only the directory's own write bit for
-"other" was ever the problem.
-
-```python
-# app/teams.py:1095, inside _run_headless_session()
-os.chmod(rundir, 0o733)   # was 0o711
-
-# app/teams.py:3462, inside _run_run_user_command()
-os.chmod(rundir, 0o733)   # was 0o711
-```
-
-**Also worth adding (same fix, diagnostic improvement, not required for
-correctness but directly requested by the E2E tester)**: the
-`subprocess.run(TMUX + ["new-session", ...])` calls at both these sites
-(`app/teams.py:1139` inside `_run_headless_session()`, and
-`app/teams.py:3473` inside `_run_run_user_command()`) don't capture or
-check their own return code/stderr at all — this is exactly what made
-diagnosing item 28 slow (the generic "vanished" message is
-indistinguishable from a dozen other real causes). Add
-`capture_output=True, text=True` to both calls, and if the returncode is
-non-zero, fold `result.stderr` into the existing failure-path error
-message at each site instead of silently proceeding to the vanished-
-session fallback. Read each function's surrounding code first to thread
-this through correctly — do not just add the kwarg without using the
-result, and do not change either function's existing return contract
-(`{"ok": bool, ...}` shape) beyond making the error message more specific
-when this particular failure mode occurs.
-
-**Acceptance**: after this fix (and item 27's from PR #27), a real
-`POST /projects/<name>/team/start` succeeds, creates real worktrees, and a
-real headless delegate call to a teammate completes — not just "doesn't
-throw," an actual file edit lands on disk (matching the E2E report's own
-positive-result confirmation).
-
----
-
-## Fix 2 — Item 29: `board_read`/`board_write` always report "Taiga isn't configured" — `~` expands per-process, not per-install
-
-**Where**: `app/taiga_board.py:33` (`DEFAULT_CONFIG_PATH`).
-
-**Problem**: both `scripts/taiga_push_spec.py` (invoked as `RUN_USER` via
-the CLI) and `app/taiga_board.py` (invoked as `SVC_USER`, from inside the
-lead loop running as part of `ai-dev-switchboard.service`) independently
-compute:
-```python
-DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/ai-dev-switchboard/taiga-push.env")
-```
-`~` expands relative to *whichever user's process evaluates it* —
-`/home/dev/...` for the CLI script, `/home/switchboard-svc/...` for the
-board tools. `scripts/taiga-configure-push.sh`'s own documented usage
-("Run once, by RUN_USER") writes the file to `/home/dev/...`, but
-`taiga_board.py` reads from `/home/switchboard-svc/...` — two entirely
-separate files. Every team lead that ever calls `board_read`/
-`board_write` on a fresh install reports "not configured," even after
-following the docs exactly.
-
-**Fix**: resolve the path relative to `RUN_USER`'s home explicitly in
-`taiga_board.py`, matching where the setup script and its own docs
-already point, instead of each side independently calling
-`os.path.expanduser("~/...")` in its own process context.
-`taiga_board.py` needs to know `RUN_USER`'s value — the canonical
-resolution is `app/app.py:69`: `RUN_USER = os.environ.get("RUN_USER",
-"dev")`. **Do not import this from `app.py`** — `taiga_board.py` is
-imported by `teams.py` (`import taiga_board`, `app/teams.py:55`), which is
-in turn imported by `app.py` partway through its own module body
-(`import teams`, confirmed as the exact line that crashed in item 22's
-bug report); `taiga_board.py` importing `app` back would create a real
-circular import (`app → teams → taiga_board → app`) that breaks at module
-load time, not just a style nit. `taiga_board.py`'s own docstring already
-states its design goal of not importing anything privileged of its own —
-keep that property. Instead, replicate the same `os.environ.get(...)`
-read independently, matching `app.py:69`'s exact default value:
-```python
-RUN_USER = os.environ.get("RUN_USER", "dev")
-DEFAULT_CONFIG_PATH = f"/home/{RUN_USER}/.config/ai-dev-switchboard/taiga-push.env"
-```
-
-**Non-goal**: do not change `scripts/taiga_push_spec.py`'s own
-`DEFAULT_CONFIG_PATH` (it's correctly `~`-relative already, since it
-always runs as `RUN_USER` via the CLI — this bug is specific to
-`taiga_board.py` being invoked from a different user context). Do not
-attempt to fix the underlying read-permission question (the E2E tester's
-own report notes `taiga-configure-push.sh` writes 600-mode/`RUN_USER`-
-owned, so `SVC_USER` reading the *correct* path still needs either a
-narrowly-scoped read grant or `install.sh` creating the file's directory
-with shared permissions up front) — that's a separate, not-yet-fully-
-specified follow-up the E2E report itself flags as needing a decision,
-not something to guess at in this cycle. This fix only corrects *which
-path* is computed; if `SVC_USER` still can't read a `RUN_USER`-600-owned
-file at that corrected path, that's the next thing to fix, tracked
-separately.
-
-**Acceptance**: `python3 -c "import sys; sys.path.insert(0, 'app'); import
-taiga_board; print(taiga_board.DEFAULT_CONFIG_PATH)"` (with `RUN_USER=dev`
-in the environment) prints `/home/dev/.config/ai-dev-switchboard/taiga-push.env`
-— matching exactly where `taiga-configure-push.sh`'s own documented usage
-writes the file.
-
----
-
-## Fix 3 — Item 33: `/team/interject`'s error message names the wrong field
-
-**Where**: `app/app.py:6472-6476`.
+**Where**: `ct/create.sh:87`.
 
 **Current**:
-```python
-text = (body.get("text") or "").strip()
-if not text or len(text) > teams.TEAM_INTERJECT_MAX_CHARS:
-    return self._json(
-        {"error": f"message must be non-empty and at most "
-                  f"{teams.TEAM_INTERJECT_MAX_CHARS} characters"}, 400)
+```bash
+DEFAULT_DISK_GB="8"
 ```
-The route reads `body.get("text")` (correct — this is genuinely the field
-name the frontend sends and the field name documented in `docs/spec.md`)
-but the error string says "message," not "text" — misleading anyone
-constructing the request by hand or from the error text alone (the E2E
-tester's own first, reasonable guess based on the error string and the
-feature's name — "interject a message" — was `{"message": "..."}`, which
-the route silently treats as absent and returns this same misleading
-error).
 
-**Fix**: correct the error string to name the real field:
-```python
-text = (body.get("text") or "").strip()
-if not text or len(text) > teams.TEAM_INTERJECT_MAX_CHARS:
-    return self._json(
-        {"error": f"text must be non-empty and at most "
-                  f"{teams.TEAM_INTERJECT_MAX_CHARS} characters"}, 400)
+**Problem**: following Advanced Install with all four optional features
+enabled and the installer's own default disk size fills the container's
+entire root disk (`df -h /` → 100% used, 0 available). The actual symptom
+a real user hits is not an out-of-space message — it's `taiga-db`'s
+Postgres instance failing to start with `FATAL: could not write init
+file`, giving no hint the real problem is disk space.
+
+**Fix**: raise the default to `20`:
+```bash
+DEFAULT_DISK_GB="20"
 ```
-Check `tests/test_team_routes.py` (or wherever this route's tests live)
-for any existing assertion on the literal old error string and update it
-to match.
+(The E2E report suggested a 20-24G range; 20 is the conservative end of
+that range — enough headroom for all four optional features per the
+report's own measured breakdown (~2.2G base + apt, ~3.9G Docker images/
+volumes for Gitea+Taiga, ~683M for one pipx-installed engine, plus
+working room) without being needlessly large for an installer default
+aimed at a homelab-scale Proxmox host.)
+
+**Non-goal**: the E2E report also suggests `taiga-up.sh`/`gitea-up.sh`
+could `df`-check the target filesystem before calling `docker compose up`
+and refuse with a clear message instead of letting Postgres's own opaque
+error be the first sign of trouble, and that the storage-pool step could
+size its own suggested default off the pool's live free space. Both are
+real, reasonable follow-ups but are separate, not-yet-scoped features —
+out of scope for this fix, which only raises the static default.
+
+**Acceptance**: `grep 'DEFAULT_DISK_GB=' ct/create.sh` shows `"20"`. No
+behavior change to the Advanced path's own disk-size prompt (still shows
+this as its pre-filled default, still fully editable).
+
+---
+
+## Fix 2 — Item 32: filter Proxmox's own per-container firewall bridges out of the live bridge-enumeration menu
+
+**Where**: `ct/create.sh:64-75` (`_enumerate_bridges()`).
+
+**Current**:
+```bash
+_enumerate_bridges() {
+    BRIDGE_MENU_OPTS=()
+    local _br _vnet
+    while IFS= read -r _br; do
+        [ -n "$_br" ] && BRIDGE_MENU_OPTS+=("$_br" "kernel bridge")
+    done < <(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1)
+    if [ -f /etc/pve/sdn/vnets.cfg ]; then
+        while IFS= read -r _vnet; do
+            [ -n "$_vnet" ] && BRIDGE_MENU_OPTS+=("sdn:${_vnet}" "SDN vnet")
+        done < <(awk '/^vnet:/{print $2}' /etc/pve/sdn/vnets.cfg 2>/dev/null)
+    fi
+}
+```
+
+**Problem**: on a host with per-container firewalling enabled, `ip -o link
+show type bridge` also lists the auto-created `fwbrXXXiY` bridges Proxmox
+creates for *other* containers' firewall rules (e.g. `fwbr101i0`,
+`fwbr106i0`) — not just real switch/uplink bridges (`vmbr0`) a new
+container should actually attach to. Picking one of these by mistake would
+create a container with effectively no working uplink. Nothing in the
+current menu distinguishes them from a real bridge.
+
+**Fix**: exclude Proxmox's own fixed `fwbrNNNiM` naming convention (always
+`fwbr` + digits + `i` + digits) from the kernel-bridge loop:
+```bash
+_enumerate_bridges() {
+    BRIDGE_MENU_OPTS=()
+    local _br _vnet
+    while IFS= read -r _br; do
+        [ -n "$_br" ] || continue
+        case "$_br" in
+            fwbr[0-9]*i[0-9]*) continue ;;  # item 32: Proxmox's own per-container firewall bridge, not a real uplink
+        esac
+        BRIDGE_MENU_OPTS+=("$_br" "kernel bridge")
+    done < <(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1)
+    if [ -f /etc/pve/sdn/vnets.cfg ]; then
+        while IFS= read -r _vnet; do
+            [ -n "$_vnet" ] && BRIDGE_MENU_OPTS+=("sdn:${_vnet}" "SDN vnet")
+        done < <(awk '/^vnet:/{print $2}' /etc/pve/sdn/vnets.cfg 2>/dev/null)
+    fi
+}
+```
+The `case` pattern `fwbr[0-9]*i[0-9]*` matches bash's own glob syntax
+(this file uses `case`/glob patterns elsewhere, e.g. the URL-scheme
+matching in the Advanced path's ollama/clone-adjacent logic — consistent
+with the file's existing idiom, not a new pattern style). Verify it
+matches `fwbr101i0`/`fwbr106i0`/`fwbr107i0` (the report's own examples)
+and does NOT match a real bridge name like `vmbr0` or an operator-named
+bridge like `vmbr1`.
+
+**Acceptance**: given a host with both `vmbr0` and one or more
+`fwbrNNNiM`-pattern interfaces present (`ip -o link show type bridge`),
+`_enumerate_bridges()`'s resulting `BRIDGE_MENU_OPTS` contains `vmbr0` but
+none of the `fwbrNNNiM` entries.
 
 ## Affected areas
-`app/teams.py` (fix 1), `app/taiga_board.py` (fix 2), `app/app.py` (fix 3).
-No frontend/JS changes needed for any of these three.
+`ct/create.sh` only, two independent, non-overlapping edits (a constant
+value and a filter added to one existing loop).
 
 ## Risk / rollback notes
-Fix 1 is the highest-value fix in this cycle (unblocks the entire
-multi-agent-teams feature) but is a narrow, well-understood permission-bit
-change with a verified-working fix already established — low risk. Fix 2
-is a path-computation change with no behavior change for any already-
-working case (the config was never being found correctly before this fix,
-so there's no working case to regress). Fix 3 is a one-line string
-change. Plain `git revert` on `app/teams.py`/`app/taiga_board.py`/
-`app/app.py` if anything regresses.
+Both changes are small and low-risk. Fix 1 only changes a default value
+(fully overridable by the operator either way, in both Default and
+Advanced modes). Fix 2 only narrows what's already a live-enumerated,
+operator-reviewed menu — worst case of an over-broad filter pattern is
+hiding a real bridge that happens to look like the excluded pattern,
+which is why the acceptance criterion above explicitly checks the filter
+against a real bridge name too, not just the excluded ones. Plain `git
+revert` if anything regresses.
