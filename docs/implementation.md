@@ -1774,3 +1774,97 @@ python3 -m py_compile app/app.py   # syntax check on the modified file -- OK
 this developer cycle touched; `docs/spec.md`/`docs/design.md` were already
 written by product-manager/ux-designer before this cycle started, per the
 task brief.
+
+# Implementation: Backlog item 20 -- `.team-btn`/`.deploy-btn` WCAG AA contrast fix
+
+## Summary
+`.deploy-btn, .team-btn`'s shared CSS rule paired white text (`color:
+#fff`) on the `#34c759` green background it also shares with several
+already-passing rules elsewhere in the same file (`.pill.active`,
+`.wizard-check-row.pill-choice:has(input:checked)`,
+`.wizard-actions .primary`, `.new-project-row button`) -- all of which use
+dark text (`color: #111`) instead. White-on-`#34c759` computes to ~2.2:1,
+well under WCAG AA's 4.5:1 minimum for normal text; dark-on-`#34c759`
+computes to 8.51:1 (verified below), comfortably passing AAA. Single
+one-line fix, one shared rule, fixes every call site at once (team
+start/stop/resolve/board-resolve/interject buttons, the Deploy button).
+No JS, route, or test-logic change -- purely visual.
+
+## Changes by file
+- `app/app.py`: `.deploy-btn, .team-btn` rule -- `color: #fff` -> `color:
+  #111` (the one line changed; `background: #34c759` and every other
+  property in the rule untouched).
+- `docs/design.md`: corrected two known-wrong contrast claims for this
+  exact white-on-`#34c759` pairing, both dated 2026-08-14:
+  - Backlog item 16 section ("Clone a project from a remote repository
+    URL"), Accessibility & platform notes -- claimed "Button text (#fff)
+    on button background (#34c759): 5.05:1"; this button (`.new-project-row
+    button`, which the "Clone" button's styling was specified to reuse)
+    already used `color: #111` in the actual implementation, not `#fff` --
+    the claim was wrong on both the color and the resulting ratio. Corrected
+    to `#111` / 8.51:1, with a note that white-on-`#34c759` (never actually
+    shipped for this button) would have been ~2.2:1 and failed AA.
+  - Backlog item 19 part 2 section ("Chat-UI compose surface"),
+    Accessibility & platform notes -- claimed "Send button text (#fff) on
+    button background (#34c759): 5.05:1" for the Send button, which the
+    same section explicitly identifies as `.team-btn` two lines above.
+    This was the one selector that genuinely did ship with `color: #fff`
+    until this cycle's fix. Corrected to `#111` / 8.51:1, with the same
+    ~2.2:1-fails-AA note about the old value.
+- No test file changed -- searched `tests/*.js`/`tests/*.py` for any
+  `#fff`/color-string assertion tied to `.team-btn`/`.deploy-btn`; found
+  none (`tests/test_deploy_frontend.js`'s two `.deploy-btn` assertions only
+  check for the class string's presence/absence, not any color), so
+  nothing needed updating there.
+
+## Key decisions / tradeoffs
+- **Verified the 8.51:1 figure by computing WCAG relative luminance by
+  hand** (both colors are equal in every channel for `#111`, so its
+  luminance reduces to a single gamma-corrected term; `#34c759`'s three
+  channels computed and weighted 0.2126/0.7152/0.0722 per the standard
+  formula) rather than trusting the spec's stated figure at face value --
+  it matched (8.507, rounds to 8.51:1), so no discrepancy to flag.
+- **Corrected both known-wrong design.md claims, not just the one that
+  matches the shipped `.team-btn` selector.** The item 16 claim technically
+  describes a button (`.new-project-row button`'s styling, reused by
+  "Clone") that was already `#111`/8.51:1 in the real implementation --
+  it never had the bug -- but the design doc's own math for "white text on
+  this green" was independently wrong there too (5.05:1 claimed, ~2.2:1
+  real), and the spec explicitly called out fixing "the two (at least)
+  known-wrong contrast claims for this pairing," not just the one tied to
+  the actual bug. Left uncorrected, it would keep misleading a future
+  design pass that copies this figure for a new white-on-`#34c759` button.
+
+## Deviations from spec / design
+None. Single-line CSS fix plus the two design.md corrections, exactly as
+scoped; no test changes were needed (searched, found none affected).
+
+## Known limitations
+None beyond what the spec already scoped -- this is a contrast-only fix;
+no other visual property of `.deploy-btn`/`.team-btn` changed.
+
+## How to verify locally
+```
+# Contrast math (WCAG relative luminance, #111 on #34c759):
+# L(#111) = 0.005607, L(#34c759) = 0.42305
+# ratio = (0.42305 + 0.05) / (0.005607 + 0.05) = 8.507 : 1  (passes AAA)
+# Previous #fff on #34c759: ratio ~= 2.2 : 1  (fails AA's 4.5:1 minimum)
+
+grep -n "deploy-btn, .team-btn" app/app.py
+# .deploy-btn, .team-btn { ... background: #34c759; color: #111; ... }
+
+# Full frontend suite (unaffected -- no test asserted the old color):
+node tests/test_team_frontend.js
+# ALL PASS (94/94)
+
+# Full backend suite (unaffected -- no app/teams.py or route change):
+python3 -m unittest discover -s tests
+# Ran 1034 tests in 145.543s ... OK (same count as the item 19 part 2
+# baseline -- no regressions, no new Python tests since this is CSS-only)
+
+python3 -m py_compile app/app.py   # syntax check -- OK
+```
+
+Manual visual check: open the Teams page, confirm every green button
+(Start/Stop/Resolve/Board-resolve/Send/Deploy) now renders dark (#111)
+text on the green background instead of white.
