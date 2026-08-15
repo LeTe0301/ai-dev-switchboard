@@ -1,140 +1,149 @@
-# Spec: test-infrastructure isolation (BACKLOG item 9)
+# Spec: 6f part 2 follow-ups (BACKLOG item 12)
 
 ## Why this is a small, orchestrator-authored cycle
 
-Test-infrastructure debt, not a product feature — no user-facing behavior
-changes, no new product/design decision. The shape was fully triaged and
-decided during this session's backlog review: reuse the exact per-process
-scoping technique already proven on `switchboard-headless-*` sessions
-(`tests/test_teams_headless.py`'s `_RUN_ID_SCOPE`/`_SESSION_PREFIX`,
-commit for item 6d part 2a's own follow-up) rather than inventing a new
-approach. Per this pipeline's own efficiency rule, a full product-manager
-pass isn't needed for "same technique, different files, no new judgment
-call" — this spec is written directly from `docs/BACKLOG.md` item 9's
-already-complete diagnosis. No UI surface — ux-designer is skipped.
+Three non-blocking should-fix/nit items the reviewer recorded during 6f
+part 2's own approval — all fully diagnosed already, no new product/design
+decision, all inside already-shipped Teams-page code
+(`app/app.py`'s `teamRow()` non-idle branch, `tests/test_team_frontend.js`).
+No new UI surface is being added — this is test coverage + accessibility
+attributes on existing rendering — so ux-designer is skipped, matching this
+pipeline's own precedent for bugfix-shaped cycles. `docs/design.md`'s
+existing 6f part 2 section (from `story/multi-agent-teams`, still present
+in this branch's history) already specifies the exact ARIA attributes to
+add — this cycle implements that spec, it doesn't design new UI.
 
 ## Background
 
-Two unrelated but same-class problems, found together while diagnosing a
-long-running "unrelated flake" during the multi-agent-teams story:
+Three items, found together during 6f part 2's review, all approved as
+non-blocking at the time:
 
-**A. `tests/test_deploy_target.py` mutates real host state with no orphan
-recovery.** It creates/deletes a real system `deploy` user, writes
-`/etc/sudoers.d/` entries, provisions `/home/deploy/.ssh/authorized_keys`.
-`setUp` skips only if a `deploy` **user** currently exists; it does not
-detect an orphaned `/home/deploy` directory left by an interrupted prior
-run (observed concretely: `userdel` had already removed the user, but
-`/home/deploy` and a stale `authorized_keys` survived, causing later runs
-to fail mysteriously). Recovery today is a manual `rm -rf /home/deploy` —
-risky to automate carelessly, since the same command on a host where
-`/home/deploy` is *real* deploy infrastructure would wipe live SSH access
-(this is the "near-miss" the backlog item records: a sandbox classifier
-blocked exactly that broad command mid-diagnosis).
+**A. Untested "already answered" race branch.** `renderEscalationPanel()`'s
+`!cached.pending` branch — rendered when a cached `/status` snapshot still
+says `waiting_on_you` but a freshly-fetched `GET .../team/inbox` already
+reports `pending: false` (the escalation was answered between the last
+`/status` poll and the panel opening) — was added by the developer beyond
+`docs/design.md`'s own text. It's reachable and correct (the reviewer
+confirmed with a targeted, uncommitted test at the time), but has zero
+permanent coverage in `tests/test_team_frontend.js`.
 
-**B. `team-<project>` tmux session names and one worktree-op sweep prefix
-are unscoped across concurrent test processes.** `tests/test_teams_lifecycle.py`
-and `tests/test_team_routes.py` build real tmux sessions named
-`team-<literal-project-name>` (`team-demo`, `team-proj`, `team-atomicdemo`,
-`team-failchain`, `team-sessionrace`, `team-clidemo`, etc. — real `tmux`
-binary, not mocked). `tests/test_teams_lifecycle.py` also sweeps a
-`switchboard-worktree-op-` prefix unscoped in `tearDown`. Two concurrent
-test-suite runs (or a suite run alongside a real switchboard session)
-collide directly. Contrast: `switchboard-headless-*` session names were
-already fixed this exact way for 6d part 2a's own follow-up — `_RUN_ID_SCOPE
-= f"p{os.getpid()}"`, `_SESSION_PREFIX = f"switchboard-headless-{_RUN_ID_SCOPE}"`
-(`tests/test_teams_headless.py:80-81`).
+**B. Missing ARIA attributes.** `docs/design.md`'s "Accessibility &
+platform notes" section for 6f part 2 specifies `role="log"`/
+`aria-live="polite"` on the event feed list, `aria-pressed`/`aria-checked`
+on the per-agent filter pills, and `<fieldset>`/`<legend>` wrapping the
+escalation option group. None of these were implemented in `app/app.py`.
+Basic keyboard operability is intact today (native `<button>`/
+`<input type="radio/checkbox">`/`<label>` elements throughout), so this
+isn't a live defect, but it's the first scrollable log-like/live-region
+panel in this codebase and the design doc's own recommendation was never
+actually applied.
+
+**C. fact_check/finish poll-boundary misclassification (self-healing).**
+The positional disambiguation `docs/spec.md`'s 6f part 2 text specifies (a
+`tool_use` event is a fact_check claim if immediately followed by a
+`tool_result` with `meta.found`, otherwise rendered as the run's finish
+summary) can transiently misclassify a fact_check claim as a finish
+summary if its `tool_use` event lands in the client's event buffer before
+the paired `tool_result` — e.g. split across two `GET .../team/events`
+polls. The reviewer traced this to being practically unreachable (both
+transcript entries are written in one synchronous server-side call,
+sub-millisecond apart relative to the 4s poll cadence) and self-correcting
+within one more poll — not a live bug, but worth a small rendering
+refinement per the backlog item's own suggested direction: render an
+explicit transient state for a `tool_use` event that is the event buffer's
+own last lead-agent event while `team.status` is still `running`, rather
+than assuming it's the finish summary.
 
 ## Non-goals
 
-- No production code changes. Both fixes are entirely inside `tests/`.
-- Not attempting the "uniquely-named throwaway deploy user" shape floated
-  as an alternative in the backlog item — it would conflict with item 2c
-  part 2a's own pinned acceptance criterion that the receiver's system
-  username is literally `deploy` (fixed, not templated). The orphan-
-  detection fallback the backlog item itself names as sufficient is what
-  this cycle builds.
-- Not deciding whether the privileged deploy tests should run in CI or be
-  marked local-only opt-in — the backlog item leaves that open explicitly;
-  out of scope here.
-- Not touching `tests/test_deploy_dispatch.py` beyond confirming (in
-  testing) that it's unaffected — the backlog item names it as sharing the
-  same risk class but the concrete orphan bug and its fix are specific to
-  `test_deploy_target.py`'s `setUp`/`tearDown`.
+- No new UI surface, no new route, no backend change. This is test
+  coverage (A), applying already-specified ARIA attributes (B), and one
+  small rendering-logic refinement (C) inside already-shipped code.
+- Not re-opening or re-designing any part of 6f part 2's already-approved
+  interaction model.
+- Not attempting to make the poll-boundary race (C) provably unreachable
+  (it already effectively is, per the reviewer's own tracing) — just
+  giving it a better transient rendering, per the backlog item's own
+  stated direction, rather than leaving it silently assumed-as-finish.
 
 ## Proposed approach
 
-### A. `tests/test_deploy_target.py` orphan detection + backstop cleanup
+### A. Regression test for the "already answered" race branch
 
-- `setUp`'s guard changes from "does a `deploy` **user** exist?" to "does
-  `/home/deploy` exist **at all**?" — skip the privileged test class in
-  either case (live account or orphaned directory), since both mean the
-  fixture isn't safely available.
-- `tearDown` gains an unconditional backstop: after the existing `userdel
-  -r deploy` (which silently no-ops if the account is already gone),
-  explicitly `sudo rm -rf /home/deploy` so a partial failure never leaves
-  the directory behind for the next run to trip over. This is safe to make
-  unconditional specifically because it only runs at the end of a test
-  that itself created `/home/deploy` in this same `setUp`/test lifecycle —
-  never a blind sweep against pre-existing state.
+Add a permanent test to `tests/test_team_frontend.js` driving exactly the
+scenario the reviewer originally probed by hand: a cached `/status`
+snapshot with `waiting_on_you: true`, followed by a `GET .../team/inbox`
+fetch returning `{"pending": false}`. Assert `renderEscalationPanel()`
+renders the "already answered" copy (distinct from both the normal
+question-form state and the fetch-failure state) and does NOT render a
+submit form.
 
-### B. Per-process scoping for `team-<project>` sessions and the worktree-op sweep
+### B. ARIA attributes per `docs/design.md`
 
-- Add the same `_RUN_ID_SCOPE = f"p{os.getpid()}"`-style constant to
-  `tests/test_teams_lifecycle.py` and `tests/test_team_routes.py` (or
-  import/reuse `test_teams_headless.py`'s if these files already share
-  fixtures — developer's call on the cleanest wiring), and scope every
-  project name that becomes part of a real `team-<project>` tmux session
-  name: `"demo"` → `f"demo-{scope}"`, etc., across every test in both
-  files that creates a real session (not synthetic/mocked ones).
-  `tests/test_team_routes.py`'s `_project(name="proj")` default should
-  scope its own default too.
-- Scope `tests/test_teams_lifecycle.py`'s `switchboard-worktree-op-` prefix
-  the same way, and scope its `tearDown` sweep to match (only sweep
-  sessions/prefixes this process itself could have created).
-- Do not change any production naming logic (`teams.py`'s
-  `_team_session_name()` itself is correct and untouched) — this is a
-  test-fixture-only change, mirroring the `switchboard-headless-*` fix's
-  own scope exactly.
+Add, exactly as `docs/design.md`'s "Accessibility & platform notes"
+section for 6f part 2 already specifies:
+- `role="log"` and `aria-live="polite"` on the event feed's list container.
+- `aria-pressed` (reflecting selected/not-selected state) on each per-agent
+  filter pill button.
+- `aria-checked` on... [developer: confirm from `docs/design.md`'s exact
+  wording whether this applies to the filter pills or the escalation
+  radio/checkbox inputs — the backlog item's summary conflates the two,
+  the design doc is the source of truth].
+- Wrap the escalation panel's option group in `<fieldset>`/`<legend>`
+  (legend text: the pending question's own `question`/`header` text, or a
+  reasonable fallback if that's awkward structurally — developer's call,
+  document the choice).
+
+Update `docs/implementation.md`'s "Deviations from spec" framing
+retroactively if useful, but the main deliverable is the attributes
+themselves plus a `tests/test_team_frontend.js` assertion that they're
+present in the rendered markup for each relevant state.
+
+### C. Transient rendering for the poll-boundary edge case
+
+In the event-kind rendering logic (`teamFeedEventKindClass()`/
+`teamFeedEventBody()` or wherever the fact_check-vs-finish disambiguation
+currently lives), add the narrow additional check: if a `tool_use` event
+with empty `meta` is the event buffer's own LAST lead-agent event AND
+`team.status === "running"` (the run hasn't finished), render it as a
+transient "…" / pending-classification state rather than assuming it's
+the finish summary. Once the paired `tool_result` arrives on a later poll
+(or the run's status moves to a terminal state), it resolves to whichever
+of fact_check/finish is actually correct, same as today.
 
 ## Acceptance criteria
 
 Each must be verifiable by running something, not by reading the diff.
 
-- [ ] A fresh `tests/test_deploy_target.py` run with a genuinely orphaned
-      `/home/deploy` (no `deploy` user, directory present, created by a
-      simulated interrupted prior run) is now **skipped**, not run against
-      stale state. Verify by constructing exactly this orphan condition in
-      a test and confirming the class is skipped, not that it merely
-      passes coincidentally.
-- [ ] `tearDown`'s backstop actually removes `/home/deploy` even when
-      simulating a failure partway through the privileged test body (so
-      the *next* run's `setUp` sees a clean state) — test this by forcing
-      an exception after the fixture is created but before normal cleanup
-      would run, then asserting `/home/deploy` is gone afterward.
-- [ ] Two full runs of `tests/test_team_routes.py`'s and
-      `tests/test_teams_lifecycle.py`'s real-tmux test classes, launched
-      **concurrently** (two separate processes, not sequential), both pass
-      with zero session-name collisions. This is the actual regression
-      test for the reported problem — a sequential re-run passing twice
-      does not prove concurrency safety.
-- [ ] No test in either file still creates a session literally named
-      `team-demo`, `team-proj`, `team-atomicdemo`, `team-failchain`,
-      `team-sessionrace`, or `team-clidemo` (grep the diff for these
-      literal strings post-fix — should find none used as a real session
-      name, only as documentation/comments if at all).
-- [ ] `switchboard-worktree-op-` sweep in `tests/test_teams_lifecycle.py`'s
-      `tearDown` only ever targets this process's own scoped prefix — a
-      concurrent process's own worktree-op sessions must survive
-      untouched. Verify directly: start a session under a different
-      process's scope, run this file's tests, confirm that other
-      session is still alive afterward.
-- [ ] Full existing suite (Python: 790 baseline going into this cycle,
-      Node: 84) still passes with no regression.
+- [ ] A permanent test in `tests/test_team_frontend.js` proves the
+      "already answered" branch renders its distinct copy and no submit
+      form, for the specific cached-`waiting_on_you`-true /
+      fresh-`pending`-false scenario.
+- [ ] The event feed list container carries `role="log"` and
+      `aria-live="polite"` in rendered output — verified by extracting the
+      real rendered markup (this project's established
+      extract-and-inspect-the-real-`<script>`/DOM technique), not by
+      reading the source only.
+- [ ] Per-agent filter pills carry the ARIA state attribute(s)
+      `docs/design.md` specifies, verified the same way, including a
+      toggle test (attribute value actually changes when a pill is
+      selected vs. not).
+- [ ] The escalation option group is wrapped in `<fieldset>`/`<legend>` in
+      rendered output.
+- [ ] A `tool_use` event with empty `meta` that is the buffer's own last
+      lead-agent event, while `team.status === "running"`, renders the new
+      transient state — not the finish-summary text — verified with a
+      targeted test constructing exactly that buffer state.
+- [ ] Once a paired `tool_result` (or a terminal `team.status`) arrives on
+      a subsequent poll, the transient state resolves correctly to
+      fact_check or finish as appropriate — same disambiguation logic as
+      before, just gated by the new transient check first.
+- [ ] Full existing suite (Python: 792 baseline going into this cycle,
+      Node: 84, with `test_team_frontend.js`'s own count growing by
+      whatever this cycle adds) still passes with no regression.
 
 ## Risk / rollback
 
-Test-only diff. Rollback is reverting the test files; no production
-behavior changes at all. The highest-risk part is the concurrency
-acceptance criterion itself, since it requires actually running two
-processes at once rather than trusting the scoping logic by inspection —
-budget real wall-clock time for it in the developer/reviewer cycles.
+Frontend-only diff inside already-shipped, already-reviewed 6f part 2
+code. Rollback is reverting the relevant `app/app.py` template sections
+and the new tests. No backend/production-Python risk.
