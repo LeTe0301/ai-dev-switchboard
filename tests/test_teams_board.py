@@ -28,6 +28,7 @@ uses for _call_lead() vs. its own tier adapters in tests/test_teams_lead.py.
 Run with:
     python3 -m unittest discover -s tests -v
 """
+import builtins
 import io
 import json
 import os
@@ -139,6 +140,84 @@ class LoadConfigTests(unittest.TestCase):
         cfg = tb.load_config(path)
         self.assertEqual(cfg["TAIGA_URL"], "http://127.0.0.1:9000")
         self.assertEqual(cfg["TAIGA_PROJECT_SLUG"], "my-project")
+
+
+class LoadConfigPermissionTests(unittest.TestCase):
+    """Item 29 (v2): load_config()'s open() call must distinguish
+    "file exists but can't be read" (PermissionError) from "file genuinely
+    missing" (FileNotFoundError) and from any other OSError -- three
+    distinct outcomes, and specifically proves the except-clause ORDERING
+    fix actually takes effect (PermissionError is an OSError subclass, so
+    a bare `except OSError:` ahead of it -- the pre-fix shape -- would
+    silently swallow it into the generic "isn't configured" message and
+    the more specific `except PermissionError:` clause below it would be
+    unreachable dead code). Not reproducible via a real multi-user ACL
+    setup in this sandbox (root runs everything here, so a real chmod/
+    setfacl denial wouldn't actually deny root's own open() call) --
+    monkeypatches builtins.open itself instead, same "mock the boundary
+    the real OS/user separation would otherwise provide" technique tests/
+    test_team_routes.py's own _get_forbidding_open_of() already
+    establishes, scoped here to raise instead of forbid."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="taiga-board-config-perm-")
+        self.path = os.path.join(self.tmp, "taiga-push.env")
+        with open(self.path, "w") as f:
+            f.write("TAIGA_URL=http://x\n")
+        os.chmod(self.path, 0o600)  # avoid _check_config_permissions()'s own unrelated warning
+        self._real_open = builtins.open
+        self.addCleanup(self._restore_open)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _restore_open(self):
+        builtins.open = self._real_open
+
+    def _patch_open_raises(self, exc):
+        target = os.path.abspath(self.path)
+
+        def _fake_open(file, *a, **kw):
+            if os.path.abspath(str(file)) == target:
+                raise exc
+            return self._real_open(file, *a, **kw)
+        builtins.open = _fake_open
+
+    def test_permission_error_raises_distinct_actionable_message(self):
+        self._patch_open_raises(PermissionError(13, "Permission denied"))
+        with self.assertRaises(tb.TaigaPushError) as ctx:
+            tb.load_config(self.path)
+        msg = str(ctx.exception)
+        self.assertIn("couldn't read it (permission denied)", msg)
+        self.assertIn("setfacl", msg)
+        self.assertIn("taiga-configure-push.sh", msg)
+        # Must NOT be conflated with the genuinely-missing-file message --
+        # this is the exact bug item 29 (v2) fixes.
+        self.assertNotIn("Taiga isn't configured", msg)
+
+    def test_other_oserror_during_read_still_falls_back_to_not_configured_message(self):
+        # A non-permission OSError raised mid-open (e.g. a transient I/O
+        # error) must still fall into the pre-existing generic branch --
+        # confirms the new `except PermissionError:` clause is genuinely
+        # more specific, not a wholesale replacement of the fallback.
+        self._patch_open_raises(OSError(5, "Input/output error"))
+        with self.assertRaises(tb.TaigaPushError) as ctx:
+            tb.load_config(self.path)
+        msg = str(ctx.exception)
+        self.assertIn("Taiga isn't configured", msg)
+        self.assertIn("taiga-configure-push.sh", msg)
+        self.assertNotIn("permission denied", msg)
+
+    def test_genuinely_missing_file_still_gives_the_same_not_configured_message(self):
+        # Contrast case, unaffected by this fix -- os.path.isfile() itself
+        # (not open()) is what raises this one, so it's checked before
+        # open() is ever reached at all.
+        missing = os.path.join(self.tmp, "does-not-exist.env")
+        with self.assertRaises(tb.TaigaPushError) as ctx:
+            tb.load_config(missing)
+        msg = str(ctx.exception)
+        self.assertIn("Taiga isn't configured", msg)
+        self.assertNotIn("permission denied", msg)
 
 
 class AuthenticateTests(_TaigaRequestPatchCase):

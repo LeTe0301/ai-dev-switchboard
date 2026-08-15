@@ -146,6 +146,12 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> dict:
                     continue
                 key, _, value = line.partition("=")
                 cfg[key.strip()] = value.strip()
+    except PermissionError:
+        raise TaigaPushError(
+            f"Found {path} but couldn't read it (permission denied) — the account "
+            f"running this service needs read access. Re-run "
+            f"scripts/taiga-configure-push.sh (it now grants this automatically), "
+            f"or grant it manually: sudo setfacl -m u:<service-user>:r {path}.")
     except OSError:
         raise TaigaPushError(
             f"Taiga isn't configured — run scripts/taiga-configure-push.sh first "

@@ -2697,8 +2697,30 @@ def taiga_run(action: str) -> str:
     assert action in ("up", "down", "status")
     script = {"up": TAIGA_UP_SCRIPT, "down": TAIGA_DOWN_SCRIPT,
               "status": TAIGA_STATUS_SCRIPT}[action]
+    # Item 30 (v2): scripts/taiga-up.sh's own retry loop now sleeps up to
+    # 10+20+40+80 = 150s across its 5 default attempts (exponential
+    # backoff) before giving up, plus the `docker compose up -d`/`ps` calls
+    # themselves between sleeps -- comfortably past the previous flat 90s
+    # timeout here, which would have killed the script mid-retry before it
+    # ever got a chance to recover. Raised to 180s for "up" specifically to
+    # give that retry loop room to run to exhaustion; "down"/"status" never
+    # retry, so their timeouts are unchanged.
+    #
+    # Margin arithmetic (docs/test-review.md round-5 Finding 2): 180s total
+    # minus the 150s worst-case pure `sleep` above leaves ~30s for the loop's
+    # 14 real subprocess calls (5x `up -d` + 5x `ps` + 4x `rm -f`), ~2.1s/call
+    # average if spread evenly. That's thin for the exact degraded-Docker
+    # scenario this retry loop exists to survive, but this ceiling is a
+    # last-resort safety net, not the loop's primary defense -- the retry
+    # loop's own 5-attempt/exponential-backoff logic is what actually
+    # recovers from a slow daemon; this timeout only guards against the
+    # subprocess wedging entirely (e.g. a hung `docker compose` call that
+    # never returns). Widen this (and SINGLETON_TOGGLE_CONFIG.taiga.timeoutMs
+    # below, which is deliberately kept >= this value -- see its own comment)
+    # together if real-world margin turns out to be too thin.
+    timeout = 180 if action == "up" else (10 if action == "status" else 90)
     r = subprocess.run(["sudo", script], capture_output=True, text=True,
-                       timeout=(10 if action == "status" else 90))
+                       timeout=timeout)
     return r.stdout.strip()
 
 
@@ -3181,8 +3203,10 @@ let TEAM_BY_NAME = {};
 // wasRunning — only the toggle-off code paths themselves increment/
 // decrement it.
 //
-// offPendingCount is a count, not a boolean, because the toggle checkbox is
-// never disabled while an action is in flight and the row keeps
+// offPendingCount is a count, not a boolean, because an intentional
+// toggle-off dispatch is NOT one of the states row()'s checkbox gets
+// disabled for (see singletonToggleSub()'s own "disabled" doc comment —
+// that only covers the on-dispatch's "starting…" window) — the row keeps
 // re-rendering as "on" (accurately) for as long as any prior off request is
 // still running — an impatient user can realistically fire a second,
 // independent off dispatch before the first resolves. A plain boolean that
@@ -3197,13 +3221,20 @@ let singletonToggleState = {
   gitea: {pending: null, wasRunning: false, offPendingCount: 0},
 };
 // Per-kind values that used to be hardcoded to Taiga's own numbers/text
-// (the 90s starting-timeout, the resource badge) — see docs/design.md
+// (the starting-timeout, the resource badge) — see docs/design.md
 // "Resource badge: informational tone, not warning" for why Gitea's badge
 // uses a different symbol/tone/color-class than Taiga's, and "Starting-state
-// timeout" for why both kinds keep the same safe 90s upper bound rather than
-// tuning Gitea's down (a safety ceiling, not a performance target).
+// timeout" for why each kind's timeoutMs is a safety ceiling, not a
+// performance target: it must stay >= that kind's own backend `taiga_run()`/
+// `gitea_run()` "up" timeout (app.py's own subprocess.run(..., timeout=...)
+// call), since both are deliberately kept in sync so the frontend never
+// flips to "error" while the backend POST is still legitimately in flight
+// (docs/test-review.md round-5 Finding 1 — this broke once, when the
+// backend's "up" timeout was raised to 180s for item 30's retry-loop fix but
+// this value was left at the old 90000). Gitea's own backend timeout is
+// unchanged (still 90s), so its timeoutMs stays 90000 too.
 const SINGLETON_TOGGLE_CONFIG = {
-  taiga: {timeoutMs: 90000, badgeText: '⚠ ~3–5 GB RAM when running',
+  taiga: {timeoutMs: 180000, badgeText: '⚠ ~3–5 GB RAM when running',
           badgeClass: 'taiga-ram', errClass: 'taiga-err', spinnerClass: 'taiga-starting-spinner'},
   gitea: {timeoutMs: 90000, badgeText: 'ℹ ~1 GB RAM when running',
           badgeClass: 'gitea-resources', errClass: 'gitea-err', spinnerClass: 'gitea-starting-spinner'},
@@ -3212,11 +3243,24 @@ const SINGLETON_TOGGLE_CONFIG = {
 // error) AND updates that kind's own singletonToggleState entry as a side
 // effect — same single computation refresh() used to do inline for Taiga
 // alone, now shared by every kind in SINGLETON_TOGGLE_CONFIG. Returns
-// {sub, showBadge}.
+// {sub, showBadge, disabled}.
+//
+// `disabled` is true only while `sub` is literally the "starting…" text —
+// i.e. an on-dispatch (or the "was running, suddenly isn't" re-arm below) is
+// still within its own timeoutMs window. This is what keeps the checkbox
+// from being double-clicked into firing a second, concurrent taiga_run()
+// against the same Docker Compose stack while the first is still mid-retry
+// (docs/test-review.md round-5 Finding 1). It's safe to key this purely off
+// elapsed time, not off the actual in-flight fetch, because timeoutMs is now
+// kept >= the backend's own blocking timeout (see SINGLETON_TOGGLE_CONFIG's
+// comment) — by the time this flips from "starting…" to "error", the
+// backend call is guaranteed to have already resolved one way or the other,
+// so "error" is a genuine terminal state safe to re-enable on, not a false
+// one racing an in-flight request.
 function singletonToggleSub(kind, on, url) {
   const cfg = SINGLETON_TOGGLE_CONFIG[kind];
   const st = singletonToggleState[kind];
-  let sub, showBadge = true;
+  let sub, showBadge = true, disabled = false;
   if (on) {
     sub = 'running' + (url ? ' — <a href="' + url + '" target="_blank">open</a>' : '');
     st.pending = null;
@@ -3236,12 +3280,13 @@ function singletonToggleSub(kind, on, url) {
         showBadge = false;
       } else {
         sub = 'starting… <span class="' + cfg.spinnerClass + '">◌</span>';
+        disabled = true;
       }
     } else {
       sub = 'stopped';
     }
   }
-  return {sub, showBadge};
+  return {sub, showBadge, disabled};
 }
 
 async function refresh() {
@@ -3275,12 +3320,12 @@ async function refresh() {
   if (s.instances.length === 0) html += '<div class="empty">No project folders under the configured PROJECTS_DIR yet.</div>';
   if (s.host_enabled) html += row(s.host_label, s.host, s.host_url, 'host', null, '', null, false, null);
   if (s.taiga_enabled) {
-    const {sub, showBadge} = singletonToggleSub('taiga', s.taiga, s.taiga_url);
-    html += row(s.taiga_label, s.taiga, s.taiga_url, 'taiga', null, '', null, false, null, sub, showBadge);
+    const {sub, showBadge, disabled} = singletonToggleSub('taiga', s.taiga, s.taiga_url);
+    html += row(s.taiga_label, s.taiga, s.taiga_url, 'taiga', null, '', null, false, null, sub, showBadge, undefined, undefined, undefined, disabled);
   }
   if (s.gitea_enabled) {
-    const {sub, showBadge} = singletonToggleSub('gitea', s.gitea, s.gitea_url);
-    html += row(s.gitea_label, s.gitea, s.gitea_url, 'gitea', null, '', null, false, null, sub, showBadge);
+    const {sub, showBadge, disabled} = singletonToggleSub('gitea', s.gitea, s.gitea_url);
+    html += row(s.gitea_label, s.gitea, s.gitea_url, 'gitea', null, '', null, false, null, sub, showBadge, undefined, undefined, undefined, disabled);
   }
   document.getElementById('rows').innerHTML = html;
 }
@@ -4333,12 +4378,15 @@ function teamRow(name, team) {
     "'" + name + "'" + ')">Stop team</button></div>' +
     msgSlot + renderTeamBranches(name) + '</div>';
 }
-function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverride, showBadge, gitSync, deploy, team) {
+function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverride, showBadge, gitSync, deploy, team, toggleDisabled) {
   // subOverride lets a singleton-toggle row (Taiga/Gitea — see refresh())
   // supply its own starting/running/stopped/error text instead of this
   // generic on/off computation — every other kind (inst/host/code) omits it
   // and keeps the plain behavior unchanged. showBadge + SINGLETON_TOGGLE_CONFIG
   // (keyed by kind) supply that row's own resource-cost badge text/class.
+  // toggleDisabled likewise only ever comes from a singleton-toggle row's own
+  // singletonToggleSub() result (see its "disabled" doc comment) — every
+  // other kind omits it and the checkbox stays always-enabled, unchanged.
   const sub = (subOverride != null ? subOverride :
     (on ? (url ? 'running — <a href="' + url + '" target="_blank">open</a>' : 'running') : 'stopped')) +
     gitSyncSuffix(gitSync);
@@ -4354,7 +4402,7 @@ function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverr
     (kind === 'inst' ? deployRow(name, deploy) : '') +
     (kind === 'inst' ? teamRow(name, team) : '') +
     '</div>' +
-    '<label class="switch"><input type="checkbox" ' + (on ? 'checked' : '') +
+    '<label class="switch"><input type="checkbox" ' + (on ? 'checked' : '') + (toggleDisabled ? ' disabled' : '') +
     ' onchange="toggle(' + arg + ', this.checked, this)"><span class="slider"></span></label></div>';
 }
 let pendingToggle = null;  // {kind, name, on, checkboxEl} — only set while the code overlay is up
@@ -6316,15 +6364,17 @@ class Handler(BaseHTTPRequestHandler):
             if name not in instance_names():
                 return self._json({"error": "unknown project"}, 404)
             run = teams.latest_run_for_project(name)
-            # "blocked_board_write" added (backlog item 7 part 2, docs/
-            # spec.md §4) -- previously this tuple only named
-            # "blocked_ask_user", so a run blocked on a pending board-write
-            # proposal fell into the early-return "no team currently
-            # running" branch below and Stop silently did nothing (disclosed
-            # gap, docs/implementation.md "Known limitations"). stop_team()
-            # itself already handles any non-terminal status generically, so
-            # this one-tuple extension is the entire fix.
-            if run is None or run["status"] not in ("running", "blocked_ask_user", "blocked_board_write"):
+            # Item 35: only "no run has ever existed" is a genuine no-op.
+            # stop_team() itself already handles every status unconditionally
+            # (its own docstring: "works regardless of status (running /
+            # blocked_ask_user / finished / error / escalated_max_rounds /
+            # stopped)") -- a status-tuple gate here previously turned a
+            # terminal (finished/escalated_max_rounds) run's Stop click into
+            # a silent, misleading "no team currently running" no-op, even
+            # though the web UI's own Stop button renders unconditionally
+            # for any non-idle status. Let stop_team()'s already-correct
+            # logic decide, instead of second-guessing it here.
+            if run is None:
                 return self._json({"ok": True, "message": "no team currently running for this project"})
             entry = _team_threads_get(name)
             if entry is not None and entry.get("run_id") == run["run_id"]:

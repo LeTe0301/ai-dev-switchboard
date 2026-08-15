@@ -1,3 +1,8 @@
 __pycache__/
 *.pyc
 *.tmp
+
+# Local Claude Code tooling state (not project content)
+/CLAUDE.md
+/.claude/
+/graphify-out/

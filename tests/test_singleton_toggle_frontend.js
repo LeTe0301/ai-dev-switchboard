@@ -251,6 +251,14 @@ const BADGE_CONFIG = {
   gitea: { text: 'ℹ ~1 GB RAM when running', class: 'gitea-resources' },
 };
 
+// The exact per-kind starting→error timeoutMs app.py's own
+// SINGLETON_TOGGLE_CONFIG configures (docs/test-review.md round-5 Finding 1
+// — taiga's was raised from 90000 to 180000 to stay >= taiga_run()'s own
+// 180s backend "up" timeout; gitea's backend timeout is unchanged, so its
+// timeoutMs stays 90000). Duplicated deliberately, not imported, same
+// rationale as BADGE_CONFIG above.
+const TIMEOUT_MS_CONFIG = { taiga: 180000, gitea: 90000 };
+
 function statusFor(kind, { on, url = null }) {
   const other = OTHER_KIND[kind];
   const base = {
@@ -425,8 +433,9 @@ function registerSingletonToggleTests(kind) {
     assert.ok(!html.includes(errClass), `[${kind}] must not have shown "error" during a recovered blip, got: ` + html);
   });
 
-  test(`[${kind}] unexpected stop while running that never recovers still surfaces error after 90s`, async () => {
+  test(`[${kind}] unexpected stop while running that never recovers still surfaces error after this kind's own timeoutMs`, async () => {
     const c = await setupCase();
+    const timeoutMs = TIMEOUT_MS_CONFIG[kind];
 
     let p = c.call('refresh');
     c.resolveFetch((f) => f.url === '/status', 200, statusFor(kind, { on: true }));
@@ -437,13 +446,76 @@ function registerSingletonToggleTests(kind) {
     await p2;
     assert.ok(c.rowHtml(kind).includes('starting'));
 
-    c.advanceMockNow(91000);
+    c.advanceMockNow(timeoutMs + 1000);
     let p3 = c.call('refresh');
     c.resolveFetch((f) => f.url === '/status', 200, statusFor(kind, { on: false }));
     await p3;
 
     const html = c.rowHtml(kind);
-    assert.ok(html.includes(errClass), `[${kind}] expected "error" after a 90s non-recovering failure, got: ` + html);
+    assert.ok(html.includes(errClass), `[${kind}] expected "error" after a ${timeoutMs}ms non-recovering failure, got: ` + html);
+  });
+
+  // ─── docs/test-review.md round-5 Finding 1 — the checkbox must be
+  // disabled for exactly the "starting…" window (an on-dispatch's own
+  // timeoutMs), so an operator can't fire a second, concurrent taiga_run()/
+  // gitea_run() "up" against the same Docker Compose stack while the first
+  // is still mid-retry — and it must re-enable once that window ends,
+  // whether the outcome is a genuine "error" (timeoutMs elapsed) or a
+  // recovered "running" ─────────────────────────────────────────────────
+  test(`[${kind}] checkbox is disabled while "starting…", re-enabled once it becomes "error" after timeoutMs`, async () => {
+    const c = await setupCase();
+    const timeoutMs = TIMEOUT_MS_CONFIG[kind];
+
+    const cb = { checked: true };
+    const togglePromise = c.call('toggle', kind, null, true, cb);
+    await tick();
+
+    let p = c.call('refresh');
+    c.resolveFetch((f) => f.url === '/status', 200, statusFor(kind, { on: false }));
+    await p;
+    let html = c.rowHtml(kind);
+    assert.ok(html.includes('starting'), `[${kind}] expected "starting…" right after an on-dispatch, got: ` + html);
+    assert.ok(html.includes('<input type="checkbox"  disabled'),
+      `[${kind}] expected the checkbox to be disabled while "starting…", got: ` + html);
+
+    c.advanceMockNow(timeoutMs + 1000);
+    let p2 = c.call('refresh');
+    c.resolveFetch((f) => f.url === '/status', 200, statusFor(kind, { on: false }));
+    await p2;
+    html = c.rowHtml(kind);
+    assert.ok(html.includes(errClass), `[${kind}] expected "error" after timeoutMs elapsed, got: ` + html);
+    assert.ok(!html.includes('<input type="checkbox"  disabled') && !html.includes('<input type="checkbox" disabled'),
+      `[${kind}] expected the checkbox to be re-enabled once in the (now-terminal) "error" state, got: ` + html);
+
+    c.resolveFetch((f) => f.url === `/${kind}/on`, 200, {});
+    await togglePromise;
+    await tick();
+  });
+
+  test(`[${kind}] checkbox is re-enabled once an on-dispatch actually succeeds ("running")`, async () => {
+    const c = await setupCase();
+
+    const cb = { checked: true };
+    const togglePromise = c.call('toggle', kind, null, true, cb);
+    await tick();
+
+    let p = c.call('refresh');
+    c.resolveFetch((f) => f.url === '/status', 200, statusFor(kind, { on: false }));
+    await p;
+    assert.ok(c.rowHtml(kind).includes('<input type="checkbox"  disabled'),
+      `[${kind}] expected the checkbox to be disabled while "starting…"`);
+
+    c.resolveFetch((f) => f.url === `/${kind}/on`, 200, {});
+    await togglePromise;
+    await tick();
+
+    let p2 = c.call('refresh');
+    c.resolveFetch((f) => f.url === '/status', 200, statusFor(kind, { on: true }));
+    await p2;
+    const html = c.rowHtml(kind);
+    assert.ok(html.includes('running'), `[${kind}] expected "running" after a successful on-dispatch, got: ` + html);
+    assert.ok(!html.includes('<input type="checkbox"  disabled') && !html.includes('<input type="checkbox" disabled'),
+      `[${kind}] expected the checkbox to be re-enabled once running, got: ` + html);
   });
 
   // ─── docs/test-review.md Defect 2 — two overlapping toggle-off
