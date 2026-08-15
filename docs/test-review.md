@@ -1,183 +1,99 @@
-# Test & Review: install.sh fixes from Proxmox E2E test round 1 (items 22-27)
+# Test & Review: taiga-up.sh resilience from Proxmox E2E test round 4 (item 30)
 
 ## Scope
-Six independently-diagnosed `install.sh` bugs found by a real Proxmox E2E
-test (`docs/BACKLOG.md` items 22-27; fix 4/item 25 also touches
-`scripts/gitea-sync-project.sh`). Two (22, 27) currently make the product
-completely non-functional out of the box. No open design questions — every
-fix's shape was already pinned down with exact repro/root-cause/verified-
-working-fix by the E2E tester, per `docs/spec.md`.
-
----
+Independent re-verification of `scripts/taiga-up.sh`'s retry/detect/fail-loudly
+rewrite and its new test harness (`tests/test_taiga_up_retry.py`) against
+`docs/spec.md`'s five acceptance criteria, plus a full-suite regression check
+and a final isolation check that this branch's own diff (vs.
+`backlog/e2e-fixes-round3`) contains nothing but this item's changes.
 
 ## Test cases
 
 | # | Criterion / case | Method | Result | Evidence |
 |---|---|---|---|---|
-| 1 | Fix 1 (item 22): `taiga_board.py` copied during install | Read: `install.sh:300-303` diff | pass | `cp "$REPO_DIR/app/taiga_board.py" "$INSTALL_DIR/taiga_board.py"` added, same quoting/path-construction pattern as the two sibling `cp` lines it sits next to |
-| 2 | Fix 2 (item 23): `-it` dropped from printed `docker exec` command | Read: `install.sh:967` diff | pass | Line now reads `docker exec --user git ai-dev-switchboard-gitea gitea admin user create \` — `-it` removed, nothing else on the line changed |
-| 3 | Fix 3 (item 24): `$STATE_DIR` itself chowned to `SVC_USER`, right after `useradd` | Read: `install.sh:244-248` | pass | `chown "$SVC_USER:$SVC_USER" "$STATE_DIR"` lands immediately after the `id "$SVC_USER" ... useradd` line; exactly one occurrence (`grep -n 'chown.*STATE_DIR'` shows this line plus the pre-existing, untouched `.../uploads` chown at line 474 — not duplicated, not dropped) |
-| 4 | Fix 4 (item 25): `runtime.env` written with resolved `RUN_USER`/`PROJECTS_DIR` values (not literal placeholders), mode 644 | Read: `install.sh:493-503`; live shell reproduction of the exact heredoc | pass | Heredoc is `<<EOF` (unquoted → variable expansion, not `<<'EOF'`); reproduced the exact block in isolation with `RUN_USER=testuser`/`PROJECTS_DIR=/home/testuser/projects` and confirmed the written file contains the literal resolved values `RUN_USER=testuser` / `PROJECTS_DIR=/home/testuser/projects`, and `stat -c %a` = `644` |
-| 5 | Fix 4: `gitea-sync-project.sh` `CONFIG` path repointed at `runtime.env`, not just commented | Read: `scripts/gitea-sync-project.sh:37` diff | pass | `CONFIG=/etc/ai-dev-switchboard/switchboard.env` → `CONFIG=/etc/ai-dev-switchboard/runtime.env`; confirmed via `grep` that no other reference to the old path remains in the script |
-| 6 | Fix 4: `switchboard.env`'s own `chmod 600` genuinely untouched | Read: `install.sh:490-491` | pass | `chown "$SVC_USER:$SVC_USER" "$ENV_FILE"` / `chmod 600 "$ENV_FILE"` unchanged, sit *above* and separate from the new `runtime.env` block — no loosening |
-| 7 | Fix 5 (item 26): top-level `~RUN_USER/.local` chowned, not just the code-server subtree, and not chowned any broader (e.g. not the home dir itself) | Read: `install.sh:296` diff, plus full `grep` of every `chown` in the file | pass | `chown -R "$RUN_USER:$RUN_USER" "$CODE_SERVER_DIR"` → `chown -R "$RUN_USER:$RUN_USER" "/home/$RUN_USER/.local"`; still gated inside `if [ "$WITH_CODE_SERVER" -eq 1 ]` → non-symlink `else` branch, same as before; target is exactly `.local`, not `/home/$RUN_USER` |
-| 8 | Fix 6 (item 27): `safe.directory` configured for `SVC_USER`, exact literal `'*'` (not a glob), placed right after `useradd`, alongside fix 3 | Read: `install.sh:249-260` | pass | `sudo -u "$SVC_USER" git config --global --add safe.directory '*'` — single-quoted literal `*`, exactly one occurrence in the file, lands directly after fix 3's `chown`, both after the `useradd` line (valid required order — `$SVC_USER` must exist first) |
-| 9 | Fix 6 security judgment: "no privilege crossing" claim — SVC_USER never runs a *write* git command directly (only via `sudo -u RUN_USER`) | Read: every `["git", ...]` call site in `app/teams.py` and `app/app.py` | pass, claim holds | Direct (non-sudo) git calls found: `teams.py:3577` (`rev-parse --is-inside-work-tree`), `:3585` (`symbolic-ref -q HEAD`), `:3593` (`status --porcelain`), `:3695` (`branch --list`), `app.py:939` (`remote get-url origin`) — all read-only. The only *write* git operations (`worktree add`/`worktree remove`, `teams.py:3626`/`:3649`) go through `_run_run_user_command()` (`sudo -u RUN_USER`), not direct `SVC_USER` git calls. `safe.directory '*'` therefore only lifts the ownership-mismatch refusal on read-only inspection commands SVC_USER already runs; it does not hand SVC_USER any new write capability |
-| 10 | Fix 6: SVC_USER's effective access to project dirs isn't gated by anything `safe.directory` itself weakens (i.e., filesystem perms, not just the ownership check, still bound it) | Read: `install.sh` — no `setfacl`/`usermod -aG`/broadening `chmod` on `PROJECTS_DIR` or per-project dirs found | pass | `PROJECTS_DIR` is `chown "$RUN_USER:$RUN_USER"` only (`install.sh:264`), left at `mkdir -p`'s default mode (world-readable/executable, ~755) — SVC_USER already had ambient read access via world-readable perms before this fix (matches `app.py:924`'s own comment); `safe.directory '*'` doesn't change filesystem permissions, only whether git's ownership check permits the read |
-| 11 | `bash -n install.sh` / `bash -n scripts/gitea-sync-project.sh` | Automated: ran directly | pass | Both exit 0, no output |
-| 12 | `shellcheck install.sh` | Automated: ran directly | pass (pre-existing warnings only) | Only SC2015 (line 70) and SC2001 (line 601) — both pre-existing, unrelated to any of the six changed spots |
-| 13 | `shellcheck scripts/gitea-sync-project.sh` | Automated: ran directly | pass (pre-existing warning only) | Only SC1090 (line 38, inherent to sourcing a non-constant path) — pre-existing, present before this change too |
-| 14 | No existing `tests/test_install_*.py` test asserts the specific `cp`/`chown` lines changed | `grep -n` across `tests/test_install_*.py` for the changed identifiers | pass | No hits on `taiga_board`/`chown`/`STATE_DIR`/`CODE_SERVER_DIR`/`safe.directory`/`runtime.env` in any assertion; `switchboard.env` hits are all unrelated (`env_file` tmp-path fixture setup, not path assertions on the real `/etc/...` path) |
-| 15 | `RunUserSvcUserDefaultTests` harness (`tests/test_install_update.py`) unaffected by fixes 3/6 landing after `useradd` | Read `_build_users_block_harness()` | pass | Extraction end marker is `'id "$RUN_USER" &>/dev/null'` — strictly before the `id "$SVC_USER"` line fixes 3/6 attach after; harness never sees the new lines |
-| 16 | `test_gitea_sync_project.py` unaffected by the `CONFIG` path rename | Read the test file | pass | Test sets `PROJECTS_DIR` directly via env var and never touches `/etc/ai-dev-switchboard/` at all — the script's `[ -f "$CONFIG" ] && source` is a no-op on the test box regardless of path |
-| 17 | Full existing regression suite | Automated: `python3 -m unittest discover -s tests -v`, run independently in this session (not reusing the developer's reported numbers) | pass | `Ran 1198 tests in 160.259s` / `OK`; independently grepped the verbose log for `" ... FAIL$"` and `" ... ERROR$"` — zero matches | 
-| 18 | The four most directly relevant test files | Automated: `python3 -m unittest tests.test_gitea_sync_project tests.test_install_ollama tests.test_install_set_env tests.test_install_update -v`, run independently | pass | `Ran 54 tests in 80.102s` / `OK` |
+| 1 | AC1: `taiga-gateway` runs on first `up -d` → exit 0 immediately, zero retry/sleep overhead | Automated (`test_succeeds_on_first_attempt_no_retry`) + code trace | pass | `python3 tests/test_taiga_up_retry.py -v` → ok; asserts `up_calls==1`, `rm_calls==0`; loop's `exit 0` fires before the `rm`/`sleep` block on the first iteration |
+| 2 | AC2: non-`running` state → removes just `taiga-gateway`, retries, capped at `TAIGA_UP_MAX_ATTEMPTS` total attempts | Automated (`test_succeeds_on_second_attempt_after_one_retry`, `test_exhausts_all_attempts_and_fails_loudly`) + deliberate off-by-one mutation test | pass | See "Loop-bound trace" below — mutating `-le`→`-lt` caused `up_calls` to drop from 3→2, caught by the existing tests, then reverted and diff-confirmed clean |
+| 3 | AC3: all attempts fail → exit non-zero, stderr names container, attempt count, and 3 "look next" pointers | Automated (`test_exhausts_all_attempts_and_fails_loudly`) | pass | asserts exact substrings: `taiga-gateway failed to come up after 3 attempts`, `manual intervention needed`, `docker compose logs taiga-gateway`, `docker network ls`, `disk space` |
+| 4 | AC4: `TAIGA_UP_MAX_ATTEMPTS` env-overridable, default 3 | Automated (`test_max_attempts_env_override_is_honored`, default used implicitly by all other cases) | pass | override to 5 → `up_calls==5`, `rm_calls==4`, stderr `after 5 attempts` |
+| 5 | AC5: `bash -n` / `shellcheck` clean | Manual command run | pass | `bash -n scripts/taiga-up.sh` exit 0; `shellcheck scripts/taiga-up.sh` exit 0, zero warnings/output |
+| 6 | Final failure message fires only after full exhaustion, not on every intermediate failure | Code trace | pass | message is textually after the `done` closing the `while` loop — only reachable once the loop condition (`attempt -le MAX`) goes false; both retry tests confirm the *intermediate* message (`didn't come up cleanly`) is what's seen on non-final attempts |
+| 7 | `rm -f taiga-gateway` targets only the one container, never a full stack `down` | Code read + test | pass | script never calls `down`; `"${COMPOSE[@]}" rm -f taiga-gateway` is the only removal call, gated inside `if [ "$attempt" -lt "$TAIGA_UP_MAX_ATTEMPTS" ]` so it never runs after the final attempt (exhaustion test: `rm_calls==2` for `max_attempts=3`) |
+| 8 | Test harness runs the REAL script, not a reimplementation | Code read + deliberate revert-and-watch-it-fail check | pass | harness reads `scripts/taiga-up.sh` verbatim via `open(TAIGA_UP_SH).read()` and appends it after stub definitions, run via `bash -c`; confirmed by mutating the real script (`-le`→`-lt`) and observing 2 of 4 tests fail with the exact expected wrong counts, then reverting |
+| 9 | Disclosed SC1090 deviation is accurate and scoped to only that one warning | Manual shellcheck runs, before/after directive | pass | `taiga-status.sh`, `gitea-up.sh`, `taiga-down.sh` each independently show the identical unaddressed `SC1090` warning today; removing the new `# shellcheck disable=SC1090` line from a scratch copy of `taiga-up.sh` reproduces exactly that one warning and no other — directive suppresses nothing beyond the disclosed finding |
+| 10 | `app/app.py::taiga_run()` and `scripts/gitea-up.sh` untouched (Non-goals) | `git diff HEAD -- app/app.py scripts/gitea-up.sh` | pass | empty diff for both files |
+
+## Loop-bound trace (off-by-one check)
+Traced by hand and then confirmed empirically: `while [ "$attempt" -le "$TAIGA_UP_MAX_ATTEMPTS" ]` with `attempt` starting at 1 and incrementing once per full loop body — this runs the body exactly `TAIGA_UP_MAX_ATTEMPTS` times (attempts 1..N inclusive), matching the spec's "up to `TAIGA_UP_MAX_ATTEMPTS` total attempts." To make sure this wasn't just my own re-derivation being wrong in the same way the code might be wrong, I mutated the real script's comparison from `-le` to `-lt` (which would make it an off-by-one, running only N-1 attempts) and reran the real test suite: `test_exhausts_all_attempts_and_fails_loudly` and `test_max_attempts_env_override_is_honored` both failed with exactly the predicted wrong counts (`2 != 3`, `4 != 5`). Reverted immediately after (`diff` confirmed byte-identical to the pre-mutation file). This also served as the "genuinely exercises this fix, not a vacuous test" check called for in the task.
 
 ## Regression check
-Ran the full suite independently (case 17) rather than trusting
-`docs/implementation.md`'s reported count — got the identical `1198` total
-and a clean `OK`, with zero `FAIL`/`ERROR` lines on independent grep of the
-verbose output. (Note on process: an initial non-verbose background run
-appeared to stall/truncate — a harness/output-capture artifact tied to
-this suite's real-tmux-session tests taking a long time under `discover`,
-reproduced identically in this session's scratchpad from an earlier
-non-verbose attempt — not a real hang; re-running with `-v` and enough
-wall-clock budget completed cleanly at 160s. Flagging this only as a
-"give this suite 3+ minutes and use `-v`" operational note for future
-reviewer passes, not a project defect.) `git diff --stat` confirms the
-code-level diff is isolated to `install.sh` (34 lines) and
-`scripts/gitea-sync-project.sh` (1 line) — nothing else in the app/tests
-tree touched, so there is no broader surface to regress.
+Full existing suite run: `python3 -m unittest discover -s tests`
+
+- Baseline (this diff stashed, i.e. `backlog/e2e-fixes-round3` tip): **1205 tests, OK, 0 failures.**
+- With diff applied, run in isolation with no other test processes on the box: **1209 tests, OK, 0 failures** (1205 + the 4 new `test_taiga_up_retry.py` cases — matches the developer's claimed count exactly).
+
+One earlier run *with the diff applied* did show 4 failures, all in
+`PrivilegedEndToEndTests`/`PrivilegedDeployRunEndToEndTests` (`test_deploy_target.py`,
+`test_deploy_dispatch.py`) with errors like `switchboard-deploy-wrapper.sh: not found`.
+I did not take this at face value — these tests provision real system users, a
+real sshd session against 127.0.0.1, and real systemd units
+(`docs/spec.md`'s own Non-goals confirm this change touches nothing in that
+area), so a causal link to a `taiga-up.sh`-only diff plus an independent new
+test file is not plausible on its face. I re-ran exactly those 4 tests in
+isolation (both with and without the diff stashed) and they passed cleanly
+both times, then re-ran the entire suite once more end-to-end with no other
+test processes running concurrently on the box and got a clean `1209 OK`.
+Root cause: I had a stray overlapping background full-suite invocation of my
+own running at the same time as that one failing run, which raced the same
+real system user / sshd / systemd-unit provisioning the privileged tests use.
+This is pre-existing environment flakiness under concurrent invocation, not a
+regression introduced by this diff — confirmed, not assumed, via the
+baseline-vs-diff comparison above. Documenting it here since the developer's
+own implementation.md claim of "Ran 1209 tests ... OK" should not be taken on
+faith either, and this record shows it checks out under a clean run.
+
+Type-check/lint: `bash -n scripts/taiga-up.sh` and `shellcheck scripts/taiga-up.sh` both clean (see test case 5).
 
 ## Defects found
-None.
+None. Testing pass is clean.
 
 ---
 
 ## Spec coverage
-All six fixes in `docs/spec.md` are implemented exactly as specified and
-directly verified against the live diff (cases 1-10 above), not just
-against the spec's own description of them:
-- Fix 1 / item 22 (`taiga_board.py` cp) — covered, case 1.
-- Fix 2 / item 23 (`-it` removal) — covered, case 2.
-- Fix 3 / item 24 (`$STATE_DIR` chown) — covered, case 3.
-- Fix 4 / item 25 (`runtime.env`, 644, resolved values; `gitea-sync-
-  project.sh` CONFIG repoint; `switchboard.env` 600 untouched) — covered,
-  cases 4-6.
-- Fix 5 / item 26 (`.local` top-level chown, not broader) — covered, case 7.
-- Fix 6 / item 27 (`safe.directory '*'`, literal not glob, correct
-  placement/order, security reasoning independently re-derived and
-  confirmed) — covered, cases 8-10.
+All 5 acceptance criteria in `docs/spec.md` are implemented and covered by
+either the automated harness or a direct code/behavior trace (see test cases
+1-5 above; no gaps found). The spec's "Proposed approach" code block was
+compared line-by-line against `scripts/taiga-up.sh` and matches exactly,
+with one disclosed, verified-accurate deviation (the `SC1090` suppression
+comment, needed to satisfy the spec's own "shellcheck clean" criterion —
+see test case 9). Both Non-goals items that name specific files
+(`app/app.py::taiga_run()`, `scripts/gitea-up.sh`) were confirmed untouched
+(test case 10). The other two Non-goals (root-cause fix, pre-flight `df`
+check) are correctly absent from the diff — nothing in the script attempts
+either.
 
-The spec's literal shell-level acceptance criteria that require a real
-multi-user box (`sudo -u switchboard-svc touch ...`, `sudo -u dev cat
-runtime.env`, a real Gitea push/poll round-trip, a real `pipx install`
-under `.local`) cannot be executed in this environment — this is the same
-documented, unavoidable limitation `docs/implementation.md` itself calls
-out (no real `useradd`/multi-user boundary available here). Per the task
-brief, direct line-by-line code verification (cases 1-16 above) is the
-strongest verification actually available pre-Proxmox, and every one of
-those literal acceptance criteria has been traced to a concrete, correct
-code change that would produce the claimed behavior on a real box (e.g.
-case 4's live reproduction of the exact `runtime.env` heredoc against
-synthetic `RUN_USER`/`PROJECTS_DIR` values, which is the closest
-in-environment proxy for "sudo -u dev cat runtime.env shows correct
-values" available without a second real user account).
-
-## Correctness review (independent re-read of the diff)
-Read `git diff -- install.sh scripts/gitea-sync-project.sh` directly.
-
-- Fixes 3 and 6 both land at the single required insertion point (right
-  after the `SVC_USER` `useradd` line, since `$SVC_USER` doesn't exist
-  before that) — confirmed present exactly once each, in valid order
-  (`useradd` → `chown $STATE_DIR` → `safe.directory`), matching the
-  spec's explicitly-allowed ordering.
-- Fix 4's `runtime.env` write is placed after `$ENV_FILE`'s own
-  `chown`/`chmod 600`, and after `$PROJECTS_DIR` is set (line 262, well
-  before line 493) — both variables are genuinely in scope, confirmed by
-  reading the surrounding 250 lines of the file, not just trusting the
-  spec's own line-number claims (which had already shifted slightly from
-  the original spec references, as `docs/implementation.md` notes — the
-  live positions were re-confirmed directly here).
-- Fix 5's chown target is exactly `/home/$RUN_USER/.local` — read the
-  full list of every `chown` call in `install.sh` (case 7's evidence) to
-  rule out any accidental broadening to the home directory itself or
-  narrowing that would miss `.local/share`; the new target is a strict
-  superset of the old `$CODE_SERVER_DIR`, as the spec claims.
-- Fix 6's `git config --global --add safe.directory '*'` is run via
-  `sudo -u "$SVC_USER"` so it lands in `SVC_USER`'s own `~/.gitconfig`
-  (a real home dir exists — `SVC_USER` was created with `-m`), not
-  root's or a system-wide config — correctly scoped to the account that
-  actually needs it.
-- No off-by-one, quoting, or ordering errors found anywhere in the diff.
-  All `cp`/`chown`/`mkdir` paths use the same double-quoted
-  `"$VAR/literal"` construction pattern already established elsewhere in
-  the file (fix 1's `cp` line, checked side-by-side against its two
-  siblings, is byte-for-byte the same pattern).
-
-## Security review
-Fix 6 (`safe.directory '*'`) is the one deliberate security-relevant
-change in this cycle, and was independently re-derived rather than taken
-on trust (case 9-10 above):
-- Confirmed by reading every `["git", ...]` call site in `app/teams.py`
-  and `app/app.py` that SVC_USER never runs a git *write* command
-  directly — the only writes (`worktree add`/`remove`) are dispatched via
-  `_run_run_user_command()`, i.e. `sudo -u RUN_USER`, already crossing
-  into the less-privileged account before touching the filesystem. The
-  spec's "no privilege crossing beyond what the account already
-  effectively has" claim holds under direct inspection, not just as an
-  assertion in the code comment.
-- `safe.directory '*'` only affects git's ownership-mismatch *refusal*;
-  it grants no new filesystem permission. `PROJECTS_DIR` and its project
-  subdirectories are left at `mkdir -p`'s default (non-restrictive) mode
-  with no ACL/group broadening added anywhere in this diff, so SVC_USER's
-  actual read access is unchanged by this fix — it already had ambient
-  read access via ordinary world-readable permissions (matching the
-  existing `app.py:924` comment/precedent for `load_grounding()`), and
-  this fix only unblocks git's own separate ownership check on top of
-  that pre-existing access.
-- `'*'` (the literal string) is required, not a path glob, because git's
-  own `safe.directory` semantics only match a literal configured path or
-  the literal string `*` — confirmed against git's documented behavior;
-  a shell glob would either be expanded by the shell before git ever
-  sees it (harmless here since it's single-quoted) or, if unquoted,
-  would silently fail to protect anything git actually matches on,
-  which the spec's own reasoning already correctly identifies.
-- No injection surface: no external/user input flows into any of the
-  six changed lines (all values are install-time shell variables set
-  earlier in the same script, or hardcoded strings/paths).
-- Fix 4 correctly avoids the shortcut of loosening `switchboard.env`
-  itself — confirmed `chmod 600 "$ENV_FILE"` is untouched and the new
-  `runtime.env` contains only `RUN_USER`/`PROJECTS_DIR`, no secret
-  key ever gets routed through this file (verified by reading the
-  entire new block — no `GITEA_API_TOKEN`/`SIMPLE_PASSWORD`/
-  `TOTP_SECRET`-shaped variable appears anywhere near it).
-
-## Simplicity/scope review
-All six changes are minimal, single-purpose, additive-or-corrective edits
-matching the spec's exact proposed code verbatim — no new abstractions, no
-unrelated refactoring, no scope creep. `git diff --stat` confirms the code
-surface: `install.sh | 34 +-`, `scripts/gitea-sync-project.sh | 2 +-`
-(`docs/*.md` changes are documentation only). `docs/BACKLOG.md`'s
-additions (items 22-33) are pre-existing backlog documentation from the
-E2E test report, not new scope introduced by this cycle's code — items
-28-33 are explicitly out of scope for this cycle and untouched in
-`install.sh`.
+## Isolation check (this round's own diff vs. round 3)
+`git diff backlog/e2e-fixes-round3 HEAD --stat` is empty — `HEAD` on this
+branch is still exactly `backlog/e2e-fixes-round3`'s tip (no commits made
+yet this round). The only changes present are uncommitted working-tree
+changes: `git status --porcelain` shows exactly `docs/implementation.md`
+(modified), `docs/spec.md` (modified), `scripts/taiga-up.sh` (modified),
+and `tests/test_taiga_up_retry.py` (untracked/new) — nothing left over from
+an earlier round, nothing extraneous.
 
 ## Findings (most severe first)
-None. No must-fix, should-fix, or nit findings.
+None — no must-fix, should-fix, or nit findings from the correctness,
+security, or simplicity passes. The diff is a near-verbatim implementation
+of the spec's own proposed code (one disclosed, verified line added), the
+new test file follows this session's already-proven real-script-with-
+stubbed-`docker` technique faithfully, and there is no unnecessary
+abstraction, dead code, or scope creep beyond `scripts/taiga-up.sh` and its
+dedicated test file.
 
 ## Follow-ups (non-blocking)
-- The spec's literal shell-level acceptance criteria (real `sudo -u`
-  round-trips, a real Gitea push/poll cycle, a real `pipx install`) still
-  need a second real Proxmox E2E pass to fully close the loop, exactly as
-  `docs/implementation.md`'s "Known limitations" already states. Not a
-  blocker for this review — no environment capable of exercising a real
-  multi-user `useradd`/`chown` boundary exists here, and the code-level
-  verification in this review is as strong as is achievable pre-Proxmox.
-- Items 28-33 (already logged in `docs/BACKLOG.md` by the same E2E test
-  report) remain for a future cycle — out of scope here, noted only so
-  the next `product-manager` pass doesn't need to re-discover them.
+- None specific to this item. (The spec's own Non-goals already list the
+  known adjacent follow-ups — root-cause investigation, `df` pre-flight
+  check, `app.py` stderr surfacing — as explicitly out of scope, not as
+  gaps in this change.)
 
 ## Overall verdict
 Approve.

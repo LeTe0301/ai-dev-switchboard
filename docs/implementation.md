@@ -1,153 +1,163 @@
-# Implementation: install.sh fixes from Proxmox E2E test round 1 (items 22-27)
+# Implementation: taiga-up.sh resilience from Proxmox E2E test round 4 (item 30)
 
 ## Summary
-Applied all six precisely-diagnosed fixes from `docs/spec.md` to `install.sh`
-(fix 4 also touches `scripts/gitea-sync-project.sh`): a missing `cp` for
-`app/taiga_board.py` that crash-loops every fresh install, a `-it` flag in a
-printed non-interactive docker command, a missing `chown` of `$STATE_DIR`
-itself, a world-readable `runtime.env` sibling file so `gitea-sync-project.sh`
-(run as `RUN_USER`) can read `RUN_USER`/`PROJECTS_DIR` without needing access
-to the 600-mode secrets file, a `chown` of the top-level `~RUN_USER/.local`
-instead of just the code-server subtree, and a `git config --global
-safe.directory '*'` for `SVC_USER` so its read-only git inspection calls
-against `RUN_USER`-owned project directories don't get blocked by git's
-"dubious ownership" protection.
+Rewrote `scripts/taiga-up.sh` (docs/BACKLOG.md item 30) to detect and
+recover from a real, reproduced Docker Compose port-bind race that can
+leave `taiga-gateway` (the Taiga stack's only public entrypoint) created
+but never network-attached. Previously the script was a 6-line wrapper
+that ran `docker compose up -d` and exec'd out with whatever exit code
+Compose returned — nothing downstream inspected it, so one bad pass left
+the feature silently, indefinitely wedged (correctly reported "off" by
+`taiga-status.sh`, but with no automatic path back to "on"). The new
+script attempts `up -d`, checks `taiga-gateway`'s resulting state via the
+same `docker compose ps taiga-gateway --format '{{.State}}'` idiom
+`taiga-status.sh` already uses, and — if not `running` — removes just
+that one container and retries, up to `TAIGA_UP_MAX_ATTEMPTS` (default 3,
+env-overridable) total attempts, before failing loudly with a specific,
+actionable stderr message.
 
 ## Root cause
-Each of the six bugs stems from the same class of gap: the existing test
-suite mocks `useradd`/`chown`/multi-user boundaries rather than exercising
-them for real, so none of these could have been caught without a real
-Proxmox install. Specifics:
-- **Item 22**: `app/taiga_board.py` was added to the app but never added to
-  the "-- App + engines --" `cp` block in `install.sh`, so the installed
-  `/opt/ai-dev-switchboard/` tree is missing a module `app.py` imports —
-  `ai-dev-switchboard.service` fails immediately with `ModuleNotFoundError`.
-- **Item 23**: the printed Gitea admin-bootstrap `docker exec` command
-  carried `-it` even though every value is passed as a flag (nothing about
-  the command is interactive) — `-it` requires an attached TTY and fails
-  when copy-pasted into a non-interactive shell (e.g. `pct exec`).
-- **Item 24**: `install.sh` created `$STATE_DIR` but only ever chowned its
-  later-created `uploads/` subdirectory, never `$STATE_DIR` itself, so
-  `SVC_USER` couldn't write directly under it (e.g. `GITEA_REPO_MAP_FILE`).
-- **Item 25**: `gitea-sync-project.sh` runs as `RUN_USER` (via `sudo -u`)
-  but sourced `/etc/ai-dev-switchboard/switchboard.env`, which is
-  `600`/`SVC_USER`-owned — `RUN_USER` can't read it, `source` fails under
-  `set -euo pipefail`, and the script exits 1 silently every poll interval.
-- **Item 26**: the code-server chown only covered
-  `/home/$RUN_USER/.local/share/code-server`, two levels below `.local`
-  itself; `.local` and `.local/share` were created by `mkdir -p` as
-  `root:root` and never reassigned, so anything else writing under
-  `~/.local` (e.g. `pipx`/`pip install --user`) hits `PermissionError`.
-- **Item 27**: `_check_git_repo_state()` (`app/teams.py`) runs
-  `git -C workdir rev-parse --is-inside-work-tree` as `SVC_USER` against
-  `RUN_USER`-owned project directories. Git ≥2.35.2's "dubious ownership"
-  protection (CVE-2022-24765 mitigation) refuses to operate across that
-  user boundary unless the path is in the caller's `safe.directory` list,
-  which `install.sh` never configured — every `team/start` call failed with
-  a flatly wrong `"not a git repository"` error.
+Not applicable in the "logic defect" sense — root cause of the underlying
+transient port-bind race is explicitly not pinned down by the E2E tester
+and is out of scope for this fix (see spec's Non-goals). What this fixes
+is the *lack of detection and recovery*: `taiga-up.sh` had no state check
+at all, so a wedged `taiga-gateway` container was indistinguishable from a
+successful start as far as the script (and anything calling it) was
+concerned.
 
 ## Changes by file
-- `install.sh`:
-  - Added `cp "$REPO_DIR/app/taiga_board.py" "$INSTALL_DIR/taiga_board.py"`
-    to the "-- App + engines --" step (fix 1 / item 22).
-  - Removed `-it` from the printed `docker exec` admin-bootstrap command in
-    the `--with-git-hosting` summary block (fix 2 / item 23).
-  - Added `chown "$SVC_USER:$SVC_USER" "$STATE_DIR"` immediately after the
-    `SVC_USER` `useradd` line (fix 3 / item 24).
-  - Added a `RUNTIME_ENV_FILE="$CONFIG_DIR/runtime.env"` write (mode 644,
-    containing only `RUN_USER`/`PROJECTS_DIR`) right after `$ENV_FILE`'s
-    own `chown`/`chmod 600` (fix 4 / item 25).
-  - Changed the code-server chown target from `$CODE_SERVER_DIR` to
-    `/home/$RUN_USER/.local` (fix 5 / item 26).
-  - Added `sudo -u "$SVC_USER" git config --global --add safe.directory
-    '*'` right after the `SVC_USER` `useradd` line, alongside fix 3 (fix 6
-    / item 27).
-- `scripts/gitea-sync-project.sh`: changed `CONFIG` from
-  `/etc/ai-dev-switchboard/switchboard.env` to
-  `/etc/ai-dev-switchboard/runtime.env` (fix 4 / item 25) — same
-  fallback-default shape retained, so a box that hasn't re-run `install.sh`
-  yet still degrades to the existing `dev`/`/home/dev/projects` defaults
-  rather than a hard failure.
-
-All six fixes match the spec's exact "Proposed approach" code verbatim;
-live line numbers had shifted only slightly from the spec's references
-(off by a handful of lines), confirmed by reading the live file before
-editing — no other drift found.
+- `scripts/taiga-up.sh` — rewritten per `docs/spec.md`'s "Proposed
+  approach" (implemented essentially verbatim, one addition — see
+  "Deviations from spec" below):
+  - Header comment explains the fix's reasoning (the port-bind race, why a
+    bare `docker start` retry can't fix it, and the detect-then-retry-
+    then-fail-loudly mechanism), replacing the old header's "no extra
+    locking" note (superseded — the script is no longer just an idempotent
+    one-shot `exec`).
+  - `TAIGA_UP_MAX_ATTEMPTS="${TAIGA_UP_MAX_ATTEMPTS:-3}"` — new
+    env-overridable tunable, matching this project's established
+    `${VAR:-default}` convention.
+  - `COMPOSE=(docker compose -f docker-compose.yml -f
+    docker-compose.override.yml)` array, reused across all three Compose
+    invocations (`up -d`, `ps taiga-gateway`, `rm -f taiga-gateway`)
+    instead of the old single inline `exec`.
+  - `while` loop: run `up -d`, check `taiga-gateway`'s state, `exit 0` on
+    `running`. On any other state, print a stderr message naming the
+    state and attempt count, then (only if attempts remain) `rm -f
+    taiga-gateway` (the specific, wedged container only — never a full
+    stack `down`, so the other 8 already-healthy containers are
+    undisturbed) and `sleep 2` before the next attempt.
+  - After the loop exits (all attempts exhausted): a final stderr message
+    naming the container, the attempt count, and where to look next
+    (`docker compose logs taiga-gateway`, `docker network ls`, disk
+    space), then `exit 1`.
+- `tests/test_taiga_up_retry.py` (new) — standalone test harness covering
+  the retry/detection/failure logic (see "How to verify locally" below).
 
 ## Key decisions / tradeoffs
-- Fixes 3 and 6 both had to land after the `SVC_USER` `useradd` line
-  (since `$SVC_USER` doesn't exist until then) — implemented them
-  back-to-back at that single insertion point, per the spec's own
-  instruction that either order is fine as long as both come after
-  `useradd`.
-- Fix 6's `safe.directory '*'` is a real, if bounded, security-relevant
-  change (flagged as such by the spec itself for extra review scrutiny):
-  `SVC_USER` only ever runs read-only git inspection commands directly;
-  all git writes already cross into `RUN_USER` via `sudo -u`, so this
-  doesn't hand out any privilege the account didn't already effectively
-  have. `*` (not a path glob) is required because git's `safe.directory`
-  only matches literal paths or the literal string `*`, and projects are
-  created dynamically after install so a fixed literal-path list can't
-  work here.
-- Fix 4 deliberately keeps `switchboard.env` at 600 and introduces a
-  separate, narrow, world-readable `runtime.env` holding only two
-  non-secret values, rather than loosening the secrets file itself (which
-  would leak `GITEA_API_TOKEN`/`SIMPLE_PASSWORD`/`TOTP_SECRET` to every
-  local account, including `RUN_USER`'s own coding-agent sessions).
+- Implemented the spec's "Proposed approach" code essentially verbatim —
+  it was already near-final. One line added beyond the spec's literal
+  code block: a `# shellcheck disable=SC1090` directive above the
+  `source "$CONFIG"` line (see "Deviations from spec").
+- Test harness follows the exact precedent `tests/test_create_enumerate_
+  bridges.py` established this session: stub the one non-pure external
+  dependency (`docker`) as a shell function (shell functions take
+  priority over `PATH` executables, so no real Docker daemon or binary is
+  needed) and run the *real* script, not a reimplementation. Since
+  `taiga-up.sh` is the entire unit under test (unlike `_enumerate_
+  bridges()`, which is one function inside a larger file), the harness
+  reads the whole script's source verbatim from disk and appends it after
+  the `docker`/`sleep` stub function definitions in one generated bash
+  script, then runs that via `subprocess.run(["bash", "-c", ...])`.
+- The `docker` stub tracks how many times `up -d` has been called via a
+  counter *file* (not a shell variable) because `state=$(...)` is a
+  command substitution, which forks a subshell — a plain variable
+  increment inside the stub would not survive back to the next `ps` call
+  in the same script. `rm -f taiga-gateway` calls are logged to a second
+  file for the same reason, so the harness can assert exactly how many
+  retries fired.
+- `sleep` is also stubbed to a no-op. This is not part of the logic under
+  test (it exists to avoid hammering a wedged Compose stack), and
+  stubbing it keeps the exhaustion test fast (confirmed: full 4-test file
+  runs in ~0.04s, not ~4s+, proving the stub is actually taking effect and
+  not silently falling through to a real `sleep 2`).
+- `TAIGA_DIR` is pointed at an empty temp directory per test — the stub
+  never inspects its contents, only the script's own `cd "$TAIGA_DIR"`
+  needs it to exist. `/etc/ai-dev-switchboard/switchboard.env` does not
+  exist in this sandbox (confirmed directly), so the unconditional
+  `CONFIG=/etc/ai-dev-switchboard/switchboard.env` line's `[ -f "$CONFIG"
+  ] && source "$CONFIG"` is a safe no-op in the test environment, same as
+  it is for every other script in `scripts/` that uses this exact idiom.
+- Covered four cases: (1) `running` on attempt 1 → exit 0, zero `rm`/sleep
+  overhead on the common path (spec's first acceptance criterion,
+  explicit about "no unnecessary retry/sleep delay added to the normal
+  path"); (2) recovers on attempt 2 after exactly one targeted `rm -f
+  taiga-gateway`; (3) exhausts all `TAIGA_UP_MAX_ATTEMPTS` (default 3) and
+  exits 1 with the exact expected stderr wording (container name, attempt
+  count, and all three "look next" pointers); (4) confirms the
+  `TAIGA_UP_MAX_ATTEMPTS` env override is honored (5 attempts, 4 retries)
+  rather than only testing the default.
 
 ## Deviations from spec
-None. All six fixes were applied exactly as specified in
-`docs/spec.md`'s "Proposed approach"/code-block sections, at the (slightly
-shifted but easily located) equivalent points in the live file.
+- Added `# shellcheck disable=SC1090` above the `source "$CONFIG"` line,
+  which is not present in the spec's literal code block. Without it,
+  `shellcheck scripts/taiga-up.sh` reports one warning (`SC1090:
+  ShellCheck can't follow non-constant source`) — a pre-existing,
+  unaddressed warning present identically in `taiga-status.sh`,
+  `gitea-up.sh`, and `taiga-down.sh` today (confirmed by running
+  `shellcheck` against each). The spec's acceptance criteria explicitly
+  require "`bash -n` / `shellcheck` clean," so I added the directive
+  (matching the inline-suppression convention `ct/create.sh:359` already
+  uses for a different warning) rather than leaving the new script with a
+  warning the spec asked to avoid. This is a lint annotation only — no
+  behavior change, and the sourcing logic is otherwise character-for-
+  character identical to the spec's code block. I did not touch the other
+  three scripts that share this same warning — out of scope for this fix.
+- Nothing else deviates. `app/app.py`'s `taiga_run()` and
+  `scripts/gitea-up.sh` were not touched, per the spec's Non-goals.
 
 ## Known limitations
-- As called out in the task brief and the spec itself: no existing test
-  suite can exercise a real fresh `install.sh` run against real
-  `useradd`/`chown`/multi-user boundaries — that is exactly the class of
-  bug this whole round exists because the mocked test suite couldn't catch
-  it. Verification for this cycle is therefore necessarily indirect (see
-  below); a second real Proxmox E2E pass, not available in this
-  environment, is the only way to fully close the loop on all six
-  acceptance criteria as literally written in the spec (e.g. "`sudo -u
-  switchboard-svc touch /var/lib/ai-dev-switchboard/testwrite` succeeds
-  after a fresh install").
-- No existing `tests/test_install_*.py` test asserted on the specific
-  `cp`/`chown` lines being changed (confirmed by inspection — see
-  "How to verify locally" below), so none needed updating, and none was
-  added: the spec/task brief and this project's own precedent
-  (`tests/test_install_set_env.py`) scope new install.sh test
-  infrastructure to what already exists, and building a real
-  useradd/chown harness was explicitly out of scope for this cycle.
+- This can't be exercised against a real Docker daemon running a real
+  Taiga stack in this sandbox (no Docker Compose plugin available here),
+  consistent with `tests/test_taiga.py`'s own documented limitation for
+  `taiga_run()`. What *is* fully covered by the new harness is the
+  script's own control flow — the part with real risk of a bug (retry
+  bound, which container gets removed, exit codes, exact stderr wording)
+  — by running the real, unmodified script against a stubbed `docker`
+  that simulates the reported failure mode precisely (state stays
+  non-`running` until a configurable attempt number). This was not
+  "untestable"; the same stub-the-one-external-command technique already
+  proven in this session's `test_create_enumerate_bridges.py` worked
+  without modification.
+- The harness does not simulate `docker compose up -d` itself failing
+  (non-zero exit) — the script's `set -uo pipefail` (no `-e`) means a
+  failed `up -d` call falls through to the state check exactly like a
+  successful-but-not-running one does, so this is already covered by the
+  same code path the "exhausts all attempts" test exercises; a
+  dedicated case wasn't added since it would exercise identical logic to
+  an existing test, not new behavior.
 
 ## How to verify locally
-1. **Syntax**: `bash -n install.sh && bash -n scripts/gitea-sync-project.sh`
-   — both clean.
-2. **Lint**: `shellcheck install.sh` and `shellcheck scripts/gitea-sync-project.sh`
-   — only pre-existing warnings remain (`install.sh:70` SC2015, an
-   unrelated `A && B || C` note; `install.sh:601` SC2001, an unrelated
-   `sed` style note; `gitea-sync-project.sh:38` SC1090, inherent to
-   `source "$CONFIG"` with a non-constant/config-derived path, present
-   before this change too) — nothing flagged in any line touched by this
-   cycle.
-3. **Diff review**: `git diff -- install.sh scripts/gitea-sync-project.sh`
-   confirms all six changes land exactly as specified.
-4. **Existing test assertions on changed lines**: confirmed no
-   `tests/test_install_*.py` test asserts the specific `cp`/`chown` lines
-   changed here (`grep -n "taiga_board\|teams.py\|app.py\|chown\|STATE_DIR\|CODE_SERVER_DIR\|safe.directory\|switchboard.env\|runtime.env" tests/test_install_*.py`).
-   Confirmed `tests/test_install_update.py`'s `RunUserSvcUserDefaultTests`
-   harness (which extracts and runs the literal "-- Users --" block from
-   `install.sh`) extracts only up to (exclusive of) the `id "$RUN_USER"`
-   line — well before this cycle's insertion point after `id "$SVC_USER"`
-   — so it's unaffected by fixes 3/6 landing there.
-5. **Old-CONFIG-path regression check for fix 4**: grepped `tests/` for
-   any test asserting the old `/etc/ai-dev-switchboard/switchboard.env`
-   path in `gitea-sync-project.sh`'s context; `tests/test_gitea_sync_project.py`
-   sets `PROJECTS_DIR` directly via env var and never touches
-   `/etc/ai-dev-switchboard/` at all (its own comment already documents
-   this — "No /etc/ai-dev-switchboard/switchboard.env on the test box"),
-   so the `CONFIG=` path rename doesn't affect it.
-6. **Full regression run**: `python3 -m unittest discover -s tests` — all
-   1198 tests pass (`Ran 1198 tests ... OK`). Also ran the four most
-   directly relevant files individually for a clean, uncluttered result:
-   `python3 -m unittest tests.test_gitea_sync_project tests.test_install_ollama tests.test_install_set_env tests.test_install_update -v`
-   — 54 tests, all `ok`.
+```bash
+# Syntax + lint, zero-warning baseline:
+bash -n scripts/taiga-up.sh
+shellcheck scripts/taiga-up.sh
+# -> both exit 0, no warnings
+
+# New retry/detection/failure-signal harness:
+python3 tests/test_taiga_up_retry.py -v
+# -> Ran 4 tests ... OK (succeeds-on-first-attempt, succeeds-after-one-
+#    retry, exhausts-all-attempts-with-expected-stderr, and
+#    TAIGA_UP_MAX_ATTEMPTS-env-override cases)
+
+# Full existing suite -- no regressions:
+python3 -m unittest discover -s tests
+# -> Ran 1209 tests ... OK
+```
+
+All commands above were run during implementation: `bash -n` passed,
+`shellcheck` reported zero warnings, the new 4-test harness passed on its
+own (0.041s -- confirms the `sleep` stub is actually taking effect, not
+silently falling through to a real 2s sleep), and the full suite
+(including those 4 new tests, 1205 → 1209) passed with no failures or
+errors.

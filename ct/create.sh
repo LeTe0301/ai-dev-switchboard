@@ -65,7 +65,11 @@ _enumerate_bridges() {
     BRIDGE_MENU_OPTS=()
     local _br _vnet
     while IFS= read -r _br; do
-        [ -n "$_br" ] && BRIDGE_MENU_OPTS+=("$_br" "kernel bridge")
+        [ -n "$_br" ] || continue
+        case "$_br" in
+            fwbr[0-9]*i[0-9]*) continue ;;  # item 32: Proxmox's own per-container firewall bridge, not a real uplink
+        esac
+        BRIDGE_MENU_OPTS+=("$_br" "kernel bridge")
     done < <(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1)
     if [ -f /etc/pve/sdn/vnets.cfg ]; then
         while IFS= read -r _vnet; do
@@ -84,7 +88,7 @@ INSTALL_MODE=$(whiptail --title "ai-dev-switchboard" --menu \
 
 DEFAULT_CT_HOSTNAME="ai-dev-switchboard"
 DEFAULT_STORAGE="local-lvm"
-DEFAULT_DISK_GB="8"
+DEFAULT_DISK_GB="20"
 DEFAULT_CORES="2"
 DEFAULT_MEM_MB="2048"
 DEFAULT_BRIDGE="vmbr0"

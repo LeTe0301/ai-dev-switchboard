@@ -1197,6 +1197,48 @@ class RealTmuxHeadlessTests(unittest.TestCase):
         self._no_leftover_sessions()
         self._no_leftover_rundir()
 
+    def test_tmux_new_session_nonzero_returncode_surfaces_stderr_not_generic_vanished(self):
+        # docs/spec.md fix 1 (backlog item 28) diagnostic addition: a real
+        # `tmux new-session -d` failure (rc != 0) must return early with
+        # `result.stderr` folded into the error message, not fall through to
+        # _run_headless_session()'s generic "vanished with no rc" fallback.
+        # Forced here via a genuine tmux failure mode (duplicate session
+        # name) rather than a mock, through the full real agent_run() path.
+        _write_engine_file(self.engines_dir, "dupe.engine", """\
+            LABEL=Dupe
+            CMD=unused
+            HEADLESS_CMD=echo hi
+            HEADLESS_FORMAT=plain
+            HEADLESS_PROMPT=arg
+            """)
+        fixed_run_id = f"{_RUN_ID_SCOPE}-fixedid-duplicatesession"
+        orig_run_id = teamsmod._run_id
+        teamsmod._run_id = lambda: fixed_run_id
+        self.addCleanup(lambda: setattr(teamsmod, "_run_id", orig_run_id))
+        session = f"switchboard-headless-{fixed_run_id}"
+
+        # Pre-occupy the exact session name agent_run() will try to create,
+        # so its own `tmux new-session -d -s session ...` collides and tmux
+        # itself exits non-zero with "duplicate session: ..." on stderr.
+        r = subprocess.run(["tmux", "new-session", "-d", "-s", session, "-c", "/tmp", "sleep", "30"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, f"failed to pre-occupy session: {r.stderr}")
+        self.addCleanup(lambda: subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True))
+
+        result = teamsmod.agent_run("dupe", self.workdir, "go", timeout=5)
+        self.assertFalse(result["ok"])
+        self.assertIsNone(result["exit_code"])
+        self.assertFalse(result["cancelled"])
+        self.assertIn("failed to start headless session:", result["error"])
+        self.assertIn("duplicate session", result["error"])
+        # The success path's own tail-through to _run_headless_session()
+        # must NOT have run -- confirmed indirectly: result["text"] is the
+        # _result() default ("", set explicitly in the new failure branch),
+        # never "hi" (which "echo hi" would have produced had the tailer
+        # actually run against a session that was never this call's own).
+        self.assertEqual(result["text"], "")
+        self._no_leftover_rundir()
+
     def test_sigterm_cleanly_stops_and_is_reported_as_cancelled(self):
         script = _write_script(self.scripts_dir, "hang.py", """\
             #!/usr/bin/env python3
