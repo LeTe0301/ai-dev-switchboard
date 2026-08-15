@@ -655,3 +655,175 @@ around. Two nit-level findings (a missing `UPDATE=0` test case in
 `GuardedRestartBlockTests`, and a doc-accuracy slip about mkdir/update-pull
 ordering in `docs/implementation.md`) -- neither blocks approval, both
 optional to pick up in a future cycle.
+
+# Test & Review: Backlog item 17 part 1 -- unprivileged per-project origin detection + GitHub REST API client (backend-only)
+
+## Scope
+`docs/spec.md`'s 14 acceptance criteria for item 17 part 1: (1) origin
+classification (`_project_origin_url`/`_classify_origin_url`/
+`detect_project_origin` -- local/github/external/none), (2) a GitHub REST
+client (`_github_api`/`_github_api_raw`) mirroring `_gitea_api`/
+`_gitea_api_raw`'s exact contract, (3) a global in-memory rate-limit
+cooldown gate driven by `X-RateLimit-Remaining`/`X-RateLimit-Reset`/
+`Retry-After`, (4) four read+write convenience functions
+(`github_list_open_prs`, `github_pr_diff`, `github_list_branches`,
+`github_post_pr_comment`), and (5) confirmation that this cycle is inert
+(no route, no poll-loop wiring, no item 8 integration). Per this session's
+recorded scope decision (`docs/BACKLOG.md` item 17, `docs/spec.md`
+"Settled scope decision"), `github_post_pr_comment()`'s lack of a
+propose-then-approve gate is deliberate, authorized design, not reviewed
+as a finding here.
+
+## Test cases
+
+| # | Criterion / case | Method | Result | Evidence |
+|---|---|---|---|---|
+| 1 | Loopback origin (`127.0.0.1`, any port) -> `kind: "local"` | automated | pass | `tests/test_github_api.py::OriginDetectionTests::test_loopback_https_form_classifies_local`, `test_loopback_any_port_classifies_local` |
+| 2 | `https://github.com/owner/repo.git` -> `github`, owner/repo, `.git` stripped | automated | pass | `test_github_https_form` |
+| 3 | `git@github.com:owner/repo.git` (scp-shorthand) -> same as HTTPS | automated | pass | `test_github_scp_shorthand_form_matches_https` |
+| 4 | `ssh://git@github.com/owner/repo.git` -> same as HTTPS | automated | pass | `test_github_ssh_scheme_form_matches_https` |
+| 5 | No `origin` / not a git repo -> `kind: "none"`, never raises | automated | pass | `test_detect_project_origin_no_remote_returns_none_kind`, `test_detect_project_origin_never_raises_for_not_a_repo` |
+| 6 | Non-loopback, non-github host -> `external`, owner/repo `None` | automated | pass | `test_non_loopback_non_github_host_classifies_external` |
+| 7 | Case-insensitive `github.com` match | automated | pass | `test_github_host_case_insensitive` |
+| 8 | `_github_api`/`_github_api_raw`: 200 -> parsed body; HTTPError never raises; only URLError/TimeoutError -> `ConnectionError` | automated | pass | `GithubApiTests.test_success_sends_expected_request_and_parses_json`, `test_http_error_with_json_body_returns_status_and_parsed_body_never_raises`, `test_connection_failure_raises_connection_error`, `test_timeout_raises_connection_error`, `test_raw_http_error_returns_status_and_text_never_raises` |
+| 9 | Every request includes `Authorization: Bearer`, non-empty `User-Agent`, `X-GitHub-Api-Version` | automated | pass | `test_success_sends_expected_request_and_parses_json` (asserts on captured `Request` headers) |
+| 10 | `X-RateLimit-Remaining: 0` + `X-RateLimit-Reset` epoch -> short-circuits (429, zero `urlopen` calls) before epoch, proceeds after | automated | pass | `test_rate_limit_remaining_zero_trips_cooldown_short_circuits_next_call` (asserts `urlopen` call count) |
+| 11 | `403` + `Retry-After: 30` -> same short-circuit-then-recover | automated | pass | `test_retry_after_header_trips_cooldown_short_circuits_next_call` |
+| 12 | Convenience functions build correct method+path(+body), return `{"ok": True, ...}` | automated | pass | `GithubConvenienceTests.test_list_open_prs_builds_correct_call_and_shape`, `test_pr_diff_builds_correct_call_and_shape`, `test_list_branches_builds_correct_call_and_shape`, `test_post_pr_comment_builds_correct_call_and_body` |
+| 13 | `GITHUB_TOKEN` unset -> `{"ok": False, ...}`, zero calls to `_github_api`/`_github_api_raw` | automated | pass | `test_missing_token_short_circuits_every_convenience_function_no_client_call` (fakes raise `AssertionError` if called) |
+| 14a | No new Flask route / HTML/JS template change | manual structural check | pass | `git diff app/app.py \| grep -i "Flask\|@app.route\|def do_GET\|def do_POST"` -> no output; `git diff --stat -- 'app/templates/*' 'app/static/*'` -> no output |
+| 14b | `git -C PROJECTS_DIR/<name> remote get-url origin` runs unprivileged, no `sudo`/`RUN_USER` hand-off | automated + manual read | pass | `test_project_origin_url_runs_git_remote_get_url_unprivileged` asserts `"sudo" not in cmd`; direct read of `_project_origin_url()` source confirms the only subprocess call is the bare `git -C ...` argv, no `sudo -u` anywhere in the new code |
+| 15 | Inert this cycle -- no call site to any new function outside the new test file | manual grep | pass | `grep -rn` for all 10 new function/constant names across `*.py/*.sh/*.html/*.js`, excluding `tests/test_github_api.py` and `docs/` -> only definitions in `app/app.py`, no call sites |
+| 16 | Adversarial host classification (beyond dev's own test list) -- lookalike hosts, IPv6, decimal/octal loopback forms, `localhost`, unusual scp forms | manual (own script, `_classify_origin_url` called directly) | pass | See "Adversarial classification testing" below |
+| 17 | Token never logged/surfaced in an error message; safe, clear error on unset token for a write call | manual read + grep | pass | `grep -n "GITHUB_TOKEN" app/app.py` -- only appears in the `os.environ.get` default, the `Authorization` header f-string (sent, never returned/logged), and `if not GITHUB_TOKEN` checks; `_github_token_missing_error()` returns a fixed string with no token interpolation |
+| 18 | Cooldown never lowered by a stale/racing update | automated | pass | `test_cooldown_never_lowered_by_a_later_smaller_signal` |
+| 19 | Malformed/non-numeric rate-limit headers tolerated, fall back to `GITHUB_RATE_LIMIT_FALLBACK_SECONDS` | automated | pass | `test_malformed_rate_limit_reset_falls_back_to_default_cooldown` |
+
+### Adversarial classification testing (item 1 in the reviewer's task, done independently of the developer's own test list)
+Ran `_classify_origin_url()` directly against a battery of adversarial
+inputs not in `tests/test_github_api.py`:
+- Lookalike hosts: `github.com.evil.example`, `not-github.com`,
+  `github.com@evil.example` (userinfo-confusion attempt),
+  `evil.example/github.com/owner/repo` (path-confusion attempt),
+  `xn--github-com` (punycode-lookalike attempt) -- **all correctly
+  classify as `"external"`**, never `"github"`.
+- Loopback lookalikes/alternate representations: `127.0.0.1.evil.example`
+  (subdomain trick), `0177.0.0.1` (octal), `2130706433` (decimal), `[::1]evil`
+  (malformed bracket), bare `localhost` (hostname, not a literal IP) --
+  **all correctly classify as `"external"`, never `"local"`**. This is the
+  safe direction (Python's `ipaddress.ip_address()` only parses literal IP
+  address strings, so anything it can't parse falls through to
+  `"external"`, not `"local"`) -- being conservative about granting
+  `"local"` trust status is the right failure mode, since `"local"` is the
+  higher-trust classification.
+- Legitimate variants confirmed still correct: `GITHUB.COM` case variants,
+  explicit port (`github.com:443`), embedded userinfo
+  (`user:pass@github.com/...`), scp-shorthand loopback
+  (`user@127.0.0.1:owner/repo.git` -> `"local"`, correctly, via the
+  scp-fallback path).
+- No case produced a misclassification in the security-relevant direction
+  (a hostile/external host being classified as `"local"` or `"github"`) or
+  an unhandled exception -- confirms the spec's "Wrap the whole thing in a
+  bare `try/except Exception`" requirement and the "never misidentifies a
+  hostile host" property this review was specifically asked to verify.
+
+### Rate-limit gate trace (item 2 in the reviewer's task)
+- **`Retry-After` parsing**: `int(retry_after)` only -- handles GitHub's
+  real, documented behavior (GitHub's REST API always sends `Retry-After`
+  as an integer number of seconds, never an HTTP-date; unlike the generic
+  HTTP spec, GitHub's own docs specify seconds-only). A non-numeric value
+  (or, hypothetically, an HTTP-date string from some intermediary) falls
+  through to `except (TypeError, ValueError)` -> the
+  `GITHUB_RATE_LIMIT_FALLBACK_SECONDS` default rather than crashing or
+  silently not backing off -- confirmed by
+  `test_malformed_rate_limit_reset_falls_back_to_default_cooldown`
+  (exercises the `X-RateLimit-Reset` fallback path; the `Retry-After`
+  fallback path uses the identical `except` pattern, read directly in
+  `app/app.py:1017-1021`).
+- **Monotonic-forward-only**: `_github_note_rate_limit()` computes `until`
+  then only assigns `_github_rate_limited_until = until` if
+  `until > _github_rate_limited_until`, under `_github_rate_limit_lock` --
+  confirmed both by reading the code and by
+  `test_cooldown_never_lowered_by_a_later_smaller_signal` (pre-seeds a
+  longer cooldown, sends a response that would compute a shorter one,
+  asserts the longer value survives).
+- **Gate consulted before the request, not just recorded after**:
+  `_github_api`/`_github_api_raw` both call `_github_rate_limited()` as
+  their first line, before building the `Request` object -- confirmed by
+  reading the code (`app/app.py:1054`, `1083`) and by
+  `test_rate_limit_remaining_zero_trips_cooldown_short_circuits_next_call`/
+  `test_retry_after_header_trips_cooldown_short_circuits_next_call`, both
+  of which assert `urlopen`'s call count stays at 1 across a short-circuited
+  second call -- i.e. genuinely zero HTTP calls made while cooling down,
+  not merely a note-after-the-fact.
+- **Global, not per-repo**: a single module-level
+  `_github_rate_limited_until` guarded by one `_github_rate_limit_lock`,
+  matching `docs/spec.md`'s explicit design call (GitHub's limit is
+  per-token, shared across every repo).
+
+## Regression check
+Full existing suite run: `python3 -m unittest discover -s tests` --
+**1094 tests, `OK`, exit code 0** (includes this cycle's 40 new tests in
+`tests/test_github_api.py`; no failures, no errors, no regressions in
+`tests/test_gitea.py`/`tests/test_gitea_poll.py`/`tests/test_ai_reviewer.py`
+or any other existing suite). Also ran `tests/test_github_api.py` in
+isolation (40/40 pass) and `python3 -m py_compile app/app.py` (clean).
+
+No defects found in the testing pass -- proceeding to the review pass.
+
+## Spec coverage
+All 14 acceptance criteria in `docs/spec.md` are implemented and covered
+by an automated test, a manual structural check, or both (see test-case
+table above, criteria 1-15 map onto the spec's checkbox list; criteria
+16-19 are this review's own additional verification beyond the spec's
+minimum list). No gaps.
+
+- **"No poll-loop wiring / no UI / no item 8 integration"** (non-goals) --
+  confirmed: `git diff app/app.py` contains zero changes to
+  `_ai_reviewer_poll_repo`/`_ai_reviewer_review_run`/any `@app.route`, and
+  a full-repo grep for every new function/constant name (excluding the new
+  test file and `docs/`) finds zero call sites. The feature really is
+  inert in a running install, as claimed.
+- **Settled scope decision** (`github_post_pr_comment` posts directly, no
+  propose-then-approve gate) -- confirmed present and correctly worded in
+  both `docs/spec.md` and the already-committed `docs/BACKLOG.md` item 17
+  ("Scope decision -- settled" block). Per this review's task framing,
+  not flagged as a finding.
+
+## Findings (most severe first)
+None must-fix. None should-fix.
+
+### 1. Config comment adds an extra sentence beyond `docs/spec.md`'s proposed text -- nit
+- File: `config/switchboard.env.example:172-174`
+- Issue: the developer appended "Purely additive... setting it has no
+  visible effect until a later part wires these functions in" to the
+  `GITHUB_TOKEN` comment block, which isn't in `docs/spec.md`'s literal
+  proposed comment text (§2 "GitHub API client shape").
+- Failure scenario: none -- it's accurate, harmless, arguably useful
+  context for an operator wondering why setting the token does nothing
+  yet. Purely a documentation addition, not a scope or behavior change.
+  Not worth a follow-up.
+
+## Follow-ups (non-blocking)
+- None. Part 2 (poll-loop wiring, `GITHUB_POLL_INTERVAL_SECONDS`, item 8
+  host-agnostic dispatch) is already correctly scoped out and recorded in
+  `docs/spec.md`/`docs/BACKLOG.md` item 17 as future work, not something
+  this review needs to re-flag.
+
+## Overall verdict
+**Approve.** All 14 acceptance criteria are implemented and tested; the
+full existing suite (1094 tests) passes with no regressions; this
+review's own independent adversarial testing of `_classify_origin_url()`
+(lookalike GitHub hostnames, decimal/octal/subdomain loopback tricks,
+`localhost`) found no case where a hostile or unintended host is
+misclassified as `"local"` or `"github"` -- the single highest-risk
+property this review was asked to verify, given item 16's prior
+three-round injection-fix history in adjacent code. The rate-limit gate
+was traced end-to-end (not just spot-checked): it is consulted before
+every request (zero-`urlopen`-calls proof, not just a header-recording
+side effect), never lowers an active cooldown, and degrades safely on
+malformed headers. `GITHUB_TOKEN` is never logged or surfaced in an error
+message. This cycle is confirmed genuinely inert in a running install (no
+route, no call sites, no template changes). One documentation-only nit
+(an extra, harmless sentence in the config comment) does not block
+approval.
