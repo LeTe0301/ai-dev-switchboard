@@ -53,6 +53,29 @@ mkdir -p "$CONFIG_DIR"
 )
 chmod 600 "$CONFIG_FILE"
 
+# Item 29 (v2): switchboard-svc (running app.py/teams.py) needs read
+# access to this file for board_read/board_write, but the file correctly
+# stays 600/RUN_USER-owned -- never loosened to group/world-readable
+# (this holds a live Taiga password). Grant a narrow, single-user POSIX
+# ACL instead. Best-effort: if setfacl is unavailable or the filesystem
+# doesn't support ACLs, warn clearly rather than silently leaving
+# board_read/board_write broken with no signal -- app/taiga_board.py's own
+# load_config() (see its own fix, same cycle) gives a distinct error in
+# that case too, so this isn't the only signal an operator gets.
+RUNTIME_ENV=/etc/ai-dev-switchboard/runtime.env
+SVC_USER_NAME="switchboard-svc"
+[ -f "$RUNTIME_ENV" ] && SVC_USER_NAME="$(grep '^SVC_USER=' "$RUNTIME_ENV" 2>/dev/null | tail -1 | cut -d= -f2-)"
+[ -n "$SVC_USER_NAME" ] || SVC_USER_NAME="switchboard-svc"
+if command -v setfacl >/dev/null 2>&1; then
+    if setfacl -m "u:${SVC_USER_NAME}:r" "$CONFIG_FILE" 2>/dev/null; then
+        echo "Granted $SVC_USER_NAME read access to $CONFIG_FILE (ACL)."
+    else
+        echo "WARNING: could not grant $SVC_USER_NAME read access to $CONFIG_FILE (setfacl failed -- does this filesystem support POSIX ACLs?). board_read/board_write will not work until this is granted manually: sudo setfacl -m u:${SVC_USER_NAME}:r $CONFIG_FILE" >&2
+    fi
+else
+    echo "WARNING: 'setfacl' not found -- $SVC_USER_NAME cannot read $CONFIG_FILE, so board_read/board_write will not work until this is granted manually. Install the 'acl' package and re-run this script, or: sudo setfacl -m u:${SVC_USER_NAME}:r $CONFIG_FILE" >&2
+fi
+
 echo
 echo "Wrote $CONFIG_FILE (mode 600)."
 echo "Verifying (authenticate + look up the project -- no userstory is created)..."

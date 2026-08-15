@@ -75,12 +75,18 @@ class TaigaRunTests(unittest.TestCase):
         self.assertEqual(cmd, ["sudo", appmod.TAIGA_STATUS_SCRIPT])
         self.assertEqual(kwargs.get("timeout"), 10)
 
-    def test_up_uses_longer_timeout(self):
+    def test_up_uses_even_longer_timeout_to_cover_its_own_retry_loop(self):
+        # Item 30 (v2): scripts/taiga-up.sh's own retry loop now sleeps up
+        # to 150s (5 attempts, 10/20/40/80s exponential backoff) before
+        # giving up -- comfortably past the previous flat 90s timeout here,
+        # which would have killed the script mid-retry. Raised to 180s for
+        # "up" specifically (docs/spec.md "Fix 2", the explicitly-required
+        # arithmetic check against taiga_run()'s real caller-side timeout).
         self._fake_run("")
         appmod.taiga_run("up")
         cmd, kwargs = self.calls[0]
         self.assertEqual(cmd, ["sudo", appmod.TAIGA_UP_SCRIPT])
-        self.assertEqual(kwargs.get("timeout"), 90)
+        self.assertEqual(kwargs.get("timeout"), 180)
 
     def test_down_uses_longer_timeout(self):
         self._fake_run("")

@@ -672,20 +672,76 @@ class TeamStopEndpointTests(_RealHTTPTeamTestCase):
         status, payload = self._post("/projects/nope/team/stop", cookie, {"code": code})
         self.assertEqual(status, 404)
 
-    def test_stop_on_already_finished_team_is_idempotent_ok(self):
+    def test_stop_on_finished_team_now_actually_cleans_up_and_allows_restart(self):
+        # Item 35 (docs/spec.md "Fix 4"): previously fell into the early-
+        # return "no team currently running" no-op below (this test used to
+        # be named test_stop_on_already_finished_team_is_idempotent_ok and
+        # asserted exactly that) even though stop_team() itself already
+        # unconditionally supports a terminal run's cleanup and the web UI's
+        # own Stop button renders unconditionally for any non-idle status.
+        # Now actually tears the run down, same response shape as a
+        # "running"/"blocked_ask_user" stop already returns, and a
+        # subsequent /team/start on the same project succeeds immediately
+        # after (previously blocked by the leftover tmux session name).
+        self._project(_PROJ)
+        self._write_fast_finisher_engine("lead2")
+        _write_engine_file(self.engines_dir, "helper.engine", """\
+            LABEL=Helper
+            CMD=unused
+            HEADLESS_CMD=echo unused
+            HEADLESS_FORMAT=plain
+            HEADLESS_PROMPT=arg
+            """)
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/start", cookie,
+                                     {"task": "first task", "code": code})
+        self.assertEqual(status, 200, payload)
+        run_id = payload["run_id"]
+        session = payload["session"]
+        state = teamsmod._load_state(run_id)
+        state["status"] = "finished"
+        state["summary"] = "done"
+        teamsmod._persist(state)
+
+        status, payload = self._post(f"/projects/{_PROJ}/team/stop", cookie, {"code": code})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertIn("session_removed", payload)
+        self.assertIn("worktrees", payload)
+        self.assertNotIn("message", payload)
+        # stop_team() only overwrites status -> "stopped" for a NON-terminal
+        # status (its own docstring: "If status was non-terminal, marks it
+        # 'stopped'") -- "finished" is already terminal, so it's left as-is.
+        # The real, observable effect of the fix is the session/worktree
+        # teardown (asserted above/below) actually running at all now.
+        self.assertEqual(teamsmod._load_state(run_id)["status"], "finished")
+        self.assertFalse(appmod.tmux_has(session))
+
+        status2, payload2 = self._post(f"/projects/{_PROJ}/team/start", cookie,
+                                       {"task": "second task", "code": code})
+        self.assertEqual(status2, 200, payload2)
+
+    def test_stop_on_escalated_max_rounds_team_now_actually_cleans_up(self):
+        # Item 35 acceptance criteria: same fix applies to
+        # "escalated_max_rounds", not just "finished".
         repo = self._project(_PROJ)
         result = teamsmod.launch_team(repo, "task", {"kind": "ollama", "name": "m", "tier": 1}, [])
         run_id = result["run_id"]
         state = teamsmod._load_state(run_id)
-        state["status"] = "finished"
-        state["summary"] = "done"
+        state["status"] = "escalated_max_rounds"
         teamsmod._persist(state)
         cookie = self._login()
         code = self._totp_code()
         status, payload = self._post(f"/projects/{_PROJ}/team/stop", cookie, {"code": code})
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
-        self.assertIn("no team currently running", payload["message"])
+        self.assertIn("session_removed", payload)
+        self.assertIn("worktrees", payload)
+        self.assertNotIn("message", payload)
+        # Terminal status, same as "finished" above -- stop_team() leaves it
+        # as-is; the teardown (asserted above) is the fix's real effect.
+        self.assertEqual(teamsmod._load_state(run_id)["status"], "escalated_max_rounds")
 
     def test_stop_mid_delegate_terminates_real_subprocess_promptly(self):
         repo = self._project(_PROJ)

@@ -382,7 +382,12 @@ def _build_deploy_target_block_harness(config_dir):
     block = _extract_between(
         source,
         "# ── Optional: deploy-target receiver",
-        'echo "== Done =="')
+        # Item 34's fix moved the guarded-restart block (which references
+        # $RUN_USER, not supplied by this harness) to right before
+        # `echo "== Done =="`, so the end marker was moved one section
+        # earlier to stop before it -- this harness only wants the
+        # deploy-target block itself.
+        "# Guarded restart -- refuses to restart")
     return textwrap.dedent(f"""\
         #!/usr/bin/env bash
         set -euo pipefail
@@ -615,7 +620,10 @@ class InstallScriptDeployTargetBlockTests(unittest.TestCase):
             'fi\n\n# ── Optional: link an existing remote Ollama')
         helpers = _extract_between(source, "interactive() {", "random_token() {")
         deploy_block = _extract_between(
-            source, "# ── Optional: deploy-target receiver", 'echo "== Done =="')
+            source, "# ── Optional: deploy-target receiver",
+            # See the identical comment in _build_deploy_target_block_
+            # harness() above -- same item-34 reasoning.
+            "# Guarded restart -- refuses to restart")
 
         script = textwrap.dedent(f"""\
             #!/usr/bin/env bash

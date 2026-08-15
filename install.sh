@@ -211,7 +211,7 @@ echo "Repo: $REPO_DIR"
 
 echo "-- Installing dependencies (apt) --"
 apt-get update -qq
-apt-get install -y -qq python3 tmux git curl sudo rsync openssh-client ca-certificates
+apt-get install -y -qq python3 tmux git curl sudo rsync openssh-client ca-certificates acl
 
 if [ ! -x /usr/local/bin/ttyd ]; then
     echo "-- Installing ttyd (per-project fallback terminal) --"
@@ -495,10 +495,15 @@ chmod 600 "$ENV_FILE"
 # project.sh runs as RUN_USER (not SVC_USER) and cannot read the 600
 # switchboard.env, but needs RUN_USER/PROJECTS_DIR to locate the project
 # it's syncing. Never write a secret into this file.
+# Item 29 (v2): SVC_USER's own literal username is added here too -- not a
+# secret (same category as RUN_USER/PROJECTS_DIR above), and lets scripts
+# like taiga-configure-push.sh (which runs as RUN_USER, not SVC_USER) look
+# up who to grant a read ACL to without hardcoding "switchboard-svc".
 RUNTIME_ENV_FILE="$CONFIG_DIR/runtime.env"
 cat > "$RUNTIME_ENV_FILE" <<EOF
 RUN_USER=$RUN_USER
 PROJECTS_DIR=$PROJECTS_DIR
+SVC_USER=$SVC_USER
 EOF
 chmod 644 "$RUNTIME_ENV_FILE"
 
@@ -579,32 +584,6 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable --now ai-dev-switchboard
-
-# ── Update (--update/--upgrade): guarded restart -- refuses to restart the
-# service (not just warns) whenever RUN_USER has ANY live tmux session,
-# full stop, no --force override (mirrors _remove_worktree()'s own
-# no-`--force` `git worktree remove` precedent, item 13). New code was
-# already copied to $INSTALL_DIR above regardless -- this only gates the
-# restart that makes it take effect. The generated systemd unit above sets
-# no KillMode, so systemd's default (KillMode=control-group) applies: a
-# `systemctl restart` sends SIGTERM/SIGKILL to every process still in this
-# unit's cgroup, not just app.py itself -- every per-project engine/team
-# tmux session spawned via `sudo -u $RUN_USER tmux new-session -d` is a
-# descendant of this service's own process and nothing moves it to a
-# different cgroup first, so restarting while sessions are live can very
-# likely take down the entire RUN_USER tmux server (docs/ARCHITECTURE.md,
-# docs/BACKLOG.md item 14 "Background").
-if [ "$UPDATE" -eq 1 ]; then
-    LIVE_SESSIONS="$(sudo -u "$RUN_USER" tmux list-sessions -F '#{session_name}' 2>/dev/null || true)"
-    if [ -n "$LIVE_SESSIONS" ]; then
-        echo "WARNING: $RUN_USER has live tmux session(s):" >&2
-        echo "$LIVE_SESSIONS" | sed 's/^/  - /' >&2
-        echo "New code was copied to $INSTALL_DIR, but ai-dev-switchboard was NOT restarted -- restarting now would very likely interrupt these (see docs/ARCHITECTURE.md). Stop them (or wait for them to finish), then re-run 'install.sh --update' -- it will be a fast no-op pull, just the restart. Or, if you're sure it's safe: sudo systemctl restart ai-dev-switchboard." >&2
-    else
-        echo "-- Update: no live $RUN_USER sessions -- restarting ai-dev-switchboard to pick up the update --"
-        systemctl restart ai-dev-switchboard
-    fi
-fi
 
 if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
     # ── Self-hosted Gitea (part of --with-git-hosting). Backlog item 2b
@@ -934,6 +913,24 @@ if [ "$WITH_DEPLOY_TARGET" -eq 1 ]; then
         echo "  rsync -e \"ssh -i <key>\" -a <source>/ deploy@<this-host>:"
         echo "  ssh -i <key> deploy@<this-host> deploy-restart"
     fi
+fi
+
+# Guarded restart -- refuses to restart (not just warns) whenever
+# RUN_USER has ANY live tmux session, no --force override (item 13's own
+# no-`--force` precedent). Runs unconditionally, not just for --update:
+# `systemctl enable --now` above starts the service before any --with-*
+# block below it has finished writing its own config to switchboard.env
+# (item 34) -- EnvironmentFile= is read once at process start, so without
+# this final restart, a fresh install's own optional-feature flags never
+# actually take effect in the running process, only on disk.
+LIVE_SESSIONS="$(sudo -u "$RUN_USER" tmux list-sessions -F '#{session_name}' 2>/dev/null || true)"
+if [ -n "$LIVE_SESSIONS" ]; then
+    echo "WARNING: $RUN_USER has live tmux session(s):" >&2
+    echo "$LIVE_SESSIONS" | sed 's/^/  - /' >&2
+    echo "ai-dev-switchboard was NOT restarted -- restarting now would very likely interrupt these (see docs/ARCHITECTURE.md). Stop them (or wait for them to finish), then run: sudo systemctl restart ai-dev-switchboard -- to pick up every config value written during this install/update run." >&2
+else
+    echo "-- Restarting ai-dev-switchboard to pick up this run's full configuration --"
+    systemctl restart ai-dev-switchboard
 fi
 
 echo ""

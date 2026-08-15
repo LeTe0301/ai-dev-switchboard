@@ -21,13 +21,23 @@ CONFIG=/etc/ai-dev-switchboard/switchboard.env
 # shellcheck disable=SC1090
 [ -f "$CONFIG" ] && source "$CONFIG"
 TAIGA_DIR="${TAIGA_DIR:-/opt/ai-dev-switchboard-taiga}"
-TAIGA_UP_MAX_ATTEMPTS="${TAIGA_UP_MAX_ATTEMPTS:-3}"
+TAIGA_UP_MAX_ATTEMPTS="${TAIGA_UP_MAX_ATTEMPTS:-5}"
+TAIGA_UP_RETRY_BACKOFF_SECONDS="${TAIGA_UP_RETRY_BACKOFF_SECONDS:-10}"
+# Item 30 (v2): a full `systemctl restart docker` was the only 100%-
+# reliable recovery found on the verification host, but it restarts
+# EVERY Docker container on this machine, not just Taiga's -- a real,
+# host-wide side effect this project doesn't take automatically/
+# unattended anywhere else without an explicit operator decision.
+# Default OFF; an operator who's confirmed this is safe on their own host
+# (e.g. nothing else Docker-based shares it) can opt in.
+TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION="${TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION:-0}"
 
 cd "$TAIGA_DIR" || { echo "taiga-up: $TAIGA_DIR not found" >&2; exit 1; }
 
 COMPOSE=(docker compose -f docker-compose.yml -f docker-compose.override.yml)
 
 attempt=1
+backoff="$TAIGA_UP_RETRY_BACKOFF_SECONDS"
 while [ "$attempt" -le "$TAIGA_UP_MAX_ATTEMPTS" ]; do
     "${COMPOSE[@]}" up -d
     state=$("${COMPOSE[@]}" ps taiga-gateway --format '{{.State}}' 2>/dev/null)
@@ -37,10 +47,22 @@ while [ "$attempt" -le "$TAIGA_UP_MAX_ATTEMPTS" ]; do
     echo "taiga-up: taiga-gateway didn't come up cleanly (state: ${state:-<none>}), attempt $attempt/$TAIGA_UP_MAX_ATTEMPTS" >&2
     if [ "$attempt" -lt "$TAIGA_UP_MAX_ATTEMPTS" ]; then
         "${COMPOSE[@]}" rm -f taiga-gateway >/dev/null 2>&1 || true
-        sleep 2
+        sleep "$backoff"
+        backoff=$((backoff * 2))
     fi
     attempt=$((attempt + 1))
 done
 
-echo "taiga-up: taiga-gateway failed to come up after $TAIGA_UP_MAX_ATTEMPTS attempts -- manual intervention needed (check 'docker compose logs taiga-gateway' in $TAIGA_DIR, 'docker network ls', and available disk space)." >&2
+if [ "$TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION" -eq 1 ]; then
+    echo "taiga-up: all $TAIGA_UP_MAX_ATTEMPTS attempts exhausted -- TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION=1, restarting the Docker daemon itself (affects every container on this host) and trying once more" >&2
+    systemctl restart docker
+    sleep 5
+    "${COMPOSE[@]}" up -d
+    state=$("${COMPOSE[@]}" ps taiga-gateway --format '{{.State}}' 2>/dev/null)
+    if [ "$state" = "running" ]; then
+        exit 0
+    fi
+fi
+
+echo "taiga-up: taiga-gateway failed to come up after $TAIGA_UP_MAX_ATTEMPTS attempts -- manual intervention needed (check 'docker compose logs taiga-gateway' in $TAIGA_DIR, 'docker network ls', available disk space, or set TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION=1 to let this script restart the Docker daemon itself as a last resort next time)." >&2
 exit 1

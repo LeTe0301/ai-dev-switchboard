@@ -408,17 +408,22 @@ class UpdatePullBlockTests(unittest.TestCase):
 # ── guarded-restart block: live-session detection ────────────────────────
 
 def _build_restart_block_harness(run_user, install_dir):
+    # Item 34 (docs/spec.md "Fix 3"): the guarded-restart block moved from
+    # right after `systemctl enable --now` (gated on `$UPDATE -eq 1`) to
+    # the very end of the script, right before `echo "== Done =="`, and
+    # runs unconditionally now -- no more $UPDATE gate, and no more
+    # $INSTALL_DIR reference in its own message (that was specific to the
+    # old --update-only wording). `install_dir` is accepted here only to
+    # keep this harness's own call signature stable for its callers below.
     with open(INSTALL_SH) as f:
         source = f.read()
     block = _extract_between(
-        source, "# ── Update (--update/--upgrade): guarded restart",
-        'if [ "$WITH_GIT_HOSTING" -eq 1 ]; then')
+        source, "# Guarded restart -- refuses to restart",
+        'echo "== Done =="')
     return textwrap.dedent(f"""\
         #!/usr/bin/env bash
         set -euo pipefail
-        UPDATE=1
         RUN_USER={run_user}
-        INSTALL_DIR={install_dir}
         {block}
         """)
 
@@ -474,7 +479,7 @@ class GuardedRestartBlockTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(self.systemctl_log) as f:
             self.assertEqual(f.read().strip(), "systemctl restart ai-dev-switchboard")
-        self.assertIn("restarting ai-dev-switchboard", r.stdout)
+        self.assertIn("Restarting ai-dev-switchboard", r.stdout)
 
     def test_live_session_defers_restart_names_it_in_stderr(self):
         self._fake_tmux(["team-myproject"])
@@ -486,7 +491,11 @@ class GuardedRestartBlockTests(unittest.TestCase):
                          "systemctl restart must never be invoked while a session is live")
         self.assertIn("dev has live tmux session", r.stderr)
         self.assertIn("team-myproject", r.stderr)
-        self.assertIn("/opt/ai-dev-switchboard", r.stderr)
+        # Item 34: the deferred-restart message is no longer --update-
+        # specific (no more "New code was copied to $INSTALL_DIR" wording,
+        # since the block now also covers a plain fresh install) -- it
+        # names the config-pickup reason instead.
+        self.assertIn("pick up every config value written during this install/update run", r.stderr)
         self.assertIn("sudo systemctl restart ai-dev-switchboard", r.stderr)
         self.assertNotIn("--force", r.stderr)
 

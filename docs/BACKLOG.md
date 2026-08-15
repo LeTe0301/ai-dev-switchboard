@@ -2023,3 +2023,73 @@ statuses too (clean up the tmux session/worktrees for a `finished` or
 `launch_team()`'s pre-flight check look at the run's actual status
 instead of raw tmux-session existence, so a terminal run's leftover
 session doesn't block a fresh one.
+
+---
+
+## Round 5 fixes (2026-08-15): items 29-v2, 30-v2, 34, 35
+
+Closes the two gaps the regression-verification pass (above) found still
+open after rounds 1-4, plus items 34 and 35 found incidentally during
+that same verification pass.
+
+- **29-v2** (permission gap on the now-correctly-pathed Taiga config):
+  `scripts/taiga-configure-push.sh` now grants `switchboard-svc` a
+  narrowly-scoped POSIX ACL read grant (`setfacl -m u:<svc>:r`) on the
+  config file after writing it, sourcing the service-user name from
+  `runtime.env` rather than hardcoding it. `taiga_board.py`'s
+  `load_config()` gains a distinct `except PermissionError:` (ordered
+  before the existing `except OSError:`, since `PermissionError` is a
+  subclass) so a real permission failure is reported differently from a
+  genuinely-missing file.
+- **30-v2** (retry insufficient to survive the real-world recovery
+  window): `taiga-up.sh`'s retry loop goes from 3 flat 2s attempts to 5
+  attempts with exponential backoff (10/20/40/80s, ~150s worst-case). A
+  new opt-in-only `TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION` (default `0`)
+  falls back to `systemctl restart docker` after all attempts are
+  exhausted — deliberately not automatic, given the host-wide blast
+  radius of restarting the Docker daemon. `taiga_run()`'s backend
+  timeout for the `"up"` action was raised from 90s to 180s to give the
+  longer retry loop room to actually finish (150s of sleep alone already
+  exceeded the old 90s ceiling), and the frontend's matching
+  `SINGLETON_TOGGLE_CONFIG.taiga.timeoutMs` was raised in lockstep to
+  preserve the two timeouts' existing keep-in-sync invariant. The
+  Taiga toggle checkbox is now disabled for the duration of the
+  "starting…" state to prevent an operator from firing a second
+  concurrent `taiga_run("up")` during a long retry.
+- **34**: the guarded-restart block that previously only ran on the
+  `--update` path now runs unconditionally at the very end of
+  `install.sh`, after all four optional-feature config blocks have
+  finished writing to `switchboard.env` — so a fresh install picks up
+  `GITEA_ENABLED` (and everything else written late) without requiring
+  a manual `systemctl restart` afterward.
+- **35**: `/team/stop`'s status gate narrowed to just `if run is None`
+  (was also refusing to no-op-clean a terminal `finished`/
+  `escalated_max_rounds` run) — `stop_team()` itself was already correct
+  for every status, the bug was isolated to this one redundant check in
+  the route.
+
+Reviewed via a full developer→reviewer cycle including one fix-back
+round (see `docs/test-review.md`); full test suite passes at 1213 tests
+with the same 3 pre-existing failures (caused by an untracked `CLAUDE.md`
+in the repo root, unrelated to this round, confirmed via `git stash`).
+
+---
+
+## 36. Taiga toggle's "off" path has the same double-submission race the "on" path had (item 30-v2), never closed
+
+Found by the reviewer while re-verifying the round 5 fix for item 30-v2's
+on-path double-submission guard (above). The fix there only disables the
+checkbox during the "starting…" (on) transition. The "off" transition
+shows `'stopped'` optimistically and immediately, with the checkbox never
+disabled, while `taiga_run("down")` (up to 90s) may still genuinely be in
+flight server-side — an operator could click back on during that window
+and fire a concurrent `taiga_run("up")` against the same Docker Compose
+stack the in-flight `"down"` call is still tearing down. Not a regression
+from round 5 (the existing `offPendingCount` mechanism was always a
+UI-consistency guard, not a backend-concurrency one) — pre-existing,
+carried forward as its own item since it's the same class of bug as
+30-v2 and worth closing the same way.
+
+**Shape of the fix**: mirror round 5's on-path fix — disable the toggle
+for the duration of the off-dispatch's in-flight window too, re-enabling
+on the terminal response (or timeout).
