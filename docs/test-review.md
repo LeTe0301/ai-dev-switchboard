@@ -1092,3 +1092,96 @@ by it -- recommended as its own small, separate fix-and-PR (see above),
 not bundled into this commit. Two nits (no dedicated "message clears on
 refresh" test; no server-side cap on `expect_contains` length) do not
 block approval.
+
+# Test & Review: fix pre-existing `tests/test_deploy_frontend.js` regression from item 13
+
+## Scope
+The single acceptance criterion set in `docs/spec.md` (this cycle):
+`tests/test_deploy_frontend.js`'s `setupCase()` now drains the extra,
+unconditional `/projects/<name>/team/branches` fetch backlog item 13's
+`renderTeamBranches()` fires as a side effect of any `kind='inst'` row
+render, so all 9 of the file's own pre-existing test cases pass without
+any existing assertion being loosened. Branch:
+`backlog/deploy-frontend-test-fix-13b`. Nothing committed by the
+developer; nothing committed by this review. This is a mechanical,
+already-root-caused fix (root-caused by item 18's reviewer, this same
+session, via `git stash` against this branch's base commit) mirroring
+`tests/test_smoke_check_frontend.js::setupCase()`'s already-proven drain
+technique verbatim -- no new product/design decision, per the
+Entwicklung workflow's right-sizing rule 1.
+
+## Test cases
+
+| # | Criterion / case | Method | Result | Evidence |
+|---|---|---|---|---|
+| 1 | All 9 cases in `tests/test_deploy_frontend.js` pass | automated, run directly | pass | `node tests/test_deploy_frontend.js` -> `ALL PASS (9/9)`, all 9 individually printed `PASS` |
+| 2 | No existing assertion loosened/removed to make this pass | manual diff read | pass | `git diff -- tests/test_deploy_frontend.js`: 15 insertions, 0 deletions -- every one of the file's pre-existing `assert.*` calls is byte-for-byte unchanged; the only new code is the drain loop plus two `tick()` calls inside `setupCase()` |
+| 3 | No other test file regresses | automated, run directly | pass | `test_team_frontend.js` 94/94, `test_smoke_check_frontend.js` 10/10, `test_clone_frontend.js` 8/8, `test_singleton_toggle_frontend.js` 15/15, `test_upload_frontend.js` 8/8 -- all `ALL PASS` |
+| 4 (edge case) | Drain loop must not error on a case with zero `instances` (no fetch was ever made to drain) | automated, own spot-check test appended temporarily to a copy of the file, then removed | pass | `setupCase([])` returns cleanly with `pendingFetches.length === 0`; the `.some((f) => f.url === url)` guard before each `resolveFetch()` call means an empty (or non-team-branches-triggering) `instances` array is a no-op, not a thrown "no matching pending fetch" error |
+| 5 (root-cause confirmation) | The 4/9 pre-fix failure genuinely reproduces and matches the spec's diagnosis, not just trusted secondhand | automated, `git stash` to the pre-fix working tree and re-run | pass | Exactly the same 4 cases fail with the same assertion mismatches described in the spec's "Problem" section (`clicking Deploy then cancelling...`, the quote-containing-host case, `confirmed deploy that succeeds...`, the 428-mid-dispatch case) -- `git stash pop` restored the fix afterward |
+
+## Regression check
+Full sibling frontend suite run directly by this review (not re-read from
+the developer's own "How to verify locally" claims):
+```
+node tests/test_deploy_frontend.js          -> ALL PASS (9/9)
+node tests/test_team_frontend.js            -> ALL PASS (94/94)
+node tests/test_smoke_check_frontend.js     -> ALL PASS (10/10)
+node tests/test_clone_frontend.js           -> ALL PASS (8/8)
+node tests/test_singleton_toggle_frontend.js -> ALL PASS (15/15)
+node tests/test_upload_frontend.js          -> ALL PASS (8/8)
+```
+All six figures match the developer's `docs/implementation.md` "How to
+verify locally" section exactly -- independently confirmed, not trusted.
+No Python backend tests are relevant to this change (test-file-only diff,
+zero production-code lines touched), so no `test_*.py` sweep was needed
+beyond the frontend suites above.
+
+No defects found in the testing pass -- proceeding to the review pass.
+
+## Spec coverage
+All 3 acceptance criteria in `docs/spec.md` are implemented and covered
+by an automated test or a direct diff read (see test-case table above;
+cases 4-5 are this review's own additional verification of the edge case
+the dispatch prompt specifically asked about, plus an independent
+reproduction of the pre-fix regression). No gaps.
+
+## Findings (most severe first)
+None must-fix. None should-fix. One nit.
+
+### 1. Zero-`instances` drain path has no permanent regression test in the file itself -- nit
+- File: `tests/test_deploy_frontend.js`, `setupCase()` (the new drain
+  loop)
+- Issue: this review manually verified `setupCase([])` doesn't error
+  (test case 4 above), but that check was done via a temporary throwaway
+  copy of the file and was not left behind as a permanent test case in
+  `tests/test_deploy_frontend.js` itself. None of the file's real 9 cases
+  exercise a zero-instance `setupCase()` call.
+- Failure scenario: none currently -- the `.some(...)` guard makes this
+  structurally safe regardless of `instances` content, and the identical
+  pattern in the proven-good `test_smoke_check_frontend.js` precedent has
+  the same property. Purely a "nice to have" coverage note, not a
+  correctness concern; not worth blocking a mechanical, already-diagnosed
+  fix over.
+
+## Follow-ups (non-blocking)
+- Optional: add a `setupCase([])` (or equivalently, a single non-team
+  instance whose row never triggers the `team/branches` fetch) case to
+  `tests/test_deploy_frontend.js` to permanently pin the zero-drain path
+  (finding 1). Not required for approval.
+
+## Overall verdict
+**Approve.** All 3 acceptance criteria are implemented and independently
+verified by running the actual test suite in this session, not by
+trusting the developer's reported counts. The diff is exactly what the
+spec asked for and nothing else: 15 added lines inside `setupCase()`,
+zero existing assertions touched, zero production code touched. The
+pre-fix regression was independently reproduced via `git stash` and
+matches the spec's diagnosis exactly (same 4 cases, same assertion
+mismatches). The full sibling frontend suite (135 cases across 5 files)
+passes with no regression. The one edge case called out in the dispatch
+prompt -- a test case with zero `instances` -- was spot-checked directly
+against the real drain loop and confirmed safe via the existing
+`.some(...)` guard, not merely inferred from reading the code. One nit
+(no permanent regression test for the zero-instances path) does not block
+approval.
