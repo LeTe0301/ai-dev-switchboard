@@ -1789,3 +1789,237 @@ characters"` — nothing tells you the key it actually wants is `text`, not
 (matching the real field), or accept both key names. One-line fix either
 way.
   per-project row, or both, depending on which shape (1 vs 2) is chosen?
+---
+
+## Items 22-33 regression verification (2026-08-15)
+
+Fresh, isolated end-to-end verification of the 12 fixes above, against
+current `main` (`53c3012`, all four E2E fix-round PRs merged). New
+container from scratch via `ct/create.sh`, Advanced Install, all four
+optional features on: CTID 901, hostname
+`ai-dev-switchboard-e2e-verify`, IP `192.168.178.227`. The old test
+container (CTID 900) was left untouched and not reused, per the mission's
+own instruction (it had several of these fixes hand-patched locally on
+top of the old broken code).
+
+**Verdict summary** (all 12 tracker items; two additional bugs found
+along the way are recorded separately below as items 34-35):
+
+| Item | Verdict |
+|---|---|
+| 22 (crash-loop on fresh install) | **Confirmed fixed** |
+| 23 (Gitea admin-bootstrap TTY) | **Confirmed fixed** |
+| 24 (`/var/lib/ai-dev-switchboard` root-owned) | **Confirmed fixed** |
+| 25 (Gitea poll-sync non-functional) | **Confirmed fixed** |
+| 26 (`~RUN_USER/.local` root-owned) | **Confirmed fixed** |
+| 27 (dubious-ownership blocks teams) | **Confirmed fixed** |
+| 28 (worktree/headless-turn failure) | **Confirmed fixed** |
+| 29 (Taiga "isn't configured") | **Still broken in practice** (path bug fixed, new blocker found) |
+| 30 (gateway port-bind race) | **Still broken in practice** (race reliably reproduced; shipped retry doesn't recover it here) |
+| 31 (8G disk fills up) | **Confirmed fixed** |
+| 32 (firewall bridges in menu) | **Confirmed fixed** |
+| 33 (interject error field name) | **Confirmed fixed** |
+
+### Confirmed fixed (22-28, 31-33) — evidence
+
+- **22**: `systemctl status ai-dev-switchboard` was `active (running)`
+  immediately after `create.sh` finished, and again after every later
+  restart. No `ModuleNotFoundError`.
+- **23**: `docker exec --user git ai-dev-switchboard-gitea gitea admin
+  user create --admin --username admin --password '...' --email ...`,
+  run via `pct exec 901 -- bash -c '...'` (no TTY), succeeded: "New user
+  'admin' has been successfully created!"
+- **24**: `/var/lib/ai-dev-switchboard` is `switchboard-svc`-owned;
+  `sudo -u switchboard-svc touch .../testwrite` succeeded. Created a
+  Gitea-hosted project (`testproj`) and confirmed
+  `gitea-repo-map.json` got a real entry (`admin/testproj`, branch
+  `main`).
+- **25**: `sudo -u dev cat /etc/ai-dev-switchboard/runtime.env` succeeded,
+  showing `RUN_USER=dev` / `PROJECTS_DIR=/home/dev/projects`. Pushed a
+  real commit to the Gitea repo from an external clone, polled `/status`
+  past `GITEA_POLL_INTERVAL_SECONDS` (default 45s), confirmed
+  `PROJECTS_DIR/testproj` actually fast-forwarded to the pushed SHA and
+  `gitea-repo-map.json`'s `sync_state` went to `"synced"`.
+- **26**: `sudo -u dev mkdir /home/dev/.local/testdir` succeeded;
+  `/home/dev/.local` is `dev`-owned (code-server + pipx both installed
+  cleanly under it during this same session).
+- **27**: `sudo -u switchboard-svc git -C .../testproj rev-parse
+  --is-inside-work-tree` → `true`. `POST /projects/testproj/team/start`
+  did not 400 with "not a git repository" — it launched a real team run.
+- **28**: A real team run (ollama lead on `qwen2.5:7b` + `aider` as a
+  real, installed, Ollama-backed member — `claude`/`codex` were left
+  uninstalled/unauthenticated in this sandbox and skipped, noted below)
+  created real git worktrees at `testproj.teams/{aider,claude,codex}`
+  and completed multiple real headless `aider` delegate calls end to
+  end — actual file edits, actual commits (`docs: append HELLO-TEAM to
+  README.md`, etc.), not the original "command session ended
+  unexpectedly" failure.
+- **31**: `grep DEFAULT_DISK_GB ct/create.sh` → `20`. With all four
+  optional features enabled and exercised (Gitea, Taiga, code-server,
+  Ollama-link) plus aider installed, disk peaked around 42% of the 20G
+  disk (`df -h /`), never filled.
+- **32**: The live Advanced Install bridge menu, captured from the real
+  whiptail session, showed only `vmbr0` — the host had three real
+  `fwbrNNNiM`-pattern interfaces present at the time (`fwbr101i0`,
+  `fwbr106i0`, `fwbr107i0`, confirmed via `ip -o link show type bridge`
+  run separately) and none of them appeared in the menu.
+- **33**: `POST /team/interject` with an empty/missing `text` field now
+  returns `{"error": "text must be non-empty and at most 2000
+  characters"}`.
+
+### 29 — still broken in practice: the path-mismatch is fixed, but a new permission gap blocks the same symptom
+
+The original bug (fixed in `6089b04`) was RUN_USER's setup script and
+SVC_USER's read path resolving `~` to two different homes. That part is
+genuinely fixed — confirmed the resolved path is now
+`/home/dev/.config/ai-dev-switchboard/taiga-push.env` on both sides.
+
+But running `scripts/taiga-configure-push.sh` exactly as documented
+writes that file `600`-mode, `dev`-owned (its own explicit, intentional
+security choice — see the script's own comments). `switchboard-svc` (the
+user `app.py`/`teams.py` actually run as) is not in any group that file
+belongs to and has no ACL grant, so its `open()` call raises
+`PermissionError` — a subclass of `OSError`. `taiga_board.py`'s
+`load_config()` catches bare `OSError` around that `open()` and reports
+the exact same message as the *missing-file* case:
+
+```
+Taiga isn't configured — run scripts/taiga-configure-push.sh first
+(expected config at /home/dev/.config/ai-dev-switchboard/taiga-push.env).
+```
+
+So a real user who runs the documented setup script exactly as
+instructed still gets told "Taiga isn't configured" from `board_read`/
+`board_write` — the user-visible symptom this item set out to fix is
+unchanged, just from a different root cause. Confirmed by reproducing
+live: `sudo -u switchboard-svc cat .../taiga-push.env` → `Permission
+denied`; a team lead's `board_read` call failed with the message above.
+
+This exact risk was already named, unimplemented, in item 29's own
+original "Shape of the fix" write-up above ("`app.py` ... reading it will
+need either a narrowly-scoped read grant or for `install.sh` to create
+the file's directory with the right shared permissions up front") — the
+path fix shipped, that follow-up did not.
+
+Verified the rest of the mechanism works correctly once this specific
+gap is closed: manually widened the file to `640`/`dev:switchboard-svc`,
+re-ran the same team run — `board_read` returned real story data, a
+`board_write(append_comment)` call correctly blocked as
+`blocked_board_write`, `POST .../team/board-resolve` with
+`{"action":"approve"}` resolved it, and the comment ("Hello from the AI
+team -- this confirms Taiga integration.") is now really on the Taiga
+story's history via a direct API check. The mechanism itself (item 7's
+propose/approve flow) is sound; only the out-of-the-box file-permission
+gap blocks it.
+
+### 30 — still broken in practice: the race reproduces reliably here, and the shipped retry doesn't recover it
+
+Toggling Taiga on genuinely reproduced the original race — repeatedly,
+not a one-off:
+
+```
+Error response from daemon: failed to set up container networking: driver failed
+programming external connectivity on endpoint ...taiga-gateway-1: failed to bind
+host port 127.0.0.1:9000/tcp: address already in use
+```
+
+`taiga-status.sh` correctly reports `off` (not lying) every time this
+happens — that part of the item's own scope holds. But the shipped fix
+(`taiga-up.sh`'s bounded 3-attempt `rm -f` + retry loop, confirmed
+present and running exactly as designed via `bash -x`) did **not**
+recover the gateway in any of several real attempts: all 3 quick
+retries (~2s apart) hit the identical "address already in use" error.
+`ss -ltnp` confirmed nothing is actually listening on port 9000 at the
+OS level while this is happening — the failure is Docker-daemon-internal
+port-allocator state, not a real conflicting process. It only cleared
+after either an unpredictable longer wait (tens of seconds to a couple
+of minutes, confirmed twice) or a full `systemctl restart docker`
+(confirmed once, reliably).
+
+A **second, distinct** crash mode was also caught live, immediately
+after a `docker compose up -d` that otherwise looked clean:
+
+```
+2026/08/15 18:35:22 [emerg] 1#1: host not found in upstream "taiga-front" in /etc/nginx/conf.d/default.conf:9
+nginx: [emerg] host not found in upstream "taiga-front" in /etc/nginx/conf.d/default.conf:9
+```
+
+— `taiga-gateway`'s nginx resolves `taiga-front` via Docker's embedded
+DNS at startup and doesn't retry; if it starts before `taiga-front`'s DNS
+entry has propagated, it exits immediately (exit 1) and stays exited.
+Same user-visible "off" symptom, different mechanism, also not covered
+by the current retry (which only guards the port-bind failure shape, not
+this one).
+
+Per the original item's own framing ("if you can't force the original
+race to occur at all, say so plainly") — the opposite happened here: the
+race was forced repeatedly and reliably, which is new, useful signal the
+first report didn't have. **Recommended follow-up**: the bounded retry's
+timing (~2s between attempts) is too short for whatever this host's
+Docker actually needs to clear its internal state; either lengthen the
+retry backoff substantially (tens of seconds, exponential), or have
+`taiga-up.sh` fall back to `systemctl restart docker` after N failed
+attempts, which was the only 100%-reliable recovery found here. The
+nginx/DNS race is a second, separate failure mode worth its own fix
+(e.g. nginx `resolver` directive with retry, or a short sleep/health-wait
+on `taiga-front` before starting `taiga-gateway`).
+
+---
+
+## 34. Fresh Advanced Install with git-hosting never picks up `GITEA_ENABLED` — service starts before Gitea's config block is appended
+
+Found while setting up this verification container, not part of the
+original 12. `install.sh` calls `systemctl enable --now
+ai-dev-switchboard` (starting the service, which reads
+`switchboard.env` once via `EnvironmentFile=`) *before* the
+`--with-git-hosting` block later in the same script appends
+`GITEA_ENABLED`/`GITEA_PORT`/etc. to that same file — and never restarts
+the service afterward (unlike `--update`, which does restart, guarded).
+
+Result: on a genuinely fresh `--yes --with-git-hosting --with-taiga
+--with-ollama` install, `TAIGA_ENABLED` and `TEAM_LLM_BASE_URL`/`MODEL`
+(written before the service start) work immediately, but
+`GITEA_ENABLED` is simply absent from the running process's environment
+— `POST /gitea/on` returns `{"error": "gitea disabled"}` even though
+`switchboard.env` on disk clearly has `GITEA_ENABLED=1`. Confirmed via
+`/proc/<pid>/environ`: no `GITEA_*` keys at all in the first process,
+all of them present after a manual `systemctl restart
+ai-dev-switchboard`.
+
+**Shape of the fix**: move `systemctl enable --now ai-dev-switchboard`
+to after all four optional-feature config blocks have finished writing
+to `switchboard.env` (or add an unconditional restart at the very end of
+the script, mirroring what `--update` already does).
+
+---
+
+## 35. A team run that ends in `escalated_max_rounds` (or normal `finished`) leaves its tmux session and worktrees behind, blocking the next team start
+
+Also found incidentally, not part of the original 12. Once a team run
+reaches ANY terminal status — including ordinary success
+(`status: "finished"`), not just escalation — its `team-<project>` tmux
+session and per-agent worktrees (`<project>.teams/<agent>`) are left in
+place. `POST .../team/stop` no-ops for a non-`running`/`blocked_*`
+status ("no team currently running for this project"), so it never
+cleans them up either. The next `POST .../team/start` then refuses
+outright:
+
+```
+{"error": "a team is already running for 'testproj' (team-testproj) -- stop it first"}
+```
+
+— because `launch_team()`'s own "already running" check looks for the
+tmux session's existence, not the run's actual status. Reproduced this
+on every team run in this session (both an `escalated_max_rounds` run
+and a normal `finished` run); each time, starting the next run required
+manually `tmux kill-server` plus `git worktree remove --force` on all
+three agent worktrees plus deleting their branches, none of which the
+web UI's own `/team/stop` (or anything else in the API) offers a way to
+do.
+
+**Shape of the fix**: either have `/team/stop` recognize terminal
+statuses too (clean up the tmux session/worktrees for a `finished` or
+`escalated_max_rounds` run, not just an active one), or have
+`launch_team()`'s pre-flight check look at the run's actual status
+instead of raw tmux-session existence, so a terminal run's leftover
+session doesn't block a fresh one.
