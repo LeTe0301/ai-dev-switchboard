@@ -197,6 +197,16 @@ def _run_id() -> str:
     return f"{int(time.time())}-{secrets.token_hex(6)}"
 
 
+# Matches _run_id()'s own generation format exactly (int(time.time()) +
+# "-" + secrets.token_hex(6)) -- any run_id not shaped like this cannot be
+# a real run this process ever created, so rejecting it outright is both
+# safe (never a false negative against a real run_id) and correct (never
+# lets a client-supplied run_id reach a path-join unvalidated, docs/
+# BACKLOG.md item 11(b)). If _run_id()'s own format ever changes, this must
+# change with it.
+_RUN_ID_RE = re.compile(r"^[0-9]+-[0-9a-f]{12}$")
+
+
 # ─── prompt/argv/script construction -- pure functions, no subprocess ─────
 def _resume_fragment(engine, session_id):
     """
@@ -2450,6 +2460,21 @@ def _leads_root() -> str:
 
 
 def _run_dir(run_id: str) -> str:
+    # Deliberately NOT validated against _RUN_ID_RE here (docs/BACKLOG.md
+    # item 11(b); see docs/implementation.md "Deviations from spec" for the
+    # concrete conflict this avoided): this helper is shared by every
+    # internal caller too -- the CLI (team-status/team-stop/team-reap),
+    # sweep_dead_teams(), and a wide swath of existing pure-unit tests all
+    # construct or pass run_id values that were never meant to match
+    # _run_id()'s exact generation shape (short synthetic ids in tests,
+    # arbitrary CLI-typed ids that should 404 with "no such run_id" rather
+    # than a shape-validation error). The actual attacker-reachable surface
+    # -- a client-supplied run_id on GET .../team/events, GET .../team/
+    # inbox, POST .../team/resolve -- is validated at its intake in
+    # app/app.py (_team_events_run_and_ownership() and the POST /team/
+    # resolve handler) against _RUN_ID_RE, BEFORE any of those callers ever
+    # reach this function, so a malformed/traversal run_id from those three
+    # routes still never reaches a path-join.
     return os.path.join(_leads_root(), run_id)
 
 

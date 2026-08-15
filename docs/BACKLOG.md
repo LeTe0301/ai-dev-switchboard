@@ -385,16 +385,16 @@ a working mechanism rather than a greenfield feature:
   expect the AST scan to need an explicit, narrow allowance rather than a
   removal.
 
-**Scope decision that must be settled before building:** this is a genuine
-expansion of what an agent may mutate unattended. Every comparable decision
-in this project so far has landed on the cautious side — deploy is
-manual-click-only, a push landing never itself deploys, and no agent
-mutates the project's source of truth unattended. A lead silently rewriting
-the backlog is the same class of question. Options worth putting to the
-user: (a) full autonomous write, (b) write limited to cards the current run
-created or was assigned, (c) proposed changes queued for one-click human
-approval, reusing 6f's escalation inbox. Do not assume (a) just because the
-item says "read-write" — ask.
+**Scope decision — settled (2026-08-14):** option (c). The lead's board
+writes are proposals only — queued in 6f's existing escalation inbox and
+applied to Taiga only after a one-click human approval, never written
+directly. This is the user's explicit choice, made when this item came up
+for scoping, consistent with every other unattended-write decision in this
+project (manual-click-only deploy, no unattended writes to the project's
+own source of truth). `board_write`'s tool contract should therefore return
+a *pending proposal*, not perform the Taiga call itself — the actual API
+write happens only from the approval action, mirroring how `resolve_ask_user()`
+gates a lead's `ask_user` block on a human response today.
 
 **Open for the future session:** whether board writes are audited to a log
 the human can review after the fact; whether one shared board covers all
@@ -443,12 +443,12 @@ plainly rather than an implementation shortfall.
   substrate for "consistent with the project's own documented conventions"
   and should be reused rather than rebuilt.
 
-**Scope decisions to settle before building:** whether the reviewer may ever
-block or approve a merge, or only ever comment (comment-only is the
-consistent default for this project, and matches "deploy is manual-click
-only"); whether a re-review fires when the tag is removed and re-added, or
-on every new commit while the tag is present; what happens on a large diff
-that exceeds the selected model's context.
+**Scope decisions — settled (2026-08-14):** comment-only — the reviewer
+never blocks, approves, or merges, matching "deploy is manual-click only."
+Re-review fires only when the "ready for review" tag is explicitly removed
+and re-added (not on every new commit while the tag is present) — a
+deliberate, low-cost trigger the operator controls. Still open: what
+happens on a large diff that exceeds the selected model's context.
 
 **Open for the future session:** whether this shares the escalation inbox
 (item 6/6f) or gets its own surface; whether review output is persisted

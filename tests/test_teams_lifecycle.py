@@ -158,6 +158,59 @@ class PureHelperTests(unittest.TestCase):
         self.assertAlmostEqual(epoch, time.time(), delta=5)
 
 
+class RunIdRegexValidationTests(unittest.TestCase):
+    """_RUN_ID_RE (docs/BACKLOG.md item 11(b), docs/spec.md "Backend
+    hardening"): matches _run_id()'s own generation shape exactly
+    (f"{int(time.time())}-{secrets.token_hex(6)}"). Used by app.py's three
+    team/* routes to reject a client-supplied run_id at intake, before it
+    ever reaches teams._run_dir()/a path-join -- see
+    docs/implementation.md "Deviations from spec" for why the check lives
+    at that intake point in app.py rather than inside _run_dir() itself
+    (_run_dir() is also shared by internal/CLI/test callers that construct
+    run_id values outside this exact shape, and must keep accepting those
+    unchanged)."""
+
+    def test_a_genuinely_generated_run_id_matches(self):
+        run_id = teamsmod._run_id()
+        self.assertTrue(teamsmod._RUN_ID_RE.match(run_id))
+
+    def test_path_traversal_run_id_does_not_match(self):
+        self.assertIsNone(teamsmod._RUN_ID_RE.match("../../outside/evilrun"))
+
+    def test_run_id_with_slash_does_not_match(self):
+        self.assertIsNone(
+            teamsmod._RUN_ID_RE.match("1700000000-abc123def456/../../etc/passwd"))
+
+    def test_empty_run_id_does_not_match(self):
+        self.assertIsNone(teamsmod._RUN_ID_RE.match(""))
+
+    def test_syntactically_plausible_but_nonexistent_run_id_matches(self):
+        # _RUN_ID_RE only validates SHAPE, not existence -- a well-shaped
+        # but never-created run_id must still match here (existence is what
+        # the subsequent open() call 404s/400s on, via the route's own
+        # OSError handling downstream of this check, not this regex).
+        self.assertTrue(teamsmod._RUN_ID_RE.match("1700000000-abc123def456"))
+
+    def test_uppercase_hex_does_not_match(self):
+        self.assertIsNone(teamsmod._RUN_ID_RE.match("1700000000-ABC123DEF456"))
+
+    def test_wrong_length_hex_portion_does_not_match(self):
+        self.assertIsNone(teamsmod._RUN_ID_RE.match("1700000000-abc123"))
+
+    def test_nul_byte_in_run_id_does_not_match(self):
+        self.assertIsNone(
+            teamsmod._RUN_ID_RE.match("1700000000-abc123def456\x00/etc/passwd"))
+
+    def test_run_dir_itself_does_not_validate_shared_internal_helper_unchanged(self):
+        # _run_dir() deliberately still joins ANY string unvalidated
+        # (docs/implementation.md "Deviations from spec") -- internal
+        # callers (CLI, sweep_dead_teams, many existing pure-unit test
+        # fixtures) pass run_id values that never matched _RUN_ID_RE and
+        # must keep working exactly as before this cycle.
+        d = teamsmod._run_dir("r1")
+        self.assertEqual(d, os.path.join(teamsmod._leads_root(), "r1"))
+
+
 class NewStateAdditiveFieldsTests(unittest.TestCase):
     def test_defaults_are_none_and_empty_dict(self):
         state = teamsmod._new_state("r1", "/wd", _lead(), [], "task")
