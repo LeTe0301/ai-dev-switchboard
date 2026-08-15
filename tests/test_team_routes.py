@@ -2127,6 +2127,161 @@ class TeamInterjectEndpointTests(_RealHTTPTeamTestCase):
         self.assertIn("human", payload["cursors"])
 
 
+# ─── POST /projects/<name>/team/add-member (backlog item 21 part 1) ───────
+class TeamAddMemberEndpointTests(_RealHTTPTeamTestCase):
+    def _make_run(self, name=_PROJ, status="running"):
+        os.makedirs(os.path.join(self.projects_dir, name), exist_ok=True)
+        run_id = teamsmod._run_id()
+        state = teamsmod._new_state(run_id, os.path.join(self.projects_dir, name),
+                                    {"kind": "ollama", "name": "m", "tier": 1}, [], "task",
+                                    project_name=name)
+        state["status"] = status
+        teamsmod._persist(state)
+        return run_id
+
+    def test_unknown_project_404(self):
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/projects/nope/team/add-member", cookie,
+                                     {"agent": "codex", "code": code})
+        self.assertEqual(status, 404)
+
+    def test_no_run_at_all_400_specific_reason(self):
+        os.makedirs(os.path.join(self.projects_dir, _PROJ))
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/add-member", cookie,
+                                     {"agent": "codex", "code": code})
+        self.assertEqual(status, 400)
+        self.assertIn("no run found", payload["error"])
+
+    def test_explicit_run_id_for_a_different_project_400_specific_reason(self):
+        run_a = self._make_run(name=_PROJ_A)
+        os.makedirs(os.path.join(self.projects_dir, _PROJ_B))
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ_B}/team/add-member", cookie,
+                                     {"agent": "codex", "run_id": run_a, "code": code})
+        self.assertEqual(status, 400)
+        self.assertIn("different project", payload["error"])
+
+    def test_path_traversal_run_id_400_planted_file_never_opened(self):
+        os.makedirs(os.path.join(self.projects_dir, _PROJ))
+        planted = _plant_traversal_target(self.tmp)
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = _get_forbidding_open_of(
+            self, planted,
+            lambda: self._post(f"/projects/{_PROJ}/team/add-member", cookie,
+                               {"agent": "codex", "run_id": TRAVERSAL_RUN_ID, "code": code}))
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "no run found for this project"})
+
+    def test_malformed_non_traversal_run_id_400_no_500(self):
+        os.makedirs(os.path.join(self.projects_dir, _PROJ))
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/add-member", cookie,
+                                     {"agent": "codex", "run_id": "not-a-real-run", "code": code})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "no run found for this project"})
+
+    def test_empty_agent_400_add_team_member_never_called(self):
+        run_id = self._make_run()
+        calls = {"n": 0}
+        orig = teamsmod.add_team_member
+
+        def counting(*a, **kw):
+            calls["n"] += 1
+            return orig(*a, **kw)
+        teamsmod.add_team_member = counting
+        self.addCleanup(setattr, teamsmod, "add_team_member", orig)
+
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/add-member", cookie,
+                                     {"agent": "   ", "run_id": run_id, "code": code})
+        self.assertEqual(status, 400)
+        self.assertEqual(calls["n"], 0)
+
+    def test_terminal_status_400_specific_reason(self):
+        run_id = self._make_run(status="finished")
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/add-member", cookie,
+                                     {"agent": "codex", "run_id": run_id, "code": code})
+        self.assertEqual(status, 400)
+        self.assertIn("finished", payload["error"])
+
+    def test_run_id_omitted_defaults_to_latest_run_for_project(self):
+        repo = self._project(_PROJ)
+        _write_engine_file(self.engines_dir, "codex.engine", """\
+            LABEL=Codex
+            CMD=unused
+            HEADLESS_CMD=codex -p {resume}
+            HEADLESS_FORMAT=plain
+            HEADLESS_PROMPT=arg
+            """)
+        result = teamsmod.launch_team(repo, "task", {"kind": "ollama", "name": "m", "tier": 1}, [])
+        run_id = result["run_id"]
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/add-member", cookie,
+                                     {"agent": "codex", "code": code})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"ok": True, "run_id": run_id, "agent": "codex"})
+
+    def test_valid_running_run_creates_worktree_and_window_no_thread_started(self):
+        repo = self._project(_PROJ)
+        _write_engine_file(self.engines_dir, "codex.engine", """\
+            LABEL=Codex
+            CMD=unused
+            HEADLESS_CMD=codex -p {resume}
+            HEADLESS_FORMAT=plain
+            HEADLESS_PROMPT=arg
+            """)
+        result = teamsmod.launch_team(repo, "task", {"kind": "ollama", "name": "m", "tier": 1}, [])
+        run_id = result["run_id"]
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/add-member", cookie,
+                                     {"agent": "codex", "run_id": run_id, "code": code})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"ok": True, "run_id": run_id, "agent": "codex"})
+        self.assertTrue(os.path.isdir(teamsmod._worktree_path(repo, "codex")))
+        with open(teamsmod._membership_log_path(run_id)) as f:
+            envelope = json.loads(f.readline())
+        self.assertEqual(envelope["agent"], "codex")
+        self.assertEqual(envelope["kind"], "member_joined")
+        # Never spins up a background driving thread -- same reasoning
+        # /team/interject already documents.
+        self.assertIsNone(appmod._team_threads_get(_PROJ))
+
+    def test_over_the_cap_400_specific_reason(self):
+        repo = self._project(_PROJ)
+        for name in ("codex", "aider"):
+            _write_engine_file(self.engines_dir, f"{name}.engine", f"""\
+                LABEL={name.title()}
+                CMD=unused
+                HEADLESS_CMD={name} -p {{resume}}
+                HEADLESS_FORMAT=plain
+                HEADLESS_PROMPT=arg
+                """)
+        result = teamsmod.launch_team(repo, "task", {"kind": "ollama", "name": "m", "tier": 1},
+                                      ["codex"])
+        run_id = result["run_id"]
+        orig_max = teamsmod.TEAM_MAX_MEMBERS
+        teamsmod.TEAM_MAX_MEMBERS = 1
+        self.addCleanup(setattr, teamsmod, "TEAM_MAX_MEMBERS", orig_max)
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post(f"/projects/{_PROJ}/team/add-member", cookie,
+                                     {"agent": "aider", "run_id": run_id, "code": code})
+        self.assertEqual(status, 400)
+        self.assertIn("1", payload["error"])
+        self.assertFalse(os.path.isdir(teamsmod._worktree_path(repo, "aider")))
+
+
 # ─── POST /projects/<name>/team/start with a submitted composition ────────
 class TeamStartWithCompositionEndpointTests(_RealHTTPTeamTestCase):
     def _roster_engines(self):

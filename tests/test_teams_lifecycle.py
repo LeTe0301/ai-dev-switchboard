@@ -806,6 +806,241 @@ class LaunchTeamRealTmuxTests(_RealTmuxTeamLifecycleTestCase):
         self.assertTrue(teamsmod.tmux_has(result["session"]))
 
 
+class _AddTeamMemberRealTmuxTestCase(_RealTmuxTeamLifecycleTestCase):
+    """_RealTmuxTeamLifecycleTestCase's own real-git/real-tmux setUp,
+    extended with a scratch ENGINES_DIR: unlike launch_team()'s own
+    --members (plain strings, never checked against roster()),
+    add_team_member() DOES validate the requested agent against roster()
+    (backlog item 21 part 1, docs/spec.md 'Proposed approach' §1 step 3),
+    so real .engine fixture files matching every agent name used below are
+    required (the default ENGINES_DIR, /etc/ai-dev-switchboard/engines.d,
+    does not exist on a dev/test host)."""
+
+    def setUp(self):
+        super().setUp()
+        self.engines_dir = tempfile.mkdtemp(prefix="switchboard-addmember-engines-")
+        self._orig_engines_dir = appmod.ENGINES_DIR
+        appmod.ENGINES_DIR = self.engines_dir
+        for name in ("claude", "codex", "aider"):
+            _write_engine_file(self.engines_dir, f"{name}.engine", f"""\
+                LABEL={name.title()}
+                CMD=unused
+                HEADLESS_CMD={name} -p {{resume}}
+                HEADLESS_FORMAT=plain
+                HEADLESS_PROMPT=arg
+                """)
+
+    def tearDown(self):
+        appmod.ENGINES_DIR = self._orig_engines_dir
+        shutil.rmtree(self.engines_dir, ignore_errors=True)
+        super().tearDown()
+
+
+class AddTeamMemberRealTmuxTests(_AddTeamMemberRealTmuxTestCase):
+    def test_add_member_creates_worktree_and_window_queues_event(self):
+        repo = os.path.join(self.tmp, _scoped("demo"))
+        _init_repo(repo)
+        launch = teamsmod.launch_team(repo, "task", _lead(), ["codex"])
+        self.assertTrue(launch["ok"], launch)
+        run_id = launch["run_id"]
+        session = teamsmod._team_session_name(_scoped("demo"))
+
+        result = teamsmod.add_team_member(run_id, "aider")
+
+        self.assertEqual(result, {"ok": True, "agent": "aider",
+                                  "worktree": teamsmod._worktree_path(repo, "aider")})
+        self.assertTrue(os.path.isdir(teamsmod._worktree_path(repo, "aider")))
+        self.assertIn(teamsmod._worktree_path(repo, "aider"),
+                      _git(repo, "worktree", "list").stdout)
+        self.assertEqual(sorted(_tmux_windows(session)), sorted(["lead", "codex", "aider"]))
+
+        # Never touches run.json directly (mirrors interject()'s own
+        # race-avoidance design, docs/spec.md "Proposed approach" §1).
+        state = teamsmod._load_state(run_id)
+        self.assertNotIn("aider", state["members"])
+        self.assertNotIn("aider", state.get("worktrees", {}))
+
+        with open(teamsmod._membership_log_path(run_id)) as f:
+            envelope = json.loads(f.readline())
+        self.assertEqual(envelope["agent"], "aider")
+        self.assertEqual(envelope["kind"], "member_joined")
+        self.assertEqual(envelope["worktree"], teamsmod._worktree_path(repo, "aider"))
+
+    def test_add_member_while_blocked_ask_user_succeeds_immediately_and_drain_waits_for_resume(self):
+        # docs/spec.md "Acceptance criteria": add_team_member() succeeds
+        # (real worktree + window created immediately) while the run is
+        # blocked_ask_user, and the queued member_joined event is only
+        # drained once the run is later resumed -- not before. Closes the
+        # test-coverage gap flagged in docs/test-review.md's BACKLOG item
+        # 21 part 1 review (Finding 1): the existing
+        # test_blocked_ask_user_and_blocked_board_write_do_not_hit_the_
+        # status_check (tests/test_teams_lead.py) only proves the status
+        # *gate* accepts this status (via a deliberately-unknown engine
+        # name that fails at a later check); it never reaches the real
+        # worktree/window/drain path this test exercises.
+        repo = os.path.join(self.tmp, _scoped("demo-blocked"))
+        _init_repo(repo)
+        launch = teamsmod.launch_team(repo, "task", _lead(), ["codex"])
+        self.assertTrue(launch["ok"], launch)
+        run_id = launch["run_id"]
+        session = teamsmod._team_session_name(_scoped("demo-blocked"))
+
+        state = teamsmod._load_state(run_id)
+        state["status"] = "blocked_ask_user"
+        teamsmod._persist(state)
+
+        result = teamsmod.add_team_member(run_id, "aider")
+
+        self.assertEqual(result, {"ok": True, "agent": "aider",
+                                  "worktree": teamsmod._worktree_path(repo, "aider")})
+        self.assertTrue(os.path.isdir(teamsmod._worktree_path(repo, "aider")))
+        self.assertIn(teamsmod._worktree_path(repo, "aider"),
+                      _git(repo, "worktree", "list").stdout)
+        self.assertEqual(sorted(_tmux_windows(session)), sorted(["lead", "codex", "aider"]))
+
+        # Queued but NOT yet drained -- state["members"] still reflects the
+        # pre-add roster while the run remains blocked.
+        blocked_state = teamsmod._load_state(run_id)
+        self.assertEqual(blocked_state["status"], "blocked_ask_user")
+        self.assertNotIn("aider", blocked_state["members"])
+        self.assertNotIn("aider", blocked_state.get("worktrees", {}))
+        with open(teamsmod._membership_log_path(run_id)) as f:
+            envelope = json.loads(f.readline())
+        self.assertEqual(envelope["agent"], "aider")
+        self.assertEqual(envelope["kind"], "member_joined")
+
+        # Resume: status flips back to running, and the NEXT team_step()
+        # call is the one that actually drains the queued event -- same
+        # "only drains at the next round boundary" behavior the running-
+        # status test above (test_drain_at_next_round_boundary_makes_
+        # agent_delegate_eligible) already proves for the unblocked case.
+        blocked_state["status"] = "running"
+
+        def fail_call_lead(*a, **kw):
+            self.fail("_call_lead() was called on a round that only drained membership")
+
+        orig = teamsmod._call_lead
+        teamsmod._call_lead = fail_call_lead
+        try:
+            teamsmod.team_step(blocked_state)
+        finally:
+            teamsmod._call_lead = orig
+        self.assertIn("aider", blocked_state["members"])
+        self.assertEqual(blocked_state["worktrees"]["aider"],
+                         teamsmod._worktree_path(repo, "aider"))
+
+    def test_drain_at_next_round_boundary_makes_agent_delegate_eligible(self):
+        repo = os.path.join(self.tmp, _scoped("demo2"))
+        _init_repo(repo)
+        launch = teamsmod.launch_team(repo, "task", _lead(), ["codex"])
+        run_id = launch["run_id"]
+        teamsmod.add_team_member(run_id, "aider")
+        state = teamsmod._load_state(run_id)
+
+        def fail_call_lead(*a, **kw):
+            self.fail("_call_lead() was called on a round that only drained membership")
+
+        orig = teamsmod._call_lead
+        teamsmod._call_lead = fail_call_lead
+        try:
+            teamsmod.team_step(state)  # round 1: drains only
+        finally:
+            teamsmod._call_lead = orig
+        self.assertIn("aider", state["members"])
+
+        # docs/spec.md "Acceptance criteria": _lead_tools()/_validate_lead_
+        # action() both now accept agent="aider" with NO code change in
+        # either function -- both already rebuild from state["members"]
+        # fresh every call.
+        tools = teamsmod._lead_tools(state["members"])
+        delegate_enum = next(t["function"]["parameters"]["properties"]["agent"]["enum"]
+                             for t in tools if t["function"]["name"] == "delegate")
+        self.assertIn("aider", delegate_enum)
+        result = teamsmod._validate_lead_action(
+            {"tool": "delegate", "args": {"agent": "aider", "task": "x"}},
+            state["members"], state["action_count"])
+        self.assertTrue(result["ok"], result)
+
+    def test_tmux_session_gone_rolls_back_worktree(self):
+        repo = os.path.join(self.tmp, _scoped("demo3"))
+        _init_repo(repo)
+        launch = teamsmod.launch_team(repo, "task", _lead(), ["codex"])
+        run_id = launch["run_id"]
+        session = teamsmod._team_session_name(_scoped("demo3"))
+        subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
+
+        result = teamsmod.add_team_member(run_id, "aider")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("no longer running", result["error"])
+        self.assertFalse(os.path.exists(teamsmod._worktree_path(repo, "aider")))
+        self.assertFalse(os.path.exists(teamsmod._membership_log_path(run_id)))
+
+
+class CliTeamAddMemberSubprocessTests(unittest.TestCase):
+    """team-launch then team-add-member through the REAL CLI as a separate
+    subprocess, same technique CliTeamLifecycleSubprocessTests above already
+    establishes (no TMUX monkeypatch -- a fresh subprocess re-imports app.py,
+    so an in-process patch wouldn't apply anyway; relies on the same real
+    `sudo -u $RUN_USER tmux` path that class's own docstring already proved
+    works in this environment). Verifies docs/spec.md 'Acceptance criteria':
+    team-add-member produces the same effect as the HTTP route, without any
+    web server running."""
+
+    def setUp(self):
+        self.state_dir = tempfile.mkdtemp(prefix="switchboard-addmember-clistate-")
+        self.tmp = tempfile.mkdtemp(prefix="switchboard-addmember-cli-")
+        self.projects_dir = tempfile.mkdtemp(prefix="switchboard-addmember-cliprojects-")
+        self.engines_dir = tempfile.mkdtemp(prefix="switchboard-addmember-cliengines-")
+        for name in ("codex", "aider"):
+            _write_engine_file(self.engines_dir, f"{name}.engine", f"""\
+                LABEL={name.title()}
+                CMD=unused
+                HEADLESS_CMD={name} -p {{resume}}
+                HEADLESS_FORMAT=plain
+                HEADLESS_PROMPT=arg
+                """)
+        self.env = dict(os.environ)
+        self.env["TEAM_STATE_DIR"] = self.state_dir
+        self.env["PROJECTS_DIR"] = self.projects_dir
+        self.env["ENGINES_DIR"] = self.engines_dir
+        self.env["TEAM_LLM_BASE_URL"] = "http://127.0.0.1:1/v1"  # never actually called
+        self.env["TEAM_LLM_MODEL"] = "stub-model"
+
+    def tearDown(self):
+        shutil.rmtree(self.state_dir, ignore_errors=True)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        shutil.rmtree(self.projects_dir, ignore_errors=True)
+        shutil.rmtree(self.engines_dir, ignore_errors=True)
+        _kill_leftover_team_sessions()
+
+    def _run_cli(self, *args):
+        cmd = [sys.executable, os.path.join(APP_DIR, "teams.py")] + list(args)
+        return subprocess.run(cmd, cwd=REPO_ROOT, env=self.env, capture_output=True, text=True, timeout=60)
+
+    def test_cli_add_member_creates_worktree_and_window(self):
+        repo = os.path.join(self.tmp, _scoped("clidemo2"))
+        _init_repo(repo)
+        r1 = self._run_cli("team-launch", repo, "--task", "do it", "--lead", "codex",
+                           "--members", "")
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        run_id = json.loads(r1.stdout)["run_id"]
+
+        r2 = self._run_cli("team-add-member", run_id, "aider")
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertIn("added 'aider'", r2.stdout)
+        self.assertTrue(os.path.isdir(teamsmod._worktree_path(repo, "aider")))
+        session = teamsmod._team_session_name(_scoped("clidemo2"))
+        self.assertIn("aider", _tmux_windows(session))
+
+        self._run_cli("team-stop", run_id)
+
+    def test_cli_add_member_unknown_run_id_nonzero_exit(self):
+        r = self._run_cli("team-add-member", "no-such-run", "aider")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no such run_id", r.stderr)
+
+
 class StopTeamRealTmuxTests(_RealTmuxTeamLifecycleTestCase):
     def test_stop_running_run_kills_session_dirty_left_clean_removed(self):
         repo = os.path.join(self.tmp, _scoped("demo"))
