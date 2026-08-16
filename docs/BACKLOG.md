@@ -2950,6 +2950,61 @@ session or removal of anything was done or will be done without the
 user's explicit go-ahead**, per their explicit "I'll end it myself when
 ready" instruction from earlier in this same session.
 
+## 46. `PUBLISH_MODE=tailscale` silently fails end-to-end — `tailscale serve` needs an explicit operator grant `install.sh` never makes, and `_publish()`/`_unpublish()` swallow the failure
+
+Found by a separate peer session (`Verify dev container repos migrated to
+AI dev switch`), asked by the user to bring CT110 up to feature parity
+with this dev sandbox's own tailscale-publish setup — a genuine code gap,
+not just an unconfigured-feature difference, and never exercised by any
+E2E round in this whole session (every round so far tested
+`PUBLISH_MODE=none`/loopback only).
+
+Repro: fresh install with `PUBLISH_MODE=tailscale` + `BASE_URL` set,
+`tailscale up` already run/authorized. Toggle "Code" on for any project:
+`{"ok": true}`, `/status` shows a plausible `code_url`
+(`https://<tailnet-host>/code/<project>`) — completely dead, because the
+underlying `tailscale serve --set-path=...` publish never took effect.
+
+Root cause: `_publish()` (app.py) runs `subprocess.run(["tailscale",
+"serve", "--bg", f"--set-path={path}", f"http://127.0.0.1:{port}"],
+capture_output=True)` — the same unchecked-returncode/discarded-stderr
+pattern items 42/43 already had before their fixes. Confirmed directly:
+running that exact command as the service account (`switchboard-svc`)
+fails with `sending serve config: Access denied: serve config denied` —
+`tailscale serve` requires either root or the tailnet's designated
+"operator" account to modify serve config, and nothing in `install.sh`
+(even under `--with-code-server` + `PUBLISH_MODE=tailscale`) ever runs
+`tailscale set --operator=$SVC_USER`. Fails on every fresh install that
+picks tailscale publishing, 100% of the time, completely silently.
+Confirmed the fix works live: running `tailscale set
+--operator=switchboard-svc` once, then the identical toggle correctly
+registers the serve route and the URL becomes genuinely reachable (`curl`
+→ `302`). Applied manually on CT110 so the user's box works now: **not
+yet fixed in the codebase**.
+
+Shape of the fix, matching the item 42/43 precedent (two parts):
+1. `install.sh`, when `PUBLISH_MODE=tailscale` is selected and
+   `tailscale` is present, should run `tailscale set
+   --operator=$SVC_USER` itself. If tailscale isn't installed/authed yet
+   at install time, print a clear one-time instruction in the summary
+   (same style as the Gitea/Taiga two-step bootstrap notes) to run that
+   command once `tailscale up` is done — install.sh can't force tailscale
+   auth itself.
+2. `_publish()`/`_unpublish()` in app.py should check the subprocess
+   returncode and surface a real error, same pattern as items 42/43,
+   instead of returning a URL that looks valid but silently doesn't work
+   — the more important half, since it's what let this go unnoticed
+   through every prior round. Whichever round picks this up should give
+   `PUBLISH_MODE=tailscale` its own real E2E pass, not just a code review
+   — nobody has hands-on-tested this mode this entire session.
+
+**Not yet pushed to a live tracker** — the reporting peer doesn't have
+Taiga credentials, and neither does this sandbox (checked: no
+`~/.config/ai-dev-switchboard/taiga-push.env` exists here, only test
+fixtures under `/tmp` from the test suite). Recorded here per this file's
+own established role as the source of truth for this session; orchestrator
+flagged the credential gap to the user rather than fabricating a push.
+
 ---
 
 ## Items 39-43: found by E2E round 6 real test on fresh CT110 (2026-08-16)
