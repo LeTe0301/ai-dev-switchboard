@@ -2824,6 +2824,79 @@ the user: **not** a clone of this whole dev sandbox. Instead:
    down — the user explicitly wants to do that manually, after reviewing
    the new container themselves.
 
+### New container up (2026-08-16): CT110 `ai-dev-switchboard-main`, tested clean
+
+Reported back by `pve-sparkling-meadow`: CTID 110, hostname
+`ai-dev-switchboard-main`, IP `192.168.178.237` (DHCP/LAN), Debian 12
+unprivileged, 4 vCPU/4096MB/32GB, `onboot=0` (not yet auto-starting on
+host reboot — flip via `pct set 110 -onboot 1` once confirmed happy with
+it). Installed from `main` @ `de60bf4`, `install.sh --yes
+--with-git-hosting --with-taiga` only, as requested. Web UI on `8333`
+(loopback-only inside the container, needs an SSH tunnel or similar to
+reach from outside — `ssh -L 8333:127.0.0.1:8333 root@192.168.178.237`).
+Login `admin`/`OjGBDmX0YvD0E13M` (`AUTH_MODE=simple`), TOTP secret
+`632USL5QSHDLGK6C7DCB3YE366SDYHRW`, all in
+`/etc/ai-dev-switchboard/switchboard.env` on CT110. Gitea admin
+`admin`/`GiteaMain-Pass9f3k` (bootstrapped with `--must-change-password=
+false`, item 40's fix, `GITEA_API_TOKEN` already configured). Taiga admin
+`admin`/`TaigaMain-Pass9f3k` (created via `taiga-manage.sh
+createsuperuser` — **note: must run as root, not `RUN_USER`/`dev`**, `dev`
+has no docker-group access by design; install-summary doesn't mention
+this, worth a doc fix later). Tested: clean fresh install, login works,
+Gitea non-first-admin bootstrap clean (item 40), Taiga toggle ~13s bound
+to `127.0.0.1:9000` (items 43/44), a real project created end-to-end then
+removed (own test artifact, cleaned up). One cosmetic-only bug noted, not
+a blocker: the install-summary's printed `Web UI:` line shows
+`http://127.0.0.1::` (missing port) when `LISTEN_PORT` isn't pre-seeded
+in `switchboard.env` before running — the actual bind is correct
+(`8333`, confirmed via `ss -ltnp`), only that one summary-text lookup is
+affected. Worth a one-line fix if anyone's doing further install.sh
+cleanup — not scheduled as its own round right now.
+
+### Repo migration (2026-08-16): in progress
+
+Of the 15 project folders in this dev sandbox, 6 are real git repos.
+`test-project` has zero commits (nothing to migrate, skipped). Of the
+remaining 5: `streakline`/`remote-dev-container` already have public
+GitHub remotes, so briefed the peer to use the new container's own
+"Clone project from URL" for those directly, no transfer needed.
+`ai-dev-switchboard`/`birdiely`/`receipt-digitalizer-and-sorter` only
+have local/private remotes (`/srv/git/repos/*.git` bare repos on this
+dev sandbox) — this sandbox has no network path to the new container's
+loopback-bound Gitea, so bundled each with full history (`git bundle
+create --all`) and served them over a temporary HTTP listener bound to
+this sandbox's own LAN IP (`192.168.178.214`, same `/24` as the pve host
+and the new container). **This required explicit user sign-off** — the
+first attempt to start that listener was blocked by the orchestrator's
+own permission classifier; asked the user, they approved a one-off
+listener. Briefed the peer with fetch URLs
+(`http://192.168.178.214:8899/{ai-dev-switchboard,birdiely,receipt-
+digitalizer-and-sorter}.bundle`) and import instructions (clone the
+bundle locally, push into a Gitea repo created via the container's own
+`GITEA_API_TOKEN`, register as a real ai-dev-switchboard project via
+whichever existing flow fits). Listener is temporary — orchestrator will
+shut it down once the peer confirms all 3 fetched, not left running
+indefinitely. Not yet confirmed as of this writing.
+
+### To resume if this session is interrupted mid-migration (repo transfer)
+
+1. Check `ListAgents` for the current pve-side peer session name.
+2. If the HTTP listener on this sandbox (`192.168.178.214:8899`,
+   `python3 -m http.server` in `/tmp/.../scratchpad/migration-bundles/`)
+   is still running and no confirmation has arrived: check whether it's
+   actually needed still (peer may have fetched already without
+   replying) before deciding whether to re-send/wait. Don't leave it
+   running indefinitely once the transfer's done — `pkill -f "http.server
+   8899"` (or find the PID via `pgrep -fa "http.server 8899"`) once
+   confirmed no longer needed.
+3. If confirmation *has* arrived: verify which of the 5 repos actually
+   landed as real registered projects (not just raw Gitea imports) on the
+   new container, shut down the HTTP listener, then report the full
+   picture back to the user — this was the last step before "let the user
+   know" per their original instruction. Do not discuss/execute shutting
+   down this session or the old container's decommissioning unless the
+   user explicitly raises it.
+
 ---
 
 ## Items 39-43: found by E2E round 6 real test on fresh CT110 (2026-08-16)
