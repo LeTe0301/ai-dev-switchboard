@@ -2696,6 +2696,31 @@ trigger for it.
    it's to be fixed, or just re-brief the peer for another round if it's
    to be re-tested first.
 
+### Item 45: investigated and fixed (2026-08-16)
+
+User chose to investigate item 45 before deciding on backup+migration.
+product-manager read the actual code (`app/teams.py`, `app/app.py`)
+rather than theorizing from the E2E report, and confirmed this is a
+real, root-cause-independent gap: the lead's `finish` tool has no
+success/failure distinction, `team_step()` unconditionally sets
+`status: "finished"` when called, and `summary` was already being
+captured on every `finish` call but never surfaced anywhere in `/status`
+or the frontend — the app's own status model conflates "completed" and
+"gave up and said so" regardless of which round's specific tool choice
+triggered it. Rejected inventing a new `give_up`/error tool (same
+unreliable-model-judgment-call problem as choosing `finish` vs
+`ask_user` today, and would still need this same surfacing fix on top);
+fixed by surfacing `summary` universally in `/status`'s team block and
+adding a small frontend display (reusing the existing `escalatedNote`/
+`.team-sub` pattern) — explicitly scoped as additive display only, not
+a failure classifier, and explicitly not extended to `error` status
+(non-goal, flagged as a possible cheap follow-up later). Full
+product-manager → developer → reviewer pipeline (no ux-designer — reused
+an existing frontend pattern 1:1). Reviewer confirmed the escaping is
+safe against injection via a real `<script>`-content test (the field now
+renders model-generated text into the DOM). Approved, no findings.
+Committed as `<pending>`, to be pushed alongside this note.
+
 ---
 
 ## Items 39-43: found by E2E round 6 real test on fresh CT110 (2026-08-16)

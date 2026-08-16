@@ -1,66 +1,62 @@
-# Test & Review: E2E round 9 — item 44's fix (taiga-gateway's host port never actually gets published)
+# Test & Review: Surface a finished team run's `summary` in `/status`'s team block (backlog item 45)
 
 ## Scope
-Verifies docs/spec.md's acceptance criteria against the actual uncommitted diff on `backlog/e2e-fixes-round6`: `install.sh`'s new grep-gated `sed` patch step for the pinned `taiga-docker` checkout's own `docker-compose.yml` `ports:` line, removal of `docker-compose.override.yml`'s now-conflicting `ports:` entry, updated explanatory comments, and the new `tests/test_install_taiga_gateway_port.py` (6 tests). Special focus per the dispatch brief: independently re-derive (not trust) the Compose `ports:`-concatenation merge-semantics claim, since this reverses part of item 30's architecture decision for the second time in three rounds.
+Covers all acceptance criteria in `docs/spec.md`: `/status`'s per-project
+`team.summary` field (backend), the `.team-sub` display line under a
+"Finished" status strip (frontend), the empty-string suppression case, the
+defensive non-`finished` gate, and the no-run-ever-started `None` default.
+Reviewed the actual diff (`app/app.py`, `tests/test_team_routes.py`,
+`tests/test_team_frontend.js`) against `docs/spec.md` and
+`docs/implementation.md`.
 
 ## Test cases
 
 | # | Criterion / case | Method | Result | Evidence |
 |---|---|---|---|---|
-| 1 | Sed/grep patterns match the real upstream `taigaio/taiga-docker` `stable` `docker-compose.yml`, not just the implementation report's claim | independent live fetch (`curl raw.githubusercontent.com/.../stable/docker-compose.yml`), diffed byte-for-byte against the test file's embedded `UPSTREAM_DOCKER_COMPOSE_YML` fixture | pass | `diff` of the freshly-fetched file against the fixture (extracted via `import test_install_taiga_gateway_port`) → identical, zero output |
-| 2 | AC1/edge case: fresh unpatched checkout gets the `ports:` line patched to `"127.0.0.1:${TAIGA_PORT}:80"` | automated: `test_fresh_unpatched_checkout_gets_port_patched_to_loopback_only` | pass | ran green |
-| 3 | Patch is scoped to exactly one line, rest of file untouched | automated: `test_only_the_ports_line_changes_rest_of_file_untouched` | pass | ran green |
-| 4 | AC4: re-run against a pre-fix, never-`TAIGA_FRESH_CLONE`-gated checkout still gets patched | automated: `test_rerun_against_preexisting_unpatched_install_still_gets_patched` | pass | ran green |
-| 5 | AC5: idempotency — 2nd/3rd run against an already-patched file is a clean, byte-identical no-op, no warning | automated: `test_rerun_against_already_patched_checkout_is_byte_identical_noop`, plus **independent manual re-derivation**: extracted install.sh's real step-3 block, ran it 3x in a row against a scratch file seeded with the real fetched upstream content | pass | automated test green; manual run: `sha256sum` after run 1 = `d57e565...`; `diff` of file-after-run-1 vs. file-after-run-2 vs. file-after-run-3 all empty (`RUN2_NOOP_CONFIRMED`, `RUN3_NOOP_CONFIRMED`) |
-| 6 | AC6/edge case: sed pattern mismatch (neither original nor patched form present) warns loudly to stderr, doesn't fail the install, doesn't silently no-op or corrupt the file | automated: `test_unexpected_format_warns_loudly_and_leaves_file_untouched`, plus independent manual re-derivation with a synthetic mismatched file (`"9001:81"`) | pass | manual run: exit code 0, stderr contains the full `WARNING: expected taiga-gateway's 'ports: - "9000:80"'...` message naming the file path and `taiga-gateway`, file content byte-identical to input afterward |
-| 7 | Same warn-vs-noop distinction for the already-patched-form-present-from-start case | automated: `test_already_patched_form_present_from_the_start_is_a_clean_noop` | pass | ran green |
-| 8 | AC2: merged `docker compose config` shows exactly one `ports:` entry for `taiga-gateway`, `127.0.0.1:9000->80/tcp` | **independent re-derivation**, real Docker Compose v5.4.0 (available in this sandbox): built a scratch `$TAIGA_DIR` from the real fetched upstream file, ran the real extracted patch step, wrote the real extracted post-fix `docker-compose.override.yml` heredoc (volumes:/depends_on: only, no ports:), ran `docker compose -f docker-compose.yml -f docker-compose.override.yml config` | pass | resolved config's `taiga-gateway.ports` = exactly one entry: `host_ip: 127.0.0.1, target: 80, published: "9000", protocol: tcp, mode: ingress` |
-| 9 | **Re-derivation of the core `ports:`-concatenation claim itself** (not just trusting the spec's quoted Docker docs) — does the *old*, pre-fix override-based approach genuinely produce two competing `ports:` entries rather than one deduped/replaced entry? | independent live re-derivation: built the *old* broken setup (unpatched base file with `"9000:80"` + old override with `ports: - "127.0.0.1:${TAIGA_PORT}:80"`), ran real `docker compose config` | pass — claim confirmed correct | merged config shows **two** `ports:` list entries for `taiga-gateway`: one with no `host_ip` (implicit `0.0.0.0`) published `9000`, one with `host_ip: 127.0.0.1` published `9000` — concatenated, not deduped/replaced, matching the spec's/implementation's stated root cause exactly (different `ip` → Compose's own dedup-by-`ip`+`target`+`published`+`protocol` rule never triggers) |
-| 10 | Item 43's mechanism (`taiga.conf` lazy-resolver bind-mount, `taiga-front` `service_healthy` gate) untouched by this diff | direct diff inspection, not the summary — read the full `install.sh` diff and the full NGINX heredoc / `docker-compose.override.yml` heredoc content before/after | pass | `docker-compose.override.taiga-gateway.conf` heredoc content (resolver + 4 `set $upstream_x` rewrites) has zero changed lines; `docker-compose.override.yml`'s `taiga-front.healthcheck` and `taiga-gateway.volumes`/`depends_on` blocks unchanged — only the `taiga-gateway.ports:` two-line block is removed. Confirmed again mechanically via case 8/9's merged-config output showing the same `volumes:`/`depends_on:` entries item 43 relies on, present and correct |
-| 11 | Tests genuinely exercise the new code, not vacuous | reverted `install.sh` only (`git checkout -- install.sh`) via a temp copy/restore round-trip, re-ran the new test file | pass (as "revert → fail" check) | all 6 tests fail with `ValueError: substring not found` (extraction marker `# 3. Item 44 (round 9):` doesn't exist in pre-fix install.sh) — confirmed `install.sh` was correctly restored afterward (`git diff --stat`/`git status` match the original diff exactly) |
-| 12 | `bash -n install.sh` syntax check | ran directly | pass | `SYNTAX_OK` |
-| 13 | `shellcheck install.sh` — no new findings from this diff | ran directly | pass | Only pre-existing info/style-level findings (SC2015 line 70, SC2001 line 1143, unrelated to this diff) plus two expected SC2016 "info" notes on the two new single-quoted `${TAIGA_PORT}`/`grep` lines (428-429) — single-quoting there is deliberate per spec/implementation, not a defect |
-| 14 | Full existing test suite — no new regressions | `python3 -m unittest discover -s tests`, twice, plus targeted re-runs | see "Regression check" below | 1272 tests; 3 known pre-existing failures reproduced exactly as implementation.md describes, plus 1 confirmed-unrelated flake (see below) |
-| 15 | `docs/BACKLOG.md` item 44 entry doesn't overclaim "confirmed fixed" | read full diff + surrounding conventions (item 43's own entry, top-level item status markers) | pass | Round 9 entry explicitly states "Not yet retest-confirmed — do not mark item 44 'confirmed fixed' until a retest report comes back clean," consistent with item 43's own prior pattern and the file's established convention |
+| 1 | `finish(summary="X")` → `/status` `team.summary == "X"` | Automated | pass | `test_summary_field` (`tests/test_team_routes.py`), ran via `pytest tests/test_team_routes.py -k summary` |
+| 2 | Non-`finished` status (`running`, `blocked_ask_user`, `blocked_board_write`, `escalated_max_rounds`, `error`, `stopped`) → `team.summary is None` | Automated | pass | same test, multi-status-case-dict loop over all 6 statuses |
+| 3 | No run ever started → `team.summary is None` (not a missing key) | Automated | pass | `test_summary_field_none_when_no_run_ever_started` |
+| 4 | `finished` + non-empty `summary` → "Finished" strip unchanged AND a `.team-sub` line with the escaped text | Automated | pass | `tests/test_team_frontend.js` new test, `node tests/test_team_frontend.js` |
+| 5 | `finished` + empty-string `summary` → no `.team-sub` line rendered | Automated | pass | `tests/test_team_frontend.js` new test, asserts `subCount === 0` |
+| 6 | Non-`finished` status → no summary line regardless of `team.summary` value (defensive gate) | Automated | pass | `tests/test_team_frontend.js` new test (`status: 'running'` with `summary` set) |
+| 7 | Existing `/status`-response tests continue passing (purely additive JSON shape) | Automated | pass | full `test_team_routes.py` run, 131/131; the one pre-existing exact-full-dict test (`test_status_idle_when_no_run_ever_started`) was updated to include `summary: None` and passes |
+| 8 | `summary` HTML-injection is escaped, not rendered raw | Automated | pass | extra test beyond the literal ACs, `<script>alert(1)</script>` case asserts `&lt;script&gt;` present, raw tag absent |
+
+Additionally performed a revert-and-watch-it-fail check (not simulated): stashed only `app/app.py`'s change (kept the new tests), reran both suites. Result: 3/3 new backend tests failed with `KeyError: 'summary'` (including the updated exact-dict test), 2/110 frontend tests failed (the non-empty-summary and script-escaping cases; the empty-string and defensive-gate cases correctly did not fail, since their expected behavior — "render nothing" — degrades a `KeyError`'d `undefined` to falsy the same way, which is expected and not a gap). Restored the change; all suites returned to green. This confirms the new tests genuinely exercise the new code path rather than passing tautologically.
 
 ## Regression check
-Full suite run: `python3 -m unittest discover -s tests` — **1272 tests, 4 failures, 1 skip** on the first run.
+- `pytest tests/test_team_routes.py -q` → **131 passed**.
+- `node tests/test_team_frontend.js` → **ALL PASS (110/110)**.
+- Full suite: `pytest tests/ -q` → **1271 passed, 3 failed, 3 skipped** (160s). The 3 failures are all in `tests/test_teams_grounding.py` (`test_discovers_architecture_backlog_readme_no_claude_or_agents`, `test_load_grounding_against_this_repo_is_non_empty`, `test_grounding_subcommand_against_this_repos_own_tree`), all failing because this sandbox has a real `CLAUDE.md` at the repo root that those grounding-discovery tests don't expect (they assert exactly 3 discovered files; this environment has 4, `CLAUDE.md` included). Confirmed independently pre-existing and unrelated to this diff by re-running the same 3 tests against `git stash` (this diff fully reverted) — identical 3 failures, same assertion diffs. No relation to `app/teams.py`/team status/summary logic. No flake from `test_teams_headless.py` was observed on this run.
 
-- **3 failures**: `tests/test_teams_grounding.py` (`test_discovers_architecture_backlog_readme_no_claude_or_agents`, `test_load_grounding_against_this_repo_is_non_empty`, `test_grounding_subcommand_against_this_repos_own_tree`) — exactly matches implementation.md's documented, environment-specific baseline (this sandbox has a real, gitignored root `CLAUDE.md` these tests don't expect). Confirmed unrelated to this diff (none of these files or `install.sh`'s taiga block feed this test's discovery logic).
-- **1 failure not mentioned in implementation.md**: `tests/test_team_routes.py::TeamStartEndpointTests::test_two_near_simultaneous_starts_exactly_one_succeeds`. Investigated via `systematic-debugging`:
-  - Re-ran standalone 3x: failed once (`[400, 400] != [200, 400]`), passed twice — a timing-dependent concurrency race in the test itself (two near-simultaneous `POST /team/start` calls expected exactly one `200`/one `400`).
-  - Re-ran standalone 4x more against a `git stash`'d clean pre-diff tree: all 4 passed (didn't reproduce there either in that sample, consistent with a low-probability flake rather than a deterministic one).
-  - This diff touches only `install.sh`, `docs/*.md`, and the new `tests/test_install_taiga_gateway_port.py` — nothing in `app/teams.py` or `tests/test_team_routes.py`. Confirmed pre-existing, order/timing-dependent flake, not a regression introduced by this change.
-- New test file (`tests/test_install_taiga_gateway_port.py`, 6 tests): all pass, independently re-run multiple times, and confirmed to genuinely depend on the new `install.sh` code (case 11 above).
+## Defects found
+None. Testing pass is clean — proceeding to review.
 
-Conclusion: no regressions caused by this diff. (Flagging the untracked 4th flaky failure as a housekeeping note for `docs/BACKLOG.md`, not a blocker — see Follow-ups.)
+---
 
 ## Spec coverage
-| Acceptance criterion (docs/spec.md) | Implemented | Tested |
-|---|---|---|
-| AC1 — fresh install: base file patched, override's `ports:` key gone | yes | yes (cases 2, 8) |
-| AC2 — merged `docker compose config` shows exactly one `ports:` entry, `127.0.0.1:9000->80/tcp` | yes | yes (case 8), plus root-cause re-derivation (case 9) |
-| AC3 — `POST /taiga/on` + real `curl`/`docker port` against a live container | not independently verified (no live `$TAIGA_DIR`/Docker Taiga stack available in this sandbox either — same constraint the developer had) | not tested — explicitly flagged in both docs/spec.md's Open Questions and docs/implementation.md's Known Limitations as needing the pve-peer hands-on retest; `docs/BACKLOG.md`'s Round 9 entry correctly does not claim this is done |
-| AC4 — re-run against pre-existing unpatched `$TAIGA_DIR` still converges | yes | yes (case 4) |
-| AC5 — re-run against already-patched `$TAIGA_DIR` is a byte-identical no-op | yes | yes (case 5, both automated and independent manual 3x re-run) |
-| AC6 — sed-pattern-mismatch warns loudly, doesn't fail install | yes | yes (case 6, both automated and independent manual re-derivation) |
-| AC7 — item 43 regression check (several `/taiga/on` trials, zero DNS-race crashes) | item 43's mechanism itself is unmodified (case 10) | not live-tested (same live-Docker-Taiga-stack constraint as AC3) — file-level non-regression confirmed via diff inspection instead, per docs/spec.md's own explicit non-goal framing ("not adding an HTTP-reachability check... a broader hardening... is a separable, later decision") and its Open Questions' acknowledgment that this needs the pve peer |
+All 7 acceptance criteria in `docs/spec.md` are implemented and covered by an automated test:
+1. `finish(summary="X")` round-trip — implemented (`app/app.py` L6036), tested (case #1 above).
+2. Non-`finished` statuses → `None` — implemented (same line, no extra gating needed per spec's own reasoning since `state["summary"]` defaults `None`), tested across all 6 non-`finished` statuses (case #2).
+3. No-run → `None` — implemented (`run is not None else None` ternary), tested (case #3).
+4. Finished + non-empty summary → visible `.team-sub` line — implemented (`finishedSummary` block, L4419-4420), tested (case #4).
+5. Finished + empty-string summary → no line — implemented (falsy-string short-circuit), tested (case #5).
+6. Non-finished + summary set anyway → no line (defensive) — implemented (`team.status === 'finished'` gate checked first), tested (case #6).
+7. Existing `/status` tests unaffected — confirmed, full file green including the one updated exact-dict test.
 
-No coverage gaps within what's achievable in this sandbox. AC3 and the live half of AC7 remain genuinely untested by both the developer and this review — correctly and consistently flagged as needing a hands-on pve-peer retest by docs/spec.md, docs/implementation.md, and `docs/BACKLOG.md`'s Round 9 entry, none of which overclaim.
+No gaps found. Non-goals were checked directly against the diff: no `error`-status treatment was added (grep confirms `"summary"` is the only new key in the status-handler dict, and `renderTeamStatusStrip()`'s `error` branch is untouched), no new tool schema/`finish` behavior change, no success/failure text classification anywhere in the diff.
 
 ## Findings (most severe first)
+None — no must-fix, should-fix, or nit findings.
 
-None must-fix or should-fix. The diff is a faithful, independently-verified implementation of docs/spec.md's proposed approach, with no deviations beyond the two the developer already flagged (test count, comment renumbering).
-
-### 1. `docs/BACKLOG.md`'s "how to verify locally" full-suite baseline (3 known failures) doesn't mention the 4th, flaky `test_team_routes.py` failure — nit
-- File: `docs/implementation.md` "How to verify locally" section; `docs/BACKLOG.md` doesn't reference this at all
-- Issue: implementation.md states "3 pre-existing, unrelated failures in `tests/test_teams_grounding.py`" as the full known baseline. This review's runs showed a 4th, intermittent failure (`test_two_near_simultaneous_starts_exactly_one_succeeds`) that is real but flaky (fails roughly 1 in 4-7 runs) and unrelated to both this diff and the 3 documented ones.
-- Failure scenario: a future contributor running the full suite sees an unexpected 4th failure, doesn't recognize it as a pre-existing flake (since it's undocumented), and either wastes time investigating or — worse — assumes their own unrelated change caused it.
-- Not blocking this cycle: confirmed via `git stash` that it exists identically on the pre-diff tree, so it's not introduced here. Worth a one-line backlog note (or a follow-up ticket to fix the race in the test itself) separate from item 44.
+Points specifically verified during review, for the record:
+- **XSS/escaping**: `esc()` (`app/app.py` L3383-3385) uses the standard `textContent` → `innerHTML` DOM round-trip, which is a robust browser-native escape (not a hand-rolled regex substitution), and is the same function already used for every other model/user-supplied string in this file (`ENGINE_LABELS`, `team.status` fallback, `run_id`, etc.) — no new escaping mechanism introduced, no gap. The injection test (`<script>alert(1)</script>` → `&lt;script&gt;`, no raw tag) is a real DOM-executed check via the existing test harness's real-`<script>`-extraction approach used throughout `test_team_frontend.js`, not a string-matching approximation.
+- **Placement/pattern fidelity**: the `finishedSummary` block is byte-for-byte the pattern the spec specified (mirrors `escalatedNote`, same `.team-sub` class, inserted at the same position in the concatenated return string, right before `escalationPanel`). No deviation.
+- **Scope discipline**: diff touches exactly the two functions the spec named (status-handler dict, `teamRow()`) plus tests — no incidental refactors, no touched `finish` tool schema, no new helper functions, no CSS additions (`.team-sub` reused verbatim as claimed).
+- **Test-file correctness**: the one pre-existing exact-full-dict test against `team` was correctly identified as the sole test needing an update (confirmed via grep — only one such assertion exists in the repo).
 
 ## Follow-ups (non-blocking)
-- File a lightweight backlog note (or ticket) for the flaky `tests/test_team_routes.py::test_two_near_simultaneous_starts_exactly_one_succeeds` concurrency race (Finding 1) — unrelated to item 44, pre-existing.
-- AC3 and the live half of AC7 still need the pve-peer hands-on retest before item 44 can be marked "confirmed fixed" in `docs/BACKLOG.md` — already correctly queued as the next step per the file's own "To resume if this session is interrupted mid-loop" section.
+- None raised by this cycle. The spec's own "Open questions" already flags `error` status as a possible independent follow-up if the user wants matching treatment later — not needed now.
 
 ## Overall verdict
-**Approve.** Both the testing pass and the review pass are clean. The core architectural claim this cycle turns on — that Compose concatenates rather than replaces `ports:` entries across `-f` files, so the override-file approach could never have closed this gap — was independently re-derived from a real `docker compose config` run against the actual old and new configurations (not just trusted from the spec's quoted docs), and confirmed correct both ways: the old setup genuinely produces two competing `ports:` entries, and the new setup genuinely produces exactly one, loopback-bound. The fix is narrowly scoped (one line, one file), genuinely idempotent (verified independently, not just via the test suite), warns rather than silently failing on a format mismatch, and leaves item 43's mechanism completely untouched. No regressions introduced. Remaining verification gap (AC3, live half of AC7) is a live-Docker-Taiga-stack constraint shared by both the developer's and this reviewer's sandbox, correctly and consistently flagged everywhere rather than papered over, and is already queued as the next step (pve-peer retest) rather than something this diff should have closed itself.
+**Approve.**

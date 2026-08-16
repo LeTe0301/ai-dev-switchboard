@@ -4408,6 +4408,16 @@ function teamRow(name, team) {
   const escalatedNote = (team.status === 'blocked' && !team.waiting_on_you) ?
     '<div class="team-sub">Escalated — max rounds reached. No pending question to answer. ' +
     'Review the feed below or Stop team and start a new run.</div>' : '';
+  // Backlog item 45, docs/spec.md "Proposed approach" (Frontend) -- a
+  // sibling block under the status strip, exactly like escalatedNote above,
+  // surfacing the lead's own finish() summary so a self-reported-failure
+  // finish doesn't look identical to a real success on the dashboard. Only
+  // rendered for a finished run with a non-empty summary (deliberately not
+  // rendered for status !== 'finished' regardless of team.summary's value,
+  // and deliberately not shown for an empty-string summary -- no
+  // classification of success vs. failure, just visibility of the text).
+  const finishedSummary = (team.status === 'finished' && team.summary) ?
+    '<div class="team-sub">' + esc(team.summary) + '</div>' : '';
   const escalationPanel = team.waiting_on_you ? renderEscalationPanel(name, team) : '';
   // Chat-UI compose surface (backlog item 19 part 2, docs/spec.md "Proposed
   // approach" §1) -- positioned between the escalation panel and the feed
@@ -4423,7 +4433,7 @@ function teamRow(name, team) {
   const addMemberControl = renderTeamAddMemberControl(name, team);
   const feedToggle = renderTeamFeedToggle(name);
   const feedPanel = renderTeamFeed(name, team);
-  return '<div class="team-row">' + statusStrip + escalatedNote + escalationPanel +
+  return '<div class="team-row">' + statusStrip + escalatedNote + finishedSummary + escalationPanel +
     interjectBox + addMemberControl + feedToggle + feedPanel +
     '<div class="team-actions"><button class="team-btn" onclick="doTeamStop(' +
     "'" + name + "'" + ')">Stop team</button></div>' +
@@ -6013,7 +6023,17 @@ class Handler(BaseHTTPRequestHandler):
                                 # own "next round boundary" delivery
                                 # semantics.
                                 "members": run.get("members", []) if run is not None else [],
-                                "lead": run.get("lead") if run is not None else None}
+                                "lead": run.get("lead") if run is not None else None,
+                                # Backlog item 45, docs/spec.md "Proposed
+                                # approach" (Backend) -- the run's
+                                # `finish`-provided summary, read straight
+                                # off the persisted state dict like
+                                # members/lead above. Only ever set via the
+                                # `finish` tool (team_step()); every other
+                                # terminal status leaves it None, so no
+                                # extra status-gating is needed here -- the
+                                # frontend decides when to render it.
+                                "summary": run.get("summary") if run is not None else None}
                 sync_entry = gitea_sync_by_name.get(n)
                 if sync_entry is not None:
                     inst["gitea_sync"] = {"state": sync_entry.get("sync_state"),
