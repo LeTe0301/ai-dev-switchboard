@@ -2925,7 +2925,30 @@ a second temporary HTTP listener — **required asking the user again**,
 since the classifier's permission gate doesn't carry over from one
 AskUserQuestion approval to the next actual tool invocation, confirmed
 this explicitly rather than assuming the earlier approval covered it.
-Briefed to the peer, not yet confirmed as of this writing.
+
+**Both landed clean.** Single-branch (`main` only) on both, no
+default-branch repoint needed this time (confirmed via the Gitea API
+post-push, not assumed) — only the same stray `HEAD`-branch cleanup as
+before. `streakline` → `main` @ `c0b117d`, `remote-dev-container` → `main`
+@ `eb8b5bf`, both with real history intact (including a visible merge
+commit from remote-dev-container's own PR #26). Scratch bundle files on
+the container cleaned up after landing. **All 5 repos now confirmed live
+as real Gitea-backed projects on CT110** (`ai-dev-switchboard-main`,
+`192.168.178.237`): `ai-dev-switchboard`, `birdiely`,
+`receipt-digitalizer-and-sorter`, `remote-dev-container`, `streakline`.
+
+### Migration phase: done (2026-08-16)
+
+Full sequence complete: PR #33 merged into `main` (`50ef05e`) → fresh
+local backup of all 15 project repos taken (`~/backups/
+2026-08-16_095558/`) → new persistent container provisioned and tested
+clean (CT110 `ai-dev-switchboard-main`, `192.168.178.237`, `main` @
+`de60bf4`, `--with-git-hosting --with-taiga`) → all 5 real git repos
+migrated in with full history and confirmed registered. Reporting back to
+the user now per their original instruction — **no auto-shutdown of this
+session or removal of anything was done or will be done without the
+user's explicit go-ahead**, per their explicit "I'll end it myself when
+ready" instruction from earlier in this same session.
 
 ---
 
