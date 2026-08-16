@@ -2580,19 +2580,61 @@ mechanism untouched), approved with one non-blocking nit, committed as
 under PR #33. Re-briefed `pve-sparkling-meadow`, item-44-focused (real
 reachability check, item-43 non-regression check, and an idempotency
 check via re-running `install.sh` on the same box rather than only a
-fresh one). Report not yet received as of this writing.
+fresh one).
+
+### Round 9 retest report (2026-08-16): clean — all three asks confirmed, no new issues
+
+Tested `1de9710` on a fresh CT110. All three asks came back clean:
+
+1. **Port binding fixed, real reachability confirmed**: `docker port` shows
+   `80/tcp -> 127.0.0.1:9000` (genuinely loopback-only, not falling back to
+   `0.0.0.0`), `curl` → real `200`. Sed patch landed cleanly on the real
+   upstream file with no warning fired (pattern matched first try); the
+   dead `ports:` block is gone from the override.
+2. **Item 43 stays fixed**: 4 `/taiga/on` events total (fresh install + 3
+   toggle cycles), zero DNS crashes. Bonus signal: each toggle now
+   completes in ~13s instead of the ~2m50s every prior round took — no
+   retry-loop/fallback firing at all anymore, independent corroboration
+   the underlying race is actually closed, not just no-longer-crashing.
+3. **Re-run idempotency confirmed against a real re-run** (not just a
+   fresh install): ran `install.sh --yes --with-taiga` a second time on
+   the already-patched box — clean exit, `docker-compose.yml` still has
+   exactly one `ports:` entry, not doubled/corrupted, gateway stayed
+   reachable throughout.
+
+No new issues found this round. **All of items 39-44 are now confirmed
+fixed** (39-42 in round 7, 43 in round 8, 44 in round 9) — three rounds
+in a row of targeted retests, zero regressions.
+
+**Not yet a basis for "fully clean" under step 3 of "The plan, in
+order"**, though: rounds 7-9 were all targeted retests scoped to specific
+items, not a full hands-on pass across the whole feature surface the way
+round 6 was. Round 6's own "Explicitly skipped / not confirmed" list is
+still open: no real browser/UI pass, upload-from-folder project creation,
+GitHub-origin AI-reviewer path, and a genuine `AUTH_MODE=pve` login
+round-trip with real credentials (round 7 verified this via code-path
+inspection only, explicitly flagged as lower-confidence). Given this
+loop's own track record — every round so far has surfaced at least one
+real issue, including one (item 44) that was completely invisible until
+a *different* bug got fixed out from under it — proceeding straight to
+backup+migration off three narrowly-scoped clean reports would be
+premature. Requested one more full-scope pass (round 10, matching round
+6's original breadth) before treating the loop as done.
 
 ### To resume if this session is interrupted mid-loop
 
 1. Check `ListAgents` for the current pve-side peer session name (may
    have changed if it died again).
-2. If no round-9 report has arrived yet: wait, or re-send the round-9
-   retest brief (see "Round 9 fix cycle" note above) to whichever peer is
+2. If no round-10 report has arrived yet: wait, or re-send the round-10
+   full-scope brief (see message sent to `pve-sparkling-meadow` after
+   this report — reconstruct from "The plan, in order" step 1 plus the
+   still-open skipped-items list above if needed) to whichever peer is
    listed.
-3. If a report *has* arrived: read it. Clean report → proceed to the
-   backup+migration steps (3-5) under "The plan, in order" above. Issues
-   found → loop back into the fix pipeline (product-manager → developer
-   → reviewer), commit, push, re-brief, repeat.
+3. If round 10 comes back fully clean (genuinely full-scope, not just a
+   targeted retest): proceed to the backup+migration steps (3-5) under
+   "The plan, in order" above. Issues found → loop back into the fix
+   pipeline (product-manager → developer → reviewer), commit, push,
+   re-brief with another full-scope round, repeat.
 
 ---
 
