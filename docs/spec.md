@@ -1,338 +1,483 @@
-# Spec: Team launcher fixes — broken Start button, lead/teammate exclusivity, undiscoverable chat UI, unexplained Smoke check
+# Spec: Concurrent sessions per project — part 1: session-identity backend (ports, tmux naming, status/API layer)
 
 ## Routing note (read first)
-**Workflow: `workflows/bugfix.md`.** This is a bundle of three real bugs (#2
-Start team broken, #3 lead/teammate exclusivity, #4 unexplained Smoke check)
-plus one investigation-turned-documentation-answer (#1 chat UI location —
-see "Background" below: no new UI needs to be built for it). All four fixes
-live in a single file (`app/app.py`, the monolithic inline HTML/CSS/JS
-switchboard UI + its Python HTTP handlers) and reuse patterns already
-established elsewhere in that same file — no new visual language, no new
-architectural layer, no schema/API shape change. **Recommend skipping
-ux-designer** and going straight to `developer`: the disabled-checkbox
-treatment reuses the exact `:disabled { opacity: 0.6; cursor: not-allowed; }`
-pattern `.clone-form` already uses (`app/app.py:3042`), and the Smoke-check
-copy/tooltip and idle-state chat hint are copy-only additions styled after
-the existing `.team-tier-3-caveat` inline-hint pattern (`app/app.py:3714`).
-Nothing here requires a new design decision.
+**Workflow: `workflows/feature.md`.** This is part 1 of a 2-part split of
+"multiple concurrent sessions per project" (Leo's request #1, already
+approved) — see "Why this is split" below. **Recommend skipping
+ux-designer for this part specifically** and going straight to `developer`:
+this part is backend-only (session identity, port allocation, tmux naming,
+`/status` JSON, new POST routes) and introduces no new visual language —
+the existing checkbox UI is deliberately left rendering unchanged this
+cycle via a back-compat shim (see "Proposed approach"). Part 2 (next spec,
+`docs/spec-feature1-part2-multi-session-ui.md`, already written and queued)
+is the one that touches the UI and does need ux-designer.
 
-**Note on `docs/`:** `docs/spec.md`, `docs/design.md`, `docs/implementation.md`,
-and `docs/test-review.md` currently hold backlog item 45's completed,
-committed work (already merged — see `de60bf4`/`391865c` in git log). This
-spec overwrites `docs/spec.md` for the new cycle per the standard convention;
-flagging this explicitly so the orchestrator can mention it to the user
-before the ux-designer/developer stages proceed. `docs/story.md` (the
-item-6 multi-agent-orchestration story doc) is unrelated and untouched.
+**Queued after this part:**
+1. **This spec** — backend session-identity model, port allocation, new
+   `/instance/<name>/spawn` + `/instance/<name>/session/<id>/stop` routes,
+   `/status` JSON gains a `sessions` array per project. Additive — the
+   existing checkbox toggle keeps working unchanged against a temporary
+   back-compat shim.
+2. `docs/spec-feature1-part2-multi-session-ui.md` — replace the checkbox
+   with a "+" control + per-session list in the frontend, remove the
+   back-compat shim and the old `/on`/`/off` routes once nothing calls them.
+3. `docs/spec-feature2-team-chat-page.md` — Leo's request #2 (dedicated
+   team chat page), independent of both parts above, queued to run
+   whenever convenient (no ordering dependency).
+
+Both Leo's requests are **already approved** — no sign-off gate applies
+here; this is scoping/spec-writing for already-agreed work, not a
+self-proposed idea awaiting confirmation.
+
+## Why this is split
+"Affected areas" below spans four distinct layers that would otherwise all
+land in one developer dispatch: the session-identity data model (what a
+"session" even is), port allocation (`_ttyd_port`/`_ttyd_ports`), the
+`/status` JSON contract every frontend row-render depends on, and two new
+mutating routes plus a change in semantics of `_reap_dead_state()`'s
+self-healing sweep. Per the load-balanced-decomposition rule, that's split
+here from the actual UI rewrite (part 2) so each half is independently
+buildable and reviewable — this half is a pure backend change verifiable
+by hitting the JSON API directly (`curl`/the existing Python test
+conventions), the same way `docs/BACKLOG.md`'s own E2E rounds already
+verify backend routes headlessly before/independent of browser checks.
 
 ## Summary
-Fix three launcher bugs (Start team silently/confusingly failing, an
-engine picked as Lead being constructible as a Teammate too, and the Smoke
-check button having no explanation of what it does), and answer the "where
-is the chat UI" question by pointing to the in-page live event feed +
-compose box that already ships (backlog item 19) but is only discoverable
-once a team is actually running — which today it can't be, because of bug
-#2/#3.
+Replace the single-session-per-(engine,project) assumption baked into
+session naming, ttyd port allocation, and `/status`'s JSON shape with a
+real per-session identity scheme, so a project can have any number of
+concurrent engine sessions running at once — while keeping the existing
+checkbox-driven frontend working unmodified against a temporary
+back-compat shim until part 2 lands.
 
 ## Goals
-- Diagnose and fix why clicking "Start team" fails/does nothing for a
-  composition matching the reported screenshot (Lead: aider, Teammates:
-  claude checked).
-- Fix a confirmed code defect: switching the Lead dropdown does not clear a
-  previously-checked Teammate of the same engine from the underlying
-  selection state, only from the checkbox *render* — so an invalid
-  "engine is both lead and teammate" composition can still be silently
-  carried into the Start request even though the UI never shows it checked.
-- Change the Teammates list so the engine currently selected as Lead is
-  shown disabled/grayed-out (not hidden), and is auto-unchecked the moment
-  it becomes Lead, per the user's explicit ask — this is a deliberate
-  behavior change from today's "omit the option entirely" approach.
-- Add a short explanation (label text, helper text, or tooltip) to the
-  Smoke check control so a user understands what clicking it does before
-  clicking it.
-- Answer the "where do I chat with the running team" question: point at
-  the feature that already exists (item 19's in-page live event feed +
-  compose box), and make its existence discoverable from the idle/launcher
-  state shown in the screenshot (where nothing indicates it's there,
-  because it isn't rendered until a team is running).
+- A new session-identity scheme: every spawned engine session gets a
+  unique `session_id` (also used verbatim as the tmux session name),
+  distinct from today's exact `f"{engine_name}-{project_name}"` naming
+  which assumed at most one live session per (engine, project).
+- ttyd port allocation (`_ttyd_port`/`_ttyd_ports`/`_ttyd_procs`/
+  `_ttyd_urls`) and captured hosted-URL tracking (`_session_urls`) re-keyed
+  from project name to `session_id`, so N concurrent sessions for one
+  project each get their own port/URL/process, independently.
+- New routes: `POST /instance/<name>/spawn` (body: `{engine}`) starts an
+  *additional* session without regard to whether others are already
+  running; `POST /instance/<name>/session/<session_id>/stop` tears down
+  exactly one session, leaving siblings untouched.
+- `/status`'s per-project object gains a `sessions` array (one entry per
+  live session: `session_id`, `engine`, `url`) — the real, new data shape
+  part 2's UI will consume.
+- `_reap_dead_state()`'s self-healing sweep (today keyed by project name,
+  driven by `active_engine()`) generalized to sweep per-session, using
+  `tmux_has(session_id)` directly as the liveness check — same philosophy
+  ("tmux dying on its own is the source of truth"), applied per session
+  instead of per project.
+- Zero visible behavior change to the existing checkbox UI this cycle
+  (back-compat shim — see "Proposed approach").
 
 ## Non-goals
-- Building a new, separate chat UI page/service/route. One already exists
-  in-page (item 19 part 2); this spec does not redesign it, only makes its
-  existence known before a team is started.
-- Any change to `teams.validate_composition()`'s actual rule set — "lead
-  cannot also be a teammate" stays a real server-side rule (defense in
-  depth); this spec only prevents the *UI* from constructing that state,
-  it does not relax or restructure the backend validation.
-- Fixing item 20 (`.team-btn` WCAG AA contrast) — a separate, already
-  backlogged, non-blocking item; not in scope here even though the same
-  file/button family is touched.
-- Redesigning the event feed into chat bubbles — already explicitly
-  rejected in backlog item 19's own writeup (`docs/BACKLOG.md:1240-1247`)
-  for accessibility reasons; not being revisited.
-- Any change to how compositions are persisted/loaded server-side
-  (`teams.save_composition`/`load_compositions`) — only the client-side
-  picker's own transient in-memory state (`teamPickerMembers`) is in scope.
+- No frontend changes (no "+" button, no session list UI) — that is part 2
+  in full.
+- No git-worktree-per-session isolation. Concurrent sessions for the same
+  project continue to share the single working copy under `PROJECTS_DIR/
+  <name>`, exactly like today's single session does — see "Open questions"
+  for why this is an explicit, flagged assumption rather than a silent
+  omission.
+- No configurable cap on session count ("any amount," per Leo's own
+  wording) — no admission-control/resource-limit logic added.
+- No change to `code-server`'s lifecycle (`_code_start`/`_code_stop`/
+  `_code_port`/`code_running`) — it is already project-scoped (one
+  instance per project, independent of engine sessions) and untouched by
+  this spec; confirmed via archaeology that nothing about it assumes
+  single-*engine*-session, only single-*code-server*-process, which stays
+  true.
+- No change to `app/teams.py` or any team-session (`team-<project>`)
+  behavior — team sessions are a structurally separate concept (one
+  session, multiple tmux *windows*) and are explicitly out of scope; the
+  only touchpoint is preserving the existing reserved-engine-name-prefix
+  collision guard described below, unchanged.
+- Not fixing the existing "ttyd/code ports grow forever, never reclaimed"
+  limitation (`_next_ttyd_port`/`_next_code_port`, documented in
+  `docs/ARCHITECTURE.md` as an accepted "one sharp edge"). This spec keeps
+  the exact same never-reclaim allocator, just re-keyed by `session_id`;
+  concurrent spawning consumes ports somewhat faster over a long uptime,
+  but the existing mitigation (restart the service) is unchanged and this
+  spec does not attempt to improve it.
+- Not changing how `smoke_check_run()`'s externally-visible single-URL
+  contract *should* work once multiple sessions exist for a project — see
+  "Edge cases" for how this spec preserves current behavior mechanically,
+  and "Open questions" for the real product question left to part 2.
 
 ## Background / current state
 
 ### Architecture note
-This project has no separate frontend framework/template files — the whole
-UI (HTML/CSS/JS) is generated inline as Python string literals inside
-`app/app.py` (a stdlib `http.server`-based app, hand-rolled routing via
-`elif parts[0] == "projects" and ...` dispatch, ~6700 lines). All four
-fixes below are edits to this one file. Multi-agent team backend logic
-(worktrees, tmux sessions, composition validation) lives in
-`app/teams.py` (~5200 lines).
+No separate frontend framework/build step — the whole UI is generated
+inline as Python string literals inside `app/app.py` (~6700 lines,
+`http.server`-based, hand-rolled routing). This spec only touches Python
+functions in that file; no `<script>`/CSS changes.
 
-### Issue #1 — "where is the chat UI"
-There is no separate hosted chat UI, service, or port. **The switchboard
-page itself is the chat UI** — this shipped as backlog item 19 ("Interactive
-chat UI for the AI team"), see `docs/BACKLOG.md:1173-1259`. Concretely:
-`teamRow()` (`app/app.py:4362`) renders one of two very different things for
-the same project depending on `team.status`:
-- `status === 'idle'` (or no team yet) → the launcher/config screen the
-  user's screenshot shows: task textarea, Configure/Lead/Teammates picker,
-  Start team button.
-- Any other status (`running`/`blocked`/`finished`/`error`) → a live,
-  cursor-polled, per-agent-colored event feed (`role="log"`,
-  `aria-live="polite"`), a status strip, an escalation-answer panel, and
-  (when running/blocked-waiting-on-you) a compose box wired to
-  `POST .../team/interject` — this is the actual "chat with the team"
-  surface, all rendered in place of the launcher inline on this same page,
-  no navigation required.
+### Today's single-instance assumption, traced end to end
+- **Session naming** (`instance_start`, `app/app.py:2603-2626`): `session =
+  f"{engine_name}-{name}"` (line 2612) — a pure function of (engine,
+  project), so starting the same engine twice for one project is
+  structurally impossible; `instance_start` also explicitly guards on it:
+  `if active_engine(name) is not None ... return` (line 2609).
+- **`active_engine(name)`** (`app/app.py:2395-2396`): `next((e for e in
+  load_engines() if tmux_has(f"{e}-{name}")), None)` — returns *at most
+  one* engine name per project, by construction. Its only real callers:
+  `instance_start`'s own guard (2609), `_reap_dead_state()` (2658, 2662),
+  and `/status`'s per-project loop (5957).
+- **ttyd port allocation** (`app/app.py:681-717`): `_ttyd_ports`/
+  `_ttyd_procs`/`_ttyd_urls` are all `dict[str, ...]` keyed by **project
+  name**, `_next_ttyd_port` starts at 7700 and only ever grows.
+  `_ttyd_start(name, session)`/`_ttyd_stop(name)` assume one ttyd process
+  per project.
+- **Captured hosted URL** (`_session_urls`, `app/app.py:2573`): also keyed
+  by project name, populated by `run_startup_watch(session, name, engine,
+  timeout)` (2576-2600) — note this function *already* takes `session`
+  (the tmux session string) and `name` (the dict key) as two separate
+  params, which is a convenient existing seam: today they're
+  `f"{engine}-{name}"` and `name` respectively, but nothing requires that.
+- **`instance_stop(name)`** (`app/app.py:2629-2636`): kills *every*
+  engine's session for a project name in a loop (`for e in
+  load_engines(): kill-session -t f"{e}-{name}"`) — today equivalent to
+  "kill the one that's running" since at most one exists, but written as
+  an unconditional bulk-stop.
+- **`_reap_dead_state()`** (`app/app.py:2639-2685`): sweeps `_session_urls`
+  and the ttyd dicts by checking `active_engine(name)` per project — a
+  project-level check, not a per-session one.
+- **`/status`'s per-project shape** (`app/app.py:5955-5964`): `engine =
+  active_engine(n)`; `url = _session_urls.get(n) if ... else
+  _ttyd_urls.get(n) if engine else None`; `inst = {"name": n, "on": engine
+  is not None, "engine": engine, "url": url, ...}` — one engine, one URL,
+  one on/off boolean, per project, full stop.
+- **Routes** (`app/app.py:6417-6428`): `POST /instance/<name>/on` (body
+  `{engine}`, falls back to the first configured engine if the given one
+  is missing/invalid — `engine = body.get("engine") if body.get("engine")
+  in engines else default_engine`, no error surfaced for a bad value) and
+  `POST /instance/<name>/off` — both operate on "the" session for a
+  project.
+- **`smoke_check_run(name, expect_contains)`** (`app/app.py:1923-1953`+):
+  reads `_session_urls.get(name)` directly — another project-name-keyed
+  consumer that would silently break once `_session_urls` is re-keyed.
 
-Because the user has never gotten past the broken Start button, they have
-never seen this state render — hence assuming it must be hosted elsewhere.
-The real fix here is not a new link to an external page (there isn't one to
-link to); it's (a) fixing #2/#3 so a team can actually start, and (b) adding
-a one-line discoverability hint in the *idle* state so it's clear something
-appears here once started, rather than the current silence.
+### The reserved-name collision guard (must be preserved unchanged)
+`_RESERVED_ENGINE_NAME_PREFIXES = ("switchboard", "team")`
+(`app/app.py:405`), enforced in `_parse_engine_file` (`app/app.py:450-479`)
+so no `.engine` file can define an engine literally named `team`,
+`team-anything`, `switchboard`, or `switchboard-anything` — because
+`f"{engine}-{project}"` would otherwise be constructible to collide with a
+real `team-<project>` team session or a `switchboard-headless-<run_id>`
+CLI-headless session. This check is keyed on the **engine name itself**,
+not on the full session-name string, so it remains correct unchanged by
+this spec's naming scheme (see "Proposed approach" — new session names
+still *start with* `f"{engine_name}-{project_name}"`, just with a
+guaranteed-unique suffix appended, and engine names still can't be `team`/
+`switchboard`-prefixed). `tests/test_teams_headless.py`'s
+`ActiveEngineHeadlessCollisionTests` (line 247) directly exercises this
+contract against `active_engine()` and must be updated (see "Affected
+areas") to exercise the new session-lookup function's equivalent
+guarantee instead, not deleted.
 
-### Issue #2 — "Start team" doesn't work
-Traced the full path: button → `doTeamStart()` (`app/app.py:4876`) →
-`toggle('team-start', ...)` → `actionBody()` builds `{task, lead, members}`
-when the picker is open and `teamCompositionError(name)` is falsy
-(`app/app.py:4507-4522`) → `POST /projects/<name>/team/start` →
-server route at `app/app.py:6401-6452` → `teams.validate_composition()`
-(`app/teams.py:2092`) → `teams.launch_team()` (`app/teams.py:3956`).
-Errors from any of these DO surface, but only as small (`font-size: 12px`,
-`color: #888`) gray text in a `.team-msg` slot directly under the button
-(`app/app.py:2910-2912`, `4615-4624`) — easy to miss, especially on mobile,
-which is consistent with the button "appearing" to do nothing even when it
-actually returned a 400.
-The concrete, confirmed root cause for the exact composition in the
-screenshot (Lead: aider, Teammate: claude) is **issue #3 below**: if the
-user had claude *or* aider checked as a teammate at any point before
-picking aider as Lead, the checkbox disappears (good) but the underlying
-`teamPickerMembers` Set still contains that name (bug), so
-`teamCompositionError()`/the server's `validate_composition()` both
-correctly reject it with "Lead cannot also be a teammate" — surfaced only
-in the easy-to-miss gray text. Fixing #3 fixes this specific repro.
-**Developer must still reproduce Start team end-to-end** (task text + a
-*clean* composition, e.g. Lead: claude, Teammate: aider or codex, no prior
-checkbox history) to confirm no *second*, independent failure exists (e.g.
-a leftover `team-<project>` tmux session from an earlier attempt blocking
-`launch_team()`'s `tmux_has(session)` check at `app/teams.py:3990-3992`, or
-a dirty-worktree rejection from `_validate_project_for_team()`) — if one is
-found, fix it too and document it in `docs/implementation.md`; if the only
-repro is the #3 scenario, say so explicitly.
-
-### Issue #3 — Lead/Teammate exclusivity (confirmed code defect)
-- `renderTeamPicker()` (`app/app.py:3702-3729`) already **filters** the
-  Lead's own engine out of the rendered Teammate checkboxes entirely
-  (`app/app.py:3717`: `.filter(e => e.delegate_capable && !(lead && ...))`)
-  — this is tested, deliberate behavior
-  (`tests/test_team_frontend.js:639`: "the saved composition pre-selects
-  the lead and excludes it from the teammate checkboxes").
-- The bug: `onTeamLeadChange()` (`app/app.py:3664-3669`) updates
-  `teamPickerLead[name]` but never touches `teamPickerMembers[name]` — so
-  if a user had already checked engine X as a teammate, then changes Lead
-  to X, the checkbox for X vanishes from the picker (filtered out) but `X`
-  remains in the `teamPickerMembers[name]` Set. `teamCompositionError()`
-  (`app/app.py:3572-3579`) then correctly reports "Lead cannot also be a
-  teammate" for a state the user can no longer see or uncheck in the UI —
-  Start stays silently blocked with no visible way to fix it apart from
-  guessing to re-open a picker row that looks fine.
-- User's explicit requested fix is a *different* UI treatment than
-  today's "filter out" approach: show the Lead's engine in the Teammates
-  list **disabled/grayed-out** (not hidden) rather than removed, so its
-  state is always visible, and **auto-uncheck** it (clearing it from
-  `teamPickerMembers[name]`) the moment it becomes Lead. This also
-  structurally fixes the stale-Set bug above, since the entry is
-  actively cleared on lead change rather than merely hidden from render.
-
-### Issue #4 — Smoke check has no explanation
-`smokeCheckRow()` (`app/app.py:3453-3463`) renders an "optional: text that
-should appear in the response" input, a bare "Smoke check" button, and an
-empty message slot — no label or tooltip says what the button itself does.
-Server-side, `smoke_check_run()` (`app/teams.py`... actually `app/app.py:1923`,
-docstring at `app/app.py:1923-1949`) does exactly one thing: a single HTTP
-GET against the project's own captured, server-derived session URL
-(`_session_urls[name]`), reporting status code + elapsed time, and
-optionally checking whether the response body contains the text typed into
-the adjacent input. It's a manual, one-click HTTP health check — nothing
-more (no auth, no side effects, no scheduling).
+### Concurrency model
+The server is a real `ThreadingHTTPServer` (`app/app.py:56,6744`) — one
+thread per request. The existing `_team_threads_lock` (`app/app.py:2419-
+2427`) exists specifically because unguarded check-then-act races on
+in-memory dicts have been found and fixed **four separate times** in this
+codebase's own team-session subsystem (per that lock's own comment). The
+new per-session bookkeeping dict this spec introduces is exactly the same
+shape of hazard (concurrent spawn/stop/reap touching the same dict) and
+should not become defect instance #5 — see "Proposed approach".
 
 ## Proposed approach
 
-### #1 (discoverability, no new UI)
-In the idle-state branch of `teamRow()` (`app/app.py:4362` area), add one
-short line of static hint copy near the task textarea or Configure link —
-e.g. "Once started, you'll see live team activity and can chat with it
-right here" — styled as a small muted note (reuse an existing muted-text
-class, e.g. the same treatment `.team-lead-picker label`/`.team-grounding`
-already use at `app/app.py:2924`, not a new color/weight). No new element
-needs to react to state; this is static copy shown only in the idle
-branch (naturally disappears once `teamRow()` switches to the
-running/blocked branch, same as the rest of that branch already does).
+### 1. New session-identity scheme
+```python
+def _new_session_id(engine_name: str, project_name: str) -> str:
+    return f"{engine_name}-{project_name}-{int(time.time())}-{secrets.token_hex(3)}"
+```
+This is the tmux session name **and** the dict key used everywhere below
+— no separate id-vs-tmux-name mapping needed. It starts with the exact
+`f"{engine_name}-{project_name}"` prefix today's code already produces
+(preserving the reserved-prefix collision guarantee above), with a
+timestamp+hex suffix (same style as the existing `_run_id()` helper in
+`app/teams.py:252`, `f"{int(time.time())}-{secrets.token_hex(6)}"` —
+shortened to 3 hex bytes here since this id is in-memory-only, never
+persisted to disk, and needs only to disambiguate concurrent spawns within
+one process's lifetime, not survive a restart). Collision probability is
+accepted at the same standard the codebase already uses for `_run_id()`
+and `_ai_reviewer_scratch`'s `secrets.token_hex(8)` (`app/teams.py:1924`)
+— not literally proven impossible, consistent with this codebase's
+existing risk tolerance for this exact class of identifier.
 
-### #2 (Start team)
-No isolated fix beyond #3 unless the developer's end-to-end reproduction
-(see "Background" above) turns up a second failure. If it does, root-cause
-and fix it using the existing error-surfacing path (`.team-msg`), and
-additionally consider (small, low-risk, in scope): bumping `.team-msg`'s
-error state to be more visually prominent than plain gray-on-dark (e.g.
-reuse `.team-msg.error`'s existing `color: #ff6b6b` — check whether the
-generic `.team-msg` base style at `app/app.py:2910` is what's actually
-winning for the case observed, or whether `.error` is applied correctly
-already) so a real rejection is never mistaken for "nothing happened."
-Only fix this if the developer's own repro shows it's actually
-contributing to the reported failure — don't change working styling
-speculatively.
+### 2. New session registry, lock-guarded
+```python
+_sessions: dict[str, dict] = {}   # session_id -> {"project": str, "engine": str}
+_sessions_lock = threading.Lock()
 
-### #3 (Lead/Teammate exclusivity)
-1. In `renderTeamPicker()` (`app/app.py:3702-3729`): stop filtering the
-   Lead's own engine out of `mateOptions`. Instead render every
-   `delegate_capable` roster entry as before, but when an entry matches
-   the current `lead` (`kind`+`name`), render its checkbox with the
-   `disabled` attribute and add a `disabled`-styled wrapper class (reuse
-   the `.clone-form input:disabled { opacity: 0.6; cursor: not-allowed; }`
-   pattern at `app/app.py:3042` — add an equivalent rule scoped to
-   `.team-mates-picker input:disabled` + its label, e.g. dim the label
-   text too so the whole row reads as inactive, not just the box).
-   Leave it unchecked (never render it as checked-and-disabled, since
-   step 2 guarantees it's never in the Set once it's the Lead).
-2. In `onTeamLeadChange()` (`app/app.py:3664-3669`): after updating
-   `teamPickerLead[name]`, if the new lead's `name` is present in
-   `teamPickerMembers[name]`, delete it from that Set before calling
-   `refresh()`. This is the actual bug fix — it guarantees the invalid
-   state can never persist past a Lead change, matching the user's "so
-   this invalid state can't be constructed in the first place" ask.
-3. `teamCompositionError()`'s existing "Lead cannot also be a teammate"
-   check (`app/app.py:3577`) stays as-is — now unreachable via normal UI
-   interaction, but kept as defense-in-depth exactly like the server-side
-   `validate_composition()` check it already mirrors.
-4. Update `tests/test_team_frontend.js:639`'s existing assertion (currently
-   "excludes it from the teammate checkboxes") to instead assert the
-   checkbox is present, unchecked, and disabled.
+def _sessions_add(session_id, project, engine):
+    with _sessions_lock:
+        _sessions[session_id] = {"project": project, "engine": engine}
 
-### #4 (Smoke check copy)
-Add a short static helper line under the smoke-check row in
-`smokeCheckRow()` (`app/app.py:3453-3463`) — e.g. "Makes a single request
-to this session's URL and reports whether it responds (optionally checking
-the response text)" — styled as a small muted note (reuse the same
-existing muted-hint styling referenced in #1, e.g.
-`.smoke-check-msg`'s own font-size/color precedent at `app/app.py:2891`,
-but as a *static* line, not the dynamic result slot). A `title="..."`
-tooltip attribute on the button itself is an acceptable alternative/addition
-to the visible line — developer's call on which is more legible in the
-existing layout, but at least one of the two (visible helper text
-preferred, since a hover-only tooltip doesn't work well on the touch/mobile
-PWA context the screenshot is from) must be present.
+def _sessions_pop(session_id):
+    with _sessions_lock:
+        return _sessions.pop(session_id, None)
+
+def active_sessions(project_name: str) -> list[dict]:
+    """Replaces active_engine() as the per-project liveness source of
+    truth. Self-healing like today's active_engine() -- tmux_has() is
+    checked fresh here, not just relied on via the periodic reap sweep."""
+    with _sessions_lock:
+        snapshot = [(sid, info) for sid, info in _sessions.items()
+                    if info["project"] == project_name]
+    return [{"session_id": sid, "engine": info["engine"]}
+            for sid, info in snapshot if tmux_has(sid)]
+```
+Every mutation and every liveness-deciding read goes through one of these
+three functions — same "sanctioned access points only" discipline
+`_team_threads_set/_get/_pop_if_owned()` already established
+(`app/app.py:2430-2440`) for exactly this defect class. `active_engine()`
+itself is removed (its only callers are rewritten below); do not leave it
+around half-used.
+
+### 3. Rewire ttyd/URL bookkeeping to key on `session_id`
+`_ttyd_ports`/`_ttyd_procs`/`_ttyd_urls`/`_session_urls`: unchanged in
+shape (`dict[str, ...]`), but every caller now passes a `session_id`
+instead of a project name. `_ttyd_port()`/`_ttyd_start()`/`_ttyd_stop()`
+(`app/app.py:687-717`) need no *internal* changes beyond that — they were
+already generic over their `name` parameter's meaning. `_code_port`/
+`_code_procs`/etc. (`app/app.py:723-761`) are **not** touched (see
+Non-goals).
+
+### 4. `instance_start` → returns a `session_id`, no longer guards on "already running"
+```python
+def instance_start(name: str, engine_name: str = "claude") -> str | None:
+    engines = load_engines()
+    engine = engines.get(engine_name)
+    workdir = os.path.join(PROJECTS_DIR, name)
+    if engine is None or not os.path.isdir(workdir):
+        return None
+    session_id = _new_session_id(engine_name, name)
+    _sessions_add(session_id, name, engine_name)
+    _session_urls.pop(session_id, None)
+    cmd = engine.cmd.format(name=shlex.quote(name))
+    subprocess.run(TMUX + ["new-session", "-d", "-s", session_id, "-c", workdir,
+                           "bash", "-lc", cmd])
+    if engine.startup or engine.url_regex:
+        run_startup_watch(session_id, session_id, engine)
+    if not engine.url_regex:
+        _ttyd_start(session_id, session_id)
+    return session_id
+```
+The old `active_engine(name) is not None: return` guard is **removed**
+here — multiplicity is now the point. (The *route* layer re-adds an
+equivalent guard for the old `/on` endpoint only, to preserve its exact
+back-compat behavior — see point 6.)
+
+### 5. New per-session stop, `_reap_dead_state()` generalized
+```python
+def instance_stop_session(session_id: str) -> None:
+    """Idempotent -- stopping an already-gone session_id is a clean no-op,
+    same tolerant style instance_stop() already has today (killing a
+    nonexistent tmux session today just fails silently under
+    capture_output=True, never raises)."""
+    _sessions_pop(session_id)
+    _session_urls.pop(session_id, None)
+    _ttyd_stop(session_id)
+    subprocess.run(TMUX + ["kill-session", "-t", session_id], capture_output=True)
+```
+`_reap_dead_state()` (`app/app.py:2639-2685`): replace the `active_engine`-
+driven ttyd/`_session_urls` sweep with a direct per-session sweep:
+```python
+for session_id in list(_sessions):
+    if not tmux_has(session_id):
+        instance_stop_session(session_id)
+```
+This is simpler than today's version (no `engines.get(active_engine(...))`
+indirection needed) since `session_id` *is* the tmux session name — the
+liveness check is a single direct `tmux_has()` call.
+
+### 6. Routes
+- **New** `POST /instance/<name>/spawn` — body `{engine}`, same
+  fallback-to-default-engine behavior as today's `/on` (no new
+  validation): `if name not in instance_names(): 404`; else
+  `session_id = instance_start(name, engine)`; respond
+  `{"ok": session_id is not None, "session_id": session_id}`.
+- **New** `POST /instance/<name>/session/<session_id>/stop` — `if name not
+  in instance_names(): 404`; else `instance_stop_session(session_id)`;
+  respond `{"ok": true}` unconditionally (idempotent, matches "Non-goals"/
+  the tolerant style noted above — do not 404 on an already-gone
+  session_id, that's a normal race, not a client error).
+- **Unchanged, temporarily** `POST /instance/<name>/on` /`/off`
+  (back-compat shim, removed in part 2 once the frontend stops calling
+  them): `/on` becomes `if active_sessions(name): return {"ok": true}`
+  (no-op — mirrors today's exact "already running" guard, generalized to
+  "already has *any* session") `else instance_start(name, engine)`. `/off`
+  becomes `for s in active_sessions(name): instance_stop_session(s
+  ["session_id"])` (stop *all* sessions for the project — mirrors today's
+  bulk-kill-every-engine loop, generalized to "every session" instead of
+  "every engine").
+
+### 7. `/status` JSON — additive
+Per-project object gains `"sessions": [{"session_id", "engine", "url"},
+...]` (one entry per `active_sessions(n)` result, `url` resolved the same
+way today's single-`url` line already does per session: `_session_urls.get
+(sid) if that session's engine has url_regex else _ttyd_urls.get(sid)`).
+**Also emit the existing singular fields unchanged**, as a temporary
+back-compat shim consumed only by today's still-unmodified frontend:
+`"on": len(sessions) > 0`, `"engine": <most-recently-started session's
+engine, or None>`, `"url": <that same session's resolved url, or None>`.
+"Most recently started" = highest embedded timestamp in the `session_id`,
+or just track insertion order in `_sessions` (a plain dict already
+preserves insertion order) — either is fine, developer's call, but must be
+deterministic (not "whichever `dict` iteration happens to return first").
+Part 2 removes these three back-compat fields once nothing reads them.
+
+### 8. Smoke-check preserved via a resolver, not touched otherwise
+Add `_latest_session_url_for_project(name) -> str | None` (project-name
+in, most-recently-started live session's resolved URL out — same "most
+recent" rule as point 7's back-compat `url` field, ideally sharing one
+implementation with it rather than two). Change `smoke_check_run`'s single
+line `url = _session_urls.get(name)` to `url =
+_latest_session_url_for_project(name)`. Behavior for the common
+single-session case is externally identical to today; for multi-session
+projects it deterministically targets the newest session, not an
+arbitrary/undefined one. This is a mechanical preservation of current
+behavior, not a new product decision — see "Open questions" for the real
+one (does smoke-check need to become session-scoped in the UI?), correctly
+left to part 2.
 
 ## Affected areas
-- `app/app.py` — `teamRow()`, `renderTeamPicker()`, `onTeamLeadChange()`,
-  `smokeCheckRow()`, associated inline `<style>` rules (all within the
-  existing single-file inline UI; no new files).
-- `tests/test_team_frontend.js` — update the existing assertion at line
-  639 for the new disabled-not-hidden behavior; add new coverage (see
-  Acceptance criteria) for the lead-change-clears-stale-member fix and the
-  disabled-checkbox rendering.
-- No backend (`app/teams.py`) changes expected unless issue #2's
-  reproduction surfaces a genuine second bug there — see "Proposed
-  approach" #2.
-- `docs/implementation.md` — developer's usual write-up, including an
-  explicit statement of what issue #2's root-cause investigation found
-  (the #3 scenario alone, or an additional distinct bug).
+- `app/app.py`: `_ttyd_*`/`_session_urls` dict semantics (re-keyed, no
+  shape change), `active_engine()` removed and replaced by
+  `active_sessions()`/`_sessions_add`/`_sessions_pop`, `instance_start()`,
+  new `instance_stop_session()`, `instance_stop()` (kept only for the
+  back-compat `/off` shim — or inlined into the route, developer's call),
+  `_reap_dead_state()`, `smoke_check_run()`'s one-line URL lookup, `/status`
+  handler (`app/app.py:5955-5964` area), new POST route branches near
+  `app/app.py:6417-6428`.
+- **No** frontend (`<script>`/`<style>` inside `PAGE_TEMPLATE`) changes.
+- `tests/test_teams_headless.py`: `ActiveEngineHeadlessCollisionTests`
+  (line 247) currently asserts `appmod.active_engine(project_name) is
+  None` against a live `switchboard-headless-<run_id>` session — update to
+  assert the equivalent via `active_sessions(project_name) == []` (same
+  collision-safety contract, new function name).
+- New Python unit tests (new file or extend an existing `tests/
+  test_*.py`) for: `_new_session_id` uniqueness/prefix shape, `spawn`
+  allowing N concurrent sessions for one project (including N sessions of
+  the *same* engine — see "Open questions"), `session/<id>/stop` only
+  tearing down the targeted session, `_reap_dead_state()` pruning exactly
+  the dead session's bookkeeping when one of several dies, and the `/on`/
+  `/off` back-compat routes' preserved semantics (no-op-if-already-running
+  / stop-all, respectively).
+- `docs/implementation.md` — developer's usual write-up.
 
 ## Edge cases
-- Lead changed to an engine that was never checked as a teammate — no-op
-  for the Set-clearing step (nothing to delete); checkbox renders disabled
-  as normal.
-- Lead cleared back to "Choose a lead..." (empty selection) — no engine
-  should render disabled in Teammates; previously-disabled engine's
-  checkbox becomes normally selectable again (auto-uncheck logic must only
-  fire on an actual lead *change*, and disabling is derived live off the
-  current `lead` value every render, not a one-time flag).
-- A saved composition loaded via `toggleTeamPicker()`'s pre-population
-  (`app/app.py:3648-3656`) can never itself contain lead-in-members
-  (server-side `save_composition()` only persists post-`validate_composition()`
-  compositions) — no special-case handling needed there, but worth a
-  regression test asserting the pre-populated picker doesn't show that
-  engine checked.
-- Rapid Lead switching back and forth between two engines, each previously
-  checked as a teammate — each switch must independently clear only the
-  newly-selected lead's own stale membership, never the other engine's
-  legitimate one.
-- Mobile/touch context (the screenshot's actual environment) — the Smoke
-  check helper text must be visible without hover, per "Proposed approach"
-  #4's tooltip caveat.
-- No roster members at all / `composition === null` — unaffected by any of
-  these changes; that branch already returns early before the picker
-  renders (`app/app.py:3719-3726`... actually the `composition === null`
-  branch at `~4382-4386`).
+- **Same engine spawned twice concurrently for one project** — explicitly
+  allowed (see Open questions); each gets an independent `session_id`,
+  tmux session, and (if applicable) ttyd port/captured URL. No dedup.
+- **Two spawns within the same wall-clock second** — disambiguated by the
+  trailing `secrets.token_hex(3)`; accepted collision risk per "Proposed
+  approach" §1.
+- **Stopping an already-gone `session_id`** (double-click, stale frontend
+  cache, or a race with the reap sweep) — idempotent no-op, `{"ok": true}`,
+  never a 404/500 (see §6).
+- **Concurrent stop + reap-sweep racing on the same `session_id`** — both
+  go through `_sessions_pop`, guarded by `_sessions_lock`; the second
+  caller's pop returns `None` and short-circuits cleanly, no double
+  teardown.
+- **Unknown engine name passed to `/spawn`** — falls back to the default
+  engine, silently, identically to today's `/on` route (no new validation
+  introduced — explicit non-goal, not an oversight).
+- **Unknown/nonexistent project name** — `404 {"error": "unknown
+  instance"}`, matching every existing `/instance/<name>/...` route's
+  convention.
+- **Project with zero sessions calling `/off`** (back-compat route) — no-
+  op, `{"ok": true}`, matches today's exact behavior.
+- **`_session_urls`/ttyd bookkeeping for a session whose engine has no
+  `url_regex`** — unchanged fallback to the ttyd-hosted terminal URL, now
+  correctly per-session instead of per-project.
+- **Shared working copy under concurrent sessions** (two sessions running
+  `git` operations, or editing the same files, at once) — a real
+  correctness risk, explicitly accepted and not mitigated by this spec;
+  see "Open questions".
 
 ## Acceptance criteria
-- [ ] Given the Teammates list is open with Lead set to engine X, when X is
-      also checked as a teammate from a prior selection, then changing Lead
-      away from X and back to X (or to any other engine and back) never
-      leaves X checked in `teamPickerMembers` — `teamCompositionError()`
-      returns null for an otherwise-valid composition.
-- [ ] Given Lead is set to engine X, when the Teammates list renders, then
-      X's checkbox is visible, unchecked, and has the `disabled` attribute
-      (styled visually dimmed, per the `.clone-form input:disabled`
-      precedent) — not omitted from the list.
-- [ ] Given a valid composition (Lead ≠ any checked Teammate, at least one
-      Teammate checked, task text non-empty), when "Start team" is clicked,
-      then a `POST .../team/start` request is sent and either succeeds
-      (team status leaves idle) or shows a legible, correctly-colored error
-      message from the actual server response — never silent no-op.
-- [ ] Given the reported screenshot's exact composition (Lead: aider,
-      Teammate: claude checked) with no prior conflicting checkbox history,
-      when "Start team" is clicked, then the team starts successfully (or,
-      if a genuine second bug is found in reproduction, that bug is fixed
-      too and documented).
-- [ ] Given a project in the idle/launcher state, when the row renders,
-      then a short static line is present indicating that team chat/live
-      activity appears in this same location once started.
-- [ ] Given a project's Smoke check row renders, when viewed without any
-      hover/interaction (mobile/touch), then visible text explains what
-      clicking "Smoke check" does.
-- [ ] `tests/test_team_frontend.js:639`'s assertion is updated to match the
-      new disabled-not-hidden rendering, and passes.
-- [ ] All pre-existing tests in `tests/test_team_frontend.js` and
-      `tests/test_teams_composition.py` continue to pass unmodified except
-      the one intentionally updated above.
+- [ ] Given a project with zero sessions, when `POST /instance/<name>/
+      spawn` is called with a valid engine, then a new tmux session
+      exists (`tmux has-session` true), `/status` lists it under that
+      project's `sessions` array with the right `engine`, and the
+      response includes a `session_id`.
+- [ ] Given a project already running engine X, when `POST /instance/
+      <name>/spawn` is called again (with X or a different engine Y),
+      then a second, independent tmux session is created — both appear
+      simultaneously in `/status`'s `sessions` array, distinct
+      `session_id`s, neither one killed.
+- [ ] Given a project with 2 running sessions, when `POST /instance/
+      <name>/session/<id>/stop` targets one of them, then only that
+      session's tmux session, ttyd process/port, and `_session_urls` entry
+      are torn down; the sibling session is completely unaffected
+      (confirmed via `/status` before and after).
+- [ ] Given a project with 2 running sessions, when the legacy `POST /
+      instance/<name>/off` is called, then **all** sessions for that
+      project are stopped (back-compat bulk-stop, matching today's
+      pre-spec behavior for the single-session case, generalized).
+- [ ] Given a project with ≥1 running session, when the legacy `POST /
+      instance/<name>/on` is called, then it is a no-op (`{"ok": true}`,
+      no new session spawned) — matches today's exact guard, generalized.
+- [ ] Given one of two running sessions for a project dies on its own
+      (kill its tmux session directly, simulating engine exit), when
+      `/status` is next polled, then `_reap_dead_state()` prunes exactly
+      that session's bookkeeping; the sibling session's entry in
+      `/status`'s `sessions` array is untouched.
+- [ ] Given `tests/test_teams_headless.py`'s
+      `ActiveEngineHeadlessCollisionTests`, when updated to call
+      `active_sessions()` instead of `active_engine()`, then it still
+      passes — a live `switchboard-headless-<run_id>` tmux session is
+      never reported as one of a project's active sessions.
+- [ ] Given a project with 2 sessions of different engines, when `POST /
+      instance/<name>/smoke-check` runs, then it targets the most-
+      recently-started session's captured URL deterministically (not an
+      arbitrary one) — verified by asserting which of two distinct mock
+      URLs the check actually hit.
+- [ ] All pre-existing Python tests continue to pass unmodified except the
+      one intentionally updated above.
 
 ## Open questions
-- Exact wording for the idle-state chat hint and the Smoke check helper
-  text is left to the developer/reviewer's judgment within the constraints
-  above (must be visible without hover; must not overstate — e.g. don't
-  call it "chat" if that reads as promising a dedicated messaging UI
-  beyond what item 19 actually built). Flagging as non-blocking copy, not
-  a product decision.
-- If issue #2's end-to-end reproduction with a clean composition (see
-  "Background" #2) turns up a second, independent failure beyond the #3
-  scenario, that's a real open question whose answer isn't knowable from
-  static code reading alone — assumption going in: the #3 scenario is the
-  sole cause, to be confirmed or refuted by the developer's own repro
-  before writing `docs/implementation.md`.
+- **Same-engine multiplicity**: assumption is that spawning the *same*
+  engine twice for one project is allowed (Leo's wording was "as many
+  concurrent sessions as he wants," not "one per distinct engine") —
+  proceeding on that basis; flagging in case the actual intent was closer
+  to "one session per engine, but pick a different engine each time,"
+  which would be a materially smaller/safer feature. If that's wrong,
+  it's a small guard to add later (reject `/spawn` when the requested
+  engine already has a live session for that project), not a rearchitect.
+- **Shared working copy, no per-session worktree isolation**: this spec
+  deliberately does not give each spawned session its own git worktree
+  (unlike the team feature's own per-agent-worktree precedent in
+  `app/teams.py`). Leo's request text frames this purely as a session-
+  identity/port/UI concern, not a workspace-isolation one, and backlog
+  item 21 (docs/BACKLOG.md:1297) already flagged this exact question as
+  unresolved for a future pass — proceeding on the assumption that a
+  shared working copy (today's status quo) is acceptable for this cycle,
+  with the risk of concurrent-write conflicts between sibling sessions
+  called out explicitly rather than silently accepted. If Leo wants
+  isolation, that's a genuinely separate, larger feature (its own spec),
+  not a tweak to this one.
+- **Smoke-check's real UI treatment once multiple sessions exist**: this
+  spec only preserves current *mechanical* behavior (targets the newest
+  session, deterministically). Whether smoke-check should become a per-
+  session control in part 2's UI, or stay a single project-level "check
+  the newest one" action, is a real product decision left to part 2 —
+  not decided here.
 
 ## Risk / rollback notes
-All four changes are additive/localized string-template and small-function
-edits inside one existing file, no schema/API/data-format changes, and no
-change to server-side validation rules (`validate_composition()` untouched
-per Non-goals). Rollback is a plain revert of the commit. The one behavior
-change with test-visible impact is #3 switching from "filter out" to
-"disabled in place" — covered by the updated + new test assertions above,
-so a regression would fail CI rather than ship silently.
+Purely additive at the route/JSON level (new fields, new endpoints; old
+fields/endpoints unchanged in behavior this cycle) and a rename/re-keying
+of internal-only dicts with no external contract today (nothing outside
+`app.py` reads `_ttyd_ports`/`_session_urls`/`active_engine` directly).
+The one real behavior change with test-visible impact is `active_engine()`
+being removed in favor of `active_sessions()` — covered by the updated
+headless-collision test above, so a regression fails CI rather than
+shipping silently. Rollback is a plain revert of the commit; no data
+migration involved since all of this state is in-memory only (already
+documented in `docs/ARCHITECTURE.md` as lost-on-restart by design).

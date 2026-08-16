@@ -93,7 +93,7 @@ def _scope_run_ids(testcase):
 
 
 def _patch_tmux(testcase, argv):
-    """Patches TMUX in both app.py (which tmux_has()/active_engine() read
+    """Patches TMUX in both app.py (which tmux_has()/active_sessions() read
     from their own module namespace) and teams.py (which built its own name
     binding via `from app import TMUX`) -- see this file's own docstring."""
     orig_app = appmod.TMUX
@@ -245,8 +245,9 @@ class EngineHeadlessParsingTests(unittest.TestCase):
 
 
 class ActiveEngineHeadlessCollisionTests(unittest.TestCase):
-    """docs/spec.md "Session naming": active_engine() must never report a
-    live headless run as a project's running engine, even in the
+    """docs/spec.md "Session naming" (part 1, "session-identity backend"):
+    active_sessions() (replacing active_engine()) must never report a live
+    headless run as one of a project's active sessions, even in the
     non-obvious `switchboard` + `headless-<run_id>` shape."""
 
     def setUp(self):
@@ -281,7 +282,7 @@ class ActiveEngineHeadlessCollisionTests(unittest.TestCase):
         self.addCleanup(lambda: subprocess.run(["tmux", "kill-session", "-t", session],
                                                capture_output=True))
         self.assertTrue(appmod.tmux_has(session))
-        self.assertIsNone(appmod.active_engine(project_name))
+        self.assertEqual(appmod.active_sessions(project_name), [])
 
 
 # ─── Tier 1: pure argv/script construction ────────────────────────────────

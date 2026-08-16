@@ -261,10 +261,12 @@ GITHUB_POLL_INTERVAL_SECONDS = int(os.environ.get("GITHUB_POLL_INTERVAL_SECONDS"
 
 # HTTP-level smoke check (backlog item 18, docs/spec.md) -- a manual,
 # per-project "Smoke check" button that makes a single in-process GET
-# against that project's own already-captured _session_urls entry. Bounded
-# by construction: a request timeout and a capped response-body read, same
-# "never trust an outbound call to behave" discipline AI_REVIEWER_MAX_DIFF_
-# BYTES already established for a different bounded read.
+# against that project's most-recently-started live session's own
+# already-captured URL (_latest_session_url_for_project(), docs/spec.md
+# "Smoke-check preserved via a resolver"). Bounded by construction: a
+# request timeout and a capped response-body read, same "never trust an
+# outbound call to behave" discipline AI_REVIEWER_MAX_DIFF_BYTES already
+# established for a different bounded read.
 SMOKE_CHECK_TIMEOUT_SECONDS = int(os.environ.get("SMOKE_CHECK_TIMEOUT_SECONDS", "10"))
 SMOKE_CHECK_MAX_BODY_BYTES = int(os.environ.get("SMOKE_CHECK_MAX_BODY_BYTES", "65536"))
 
@@ -461,11 +463,14 @@ def _parse_engine_file(path: str):
         return None
     name = os.path.splitext(os.path.basename(path))[0]
     # Reserved engine-name prefixes (docs/spec.md "Session naming", extended
-    # by backlog item 6d part 1 "Engine-name reservation"): headless tmux
-    # sessions are named f"switchboard-headless-{run_id}" (app/teams.py) via
-    # the *same* TMUX rule instance_start() uses, and active_engine() keys
-    # purely off f"{engine_name}-{project_name}" with no other cross-check.
-    # Reserving only the exact name "switchboard-headless" would still leave
+    # by backlog item 6d part 1 "Engine-name reservation", and by the
+    # per-session identity scheme, docs/spec.md "New session-identity
+    # scheme"): headless tmux sessions are named
+    # f"switchboard-headless-{run_id}" (app/teams.py) via the *same* TMUX
+    # rule instance_start() uses, and every session_id (_new_session_id())
+    # still starts with the exact f"{engine_name}-{project_name}" prefix,
+    # with no other cross-check. Reserving only the exact name
+    # "switchboard-headless" would still leave
     # a constructible collision open (engine "switchboard" + a project
     # directory literally named "headless-<run_id>"), so the *whole*
     # "switchboard" prefix is reserved. Same bug class, same fix shape for
@@ -1924,18 +1929,21 @@ def smoke_check_run(name: str, expect_contains: str) -> dict:
     """Synchronous, request-thread dispatch -- same "manually clicked
     one-shot action can and should just block the request" reasoning
     deploy_run()'s own docstring gives. HTTP-level only (backlog item 18,
-    docs/spec.md): a single GET against _session_urls[name], the
-    switchboard's own trusted, server-derived URL for that project (never
-    an arbitrary client-supplied URL, so no SSRF-style concern). Never
-    raises -- every branch below returns a dict; on/OSError-shaped failures
-    from urlopen()/resp.read() are caught and turned into a clean
+    docs/spec.md): a single GET against _latest_session_url_for_project
+    (name)'s resolved URL, the switchboard's own trusted, server-derived URL
+    for that project (never an arbitrary client-supplied URL, so no
+    SSRF-style concern). For a project with more than one live session
+    (docs/spec.md "part 1" -- session identity), this deterministically
+    targets the most-recently-started one, never an arbitrary/undefined
+    one. Never raises -- every branch below returns a dict; on/OSError-shaped
+    failures from urlopen()/resp.read() are caught and turned into a clean
     {"ok": False, ...} result instead.
 
     Returns one of:
     - {"ok": False, "error": "no captured URL for this project"} -- no
-      _session_urls entry for `name` (engine off, no url_regex, or hasn't
-      printed a matching URL yet). Returned immediately, before the lock is
-      even touched.
+      live session for `name` has a resolved URL yet (no live session at
+      all, engine off, no url_regex, or hasn't printed a matching URL yet).
+      Returned immediately, before the lock is even touched.
     - {"ok": False, "error": <msg>, "locked": True} -- a check for this
       project is already in flight. "locked" is an internal-only marker
       the route below reads (and strips) to answer with HTTP 409, mirroring
@@ -1950,7 +1958,7 @@ def smoke_check_run(name: str, expect_contains: str) -> dict:
       content_ok is None (never False) when `expect_contains` was empty --
       "not checked" must stay visibly distinct from "checked and failed".
     """
-    url = _session_urls.get(name)
+    url = _latest_session_url_for_project(name)
     if url is None:
         return {"ok": False, "error": "no captured URL for this project"}
 
@@ -2392,20 +2400,79 @@ def tmux_has(session: str) -> bool:
     return r.returncode == 0
 
 
-def active_engine(name: str) -> str | None:
-    return next((e for e in load_engines() if tmux_has(f"{e}-{name}")), None)
+def _new_session_id(engine_name: str, project_name: str) -> str:
+    """Session-identity scheme (docs/spec.md "New session-identity scheme"):
+    this is used verbatim as BOTH the tmux session name AND the key into
+    _sessions/_ttyd_*/_session_urls below -- no separate id-vs-tmux-name
+    mapping needed. Starts with the exact f"{engine_name}-{project_name}"
+    prefix the old single-session naming already produced, preserving the
+    reserved-engine-name-prefix collision guard in _parse_engine_file()
+    above unchanged, with a timestamp+hex suffix in the same style as
+    app/teams.py's own _run_id() (f"{int(time.time())}-
+    {secrets.token_hex(6)}") -- shortened to 3 hex bytes here since this id
+    is in-memory-only, never persisted to disk, and only needs to
+    disambiguate concurrent spawns within one process's lifetime, not
+    survive a restart. Collision probability is accepted at the same
+    standard this codebase already uses for _run_id() and
+    _ai_reviewer_scratch's secrets.token_hex(8) (app/teams.py) -- not
+    literally proven impossible, consistent with this codebase's existing
+    risk tolerance for this exact class of identifier.
+    """
+    return f"{engine_name}-{project_name}-{int(time.time())}-{secrets.token_hex(3)}"
+
+
+# Per-session bookkeeping (docs/spec.md "New session registry, lock-guarded")
+# -- replaces active_engine()'s "at most one live session per project"
+# assumption with a real registry, keyed by session_id (== the tmux session
+# name), so N concurrent sessions for one project are each tracked
+# independently. Same "sanctioned access points only" discipline
+# _team_threads_set()/_get()/_pop_if_owned() already established below for
+# the identical hazard shape (concurrent spawn/stop/reap touching the same
+# in-memory dict -- that lock's own comment notes this exact defect class
+# has been found and fixed four separate times in this codebase's team
+# subsystem) -- every mutation and every liveness-deciding read of
+# _sessions goes through one of the three functions below, nothing else
+# touches _sessions directly.
+_sessions: dict[str, dict] = {}   # session_id -> {"project": str, "engine": str}
+_sessions_lock = threading.Lock()
+
+
+def _sessions_add(session_id: str, project: str, engine: str) -> None:
+    with _sessions_lock:
+        _sessions[session_id] = {"project": project, "engine": engine}
+
+
+def _sessions_pop(session_id: str) -> dict | None:
+    with _sessions_lock:
+        return _sessions.pop(session_id, None)
+
+
+def active_sessions(project_name: str) -> list[dict]:
+    """Replaces active_engine() as the per-project liveness source of
+    truth. Self-healing like today's active_engine() was -- tmux_has() is
+    checked fresh here on every call, not just relied on via the periodic
+    _reap_dead_state() sweep. A plain dict preserves insertion order, so
+    the returned list is oldest-spawned first / most-recently-spawned last
+    -- relied on by /status's back-compat fields and
+    _latest_session_url_for_project() below to deterministically pick "the
+    newest session" for a project."""
+    with _sessions_lock:
+        snapshot = [(sid, info) for sid, info in _sessions.items()
+                    if info["project"] == project_name]
+    return [{"session_id": sid, "engine": info["engine"]}
+            for sid, info in snapshot if tmux_has(sid)]
 
 
 # Team session lifecycle, part 2a (backlog item 6d, docs/spec.md §1) -- the
 # reverse import direction (teams.py -> app) has existed since 6a; this is
 # the first time app.py itself imports teams. MUST sit here, after TMUX
-# (:191), load_engines() (:397), tmux_has()/active_engine() (above) are all
-# already defined -- teams.py does `from app import TMUX, tmux_has,
-# load_engines` at ITS OWN module level, so app.py must have already
-# defined all three by the time this import runs, or the circular import
-# breaks. Never move this earlier. No sys.path manipulation needed -- both
-# files live in the same directory, in a repo checkout and in a real
-# install alike (see install.sh's own new teams.py copy line below).
+# (:191), load_engines() (:397), tmux_has() (above) are all already defined
+# -- teams.py does `from app import TMUX, tmux_has, load_engines` at ITS OWN
+# module level, so app.py must have already defined all three by the time
+# this import runs, or the circular import breaks. Never move this earlier.
+# No sys.path manipulation needed -- both files live in the same directory,
+# in a repo checkout and in a real install alike (see install.sh's own new
+# teams.py copy line below).
 import teams  # noqa: E402
 
 # Background team-run threads (backlog item 6d part 2a). Keyed by PROJECT
@@ -2600,16 +2667,64 @@ def run_startup_watch(session: str, name: str, engine: "Engine", timeout: int = 
             break
 
 
-def instance_start(name: str, engine_name: str = "claude"):
+def _resolve_session_url(session_id: str, engine_name: str) -> str | None:
+    """Single source of truth for "what URL represents this session" --
+    shared by /status's per-session `sessions` array, its back-compat `url`
+    field, and _latest_session_url_for_project() below (docs/spec.md
+    "Smoke-check preserved via a resolver, not touched otherwise": "ideally
+    sharing one implementation ... rather than two"). Same resolution rule
+    the old per-project /status line already used: the engine's own
+    captured hosted link (_session_urls) if it has one (url_regex), else
+    the ttyd-hosted terminal URL (_ttyd_urls) as the fallback.
+    """
+    engine = load_engines().get(engine_name)
+    if engine is None:
+        return None
+    return _session_urls.get(session_id) if engine.url_regex else _ttyd_urls.get(session_id)
+
+
+def _latest_session_for_project(name: str) -> dict | None:
+    """The most-recently-started LIVE session for a project ({"session_id",
+    "engine"}), or None if it has zero. "Most recent" = the last entry of
+    active_sessions()'s own insertion-order-preserving list (docs/spec.md
+    "/status JSON -- additive": a plain dict already preserves insertion
+    order -- deterministic, never "whichever dict iteration happens to
+    return first")."""
+    sessions = active_sessions(name)
+    return sessions[-1] if sessions else None
+
+
+def _latest_session_url_for_project(name: str) -> str | None:
+    """Preserves smoke_check_run()'s pre-spec single-URL contract
+    mechanically (docs/spec.md "Smoke-check preserved via a resolver, not
+    touched otherwise"): externally identical to today for the common
+    single-session case; for multi-session projects, deterministically
+    targets the newest session's resolved URL, never an
+    arbitrary/undefined one.
+    """
+    latest = _latest_session_for_project(name)
+    if latest is None:
+        return None
+    return _resolve_session_url(latest["session_id"], latest["engine"])
+
+
+def instance_start(name: str, engine_name: str = "claude") -> str | None:
+    """Starts an ADDITIONAL session for `name` -- no "already running" guard
+    here (docs/spec.md "instance_start -> returns a session_id, no longer
+    guards on already running"): multiplicity is now the point. The route
+    layer re-adds an equivalent guard for the legacy /on endpoint only, to
+    preserve its exact back-compat behavior (see the /on route below).
+    Returns the new session's session_id, or None if the engine name is
+    unknown or the project directory doesn't exist.
+    """
     engines = load_engines()
     engine = engines.get(engine_name)
-    if engine is None:
-        return
     workdir = os.path.join(PROJECTS_DIR, name)
-    if active_engine(name) is not None or not os.path.isdir(workdir):
-        return
-    _session_urls.pop(name, None)
-    session = f"{engine_name}-{name}"
+    if engine is None or not os.path.isdir(workdir):
+        return None
+    session_id = _new_session_id(engine_name, name)
+    _sessions_add(session_id, name, engine_name)
+    _session_urls.pop(session_id, None)
     cmd = engine.cmd.format(name=shlex.quote(name))
     # Run the engine command directly as the tmux session's own command (not
     # via send-keys into a persistent shell). That way the *session's*
@@ -2618,53 +2733,71 @@ def instance_start(name: str, engine_name: str = "claude"):
     # tears the session down with it, so `tmux has-session` (and thus "is
     # this running") self-heals instead of reporting true forever against a
     # bare leftover shell.
-    subprocess.run(TMUX + ["new-session", "-d", "-s", session, "-c", workdir,
+    subprocess.run(TMUX + ["new-session", "-d", "-s", session_id, "-c", workdir,
                            "bash", "-lc", cmd])
     if engine.startup or engine.url_regex:
-        run_startup_watch(session, name, engine)
+        run_startup_watch(session_id, session_id, engine)
     if not engine.url_regex:
-        _ttyd_start(name, session)
+        _ttyd_start(session_id, session_id)
+    return session_id
 
 
-def instance_stop(name: str):
-    # Deliberately does NOT touch VS Code (_code_stop) — code-server has its
-    # own independent on/off lifecycle, spawnable and usable whether or not
-    # an engine session is running.
-    _session_urls.pop(name, None)
-    _ttyd_stop(name)
-    for e in load_engines():
-        subprocess.run(TMUX + ["kill-session", "-t", f"{e}-{name}"], capture_output=True)
+def instance_stop_session(session_id: str) -> None:
+    """Tears down exactly one session, leaving any siblings for the same
+    project untouched (docs/spec.md "New per-session stop"). Idempotent --
+    stopping an already-gone session_id is a clean no-op, same tolerant
+    style this already had before the per-session split: killing a
+    nonexistent tmux session under capture_output=True just fails silently,
+    never raises. Deliberately does NOT touch VS Code (_code_stop) --
+    code-server has its own independent on/off lifecycle, spawnable and
+    usable whether or not any engine session is running.
+    """
+    _sessions_pop(session_id)
+    _session_urls.pop(session_id, None)
+    _ttyd_stop(session_id)
+    subprocess.run(TMUX + ["kill-session", "-t", session_id], capture_output=True)
+
+
+def instance_stop(name: str) -> None:
+    """Legacy bulk-stop, kept only for the back-compat POST /instance/
+    <name>/off route (docs/spec.md "Routes"): stops EVERY live session for
+    `name`, mirroring the pre-spec "kill every engine's session for this
+    project" loop, generalized from "every engine" to "every session". Part
+    2 removes this once the frontend stops calling /off.
+    """
+    for s in active_sessions(name):
+        instance_stop_session(s["session_id"])
 
 
 def _reap_dead_state():
     """
     tmux sessions die on their own the moment the engine process inside them
-    exits (see instance_start), so active_engine() is the source of truth
-    for whether a project is "running" — but leftover bookkeeping (a
-    captured hosted URL, a still-running ttyd/code-server proc, a
-    tailscale-serve mapping pointing at a now-dead port) doesn't clear
-    itself just because the tmux session went away between polls. Called on
-    every /status so the UI self-heals even when a session ends on its own
-    (crash, quit, `tmux kill-session` from inside) rather than only when the
-    user explicitly flips the switch off.
+    exits (see instance_start), so tmux_has(session_id) is the source of
+    truth for whether a given session is still "running" -- but leftover
+    bookkeeping (a captured hosted URL, a still-running ttyd/code-server
+    proc, a tailscale-serve mapping pointing at a now-dead port) doesn't
+    clear itself just because the tmux session went away between polls.
+    Called on every /status so the UI self-heals even when a session ends on
+    its own (crash, quit, `tmux kill-session` from inside) rather than only
+    when the user explicitly stops it.
+
+    Per-session sweep (docs/spec.md "New per-session stop, _reap_dead_state()
+    generalized") -- simpler than the old active_engine()-driven version (no
+    engines.get(active_engine(...)) indirection needed) since session_id
+    *is* the tmux session name, so the liveness check is a single direct
+    tmux_has() call. instance_stop_session() is idempotent and safe to race
+    against a concurrent explicit /session/<id>/stop -- both go through
+    _sessions_pop(), guarded by _sessions_lock, so the loser's pop returns
+    None and short-circuits with no double teardown.
 
     Also sweeps abandoned upload-wizard staging directories (docs/spec.md
     "Two-phase protocol" — TTL/idle cleanup for abandoned uploads), reusing
     this same "opportunistic cleanup on a request that already happens
     often" precedent rather than a dedicated background thread/timer.
     """
-    engines = load_engines()
-    for name in list(_session_urls):
-        e = engines.get(active_engine(name) or "")
-        if e is None or not e.url_regex:
-            _session_urls.pop(name, None)
-    for name in set(_ttyd_urls) | set(_ttyd_procs):
-        ae = active_engine(name)
-        e = engines.get(ae or "")
-        # ttyd fallback belongs to whichever engine is active AND lacks its
-        # own hosted link; anything else means it's stale.
-        if ae is None or (e is not None and e.url_regex):
-            _ttyd_stop(name)
+    for session_id in list(_sessions):
+        if not tmux_has(session_id):
+            instance_stop_session(session_id)
     for name in list(_code_procs):
         proc = _code_procs.get(name)
         if proc is not None and proc.poll() is not None:
@@ -5954,12 +6087,26 @@ class Handler(BaseHTTPRequestHandler):
             deploy_map = _load_deploy_map()
             instances = []
             for n in instance_names():
-                engine = active_engine(n)
-                e = engines.get(engine) if engine else None
-                url = (_session_urls.get(n) if (e and e.url_regex) else
-                       _ttyd_urls.get(n) if engine else None)
-                inst = {"name": n, "on": engine is not None, "engine": engine,
-                       "url": url,
+                # Session identity, part 1 (docs/spec.md "/status JSON --
+                # additive"): `sessions` is the real, new data shape --
+                # one entry per live session for this project, in
+                # insertion (oldest-first) order. `on`/`engine`/`url`
+                # stay too, unchanged in meaning, as a temporary
+                # back-compat shim for today's still-unmodified checkbox
+                # frontend -- derived from the most-recently-started
+                # session (last entry), or all-None/False when there are
+                # none. Part 2 removes these three fields once nothing
+                # reads them.
+                proj_sessions = active_sessions(n)
+                sessions_field = [
+                    {"session_id": s["session_id"], "engine": s["engine"],
+                     "url": _resolve_session_url(s["session_id"], s["engine"])}
+                    for s in proj_sessions]
+                latest = sessions_field[-1] if sessions_field else None
+                inst = {"name": n, "on": latest is not None,
+                       "engine": latest["engine"] if latest else None,
+                       "url": latest["url"] if latest else None,
+                       "sessions": sessions_field,
                        "desc": get_description(n, os.path.join(PROJECTS_DIR, n)),
                        "code_on": code_running(n), "code_url": _code_urls.get(n)}
                 # Team session lifecycle, part 2a (backlog item 6d,
@@ -6415,16 +6562,63 @@ class Handler(BaseHTTPRequestHandler):
                 body.get("token", ""), body.get("mode", ""), body.get("selected") or [])
             self._json(payload, status)
         elif parts[0] == "instance" and len(parts) == 3 and parts[2] in ("on", "off"):
+            # Legacy back-compat shim (docs/spec.md "Routes" §6 -- removed
+            # in part 2 once the frontend stops calling these): /on is a
+            # no-op if the project already has ANY live session (today's
+            # exact "already running" guard, generalized from "exactly one"
+            # to "any"); /off stops ALL of them (today's "kill every
+            # engine's session" loop, generalized from "every engine" to
+            # "every session").
             name = parts[1]
             if name not in instance_names():
                 return self._json({"error": "unknown instance"}, 404)
             if parts[2] == "on":
-                engines = load_engines()
-                default_engine = next(iter(engines), "claude")
-                engine = body.get("engine") if body.get("engine") in engines else default_engine
-                instance_start(name, engine)
+                if not active_sessions(name):
+                    engines = load_engines()
+                    default_engine = next(iter(engines), "claude")
+                    engine = body.get("engine") if body.get("engine") in engines else default_engine
+                    instance_start(name, engine)
             else:
                 instance_stop(name)
+            self._json({"ok": True})
+        elif parts[0] == "instance" and len(parts) == 3 and parts[2] == "spawn":
+            # New session-identity route (docs/spec.md "Routes" §6): starts
+            # an ADDITIONAL session regardless of whether others are
+            # already running for this project -- no "already on" guard,
+            # unlike the legacy /on shim above. Same fallback-to-default-
+            # engine behavior as /on, no new validation (an unknown engine
+            # name falls back silently, same as today).
+            name = parts[1]
+            if name not in instance_names():
+                return self._json({"error": "unknown instance"}, 404)
+            engines = load_engines()
+            default_engine = next(iter(engines), "claude")
+            engine = body.get("engine") if body.get("engine") in engines else default_engine
+            session_id = instance_start(name, engine)
+            self._json({"ok": session_id is not None, "session_id": session_id})
+        elif (parts[0] == "instance" and len(parts) == 5 and parts[2] == "session"
+              and parts[4] == "stop"):
+            # New per-session stop route (docs/spec.md "Routes" §6): tears
+            # down exactly the targeted session_id, leaving any siblings for
+            # the same project untouched. Idempotent -- an already-gone
+            # session_id (double-click, stale frontend cache, or a race
+            # with the reap sweep) is a normal race, never a 404/500 (see
+            # docs/spec.md "Edge cases"). Ownership check below is NOT in
+            # the original spec pseudocode but is required regardless: the
+            # URL shape (/instance/<name>/session/<id>/stop) implies id
+            # belongs to name, but nothing enforced that -- without this
+            # check, any caller could tear down another project's session,
+            # or even a real team-<project> tmux session, via a bare
+            # session-name string with zero cross-check against ownership.
+            # Stopping an id that isn't (or is no longer) one of this
+            # project's live sessions is treated the same as the existing
+            # "already gone" idempotent case above -- silently ignored,
+            # still {"ok": true}, never a 404/500.
+            name = parts[1]
+            if name not in instance_names():
+                return self._json({"error": "unknown instance"}, 404)
+            if any(s["session_id"] == parts[3] for s in active_sessions(name)):
+                instance_stop_session(parts[3])
             self._json({"ok": True})
         elif parts[0] == "instance" and len(parts) == 4 and parts[2] == "code" and parts[3] in ("on", "off"):
             name = parts[1]

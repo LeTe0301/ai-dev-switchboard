@@ -150,12 +150,28 @@ class SmokeCheckRunTests(unittest.TestCase):
         appmod._smoke_check_locks.clear()
         self._orig_timeout = appmod.SMOKE_CHECK_TIMEOUT_SECONDS
         self._orig_max_body = appmod.SMOKE_CHECK_MAX_BODY_BYTES
+        # Session-identity backend (docs/spec.md, part 1 -- "Smoke-check
+        # preserved via a resolver"): smoke_check_run() now resolves its URL
+        # via _latest_session_url_for_project(), which requires a real live
+        # tracked session (see tests/test_session_identity.py's
+        # SessionIdentityEndpointTests for THAT new behavior, exercised end
+        # to end). This class predates that change and is about
+        # smoke_check_run()'s own HTTP-fetching mechanics (timeouts, body
+        # truncation, non-utf8 handling, locking) -- orthogonal to session
+        # resolution -- so _latest_session_url_for_project is monkeypatched
+        # back to its own exact pre-spec behavior (a direct _session_urls-
+        # by-name lookup) for the duration of this class, letting every
+        # test below keep writing appmod._session_urls["proj"] = ...
+        # unchanged.
+        self._orig_latest_url = appmod._latest_session_url_for_project
+        appmod._latest_session_url_for_project = appmod._session_urls.get
 
     def tearDown(self):
         appmod._session_urls.clear()
         appmod._smoke_check_locks.clear()
         appmod.SMOKE_CHECK_TIMEOUT_SECONDS = self._orig_timeout
         appmod.SMOKE_CHECK_MAX_BODY_BYTES = self._orig_max_body
+        appmod._latest_session_url_for_project = self._orig_latest_url
 
     def test_no_captured_url_returns_ok_false_without_touching_the_lock(self):
         result = appmod.smoke_check_run("does-not-exist", "")
