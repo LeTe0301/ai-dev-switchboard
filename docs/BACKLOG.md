@@ -2743,6 +2743,87 @@ again — the user has already indicated that's the trigger.
    user-approved, no need to ask again). Issues found → loop back into
    the fix pipeline, commit, push, re-brief, repeat.
 
+### Round 11 report (2026-08-16): item 45 confirmed fixed, E2E loop closed
+
+Tested `fafdfb9` on a fresh CT110. Reproducing round 10's no-engine-CLI
+dead end took 5 attempts (the local `qwen3:8b` lead is non-deterministic
+here); 3/5 escalated cleanly via `ask_user` (matches round 6/10, fine),
+1 was still running, attempt 5 hit an even sharper case than round 10's:
+the lead called `finish` with a **hallucinated false success**
+("The LICENSE file has been added to the project." — no such file
+exists), not just an honest failure summary. Confirmed both requested
+things directly: `/status`'s team block includes `summary` matching
+`run.json` exactly (and is `null` on non-finished runs), and the actual
+client-side rendering code produces the expected
+`<div class="team-sub">...</div>` under the status strip (verified via
+the rendering code itself, no browser available — same constraint every
+round). Quick sanity pass (Gitea flow) clean. **This closes items 39-45**
+— nothing outstanding from the E2E loop.
+
+### Migration phase (2026-08-16): scope redefined, in progress
+
+User redefined the migration scope significantly from the original "The
+plan, in order" wording above (raised concerns about it, specifically:
+the orchestrator has no host-level Proxmox access from this sandbox —
+confirmed again, `host_control_ed25519` still rejected by the real host
+— so container creation has to be delegated to the pve peer regardless;
+and "exact clone including Claude/agent configuration" as originally
+written would mean transferring SSH private keys and auth state over the
+network, which the orchestrator flagged before doing). Actual scope, per
+the user: **not** a clone of this whole dev sandbox. Instead:
+
+1. Merge any open PR into `main` first. Done — PR #33 merged as `50ef05e`
+   via `gh pr merge --merge` (matches this repo's own precedent: #26,
+   #27, #31, #32 were all plain merge commits, not squash/rebase). Local
+   `main`, `github/main`, and `origin/main` all fast-forwarded to
+   `50ef05e`. Feature branch `backlog/e2e-fixes-round6` deleted locally
+   and on both remotes (fully merged, per the standard
+   finishing-a-development-branch cleanup flow). Full test suite verified
+   green first: 1274 tests, same 3 pre-existing/unrelated
+   `test_teams_grounding.py` failures as every round this session, 1
+   skip.
+2. **A fresh local backup of all 15 project repos** in this dev sandbox
+   (not just ai-dev-switchboard) was taken first regardless, since the
+   only prior backup (`~/backups/2026-08-15_112951/`) predates this
+   entire session's work — new one at `~/backups/2026-08-16_095558/`,
+   1.4G, no errors.
+3. Have the pve host provision a **new, persistent** container (not a
+   throwaway E2E test CT — explicitly told to never destroy this one),
+   install `main` @ `50ef05e` with `--with-git-hosting --with-taiga`
+   only (per the user's explicit "gitea and Taiga stuff" — other
+   optional flags deliberately left off, can be added later), and test
+   it before reporting back with connection details. Briefed to
+   `pve-sparkling-meadow`, not yet actioned as of this writing.
+4. Once that's confirmed working: migrate the actual project repos
+   (from the fresh local backup in step 2) into the new instance — not
+   yet scoped in detail, comes after step 3 completes.
+5. **No auto-shutdown**: the user explicitly declined having any peer
+   session shut this orchestrator session down automatically (the
+   original "The plan, in order" step 4 above). Once migration is
+   confirmed complete, report back and let the user decide manually
+   whether/when to shut down or remove this container.
+
+### To resume if this session is interrupted mid-migration
+
+1. Check `ListAgents` for the current pve-side peer session name (may
+   have changed if it died again).
+2. Check whether PR #33 is merged (`git log main` should show
+   `50ef05e` or later as a fast-forward ancestor) — if not, that's step 1
+   above, still pending.
+3. Check whether a fresh backup post-dating this session's work exists
+   in `~/backups/` — if the newest one predates today's work, take
+   another before touching anything else (see step 2 above for the
+   command pattern used).
+4. Check whether the new persistent container has been reported back yet
+   (a message from the pve peer with its name/IP/port/credentials). If
+   not: wait, or re-send the provisioning brief (reconstruct from step 3
+   above) to whichever peer is currently listed.
+5. Once the new container is confirmed up and tested: plan and execute
+   the repo migration (step 4 above — not yet scoped in detail), then
+   report back to the user. Do **not** have any peer shut this session
+   down — the user explicitly wants to do that manually, after reviewing
+   the new container themselves.
+
 ---
 
 ## Items 39-43: found by E2E round 6 real test on fresh CT110 (2026-08-16)
