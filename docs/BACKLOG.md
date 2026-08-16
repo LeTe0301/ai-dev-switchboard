@@ -2459,19 +2459,33 @@ Tested `a6991c2` on a second fresh CT110 (destroyed after report), with
 Everything else (upload-from-folder, GitHub-origin AI-reviewer, real
 engine CLI sessions) — not re-tested this round, same as round 6.
 
+### Round 8 fix cycle: complete (2026-08-16)
+
+Item 43's real fix (nginx lazy DNS resolution via a repo-owned,
+bind-mounted `taiga.conf` — never touching the pinned `taiga-docker`
+checkout, preserving item 30's original constraint) plus a
+settle-and-recheck stopgap for the round-7 fallback, via the normal
+product-manager → developer → reviewer pipeline (no ux-designer —
+backend/infra only). Approved with one non-blocking nit, committed as
+`edb4619` on `backlog/e2e-fixes-round6`, pushed to both remotes, still
+under PR #33. Reviewer independently live-reproduced the original DNS
+crash and confirmed the fix conf stays up under the same condition,
+using real Docker containers rather than trusting the implementation
+report. Re-briefed `pve-sparkling-meadow`, item-43-focused this round
+(asked for several `/taiga/on` runs across fresh installs, since the
+original race was timing-dependent).
+
 ### To resume if this session is interrupted mid-loop
 
 1. Check `ListAgents` for the current pve-side peer session name (may
    have changed if it died again).
-2. If item 43's real fix (or at minimum the stopgap) isn't yet committed:
-   continue/resume the product-manager → developer → reviewer pipeline
-   for it (see "Round 7 retest report" above for full context — this is
-   an architecture-decision revisit, not a mechanical fix, so it warrants
-   a full product-manager pass, not a shortcut).
-3. Once fixed, reviewed, and pushed: re-send an item-43-focused retest
-   brief to whichever peer is listed.
-4. If a future report comes back fully clean: proceed to the
-   backup+migration steps (3-5) under "The plan, in order" above.
+2. If no round-8 report has arrived yet: wait, or re-send the round-8
+   retest brief (see "Round 8 fix cycle" above) to whichever peer is
+   listed.
+3. If a report *has* arrived: read it. Clean report → proceed to the
+   backup+migration steps (3-5) under "The plan, in order" above. Issues
+   found → loop back into the fix pipeline (product-manager → developer
+   → reviewer), commit, push, re-brief, repeat.
 
 ---
 
