@@ -224,6 +224,19 @@ test('project with a captured url renders a Smoke check button + input + empty m
   assert.ok(html.includes('id="smoke-check-msg-proj"'), 'expected an empty .smoke-check-msg slot, got: ' + html);
 });
 
+// docs/spec.md issue #4: a visible (not hover-only) helper line explaining
+// what "Smoke check" does, since the reported context is touch/mobile.
+test('the Smoke check row includes a static, always-visible helper line explaining what it does', async () => {
+  const c = await setupCase([
+    { name: 'proj', on: true, url: 'http://127.0.0.1:3000/', engine: 'claude', desc: '',
+      code_on: false, code_url: null },
+  ]);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('smoke-check-hint'), 'expected a static helper-text element, got: ' + html);
+  assert.ok(html.includes('single request') || html.includes('single HTTP request'),
+    'expected the helper text to explain the button makes one HTTP request, got: ' + html);
+});
+
 test('project without a captured url renders no Smoke check button at all', async () => {
   const c = await setupCase([
     { name: 'plain', on: false, url: null, engine: null, desc: '', code_on: false, code_url: null },

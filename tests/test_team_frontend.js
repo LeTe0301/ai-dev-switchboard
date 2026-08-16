@@ -281,6 +281,14 @@ async function openPicker(c, name, instances, roster, grounding) {
   await tick();
 }
 
+// Detects a real `checked` boolean attribute in a sliced checkbox tag
+// string, without false-positiving on the unrelated substring "this.checked"
+// that every teammate checkbox's own onchange="...this.checked)" attribute
+// already contains verbatim.
+function hasCheckedAttr(tagStr) {
+  return /\schecked(\s|>)/.test(tagStr);
+}
+
 function rosterEntry(overrides) {
   return Object.assign({ name: 'e', kind: 'engine', label: 'E', tier: 2, delegate_capable: true,
                         schema_flag_error: null }, overrides || {});
@@ -312,6 +320,25 @@ test('idle (team.status === "idle") renders the same idle control', async () => 
   const c = await setupCase([inst('proj', { status: 'idle', run_id: null })]);
   const html = c.instanceRowHtml('proj');
   assert.ok(html.includes('class="team-textarea"'));
+});
+
+// docs/spec.md issue #1: the idle/launcher state has no indication that
+// anything appears here once a team starts -- a short static hint makes
+// the in-page live feed + interject compose box (backlog item 19)
+// discoverable before Start is ever clicked.
+test('idle state includes a static hint that live team activity appears here once started', async () => {
+  const roster = [rosterEntry({ name: 'lead2', tier: 2 }), rosterEntry({ name: 'helper', tier: 2 })];
+  const comp = { lead: { kind: 'engine', name: 'lead2' }, members: ['helper'] };
+  const c = await setupCase([inst('proj', { status: 'idle', run_id: null, composition: comp })], roster);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(/once started/i.test(html), 'expected a discoverability hint mentioning "once started", got: ' + html);
+  assert.ok(!/\bchat\b/i.test(html), 'must not overstate this as a dedicated "chat" UI beyond what item 19 built');
+});
+
+test('the idle-state hint disappears once the team is running (superseded by the real feed)', async () => {
+  const c = await setupCase([inst('proj', { status: 'running', run_id: 'run-1' })]);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(!/once started/i.test(html), 'the idle-only hint must not linger once the team is actually running');
 });
 
 test('running renders coarse status label + Stop team button, no textarea', async () => {
@@ -636,7 +663,7 @@ test('opening the picker fetches grounding and renders every roster member as a 
   assert.ok(html.includes('Hide configuration'), 'the configure link toggles to Hide configuration once open');
 });
 
-test('the saved composition pre-selects the lead and excludes it from the teammate checkboxes', async () => {
+test('the saved composition pre-selects the lead, shows it disabled+unchecked in the teammate checkboxes (never hidden)', async () => {
   const roster = [rosterEntry({ name: 'lead2', tier: 2 }), rosterEntry({ name: 'helper', tier: 2 }),
                   rosterEntry({ name: 'other', tier: 2 })];
   const comp = { lead: { kind: 'engine', name: 'lead2' }, members: ['helper'] };
@@ -646,9 +673,102 @@ test('the saved composition pre-selects the lead and excludes it from the teamma
   const html = c.instanceRowHtml('proj');
   const leadSelect = html.slice(html.indexOf('id="team-lead-proj"'));
   assert.ok(/value='[^']*"lead2"[^']*'\s+selected/.test(leadSelect), 'expected lead2 pre-selected, got: ' + leadSelect);
-  assert.ok(!html.includes('team-mate-proj-lead2'), 'the current lead must be excluded from the teammate checkboxes');
+  // docs/spec.md issue #3: the lead's own engine is rendered DISABLED, not
+  // omitted -- present in the markup, unchecked, with the disabled attribute.
+  assert.ok(html.includes('team-mate-proj-lead2'), 'expected the lead\'s own checkbox present (disabled), got: ' + html);
+  const lead2Checkbox = html.slice(html.indexOf('id="team-mate-proj-lead2"'), html.indexOf('>', html.indexOf('id="team-mate-proj-lead2"')));
+  assert.ok(lead2Checkbox.includes('disabled'), 'expected the lead checkbox to carry the disabled attribute, got: ' + lead2Checkbox);
+  assert.ok(!hasCheckedAttr(lead2Checkbox), 'the lead checkbox must never render checked, got: ' + lead2Checkbox);
   assert.ok(html.includes('team-mate-proj-helper'));
   assert.ok(html.includes('team-mate-proj-other'));
+  // The saved composition can never itself contain lead-in-members
+  // (server-side save_composition() only persists post-validation
+  // compositions) -- regression check that the pre-populated picker never
+  // shows the lead's own engine checked.
+  assert.strictEqual(c.call('teamCompositionError', 'proj'), null);
+});
+
+test('changing Lead away from an engine previously checked as a teammate clears the stale membership (docs/spec.md issue #3)', async () => {
+  const roster = [rosterEntry({ name: 'lead2', tier: 2 }), rosterEntry({ name: 'helper', tier: 2 })];
+  const comp = { lead: { kind: 'engine', name: 'lead2' }, members: ['helper'] };
+  const instances = [inst('proj', { status: 'idle', run_id: null, composition: comp })];
+  const c = await setupCase(instances, roster);
+  await openPicker(c, 'proj', instances, roster);
+
+  // Check 'helper' as a teammate first, then change Lead to 'helper' --
+  // reproduces the exact stale-Set scenario docs/spec.md traces.
+  c.call('onTeamMateToggle', 'proj', 'helper', true);
+  await tick();
+  const sel = c.sandbox.document.getElementById('team-lead-proj');
+  sel.value = JSON.stringify({ kind: 'engine', name: 'helper' });
+  c.call('onTeamLeadChange', 'proj');
+  await tick();
+
+  // The bug (pre-fix): 'helper' would still be in teamPickerMembers even
+  // though its checkbox is no longer rendered checked -- teamCompositionError
+  // would incorrectly report "Lead cannot also be a teammate" for a state
+  // invisible in the UI. The fix: the Set is actively cleared on lead change.
+  assert.strictEqual(c.call('teamCompositionError', 'proj'), 'At least one teammate is required',
+    'expected the stale membership to be cleared (only the separate empty-teammates rule should block here)');
+});
+
+test('rapid Lead switching clears only the newly-selected lead\'s own stale membership, never an unrelated engine\'s legitimate one', async () => {
+  const roster = [rosterEntry({ name: 'e1', tier: 2 }), rosterEntry({ name: 'e2', tier: 2 }),
+                  rosterEntry({ name: 'helper', tier: 2 })];
+  const comp = { lead: null, members: [] };
+  const instances = [inst('proj', { status: 'idle', run_id: null, composition: comp })];
+  const c = await setupCase(instances, roster);
+  await openPicker(c, 'proj', instances, roster);
+
+  // 'helper' is checked once and never itself selected as Lead -- it is
+  // the control that must stay untouched across every switch below.
+  c.call('onTeamMateToggle', 'proj', 'helper', true);
+  await tick();
+
+  const sel = c.sandbox.document.getElementById('team-lead-proj');
+  async function setLead(engineName) {
+    sel.value = JSON.stringify({ kind: 'engine', name: engineName });
+    c.call('onTeamLeadChange', 'proj');
+    await waitForFetch(c, (f) => f.url === '/status');
+    c.resolveFetch((f) => f.url === '/status', 200, statusWith(instances, roster));
+    await tick();
+    await tick();
+  }
+  // e1 (never checked) -> e2 (never checked) -> e1 again: rapid back-and-
+  // forth between two engines, neither of which was ever a teammate here,
+  // so each switch's Set-clearing step is a no-op -- proves it never
+  // touches 'helper's own legitimate membership.
+  await setLead('e1');
+  await setLead('e2');
+  await setLead('e1');
+
+  assert.strictEqual(c.call('teamCompositionError', 'proj'), null,
+    'a valid composition (lead=e1, helper checked) must not be blocked by the switching');
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('team-mate-proj-helper'));
+  const helperCheckbox = html.slice(html.indexOf('id="team-mate-proj-helper"'), html.indexOf('>', html.indexOf('id="team-mate-proj-helper"')));
+  assert.ok(hasCheckedAttr(helperCheckbox), 'helper\'s own legitimate membership must survive the lead switching, got: ' + helperCheckbox);
+  assert.ok(!helperCheckbox.includes('disabled'), 'helper was never Lead -- must not render disabled, got: ' + helperCheckbox);
+});
+
+test('Lead cleared back to "Choose a lead..." makes every teammate checkbox selectable again (none disabled)', async () => {
+  const roster = [rosterEntry({ name: 'lead2', tier: 2 }), rosterEntry({ name: 'helper', tier: 2 })];
+  const comp = { lead: { kind: 'engine', name: 'lead2' }, members: ['helper'] };
+  const instances = [inst('proj', { status: 'idle', run_id: null, composition: comp })];
+  const c = await setupCase(instances, roster);
+  await openPicker(c, 'proj', instances, roster);
+
+  const sel = c.sandbox.document.getElementById('team-lead-proj');
+  sel.value = '';
+  c.call('onTeamLeadChange', 'proj');
+  await waitForFetch(c, (f) => f.url === '/status');
+  c.resolveFetch((f) => f.url === '/status', 200, statusWith(instances, roster));
+  await tick();
+  await tick();
+
+  const html = c.instanceRowHtml('proj');
+  const lead2Checkbox = html.slice(html.indexOf('id="team-mate-proj-lead2"'), html.indexOf('>', html.indexOf('id="team-mate-proj-lead2"')));
+  assert.ok(!lead2Checkbox.includes('disabled'), 'no engine should render disabled once Lead is cleared, got: ' + lead2Checkbox);
 });
 
 test('a tier-3 lead shows the plain-language reliability caveat, never blocked', async () => {

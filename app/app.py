@@ -2883,6 +2883,11 @@ PAGE_TEMPLATE = """<!doctype html>
      assumed) at 7.39:1 by WCAG relative luminance, comfortably passing
      AA's 4.5:1 minimum (see docs/implementation.md for the computed
      figures). */
+  /* docs/spec.md issue #4: static, always-visible helper line explaining
+     what "Smoke check" does -- reuses .smoke-check-msg's own font-size/
+     color precedent, just as a static line instead of the dynamic result
+     slot. */
+  .smoke-check-hint { font-size: 12px; color: #888; margin-top: 6px; }
   .smoke-check-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
   .smoke-check-row input { flex: 1; min-width: 140px; font-size: 13px; padding: 8px 10px;
                             border-radius: 8px; border: 1px solid #333; background: #1c1c1c; color: #eee; }
@@ -2925,6 +2930,12 @@ PAGE_TEMPLATE = """<!doctype html>
   .team-lead-picker select { font-size: 13px; padding: 6px 8px; border-radius: 8px;
                               border: 1px solid #333; background: #1c1c1c; color: #eee; font-family: inherit; }
   .team-mates-picker label { font-size: 13px; color: #eee; display: flex; align-items: center; gap: 6px; }
+  /* docs/spec.md issue #3: the engine currently selected as Lead renders
+     disabled (not hidden) in the Teammates list -- reuses .clone-form
+     input:disabled's own opacity/cursor pattern verbatim (app.py:3042),
+     scoped here, plus dims the label text so the whole row reads inactive. */
+  .team-mates-picker input:disabled { opacity: 0.6; cursor: not-allowed; }
+  .team-mates-picker label.team-mate-disabled { color: #888; }
   .team-tier-3-caveat { font-size: 12px; color: #ffb648; border-left: 2px solid #ffb648;
                          padding: 4px 8px; background: #1c1c1c; }
   .team-grounding { font-size: 12px; color: #888; }
@@ -3453,7 +3464,15 @@ let smokeCheckExpect = {};
 function smokeCheckRow(name, url) {
   if (!url) return '';
   const text = smokeCheckExpect[name] || '';
-  return '<div class="smoke-check-row">' +
+  // docs/spec.md issue #4: a short, always-visible helper line (not a
+  // hover-only title="..." tooltip, since the reported screenshot is a
+  // touch/mobile PWA context where hover doesn't work) explaining what the
+  // button actually does -- one HTTP GET against this project's own
+  // session URL, no auth/side effects/scheduling (see smoke_check_run()'s
+  // docstring at app.py:1923-1949).
+  return '<div class="smoke-check-hint">Makes a single request to this session&#39;s URL and reports ' +
+    'whether it responds (optionally checking for the text below).</div>' +
+    '<div class="smoke-check-row">' +
     '<input id="smoke-expect-' + esc(name) + '" maxlength="500" ' +
     'placeholder="optional: text that should appear in the response" value="' + esc(text) + '" ' +
     'oninput="smokeCheckExpect[' + "'" + name + "'" + '] = this.value">' +
@@ -3665,6 +3684,14 @@ function onTeamLeadChange(name) {
   const sel = document.getElementById('team-lead-' + name);
   const val = sel ? sel.value : '';
   teamPickerLead[name] = val ? JSON.parse(val) : null;
+  // docs/spec.md issue #3: the new lead's own engine must never be left
+  // behind as a stale, invisible teammate selection -- clear it from the
+  // underlying Set here (not just from the rendered checkbox list below),
+  // so an "engine is both lead and teammate" composition can never be
+  // silently carried into a Start request.
+  const lead = teamPickerLead[name];
+  const members = teamPickerMembers[name];
+  if (lead && members) members.delete(lead.name);
   refresh();
 }
 function onTeamMateToggle(name, memberName, checked) {
@@ -3714,10 +3741,18 @@ function renderTeamPicker(name) {
   const caveat = leadEntry && leadEntry.tier === 3 ?
     '<div class="team-tier-3-caveat">⚠ This engine&#39;s reliability is lower due to prose-parsing ' +
     'tool-calling. Use only if no tier-1 or tier-2 lead is available.</div>' : '';
-  const mateOptions = ROSTER.filter(e => e.delegate_capable && !(lead && lead.kind === e.kind && lead.name === e.name))
+  const mateOptions = ROSTER.filter(e => e.delegate_capable)
     .map(e => {
-      const checked = members.has(e.name) ? ' checked' : '';
-      return '<label><input type="checkbox" id="team-mate-' + esc(name) + '-' + esc(e.name) + '"' + checked +
+      const isLead = !!(lead && lead.kind === e.kind && lead.name === e.name);
+      // docs/spec.md issue #3: the engine currently selected as Lead is
+      // shown disabled/grayed-out here, not omitted -- its state stays
+      // always visible instead of silently vanishing from the list.
+      // Never rendered checked-and-disabled: onTeamLeadChange() guarantees
+      // it's already cleared from `members` the moment it becomes Lead.
+      const checked = !isLead && members.has(e.name) ? ' checked' : '';
+      const disabled = isLead ? ' disabled' : '';
+      return '<label class="' + (isLead ? 'team-mate-disabled' : '') + '"><input type="checkbox" id="team-mate-' +
+        esc(name) + '-' + esc(e.name) + '"' + checked + disabled +
         ' onchange="onTeamMateToggle(' + "'" + name + "','" + e.name + "'" + ', this.checked)"> ' +
         esc(e.name) + ' (' + tierLabel(e.tier) + ')</label>';
     }).join('');
@@ -4390,7 +4425,15 @@ function teamRow(name, team) {
       "'" + name + "'" + ')">' + (open ? 'Hide configuration' : 'Configure team...') + '</a></div>' : '';
     const picker = open ? renderTeamPicker(name) : '';
     const startDisabled = !text.trim() || (open && !!teamCompositionError(name));
-    return '<div class="team-row">' + taskArea + configureRow + picker +
+    // docs/spec.md issue #1: no separate chat UI exists to link to -- this
+    // same teamRow() already renders the live event feed + interject
+    // compose box below once team.status leaves 'idle' (backlog item 19).
+    // A short static hint here is the only thing making that discoverable
+    // from the launcher state the screenshot showed, where nothing
+    // indicates it's there.
+    const chatHint = '<div class="team-sub">Once started, you&#39;ll see live team activity ' +
+      'and can interject right here.</div>';
+    return '<div class="team-row">' + taskArea + chatHint + configureRow + picker +
       '<div class="team-actions"><button class="team-btn" id="start-btn-' + esc(name) + '"' +
       (startDisabled ? ' disabled' : '') +
       ' onclick="doTeamStart(' + "'" + name + "'" + ')">Start team</button></div>' +
