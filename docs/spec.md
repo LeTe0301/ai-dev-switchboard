@@ -1,210 +1,232 @@
-# Spec: E2E round 7 — 5 fixes from the round-6 real-CT110 test (items 39-43)
+# Spec: Item 43 — close the taiga-gateway startup DNS race at its root (lazy nginx upstream resolution), plus honest fallback reporting in taiga-up.sh
 
 ## Summary
-Fix five bugs found by a hands-on E2E test of branch `backlog/e2e-fixes-round6` @ `140a2ae` on a fresh Proxmox CT110 (docs/BACKLOG.md "Items 39-43"): a silently-ignored `AUTH_MODE` env var under `--yes`, a Gitea admin-bootstrap command that leaves the account unusable, a hardcoded code-server path that no-ops the whole feature, three singleton-toggle POST routes that lie about success, and one more attempt at closing out the still-flaky taiga-gateway startup race (item 30/43).
-
-Same shape as rounds 4-6 (see `b855a1a`, `94f82f8`, `140a2ae`): a straight bugfix batch, no new features. **Skip ux-designer for this cycle** — items 39-42 are backend/install-script only with no user-facing surface change beyond an HTTP response body/status becoming more honest (the frontend's existing generic error handling already covers this, see item 42 below), and item 43 is a pure shell-script retry tweak. Go straight from this spec to developer.
+Fix `taiga-gateway`'s nginx to resolve its upstream hostnames (`taiga-front`, `taiga-back`, `taiga-events`, `taiga-protected`) lazily at request time instead of once at config-load/startup — via a repo-owned override file that Compose mounts *over* the pinned checkout's own `taiga-gateway/taiga.conf`, never editing that checkout in place — and make `scripts/taiga-up.sh`'s round-7 last-resort fallback reuse the existing settle-and-recheck window so it can no longer report success for a container that's about to crash.
 
 ## Goals
-- Item 39: `install.sh --yes` (and interactive, for consistency) honors a pre-seeded `AUTH_MODE` in `switchboard.env`, defaulting to `simple` only when nothing is seeded — matching the `RUN_USER_DEFAULT`/`SVC_USER_DEFAULT` idiom already used earlier in the same script.
-- Item 40: the Gitea admin-bootstrap command install.sh prints creates an account that is immediately usable by `gitea-configure-api.sh`, regardless of whether it happens to be Gitea's literal first-ever user.
-- Item 41: toggling code-server on actually starts a process, on a fresh Debian 12 install where code-server.dev's installer puts the binary at `/usr/bin/code-server`, not `/usr/local/bin/code-server`.
-- Item 42: `POST /host/on`, `/host/off`, `/taiga/on`, `/taiga/off`, `/gitea/on`, `/gitea/off` return a response that reflects whether the underlying action actually succeeded, with the real stderr surfaced on failure, instead of an unconditional `{"ok": true}`.
-- Item 43: add the one concretely-suggested last-resort fallback step (a plain `docker compose up -d`, no `rm -f` first) to `scripts/taiga-up.sh`'s retry loop, on top of round 6's existing 5-attempt/backoff/settle-window logic, before the script gives up and exits 1.
+- Close the deterministic Docker-Compose-DNS startup race (item 43 / item 30) that makes `taiga-gateway` exit(1) at boot if `taiga-front`'s (or any other upstream's) DNS record isn't registered with Docker's embedded resolver (127.0.0.11) yet when nginx loads its config.
+- Do this without editing any git-tracked file inside the pinned, third-party `taigaio/taiga-docker` checkout at `$TAIGA_DIR` (preserves the spirit of the item-30 architecture decision at install.sh ~line 452-455 — see "Proposed approach" for why this is achievable, not a reversal).
+- Make `scripts/taiga-up.sh`'s round-7 fallback attempt (the plain `up -d` tried after `TAIGA_UP_MAX_ATTEMPTS` is exhausted) honest: it must no longer be able to report `running`/exit 0 for a container that dies seconds later, the same guarantee the main retry loop already has via its settle-and-recheck window.
 
 ## Non-goals
-- Item 43: no redesign of the retry/backoff strategy itself, no attempt to pin down the actual root cause of the race (still unknown — round 6's own comment already says so), no changes to `TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION`'s opt-in full-daemon-restart behavior.
-- Item 42: no new frontend error UI for the host/taiga/gitea toggle rows. Unlike `deploy`/`smoke-check` (which have their own dedicated inline result slots in `handleActionResult()`), `kind === 'host'/'taiga'/'gitea'` has no such slot today. This spec makes the HTTP response honest (real status code + error body) but deliberately leaves it falling through to `handleActionResult()`'s existing generic tail (`hideCodeOverlay(); setTimeout(refresh, 1500)`) — the poll-driven `/status` reconciliation this item's own repro already relies on ("`GET /status` correctly reports `host: false` a moment later") keeps working unchanged. Adding a dedicated error slot for these three rows would be a real UI change and belongs in a future round if wanted — flagged under Open questions.
-- Item 41: no change to *how* code-server gets installed (still the `curl -fsSL https://code-server.dev/install.sh | sh` one-liner) — only to how its binary location is subsequently detected/referenced.
-- Item 40: no change to Gitea's own password-change-on-first-login security model — only to how install.sh's printed bootstrap command interacts with it for this one deliberately-not-first admin account.
-- Item 39: no change to `pve` auth mode's own login logic — this is purely about the env-var default being honored under `--yes`.
-- No regression sweep beyond what's needed to confirm items 22-38 (already fixed in prior rounds) aren't disturbed — reviewer's normal test pass covers that, not a special mandate here.
+- Not touching `app/app.py`'s `taiga_run()` / `/taiga/on` error surfacing — item 42 already fixed that in round 7 (confirmed: `taiga_run()` now raises on non-zero exit, comment at app/app.py ~line 2688); this spec's fallback fix only stops the fallback from lying to `taiga_run()` in the first place.
+- Not removing item 30's `taiga-front` healthcheck / `depends_on: condition: service_healthy` gate in `docker-compose.override.yml` — kept as defense-in-depth alongside the nginx fix (see "Open questions" #3 for the reasoning).
+- Not attempting the opt-in `TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION` host-wide Docker daemon restart path — out of scope, unrelated to this item, already gated correctly behind an explicit operator opt-in.
+- Not `git pull`-ing or otherwise updating the pinned `taigaio/taiga-docker` checkout itself, and not changing install.sh's "pinned at first clone, never re-pulled" policy.
+- Not adding a UI/UX layer — this is backend/infra only (nginx config + two shell scripts); ux-designer is skipped for this cycle, same as round 7.
 
 ## Background / current state
-
-### Item 39 — `AUTH_MODE` ignored under `--yes`
-`install.sh` line 327:
-```bash
-AUTH_MODE=$(prompt "Auth mode: simple (username+password) or pve (Proxmox VE login)" "simple")
+`taiga-gateway` (upstream image `nginx:1.19-alpine`) mounts its nginx config from the pinned checkout via a **bind mount**, declared in the pinned `$TAIGA_DIR/docker-compose.yml`:
+```yaml
+  taiga-gateway:
+    image: nginx:1.19-alpine
+    ports:
+      - "9000:80"
+    volumes:
+      - ./taiga-gateway/taiga.conf:/etc/nginx/conf.d/default.conf
+      - taiga-static-data:/taiga/static
+      - taiga-media-data:/taiga/media
 ```
-`prompt()` (defined ~line 151) returns its literal default argument whenever stdin isn't a TTY or `--yes` is set — it never consults `switchboard.env`. Contrast with `RUN_USER_DEFAULT` (line 237-239):
-```bash
-RUN_USER_DEFAULT="$(get_env "$ENV_FILE" RUN_USER)"; RUN_USER_DEFAULT="${RUN_USER_DEFAULT:-dev}"
-RUN_USER=$(prompt "Unprivileged user to run coding sessions as" "$RUN_USER_DEFAULT")
+(confirmed against `taigaio/taiga-docker`'s `stable` branch on GitHub directly, fetched today — see Open Questions #1 for a caveat on this).
+
+The mounted `taiga-gateway/taiga.conf` has **5** `proxy_pass` locations, of which **4** reference a bare upstream hostname resolved once when nginx loads this config at container start:
 ```
-which correctly seeds its default from any pre-existing `switchboard.env` value first. `ct/create.sh`'s automated provisioning path pre-seeds `AUTH_MODE=pve` + `PVE_HOST` before calling `install.sh --yes`, expecting exactly this — currently silently discarded, install always lands on `simple`.
-
-### Item 40 — Gitea admin bootstrap 403
-`install.sh` prints (~line 1006-1008):
+location /       { proxy_pass http://taiga-front/; }
+location /api/   { proxy_pass http://taiga-back:8000/api/; }
+location /admin/ { proxy_pass http://taiga-back:8000/admin/; }
+location /media/ { proxy_pass http://taiga-protected:8003/; }
+location /events { proxy_pass http://taiga-events:8888/events; }
 ```
-docker exec --user git ai-dev-switchboard-gitea gitea admin user create \
-  --admin --username <name> --password <password> --email <email>
-```
-Gitea's CLI defaults `--must-change-password=true` for any account that isn't literally Gitea's first-ever user. `scripts/gitea-configure-api.sh` (run right after, per install.sh's own printed step 2) mints a token for that account and verifies it with `GET /user` (lines 133-139); Gitea rejects with 403 + `"You must change your password"`, which the script's current error handling (lines 136-139) prints as a raw curl failure without explaining the real cause.
+(`/static/`, `/_protected/`, `/media/exports/` are plain `alias`, not `proxy_pass` — not affected.)
 
-### Item 41 — code-server hardcoded path
-Two hardcoded occurrences, both wrong on a real Debian 12 install (`code-server.dev`'s installer puts the binary at `/usr/bin/code-server`, confirmed live):
-- `install.sh` line 231: `if [ "$WITH_CODE_SERVER" -eq 1 ] && [ ! -x /usr/local/bin/code-server ]; then` — idempotency check re-triggers the install every single run since it never finds the binary where it's actually looking.
-- `app/app.py` line 117: `CODE_SERVER_BIN = os.environ.get("CODE_SERVER_BIN", "/usr/local/bin/code-server")` — used at line 738 to `subprocess.Popen(["sudo", "-u", RUN_USER, CODE_SERVER_BIN, ...])`, so the toggle silently no-ops (`_code_start()` captures nothing from the failed spawn — `stdout=DEVNULL, stderr=DEVNULL`).
+If Docker's embedded DNS (127.0.0.11) hasn't registered a referenced service's name yet at the moment nginx loads this config, nginx's `[emerg] host not found in upstream "..."` config-load failure kills the whole process, and the container exits(1) immediately — fatal, not transient, and Docker's own `depends_on` (even with `condition: service_started`) only guarantees the *other* container has *started*, not that its DNS record has propagated yet. This is a narrow, real, reproducible startup-time race, confirmed twice live (round 6 original report, round 7 retest with a pinned-down mechanism).
 
-A third occurrence that the BACKLOG entry doesn't mention but that the fix must also account for, found during this spec's own archaeology: `install.sh` line 568 writes a sudoers rule scoped to the exact literal binary path:
-```bash
-echo "$SVC_USER ALL=($RUN_USER) NOPASSWD: /usr/local/bin/code-server *"
-```
-`sudo -u "$RUN_USER"` only matches a sudoers rule against the exact command path invoked — if `CODE_SERVER_BIN` is fixed to resolve to `/usr/bin/code-server` but this sudoers line still only whitelists `/usr/local/bin/code-server`, the toggle would start *failing loudly* (permission denied) instead of silently no-op-ing, which is progress but still broken. This line must be kept in sync with whatever `install.sh` resolves as the real binary path.
+Round 6 (item 30) added, in the repo-owned `docker-compose.override.yml` (install.sh ~line 434-492, regenerated deterministically every run, **not** part of the pinned checkout's own git history):
+- A healthcheck on `taiga-front` (`wget --spider http://127.0.0.1/`).
+- `taiga-gateway`'s `depends_on.taiga-front` upgraded to `condition: service_healthy`.
 
-### Item 42 — toggle POST routes lie about success
-`app/app.py` — three near-identical subprocess wrappers, none check `returncode` or capture `stderr` for the caller:
-```python
-def host_run(action: str) -> str:              # line 2677
-    ...
-    r = subprocess.run([...], capture_output=True, text=True, timeout=30)
-    return r.stdout.strip()
+This narrows the race for `taiga-front` specifically but does not close it (confirmed by round 7's live retest: gateway still crashed with the exact `taiga-front` DNS error), and never covered `taiga-back`/`taiga-events`/`taiga-protected` at all — none of those three have a healthcheck upstream, so they were never gated beyond `condition: service_started`, which is the weakest guarantee Compose offers.
 
-def taiga_run(action: str) -> str:              # line 2696
-    ...
-    r = subprocess.run(["sudo", script], capture_output=True, text=True, timeout=timeout)
-    return r.stdout.strip()
+Round 7 (item 43, commit `a6991c2`) added a last-resort plain `docker compose up -d` fallback in `scripts/taiga-up.sh` (lines 68-81, after the 5-attempt retry loop exhausts) with no settle-window recheck — its own code comment says "no settle-window recheck on this one extra attempt — keep it simple." Round 7's retest found this fallback *does* report success now (catching the container in a brief pre-crash `running` window), but the container still crashes seconds later from the identical nginx DNS error — so the toggle response goes back to lying, via a new mechanism, about the exact failure item 42 was meant to stop lying about.
 
-def gitea_run(action: str) -> str:              # line 2752
-    ...
-    r = subprocess.run(["sudo", script], capture_output=True, text=True, timeout=(...))
-    return r.stdout.strip()
-```
-`do_POST` (lines 6259-6283) calls these and unconditionally replies `{"ok": True}`:
-```python
-if parts[0] == "host" and ... :
-    host_run("start" if parts[1] == "on" else "stop")
-    self._json({"ok": True})
-elif parts[0] == "taiga" and ...:
-    if parts[1] == "on":
-        taiga_run("up"); _publish(...)
-    else:
-        _unpublish(...); taiga_run("down")
-    self._json({"ok": True})
-elif parts[0] == "gitea" and ...:               # same shape as taiga
-    ...
-    self._json({"ok": True})
-```
-All three functions are also called for `"status"` polling, in 4 places, which must keep working exactly as today (`out[0] == "on"` string parsing): `do_GET`'s `/status` handler (lines 5832, 5837, 5842) and `create_project()` (line 2006).
+`taiga-up.sh`'s main retry loop (lines 47-59) already has the fix pattern needed for the fallback: sleep `TAIGA_UP_SETTLE_SECONDS` (default 5) after seeing `running`, then re-check before trusting it.
 
-Existing tests (`tests/test_gitea.py`, `tests/test_taiga.py`) monkeypatch `appmod.gitea_run`/`appmod.taiga_run` as plain functions returning bare strings (e.g. `appmod.gitea_run = lambda action: "on"`) and call `appmod.gitea_run("status")` directly expecting a string back — any fix here must not force a wholesale rewrite of those existing mocks/assertions for the happy path.
-
-### Item 43 — taiga-gateway retry still flaky
-`scripts/taiga-up.sh` (round 6's fix, item 30 v2) already retries `docker compose up -d` + settle-window recheck + `rm -f taiga-gateway` + exponential backoff, up to `TAIGA_UP_MAX_ATTEMPTS` (default 5) times, then optionally (opt-in, default off) restarts the whole Docker daemon, then gives up:
-```bash
-while [ "$attempt" -le "$TAIGA_UP_MAX_ATTEMPTS" ]; do
-    "${COMPOSE[@]}" up -d
-    state=$("${COMPOSE[@]}" ps taiga-gateway --format '{{.State}}' 2>/dev/null)
-    ...
-    if [ "$attempt" -lt "$TAIGA_UP_MAX_ATTEMPTS" ]; then
-        "${COMPOSE[@]}" rm -f taiga-gateway >/dev/null 2>&1 || true
-        sleep "$backoff"; backoff=$((backoff * 2))
-    fi
-    attempt=$((attempt + 1))
-done
-if [ "$TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION" -eq 1 ]; then ...; fi
-echo "taiga-up: taiga-gateway failed to come up after $TAIGA_UP_MAX_ATTEMPTS attempts..." >&2
-exit 1
-```
-Live repro (round 6 E2E, default config, `TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION` unset/0): all 5 attempts exhausted, script exited 1 — then a bare, manual `docker compose up -d taiga-gateway` (no flags, no `rm -f` first) immediately afterward succeeded in ~3s with clean logs. Root cause still not pinned down (round 6's own comment already says so); this item only adds the one concrete, cheap fallback step the tester's own repro points at.
+Docker Compose's documented multi-file merge behavior (confirmed against Docker's own docs): `volumes:` entries merge **by container target path** across `-f` files — an override entry whose target matches a base entry's target *replaces* that one entry; entries at other targets are left untouched. This is the same principle install.sh's existing `docker-compose.override.yml` already relies on for `depends_on`/`ports`, just not yet exercised for `volumes`.
 
 ## Proposed approach
 
-### Item 39
-In `install.sh`, replace line 327 with the same seed-from-env idiom `RUN_USER_DEFAULT`/`SVC_USER_DEFAULT` use:
-```bash
-AUTH_MODE_DEFAULT="$(get_env "$ENV_FILE" AUTH_MODE)"; AUTH_MODE_DEFAULT="${AUTH_MODE_DEFAULT:-simple}"
-AUTH_MODE=$(prompt "Auth mode: simple (username+password) or pve (Proxmox VE login)" "$AUTH_MODE_DEFAULT")
+### 1. Real fix: lazy DNS resolution via a repo-owned nginx conf, bind-mounted over the pinned checkout's own file
+
+Add a second heredoc-generated file, written unconditionally every install.sh run (same "deterministically regenerated, untracked by the pinned checkout's git history" idiom as `docker-compose.override.yml` itself), e.g. `$TAIGA_DIR/docker-compose.override.taiga-gateway.conf`:
+
+```nginx
+server {
+    listen 80 default_server;
+
+    client_max_body_size 100M;
+    charset utf-8;
+
+    resolver 127.0.0.11 valid=10s;
+
+    # Frontend
+    location / {
+        set $upstream_front taiga-front;
+        proxy_pass http://$upstream_front/;
+        proxy_pass_header Server;
+        proxy_set_header Host $http_host;
+        proxy_redirect off;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Scheme $scheme;
+    }
+
+    # API
+    location /api/ {
+        set $upstream_back taiga-back;
+        proxy_pass http://$upstream_back:8000/api/;
+        proxy_pass_header Server;
+        proxy_set_header Host $http_host;
+        proxy_redirect off;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Scheme $scheme;
+    }
+
+    # Admin
+    location /admin/ {
+        set $upstream_back taiga-back;
+        proxy_pass http://$upstream_back:8000/admin/;
+        proxy_pass_header Server;
+        proxy_set_header Host $http_host;
+        proxy_redirect off;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Scheme $scheme;
+    }
+
+    # Static
+    location /static/ {
+        alias /taiga/static/;
+    }
+
+    # Media
+    location /_protected/ {
+        internal;
+        alias /taiga/media/;
+        add_header Content-disposition "attachment";
+    }
+
+    # Unprotected section
+    location /media/exports/ {
+        alias /taiga/media/exports/;
+        add_header Content-disposition "attachment";
+    }
+
+    location /media/ {
+        set $upstream_protected taiga-protected;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Scheme $scheme;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_pass http://$upstream_protected:8003/;
+        proxy_redirect off;
+    }
+
+    # Events
+    location /events {
+        set $upstream_events taiga-events;
+        proxy_pass http://$upstream_events:8888/events;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_connect_timeout 7d;
+        proxy_send_timeout 7d;
+        proxy_read_timeout 7d;
+    }
+}
 ```
-No other lines need to change — `set_env "$ENV_FILE" AUTH_MODE "$AUTH_MODE"` right after it already persists whatever value is chosen.
+This is upstream's own `taiga-gateway/taiga.conf` verbatim (fetched directly from `taigaio/taiga-docker`'s `stable` branch today — see Open Questions #1), with exactly two categories of change: one `resolver 127.0.0.11 valid=10s;` line added, and each of the 4 bare-hostname `proxy_pass` targets rewritten to `set $upstream_x <hostname>; proxy_pass http://$upstream_x...;` — nginx only does the DNS lookup for a `proxy_pass` target when it's a variable, at *request* time, honoring `resolver`'s TTL, instead of once at config load. This is nginx's standard, documented fix for this exact class of Docker-Compose-DNS race. `/static/`, `/_protected/`, `/media/exports/` are untouched (`alias`, no proxy, no DNS involved).
 
-### Item 40
-1. In `install.sh`'s printed instructions (~line 1007-1008), add `--must-change-password=false` to the printed `gitea admin user create` command.
-2. In `scripts/gitea-configure-api.sh`'s verification block (lines 133-139), special-case a 403 response so the real cause is surfaced instead of a bare curl error. `curl -fsS` on a non-2xx exits nonzero and `VERIFY_OUTPUT` contains curl's own error text, not Gitea's JSON body (the `-f` flag suppresses it) — switch that one call to drop `-f` (or add a separate diagnostic re-fetch without `-f` inside the failure branch) so the script can inspect the actual HTTP status/body and print a targeted message when it's a 403 with `"must change"` in the body, pointing at `gitea admin user change-password --must-change-password=false` as the fix, while still failing loudly (non-zero exit) either way.
+Then extend the *existing* `docker-compose.override.yml` heredoc (install.sh, currently lines 473-492) to add a `volumes:` key under the existing `taiga-gateway:` block:
+```yaml
+  taiga-gateway:
+    ports:
+      - "127.0.0.1:${TAIGA_PORT}:80"
+    volumes:
+      - ./docker-compose.override.taiga-gateway.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      taiga-front:
+        condition: service_healthy
+      taiga-back:
+        condition: service_started
+      taiga-events:
+        condition: service_started
+```
+Because Compose merges `volumes:` by container target path (confirmed against Docker's docs — see "Background"), this single-entry `volumes:` list **replaces only** the `/etc/nginx/conf.d/default.conf` mount; the base file's other two `taiga-gateway` mounts (`taiga-static-data:/taiga/static`, `taiga-media-data:/taiga/media`) are left untouched and still apply. The pinned checkout's own `$TAIGA_DIR/taiga-gateway/taiga.conf` file is never opened for writing by this change — the mount is redirected, not the file it used to point at.
 
-### Item 41
-Resolve the real code-server binary path once, at install time, and keep every reference (idempotency check, sudoers rule, `CODE_SERVER_BIN`) in sync with that single resolved value — this closes the sudoers gap identified in Background above, not just the two locations the BACKLOG entry names.
+**Why this preserves the item-30 decision's spirit rather than reversing it**: that decision's actual constraint (install.sh's own comment) is "not by patching taiga.conf/docker-compose.yml inside the pinned, third-party checkout itself" — i.e. never write into files that checkout's own `git` history tracks, so a hypothetical future `git pull` in `$TAIGA_DIR` never conflicts. `docker-compose.override.taiga-gateway.conf` is a new, untracked file living alongside `docker-compose.override.yml` (which the decision's own text already treats as the correct pattern), regenerated deterministically every install.sh run, and it changes *only* which file Compose bind-mounts into the container — the pinned checkout's own `taiga-gateway/taiga.conf` is byte-for-byte untouched on disk. This is a direct application of the same override-file idiom the item-30 decision established, extended from `depends_on`/`ports` (already overridden today) to `volumes` (not yet exercised until now) — not a departure from it.
 
-Recommended shape:
-1. In `install.sh`, add a small helper (or inline logic) that resolves `command -v code-server` after the `--with-code-server` block's install step, falling back to `/usr/local/bin/code-server` only if `command -v` finds nothing (matches the pre-existing default so an already-working custom install isn't disturbed). Use that resolved path for:
-   - The idempotency check at line 231 (`command -v code-server` in place of `[ ! -x /usr/local/bin/code-server ]`, since the goal there is "does a usable code-server already exist anywhere on PATH", not one specific location).
-   - The sudoers line at 568 (write whatever path was actually resolved, not the hardcoded literal).
-   - Persist it into `switchboard.env` as `CODE_SERVER_BIN` via `set_env` (same idiom already used for `NEW_PROJECT_FROM_URL_SCRIPT` etc.), so app.py's `os.environ.get("CODE_SERVER_BIN", ...)` picks up the real path without app.py itself needing to re-resolve anything at runtime.
-2. In `app/app.py` line 117, additionally make the *default* (used when `CODE_SERVER_BIN` isn't set in the environment at all — e.g. an existing install upgrading without re-running install.sh) resolve via `shutil.which("code-server")` before falling back to the literal `/usr/local/bin/code-server` string, so an already-broken existing install self-heals on a plain code restart without requiring a full re-run of install.sh.
+Both files get written in the same "4. Loopback-only binding, and (item 30) health-gating..." section of install.sh, right before the existing `docker-compose.override.yml` heredoc, and the section's own comment block should be extended (not replaced) to record this second layer of the item-30/43 fix and its reasoning, matching the file's existing very-heavily-commented style.
 
-Either half alone is insufficient (env-only fixes fresh installs but not existing broken ones; `shutil.which`-only fixes app.py but leaves install.sh's idempotency check and the sudoers rule still pinned to the wrong path) — both are needed together.
+### 2. Stopgap: settle-and-recheck on the round-7 fallback too
 
-### Item 42
-Change `host_run`/`taiga_run`/`gitea_run` so a caller can distinguish success from failure without breaking the existing `"status"` call sites' string-parsing contract. Recommended shape (chosen specifically to minimize churn against the existing test mocks in `tests/test_gitea.py`/`tests/test_taiga.py`, which monkeypatch these three functions as plain callables returning bare strings):
-
-- Keep the return type as `str` (the stripped stdout) for the `"status"` action — completely unchanged, so all 4 existing status call sites (`do_GET`'s `/status` handler lines 5832/5837/5842, `create_project()` line 2006) and every existing status-path test mock keep working with zero changes.
-- For the non-`"status"` actions (`"start"/"stop"` for `host_run`, `"up"/"down"` for `taiga_run`/`gitea_run`), raise a small new exception (e.g. `SingletonActionError(Exception)`, carrying `.stderr`) when `r.returncode != 0`, instead of silently returning. Define it once, near `host_run`.
-- In `do_POST`'s three branches (lines 6259-6283), wrap the `host_run("start"/"stop")` / `taiga_run("up"/"down")` / `gitea_run("up"/"down")` calls in `try/except SingletonActionError as e`, and on failure return `502` with `{"error": "...", "stderr": (e.stderr or "").strip()[-200:]}` — same truncate-to-200-chars-of-stderr precedent `deploy_run` already uses (`app.py` ~line 1874: `f"push failed: {(push.stderr or '').strip()[-200:]}"`). On success, keep returning `{"ok": True}` exactly as today.
-- For `taiga`/`gitea` off, `_unpublish(...)` still runs before `taiga_run("down")`/`gitea_run("down")` is even called today — keep that ordering; only wrap the `_run` call itself in the try/except.
-- Existing tests that monkeypatch these three functions for the failure path (if any use a fake `subprocess.run` returning nonzero) will need their fakes updated to actually raise `SingletonActionError` for non-status actions instead of just returning a string — call this out to the reviewer explicitly since it's the one place existing test behavior needs conscious updating, not just new tests added.
-
-### Item 43
-In `scripts/taiga-up.sh`, add exactly one fallback step between the retry loop's exhaustion and the final failure message — deliberately the tester's own suggested minimal step, not a broader redesign:
+In `scripts/taiga-up.sh`, the round-7 fallback block (currently lines 76-81):
 ```bash
-# ... existing while loop (lines 39-66) unchanged ...
-
-# Item 43: round 6's retry loop still reproduced flaky under live testing --
-# all attempts exhausted, but a bare `docker compose up -d` (no `rm -f`
-# first) immediately afterward succeeded in ~3s. Root cause still not
-# pinned down; this is the cheapest concrete fallback the live repro
-# points at, tried before the (opt-in, heavier) full-Docker-daemon-restart
-# path below and before giving up.
-echo "taiga-up: all $TAIGA_UP_MAX_ATTEMPTS attempts exhausted -- trying one plain 'docker compose up -d' with no rm -f first, as a last resort before giving up" >&2
 "${COMPOSE[@]}" up -d
 state=$("${COMPOSE[@]}" ps taiga-gateway --format '{{.State}}' 2>/dev/null)
 if [ "$state" = "running" ]; then
     exit 0
 fi
-
-if [ "$TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION" -eq 1 ]; then
-    ... # unchanged
-fi
-
-echo "taiga-up: taiga-gateway failed to come up after $TAIGA_UP_MAX_ATTEMPTS attempts..." >&2
-exit 1
 ```
-Placed *before* the existing opt-in `TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION` block (not after) since it's strictly cheaper/safer (no host-wide side effect) and the live repro that motivates it never had that flag set — if this plain retry succeeds, the heavier opt-in path is never reached. No settle-window recheck on this one extra attempt (keep it simple, matching the tester's literal suggestion — round 6's settle-window logic can be revisited separately if this still isn't enough).
+must gain the identical settle-and-recheck the main loop already does at lines 50-56 before trusting `running`:
+```bash
+"${COMPOSE[@]}" up -d
+state=$("${COMPOSE[@]}" ps taiga-gateway --format '{{.State}}' 2>/dev/null)
+if [ "$state" = "running" ]; then
+    sleep "$TAIGA_UP_SETTLE_SECONDS"
+    state=$("${COMPOSE[@]}" ps taiga-gateway --format '{{.State}}' 2>/dev/null)
+    if [ "$state" = "running" ]; then
+        exit 0
+    fi
+    echo "taiga-up: last-resort attempt reported running but died within the ${TAIGA_UP_SETTLE_SECONDS}s settle window (state: ${state:-<none>})" >&2
+fi
+```
+Prefer factoring the "up -d, check running, sleep+recheck" sequence (now used identically 2 places, or 3 counting each loop iteration) into a small shell function to avoid a third copy-paste of the same 6 lines, if that doesn't make the diff harder to review than the straightforward duplication — developer's call, not a hard requirement. Update the block's own comment (currently says "No settle-window recheck on this one extra attempt — keep it simple") to reflect the new behavior and why it changed (item 43 stopgap, kept as defense-in-depth even after the real nginx fix lands, in case the nginx fix needs a second round to land cleanly).
+
+### 3. Tests
+Extend `tests/test_taiga_up_retry.py` (existing harness: real `scripts/taiga-up.sh` run as a subprocess with `docker` stubbed as a shell function reporting state via a counter file — see its own module docstring) with a case for the fallback: all `TAIGA_UP_MAX_ATTEMPTS` attempts fail, then the fallback's own `up -d` call reports `running` on the first `ps` check but `exited` on the settle-window recheck — assert the script now exits 1 (not 0), proving the fallback can no longer fabricate success for a container about to crash. The existing `settle_die_at` parameter in `_run()`'s helper (per its docstring) already models "running on first check, exited after settle sleep" for the main loop — extend it (or add an analogous parameter) to also cover the fallback's own extra attempt.
+
+No test is added asserting the nginx conf's actual DNS-resolution behavior against a real Docker daemon — that requires a live Taiga stack and embedded DNS, which isn't available in unit-test scope; verifying AC1-AC4 below is a job for the next real E2E retest round, called out explicitly rather than faked with a shell-level assertion that wouldn't actually prove nginx behaves correctly under a real DNS race.
 
 ## Affected areas
-- `install.sh` — items 39, 40, 41 (three separate, independent edits; no shared code path between them).
-- `scripts/gitea-configure-api.sh` — item 40.
-- `app/app.py` — items 41 (one default value) and 42 (three functions + their `do_POST` callers). Backend only, single file for item 42.
-- `scripts/taiga-up.sh` — item 43.
-- Tests likely needing updates or additions: `tests/test_install_set_env.py` or a new install.sh-focused test for item 39 (whichever existing harness already extracts install.sh snippets verbatim — see that file's own `_extract_between()` technique); `tests/test_gitea.py` for item 40's verification-message change; `tests/test_gitea.py`/`tests/test_taiga.py` for item 42 (both new failure-path coverage and updating any existing fakes that simulate a failed action); `tests/test_taiga_up_retry.py` for item 43 (it already runs the real `scripts/taiga-up.sh` end to end against a fake `docker`/`docker compose` — see its own module docstring).
-
-This is a flat, single-layer batch (backend Python + shell scripts only, no schema/API/UI layers to split across) — the whole thing fits one developer dispatch, same as rounds 4-6.
+- `install.sh` (~line 434-492 section): new heredoc for `docker-compose.override.taiga-gateway.conf`, extended `docker-compose.override.yml` heredoc (`volumes:` key added to `taiga-gateway:`), extended comment block.
+- `scripts/taiga-up.sh` (lines 68-81): fallback block gains settle-and-recheck, comment updated.
+- `tests/test_taiga_up_retry.py`: new test case for the fallback's settle-window behavior.
+- No API/interface changes, no data model changes. Single architectural layer (install/infra shell + one vendored-but-overridden config file) — no split into sub-specs needed (skill 11 N/A here).
 
 ## Edge cases
-- Item 39: an empty/unset `AUTH_MODE` in an existing `switchboard.env` (fresh install, nothing seeded) must still default to `simple`, not empty string — covered by the `${AUTH_MODE_DEFAULT:-simple}` fallback.
-- Item 40: the fix must not assume the printed command is the only way an admin account ever gets created — `gitea-configure-api.sh`'s special-cased 403 message is a diagnostic improvement for *whatever* account state produces that error, not solely the printed-command path.
-- Item 41: an operator who already has a working custom code-server install at some other PATH-visible location must not be broken by this change (`command -v`-based resolution handles this naturally); an operator with no code-server on PATH at all (a fresh box, code-server disabled) must not have install.sh's idempotency check treat "not found" as an error — it should still just proceed to install, same as today.
-- Item 41: the sudoers rule and `CODE_SERVER_BIN` must always agree on the exact same path — a mismatch after this fix would trade "silent no-op" for "permission denied," which is more debuggable but still broken; acceptance criteria below check this explicitly.
-- Item 42: a `SingletonActionError` must never leak out of the `"status"` action path — a transient failed status check must keep degrading to "reported off" (today's self-correcting behavior), not start throwing 500s from `/status` or `create_project()`.
-- Item 42: `taiga`/`gitea` off already calls `_unpublish()` before the run call — on a failed `_run("down")`, the singleton is already unpublished but the containers may still be up; this spec doesn't change that ordering/behavior, only the honesty of the HTTP response about the `_run` call itself.
-- Item 43: the one extra fallback `up -d` must not run at all if the retry loop already succeeded within its normal attempts (i.e., must be unreachable on the already-covered `exit 0` paths inside the loop) — it only runs after the loop truly exhausts every attempt.
-- Item 43: must not swallow the eventual failure — if even the extra fallback doesn't come up running, the script must still exit 1 with the existing loud failure message (falling through to the unchanged final `echo ... >&2; exit 1`), so item 42's now-honest `/taiga/on` response still correctly reports the failure end to end.
+- **Re-run on an existing `$TAIGA_DIR`** (not a fresh clone): both new/changed files must be written unconditionally every run, same as `docker-compose.override.yml` already is today (not gated behind `TAIGA_FRESH_CLONE`, which only gates one-time secret randomization) — otherwise a host that was set up before this fix ships never picks it up on a subsequent `install.sh` re-run.
+- **A host operator who manually customized the pinned checkout's own `taiga-gateway/taiga.conf`** (e.g. added a header, changed `client_max_body_size`): after this change, that customization is silently superseded at the *mount* level (Compose uses our override's target-matching entry, not the base's), even though the physical file on disk is untouched and looks unmodified if someone inspects it directly. This is a real, if narrow, behavior change — flagged under Open Questions rather than silently absorbed.
+- **`taiga-back`/`taiga-events`/`taiga-protected` never had item 30's healthcheck-based gating** (only `taiga-front` did) — this fix is actually their *only* protection against the same class of race, not just an incremental improvement over an existing gate. Worth stating in the acceptance criteria explicitly rather than only testing the one upstream (`taiga-front`) that's already been observed racing live.
+- **Docker's embedded resolver itself being unreachable** (unusual host-level Docker networking misconfiguration): nginx would serve a `502` on the affected location rather than fail to load config — a strict improvement over today's full container crash regardless of this edge case's likelihood.
+- **The fallback's new settle window adds `TAIGA_UP_SETTLE_SECONDS` (default 5s) to the worst-case `/taiga/on` request duration** in the already-slow exhausted-retry-budget path — acceptable; item 42's fix means a real failure now surfaces correctly either way, and this path is already the ~2m45s worst case, not the common one.
+- **Concurrent/double `/taiga/on` submissions** — already handled by item 36's earlier fix; out of scope here, not re-touched.
 
 ## Acceptance criteria
-- [ ] **Item 39**: given `switchboard.env` pre-seeded with `AUTH_MODE=pve` and `PVE_HOST=<ip>` before running `install.sh --yes ...`, when install completes, then `switchboard.env` contains `AUTH_MODE=pve` (not `simple`) and the `pve` branch's prompts (`PVE_HOST`) are exercised. Given no pre-seeded `AUTH_MODE`, when running `install.sh --yes`, then it still defaults to `simple` exactly as before.
-- [ ] **Item 40**: given the exact command install.sh now prints, when run against a fresh Gitea instance for an account that is *not* Gitea's first-ever user, then the account is created without `must_change_password` set, and a subsequent `scripts/gitea-configure-api.sh` run's `GET /user` verification succeeds without the 403 workaround. Given a token verification does hit a 403 with a "must change password" body (e.g. against an account created some other way), then `gitea-configure-api.sh`'s error output names the real cause and points at the `--must-change-password=false` fix, not just a bare curl error.
-- [ ] **Item 41**: given a fresh install with `--with-code-server` on a host where the real binary lands at `/usr/bin/code-server` (not `/usr/local/bin/`), when the install completes and "Code" is toggled on for a project, then a real code-server process starts and `code_on` reports `true`. Given install.sh is re-run a second time in the same state, then it does not redundantly reinstall code-server (idempotency check correctly finds the already-installed binary). Given the resolved binary path, then the sudoers rule for `$SVC_USER ALL=($RUN_USER) NOPASSWD: ...` and `CODE_SERVER_BIN` both reference that same exact path.
-- [ ] **Item 42**: given `POST /host/on` (or `/off`) with `HOST_CONTROL_KEY`/target unconfigured or otherwise failing, when the underlying `ssh`/script call exits nonzero, then the response is a non-200 status (502) with a JSON body containing a real `error` message and truncated `stderr`, not `{"ok": true}`. Given the same for `/taiga/on`, `/taiga/off`, `/gitea/on`, `/gitea/off`. Given a successful action for any of the six routes, then the response remains `200 {"ok": true}` exactly as today. Given `GET /status` or `POST /projects/new` (`create_project`'s Gitea-status check), then their behavior for the `"status"` action is completely unchanged (same string-parsing contract, same 4 call sites).
-- [ ] **Item 43**: given `scripts/taiga-up.sh`'s retry loop exhausts all `TAIGA_UP_MAX_ATTEMPTS` attempts and taiga-gateway is still not running, when the script reaches its final fallback step, then it runs one plain `docker compose up -d` (no `rm -f` first) and re-checks state before declaring failure; if that fallback succeeds, the script exits 0. Given the fallback also fails, then the script still exits 1 with its existing failure message on stderr (so item 42's now-honest error propagation still reports the real end-to-end failure). Given the retry loop already succeeds within its normal attempts, then the fallback step is never reached (verify via `tests/test_taiga_up_retry.py`'s existing fake-docker-compose harness, extended with a new case for "all normal attempts fail, fallback succeeds").
+- [ ] Given a fresh `--with-taiga` install (new `$TAIGA_DIR` clone) or a re-run of `install.sh` against an existing `$TAIGA_DIR`, when install.sh's Taiga section runs, then `$TAIGA_DIR/taiga-gateway/taiga.conf` (the pinned checkout's own git-tracked file) is byte-for-byte unchanged from what `git clone` produced.
+- [ ] Given the same run, when it completes, then `$TAIGA_DIR/docker-compose.override.taiga-gateway.conf` exists, contains `resolver 127.0.0.11 valid=10s;`, and all 4 previously-bare-hostname `proxy_pass` locations (`/`, `/api/`, `/admin/`, `/media/`, `/events`) now reference a `set $upstream_...` variable instead of a literal hostname directly in `proxy_pass`.
+- [ ] Given two consecutive `install.sh` runs against the same `$TAIGA_DIR`, when both complete, then `docker-compose.override.taiga-gateway.conf`'s content is byte-for-byte identical across both runs (deterministic regeneration, same as `docker-compose.override.yml` today).
+- [ ] Given `docker compose -f docker-compose.yml -f docker-compose.override.yml config` is run in `$TAIGA_DIR`, when `taiga-gateway`'s resolved config is inspected, then its `/etc/nginx/conf.d/default.conf` mount source is `docker-compose.override.taiga-gateway.conf`, and its `taiga-static-data`/`taiga-media-data` mounts are still present and unchanged from the base file.
+- [ ] Given a real Taiga install reproducing the original race (`taiga-front`'s Docker DNS record not yet registered at the moment `taiga-gateway`'s nginx boots), when `taiga-gateway` starts, then nginx starts successfully and the container does not exit(1) — this is the E2E-verifiable claim for the next retest round, not unit-testable in this repo.
+- [ ] Given `scripts/taiga-up.sh`'s main retry loop exhausts all `TAIGA_UP_MAX_ATTEMPTS`, when the round-7 last-resort fallback's `up -d` reports `taiga-gateway` as `running` but the container dies within `TAIGA_UP_SETTLE_SECONDS`, then the script exits 1 (not 0) — proven by a new automated test in `tests/test_taiga_up_retry.py` using the existing stub-`docker`-as-shell-function technique.
+- [ ] Given the fallback's `up -d` reports `running` and the container is still `running` after the settle window, when the script finishes, then it exits 0 exactly as it does today (no regression to the already-working case).
+- [ ] `python3 -m unittest discover -s tests` still passes in full, including the existing `tests/test_taiga_up_retry.py` cases.
 
 ## Open questions
-- Item 42: should `host`/`taiga`/`gitea` toggle failures eventually get their own dedicated inline error slot in the frontend (like `deploy`/`smoke-check` already have), instead of falling through to the generic silent-refresh tail? Proceeding under the assumption that this round stays backend-only per the task's own framing ("no UI/design changes needed") — the response body is now honest and debuggable via devtools/logs even without a visible UI change, and the existing poll-driven reconciliation already surfaces the true state within one `/status` tick. Flagging this as a plausible future round if the human wants toggle failures visible in the UI itself.
-- Item 40: exact wording of `gitea-configure-api.sh`'s special-cased 403 message is left to the developer's judgment — the acceptance criterion only requires that the real cause and fix are named, not exact copy.
-- Item 41: whether to also backfill `CODE_SERVER_BIN` into an *already-installed* system's `switchboard.env` (i.e., should `install.sh --update`, if it re-runs any part of this block, force-overwrite an existing wrong value) is left to the developer — `set_env`'s existing idempotent-upsert behavior already handles this correctly (it overwrites), so no special-casing should be needed, but flagging it since item 41 was specifically about an existing-install-time bug.
-- None of the above are blockers — proceeding straight to developer with the assumptions stated.
+- **#1 (flagged per the brief's own instruction — no live Taiga install available in this sandbox to verify against)**: the exact literal content of `taiga-gateway/taiga.conf` and `docker-compose.yml` used above was fetched directly from `taigaio/taiga-docker`'s `stable` branch on GitHub today (2026-08-16), not from an actual `$TAIGA_DIR` on a real installed host, because none exists in this sandbox. install.sh pins whatever commit was first cloned on a given host — if an existing test host's `$TAIGA_DIR` was cloned from an older `stable` HEAD whose `taiga.conf`/`docker-compose.yml` structure differed (unlikely for a file this stable, but not independently verified here), the heredoc content and/or the volume-mount target path could be stale for that specific host. Proceeding on the assumption this file's shape has been stable for a long time; developer should diff the heredoc against the actual `$TAIGA_DIR/taiga-gateway/taiga.conf` on whatever host round-8's retest runs against (or on this dev box's own `$TAIGA_DIR` if a Taiga install exists there) before considering AC1-AC4 verified, not just AC1-AC3 (which are mechanical/install.sh-only and don't depend on this).
+- **#2**: the `volumes:` merge-by-target-path behavior is confirmed against Docker's own current documentation, not independently re-verified against the exact Compose version `ensure_docker()` installs on a live host. This has been stable Compose-v2 behavior for a long time; low risk, but not hands-on-verified here either — same category of gap as #1.
+- **#3**: proceeding under the assumption that item 30's `taiga-front` healthcheck / `service_healthy` gate should stay in `docker-compose.override.yml` even after this fix lands, as defense-in-depth (cheap, already-working code, and a second, independent layer in case the nginx fix needs a follow-up round) — not proposing its removal. Flagging in case there's a reason to prefer simplifying it away instead once the nginx fix is confirmed sufficient on its own.
+- **#4**: the new file's name (`docker-compose.override.taiga-gateway.conf`) is a proposal for consistency with `docker-compose.override.yml`'s existing naming; no strong constraint found elsewhere in the codebase, developer may rename if something reads more clearly, as long as it stays deterministically-regenerated and untracked by the pinned checkout exactly like `docker-compose.override.yml`.
 
 ## Risk / rollback notes
-- All five fixes are localized and independently revertable (five separate concerns across four files, no shared plumbing between them apart from item 41's own two-plus-one-location coupling, which is internal to that one item).
-- Item 42 is the one with the widest blast radius (touches three shared subprocess wrapper functions used by both the mutating on/off routes and the read-only status polling), so its "status" call sites must be verified byte-for-byte behavior-identical, not just "probably fine" — called out explicitly in Edge cases and Acceptance criteria above.
-- Item 43's fallback step adds at most one more `docker compose up -d` call (no sleep) to the already-long worst-case runtime of a full retry exhaustion — negligible relative to the existing ~220s timeout `taiga_run()` already budgets for the "up" action (`app/app.py` line 2733), no timeout-arithmetic changes needed.
-- If item 42's exception-based approach turns out to be awkward in practice (e.g. the developer finds a cleaner shape), the acceptance criteria are written against observable HTTP behavior (status code + body content), not the internal exception-based mechanism — the mechanism described in "Proposed approach" is a strong recommendation made specifically to minimize test-mock churn, not a hard mandate.
+- Both changes are purely additive/config-level and confined to `install.sh`'s Taiga section, `scripts/taiga-up.sh`, and one new test file — no changes to `app/app.py`, the frontend, or any other feature area. Rollback is a plain `git revert` of the commit; on an already-installed host, re-running `install.sh` after a revert regenerates the old two-file `docker-compose.override.yml` (no `volumes:` override) and removes the need for the new conf file (stale copies of it left on disk are harmless — Compose only reads what the current override file references).
+- Worst-case failure mode if the nginx conf heredoc has a typo: `docker compose up -d taiga-gateway` fails immediately and loudly at `nginx -t`/config-parse time (same failure class Docker already surfaces today), not a silent partial-behavior regression — easy to catch in the next E2E retest round.
+- If AC1-AC4 turn out to need a second round to fully close (per Open Question #1's caveat), the taiga-up.sh stopgap (AC6-AC7) still ships independent value on its own: it stops the toggle from lying about success even if the underlying race isn't fully closed yet, same reasoning the brief itself gave for scoping it in regardless of which real-fix path was chosen.

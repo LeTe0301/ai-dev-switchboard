@@ -470,6 +470,121 @@ if [ "$WITH_TAIGA" -eq 1 ]; then
     # sudoers file below. The single-quoted heredoc is deliberate:
     # ${TAIGA_PORT} must stay literal here so Compose (not this shell)
     # substitutes it from $TAIGA_DIR/.env at `docker compose` time.
+    #
+    # Item 43 (round 8): item 30's healthcheck above narrows the DNS race
+    # for taiga-front specifically but doesn't close it — nginx still
+    # resolves all 4 of taiga-gateway's proxy_pass upstream hostnames
+    # (taiga-front, taiga-back x2, taiga-events, taiga-protected) exactly
+    # once, at config-load time, so a `service_healthy` gate that only
+    # covers taiga-front's own container being up doesn't guarantee
+    # taiga-front's (or any of the other three, which have no healthcheck
+    # at all) DNS record has actually propagated through Docker's embedded
+    # resolver (127.0.0.11) at that exact instant — confirmed live: gateway
+    # still crashed with the identical taiga-front DNS error even with the
+    # healthcheck gate in place. The real fix is nginx-side: make it resolve
+    # those hostnames lazily, at request time, instead of once at startup.
+    # docker-compose.override.taiga-gateway.conf (written just below) is
+    # upstream's own taiga-gateway/taiga.conf with a `resolver 127.0.0.11
+    # valid=10s;` directive added and each bare-hostname proxy_pass target
+    # rewritten to a `set $upstream_x <host>; proxy_pass
+    # http://$upstream_x...;` variable indirection — nginx only performs the
+    # DNS lookup for a variable proxy_pass target at request time, honoring
+    # `resolver`'s TTL, which is nginx's own documented fix for this exact
+    # class of Docker-Compose startup-DNS race. It's bind-mounted over the
+    # pinned checkout's own taiga.conf via the `volumes:` entry added to
+    # taiga-gateway below — Compose merges `volumes:` entries by container
+    # target path across -f files, so this single entry *replaces only* the
+    # /etc/nginx/conf.d/default.conf mount; the base file's
+    # taiga-static-data/taiga-media-data mounts on the same service are left
+    # untouched. This is the same override-file idiom already used for
+    # depends_on/ports above, just extended to volumes — the pinned
+    # checkout's own $TAIGA_DIR/taiga-gateway/taiga.conf is never opened for
+    # writing. Item 30's healthcheck/service_healthy gate is kept in place
+    # as defense-in-depth alongside this fix, not replaced by it.
+    cat > "$TAIGA_DIR/docker-compose.override.taiga-gateway.conf" <<'NGINX'
+server {
+    listen 80 default_server;
+
+    client_max_body_size 100M;
+    charset utf-8;
+
+    resolver 127.0.0.11 valid=10s;
+
+    # Frontend
+    location / {
+        set $upstream_front taiga-front;
+        proxy_pass http://$upstream_front/;
+        proxy_pass_header Server;
+        proxy_set_header Host $http_host;
+        proxy_redirect off;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Scheme $scheme;
+    }
+
+    # API
+    location /api/ {
+        set $upstream_back taiga-back;
+        proxy_pass http://$upstream_back:8000/api/;
+        proxy_pass_header Server;
+        proxy_set_header Host $http_host;
+        proxy_redirect off;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Scheme $scheme;
+    }
+
+    # Admin
+    location /admin/ {
+        set $upstream_back taiga-back;
+        proxy_pass http://$upstream_back:8000/admin/;
+        proxy_pass_header Server;
+        proxy_set_header Host $http_host;
+        proxy_redirect off;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Scheme $scheme;
+    }
+
+    # Static
+    location /static/ {
+        alias /taiga/static/;
+    }
+
+    # Media
+    location /_protected/ {
+        internal;
+        alias /taiga/media/;
+        add_header Content-disposition "attachment";
+    }
+
+    # Unprotected section
+    location /media/exports/ {
+        alias /taiga/media/exports/;
+        add_header Content-disposition "attachment";
+    }
+
+    location /media/ {
+        set $upstream_protected taiga-protected;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Scheme $scheme;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_pass http://$upstream_protected:8003/;
+        proxy_redirect off;
+    }
+
+    # Events
+    location /events {
+        set $upstream_events taiga-events;
+        proxy_pass http://$upstream_events:8888/events;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_connect_timeout 7d;
+        proxy_send_timeout 7d;
+        proxy_read_timeout 7d;
+    }
+}
+NGINX
     cat > "$TAIGA_DIR/docker-compose.override.yml" <<'YAML'
 services:
   taiga-front:
@@ -482,6 +597,8 @@ services:
   taiga-gateway:
     ports:
       - "127.0.0.1:${TAIGA_PORT}:80"
+    volumes:
+      - ./docker-compose.override.taiga-gateway.conf:/etc/nginx/conf.d/default.conf
     depends_on:
       taiga-front:
         condition: service_healthy

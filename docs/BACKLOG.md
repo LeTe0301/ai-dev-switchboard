@@ -2390,20 +2390,88 @@ approved with 2 non-blocking nits, committed as `5292112` on
 Re-briefed `pve-sparkling-meadow` (same peer as round 6) for another
 fresh-container retest round, specifically targeting all 5 fixed items
 plus anything skipped last round (upload-from-folder, GitHub-origin
-AI-reviewer path). Report not yet received as of this writing.
+AI-reviewer path).
+
+### Round 7 retest report (2026-08-16): 4/5 confirmed fixed, item 43 still broken (new mechanism, root cause now pinned down)
+
+Tested `a6991c2` on a second fresh CT110 (destroyed after report), with
+`AUTH_MODE=pve` + `PVE_HOST` pre-seeded before `install.sh --yes`.
+
+- **#39 (AUTH_MODE)** — confirmed fixed. `switchboard.env` correctly kept
+  `AUTH_MODE=pve`; verified `pve_login()` genuinely hits the real PVE
+  ticket API and the login page/401 path both behave correctly. (A real
+  end-to-end login with live PVE credentials wasn't completed — creating
+  even a throwaway PVE-realm test account was blocked by the tester's own
+  session permission classifier as a production-auth-state change, and it
+  correctly didn't try to work around that. Verified via code-path
+  inspection instead, which the tester flagged explicitly as a
+  lower-confidence substitute for a real login round-trip.)
+- **#40 (Gitea 403)** — confirmed fixed. Reproduced the exact original
+  trigger (throwaway admin created first, then the real admin) —
+  `gitea-configure-api.sh` succeeded cleanly on the first try.
+- **#41 (code-server path)** — confirmed fixed. `CODE_SERVER_BIN`
+  correctly resolved to `/bin/code-server`; toggling "Code" on now starts
+  a real process, `/status` shows `code_on: true`, URL returns real `302`.
+- **#42 (silent ok:true)** — confirmed fixed. `POST /host/on` with no
+  target configured now returns `502` with real `stderr`
+  ("...ssh: Could not resolve hostname...").
+- **#43 (taiga-gateway race)** — **still broken, different mechanism**.
+  The new plain-`up -d` fallback (added in round 7) now reports
+  `200 {"ok": true}` after ~2m45s, but `taiga-gateway` crashes seconds
+  later: `nginx: [emerg] host not found in upstream "taiga-front"`.
+  `/status` eventually shows `taiga: false` correctly, but the toggle
+  response itself lies again, via a new mechanism (the fallback's own
+  code comment says "no settle-window recheck on this one extra attempt —
+  keep it simple", so it can catch the container in a brief pre-crash
+  "running" window).
+
+  **Root cause now pinned down** (round 6 left this open): `taiga-gateway`
+  own bundled nginx does `proxy_pass http://taiga-front/;` — a bare
+  hostname resolved once at config-load/startup, not lazily. If Docker's
+  embedded DNS (127.0.0.11) hasn't registered `taiga-front` yet when nginx
+  starts, config load fails and nginx exits(1) immediately, no internal
+  retry — this is a narrow, deterministic startup-time DNS race, not
+  something blind retrying can fully close (only narrow). Matches why a
+  manual `docker compose up -d taiga-gateway` run well after the automated
+  attempts have been retrying for 2+ minutes reliably succeeds (the race
+  window has long closed by then).
+
+  Standard nginx fix suggested: lazy DNS resolution instead of
+  startup-time — add `resolver 127.0.0.11 valid=10s;` and reference the
+  upstream via a variable (`set $upstream_front taiga-front; proxy_pass
+  http://$upstream_front/;`) instead of a literal hostname. This would
+  need to land in `taiga-gateway`'s nginx config, which lives inside the
+  pinned third-party `taigaio/taiga-docker` checkout at `$TAIGA_DIR` —
+  **this directly conflicts with the explicit item-30 architecture
+  decision** (install.sh ~line 452-455) to *not* patch
+  taiga.conf/docker-compose.yml inside that pinned checkout, and instead
+  only health-gate via the repo-owned `docker-compose.override.yml`. That
+  decision predates this round's finding that the health-gate approach
+  doesn't actually close the race — worth revisiting, possibly via a
+  volume-mounted custom `taiga.conf` from *our* override file (same
+  spirit as the existing override — never editing the pinned checkout's
+  own files directly) rather than reversing the decision outright.
+  Cheap stopgap in the meantime, called out by the tester: have the
+  item-43 fallback reuse the same settle-and-recheck the main retry loop
+  already has, so it stops reporting `{"ok": true}` for a container about
+  to crash — doesn't close the race, just stops the toggle lying about it.
+
+Everything else (upload-from-folder, GitHub-origin AI-reviewer, real
+engine CLI sessions) — not re-tested this round, same as round 6.
 
 ### To resume if this session is interrupted mid-loop
 
 1. Check `ListAgents` for the current pve-side peer session name (may
    have changed if it died again).
-2. If no round-7 report has arrived yet: wait, or re-send the round-7
-   retest brief (see "Round 7 fix cycle" above, or reconstruct from
-   `docs/BACKLOG.md`'s "Items 39-43" section) to whichever peer is
-   listed.
-3. If a report *has* arrived: read it. Clean report → proceed to the
-   backup+migration steps (3-5) under "The plan, in order" above. Issues
-   found → loop back into the fix pipeline (product-manager → developer
-   → reviewer) same as round 7, commit, push, re-brief, repeat.
+2. If item 43's real fix (or at minimum the stopgap) isn't yet committed:
+   continue/resume the product-manager → developer → reviewer pipeline
+   for it (see "Round 7 retest report" above for full context — this is
+   an architecture-decision revisit, not a mechanical fix, so it warrants
+   a full product-manager pass, not a shortcut).
+3. Once fixed, reviewed, and pushed: re-send an item-43-focused retest
+   brief to whichever peer is listed.
+4. If a future report comes back fully clean: proceed to the
+   backup+migration steps (3-5) under "The plan, in order" above.
 
 ---
 

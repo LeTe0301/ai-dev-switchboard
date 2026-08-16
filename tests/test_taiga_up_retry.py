@@ -225,6 +225,53 @@ class TaigaUpRetryTests(unittest.TestCase):
             result.stderr,
         )
 
+    def test_fallback_settle_window_recheck_catches_gateway_that_dies_before_settling(
+        self,
+    ):
+        # Item 43 (round 8): the fallback's own `up -d` (the 4th call, since
+        # max_attempts=3) reports "running" on its first `ps` check
+        # (success_at=4) but "exited" on the settle-window recheck
+        # (settle_die_at=4) -- must be treated as a failure, not honored
+        # with exit 0, proving the fallback can no longer fabricate success
+        # for a container about to crash (docs/spec.md AC6).
+        result, up_calls, rm_calls, _sleeps = self._run(
+            success_at=4, max_attempts=3, settle_die_at=4
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(up_calls, 4)  # 3 normal attempts + 1 fallback
+        self.assertEqual(rm_calls, 2)
+        self.assertIn(
+            "taiga-up: all 3 attempts exhausted -- trying one plain "
+            "'docker compose up -d'", result.stderr,
+        )
+        self.assertIn(
+            "taiga-up: last-resort attempt reported running but died "
+            "within the 5s settle window", result.stderr,
+        )
+        self.assertIn(
+            "taiga-up: taiga-gateway failed to come up after 3 attempts",
+            result.stderr,
+        )
+
+    def test_fallback_settle_window_recheck_still_honors_genuine_success(
+        self,
+    ):
+        # Item 43 (round 8) regression guard: the fallback's `up -d` reports
+        # "running" and stays "running" through the settle window -> exit 0
+        # exactly as before, no regression to the already-working case
+        # (docs/spec.md AC7).
+        result, up_calls, rm_calls, _sleeps = self._run(
+            success_at=4, max_attempts=3
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(up_calls, 4)
+        self.assertEqual(rm_calls, 2)
+        self.assertIn(
+            "taiga-up: all 3 attempts exhausted -- trying one plain "
+            "'docker compose up -d'", result.stderr,
+        )
+        self.assertNotIn("taiga-up: taiga-gateway failed to come up", result.stderr)
+
     def test_fallback_not_reached_when_normal_attempts_already_succeed(self):
         # Sanity check on the counting scheme itself: when the loop
         # succeeds within its normal attempts, up_calls must stay at

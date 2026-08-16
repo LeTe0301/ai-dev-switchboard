@@ -71,13 +71,27 @@ done
 # in ~3s with clean logs. Root cause still not pinned down; this is the
 # cheapest concrete fallback the live repro points at, tried before the
 # (opt-in, heavier, host-wide) full-Docker-daemon-restart path below and
-# before giving up. No settle-window recheck on this one extra attempt --
-# keep it simple, matching the live repro's own literal suggestion.
+# before giving up.
+# Item 43 (round 8): round 7's retest found this fallback *does* report
+# "running" now (catching the container in a brief pre-crash window), but
+# taiga-gateway still crashed seconds later from the same nginx DNS race
+# this round's real fix (install.sh's lazy-resolver taiga-gateway conf
+# override) targets -- so the toggle response went back to lying about the
+# exact failure item 42 was meant to stop lying about, just via a new
+# mechanism. This one extra attempt now gets the identical
+# settle-and-recheck window the main retry loop already has above, kept as
+# defense-in-depth even after the nginx fix lands, in case that fix needs a
+# second round to land cleanly.
 echo "taiga-up: all $TAIGA_UP_MAX_ATTEMPTS attempts exhausted -- trying one plain 'docker compose up -d' with no rm -f first, as a last resort before giving up" >&2
 "${COMPOSE[@]}" up -d
 state=$("${COMPOSE[@]}" ps taiga-gateway --format '{{.State}}' 2>/dev/null)
 if [ "$state" = "running" ]; then
-    exit 0
+    sleep "$TAIGA_UP_SETTLE_SECONDS"
+    state=$("${COMPOSE[@]}" ps taiga-gateway --format '{{.State}}' 2>/dev/null)
+    if [ "$state" = "running" ]; then
+        exit 0
+    fi
+    echo "taiga-up: last-resort attempt reported running but died within the ${TAIGA_UP_SETTLE_SECONDS}s settle window (state: ${state:-<none>})" >&2
 fi
 
 if [ "$TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION" -eq 1 ]; then
