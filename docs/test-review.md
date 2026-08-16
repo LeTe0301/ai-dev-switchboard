@@ -1,158 +1,203 @@
-# Test & Review: Team launcher fixes — broken Start button, lead/teammate exclusivity, undiscoverable chat UI, unexplained Smoke check
+# Test & Review: Dedicated team chat page (`GET /team/<project>`) — Taiga #10
 
 ## Scope
-Independent testing + review pass over the bugfix bundle described in
-`docs/spec.md` and implemented per `docs/implementation.md`: the
-`onTeamLeadChange()` stale-`Set` fix (root cause of "Start team does
-nothing"), `renderTeamPicker()`'s switch from hiding the Lead's own engine
-in the Teammates list to rendering it disabled-in-place, the idle-state
-discoverability hint for the existing in-page live feed/chat surface, and
-the static Smoke-check helper text. No `docs/design.md` — ux-designer was
-skipped per the spec's own routing note (pure CSS/copy reuse), verified
-against the actual diff below.
+Re-review pass over `docs/spec.md` + `docs/design.md` as implemented per
+`docs/implementation.md`, branch `feature/ad-10/team-chat-page`. This is a
+follow-up to the prior cycle's **Blocked** verdict (Defect 1: unconditional
+top-level `location.pathname.match(...)` router call broke 55 tests across 5
+sibling frontend test files that had no `location` stub in their sandboxes).
+The developer's fix — adding the identical `location: { pathname: '/', href:
+'' }` stub (matching `tests/test_team_frontend.js`'s own shape) to each of
+`tests/test_smoke_check_frontend.js`, `tests/test_clone_frontend.js`,
+`tests/test_deploy_frontend.js`, `tests/test_singleton_toggle_frontend.js`,
+`tests/test_upload_frontend.js` — was re-verified for real this session, and
+the independent review pass (not reached last cycle, since a blocked testing
+pass always skips review) was performed in full.
 
-All commands below were run for real, in this session, against the current
-uncommitted working tree (`git diff` against `de60bf4`, nothing committed
-yet).
+**Overall result: APPROVE.**
 
-## Test cases
+## Re-verification of Defect 1's fix
+
+Diffed all 5 previously-broken files against `main`: each received exactly
+the same 6-line addition (a `location` stub with an explanatory comment),
+scoped to that file's own sandbox-construction helper — matching the prior
+review's own "suggested fix direction" verbatim, and consistent with this
+diff's established pattern (Deviation 4's `classList` precedent) of scoping
+test-harness changes to the file that needs them.
+
+Ran all 6 frontend files for real, this session (`/usr/lib/code-server/lib/node`,
+same interpreter used previously):
+
+```
+tests/test_team_frontend.js              → ALL PASS (134/134)
+tests/test_smoke_check_frontend.js       → ALL PASS (11/11)
+tests/test_clone_frontend.js             → ALL PASS (8/8)
+tests/test_deploy_frontend.js            → ALL PASS (9/9)
+tests/test_singleton_toggle_frontend.js  → ALL PASS (19/19)
+tests/test_upload_frontend.js            → ALL PASS (8/8)
+```
+
+All six exactly match `docs/implementation.md`'s claimed counts. `node --check`
+on all 6 files: syntax OK. Defect 1 is genuinely resolved — no `location is
+not defined` errors, no other regressions surfaced.
+
+## Test cases (spec acceptance criteria)
 
 | # | Criterion / case | Method | Result | Evidence |
 |---|---|---|---|---|
-| 1 | Lead X previously checked as teammate; switching Lead away and back never leaves X in `teamPickerMembers`; `teamCompositionError()` returns null for an otherwise-valid composition | Automated (new) | pass | `tests/test_team_frontend.js`: "changing Lead away from an engine previously checked as a teammate clears the stale membership" — ran, PASS |
-| 2 | Lead X's checkbox renders visible, unchecked, `disabled` attribute present (not omitted) | Automated (updated existing test) | pass | `tests/test_team_frontend.js`: "the saved composition pre-selects the lead, shows it disabled+unchecked in the teammate checkboxes (never hidden)" — ran, PASS; manually confirmed `.team-mates-picker input:disabled`/`label.team-mate-disabled` CSS rules exist at `app/app.py:2937-2938` and correctly scope to the `.team-mates-picker` wrapper (`app/app.py:3759`), matching the `.clone-form input:disabled` precedent verbatim (`app/app.py:3053`) |
-| 3 | Valid composition + Start clicked → real `POST .../team/start`, succeeds or shows legible server-response-derived error, never silent no-op | Automated (pre-existing, re-verified) | pass | `tests/test_team_frontend.js` dispatch/error tests (all in the 115-test run below); backend: `tests/test_team_routes.py::TeamStartEndpointTests::test_valid_submitted_composition_used_instead_of_default_and_persisted` (explicit client `{task, lead, members}` body — the exact shape `doTeamStart()` sends) — ran individually, PASS |
-| 4 | Reported screenshot composition (Lead: aider, Teammate: claude, no prior conflicting history) starts successfully; if a 2nd bug exists it's fixed too | Automated (pre-existing, re-verified) + code trace | pass | `tests/test_team_routes.py::TeamStartEndpointTests::test_happy_path_tier2_default_lead_persisted_correctly` — ran individually, PASS (real tmux session + persisted `run.json`). Engine names in fixtures are generic (`lead2`/`helper`, not literally `aider`/`claude`) but the code path is data-driven and identical; confirmed no second bug exists by inspection — `app/teams.py` has zero diff this cycle |
-| 5 | Idle-state row includes a short static hint that live activity/interject appears here once started | Automated (new) | pass | `tests/test_team_frontend.js`: "idle state includes a static hint..." — ran, PASS. Manually confirmed wording avoids "chat" (`app/app.py:4434`: "Once started, you'll see live team activity and can interject right here.") |
-| 6 | Hint disappears once team is running | Automated (new) | pass | `tests/test_team_frontend.js`: "the idle-state hint disappears once the team is running" — ran, PASS |
-| 7 | Smoke check row shows visible-without-hover text explaining what the button does | Automated (new) | pass | `tests/test_smoke_check_frontend.js`: "the Smoke check row includes a static, always-visible helper line..." — ran, PASS. Manually confirmed no `title="..."` tooltip used (`app/app.py:3464-3475`) — text is a plain `<div class="smoke-check-hint">`, always rendered, no hover dependency |
-| 8 | `tests/test_team_frontend.js:639` assertion updated for disabled-not-hidden, passes | Automated | pass | Same as case 2 above — old "excludes it from the teammate checkboxes" assertion replaced, new assertion passes |
-| 9 | Rapid Lead switching between two engines clears only the newly-selected lead's own stale membership | Automated (new) — partial | pass, with a coverage gap (see Findings #2) | `tests/test_team_frontend.js`: "rapid Lead switching..." — ran, PASS, but neither `e1` nor `e2` is ever checked as a teammate before becoming Lead in the test, so the `Set.delete()` step is a no-op on each switch; verified correctness by manual code trace instead (see Findings) |
-| 10 | Lead cleared back to "Choose a lead..." → no engine renders disabled | Automated (new) | pass | `tests/test_team_frontend.js`: "Lead cleared back to..." — ran, PASS |
-| 11 | Pre-populated picker from a saved composition never shows lead checked | Automated (extended existing test) | pass | Same test as case 2; added `teamCompositionError()` === null assertion |
-| 12 | `composition === null` (no roster) branch unaffected | Not separately re-tested this cycle (pre-existing coverage, code path untouched) | pass | Confirmed via diff: `teamRow()`'s `composition === null` early-return branch (`app/app.py:4412-4421`) has zero changes in this diff |
+| 1 | Running team on `/team/<project>` renders status strip, escalation panel, interject box, add-member control, event feed | Automated (existing, retargeted) | pass | `tests/test_team_frontend.js` — ~90 pre-existing sub-renderer tests, now driven via `renderTeamPageBody()`, PASS |
+| 2 | Dashboard row shows only compact badge + link, for every status (idle/running/blocked/finished/error) | Automated (new) | pass | 7 "dashboard row: ..." tests — PASS |
+| 3 | Idle project's "Open team chat" link renders the full idle launcher, not blank/read-only | Automated (new) | pass | "renderTeamPage(): idle project renders the full idle launcher..." — PASS |
+| 4 | `/team/<project>` unauthenticated behaves like `/` (login overlay, no team data) | Automated (both layers) | pass | JS: "a 401 from /status shows the login overlay..." — PASS. HTTP: `test_team_page_returns_the_same_static_shell_as_root_unauthenticated` / `test_team_page_shell_matches_render_page_directly` — PASS |
+| 5 | Unknown project → clear "Unknown project" message + link back, no JS error | Automated | pass | JS "unknown project renders a clear..." — PASS. HTTP `test_team_page_works_for_a_nonexistent_project_name_too` — PASS |
+| 6 | Interject/escalation/add-member on the dedicated page call the exact same existing routes | Automated + spy proof | pass | Retargeted dispatch-assertion tests PASS; spy test proves `renderTeamPage()` calls the same `renderTeamStatusStrip` function object, not a forked copy — PASS |
+| 7 | `tests/test_team_frontend.js` + `tests/test_team_routes.py` all pass | Automated | pass | 134/134 and 6/6, re-run this session |
+| 8 | **Regression: sibling frontend test suites unaffected** | Automated | **pass (was FAIL)** | Defect 1 fix verified — all 5 previously-broken files now 100% passing, re-run this session |
+| 9 | Full `tests.test_team_routes` suite vs. `main` baseline — same pre-existing failure set | Automated | pass | Re-established independently this session (see below): 45 errors/2 failures on both branch and `main`, `diff` of sorted FAIL/ERROR test names is byte-identical (empty diff) |
+| 10-15 | Deviations 1-4, unauthenticated-leak check, grounding/branches reachability | Manual (carried over) | pass | Unchanged from prior cycle's manual trace/revert-and-watch-it-fail verification (code these checks cover is untouched by the Defect-1 fix) — re-confirmed the relevant code is unchanged in this cycle's diff |
 
 ## Regression check
-Full JS suites run (real Node against the **actual extracted `<script>`
-from `app.render_page()`**, not a hand-copied mock — `tests/test_team_frontend.js`'s
-own `extractRenderedScript()` shells out to `python3 -c '...render_page()'`
-and regex-extracts the live `<script>` body, so every assertion below
-exercised the real, current `app/app.py` source):
 
 ```
 NODE=/usr/lib/code-server/lib/node
-"$NODE" tests/test_team_frontend.js        → ALL PASS (115/115)
-"$NODE" tests/test_smoke_check_frontend.js → ALL PASS (11/11)
-"$NODE" tests/test_clone_frontend.js       → ALL PASS (8/8)
-"$NODE" tests/test_deploy_frontend.js      → ALL PASS (9/9)
-"$NODE" tests/test_singleton_toggle_frontend.js → ALL PASS (19/19)
-"$NODE" tests/test_upload_frontend.js      → ALL PASS (8/8)
+"$NODE" tests/test_team_frontend.js              → ALL PASS (134/134)
+"$NODE" tests/test_smoke_check_frontend.js       → ALL PASS (11/11)
+"$NODE" tests/test_clone_frontend.js             → ALL PASS (8/8)
+"$NODE" tests/test_deploy_frontend.js            → ALL PASS (9/9)
+"$NODE" tests/test_singleton_toggle_frontend.js  → ALL PASS (19/19)
+"$NODE" tests/test_upload_frontend.js            → ALL PASS (8/8)
+
+TOTP_SECRET=JBSWY3DPEHPK3PXP python3 -m unittest tests.test_team_routes.TeamPageRouteTests -v
+  → Ran 6 tests ... OK
+
+TOTP_SECRET=JBSWY3DPEHPK3PXP python3 -m unittest tests.test_team_routes -v
+  → Ran 137 tests in 9.701s, FAILED (failures=2, errors=45)
+
+# main baseline (git stash push -u, re-run, git stash pop):
+TOTP_SECRET=JBSWY3DPEHPK3PXP python3 -m unittest tests.test_team_routes -v
+  → Ran 131 tests in 9.140s, FAILED (failures=2, errors=45)
+  # sorted FAIL/ERROR test-name sets, branch vs. main: `diff` exit 0 (empty)
+  # — the branch's 6 extra passing tests are TeamPageRouteTests (new); every
+  # other failure/error is identical by test name to main, confirmed fresh
+  # this session (not just re-trusting the prior cycle's claim).
+
+python3 -m py_compile app/app.py → compiles cleanly.
+node --check on all 6 frontend test files → syntax OK.
 ```
 
-Python suites:
+No other Python test file (`test_clone.py`, `test_deploy_dispatch.py`,
+`test_gitea*.py`, `test_upload.py`, `test_host_control.py`,
+`test_install_*.py`, etc.) references `render_page()`, `PAGE_TEMPLATE`, or
+the `/` route directly (confirmed via grep) — the diff's backend surface
+touched is `do_GET` (one additive `or` branch) and `PAGE_TEMPLATE` (new ids
++ CSS + a new empty `<div id="team-page">`), none of which any of those
+suites exercise; no reason to expect or find collateral breakage there, and
+this project has no separate lint/type-check step (no `package.json`,
+`.eslintrc*`, `pyproject.toml`, or `setup.cfg` present).
 
-```
-python3 tests/test_teams_composition.py   → OK (24/24)
-python3 tests/test_smoke_check.py         → OK (25/25)
+**Testing pass: clean.** Proceeding to the independent review pass.
 
-GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@test.com \
-GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@test.com \
-python3 tests/test_team_routes.py    → 131 tests, 2 failures
-python3 tests/test_teams_lead.py     → 138 tests, 2 failures
-python3 tests/test_teams_lifecycle.py → 75 tests, 2 failures
-```
+## Review pass
 
-The 6 failures (4 `blocked_ask_user` != `finished` timing-sensitive
-assertions across `test_team_routes.py`/`test_teams_lead.py`, 2
-`sudo`-requiring CLI subprocess tests in `test_teams_lifecycle.py` failing
-with "dev is not in the sudoers file") were investigated and confirmed
-**not caused by this diff**:
-- `app/teams.py` has **zero changes** this cycle (`git diff --stat --
-  app/teams.py` is empty) — the failing lifecycle/lead-loop/CLI tests
-  invoke `teams.py` directly via subprocess or through server routes this
-  diff never touches.
-- `app/app.py`'s entire diff is confined to string literals inside
-  `PAGE_TEMPLATE` (client-side JS/CSS shipped to the browser) — no Python
-  control-flow, route-handler, or session-state-machine code changed.
-- `git stash`-based before/after comparison was attempted but denied by
-  the sandbox's action classifier; confirmed equivalently by direct code
-  inspection above, which is conclusive here since the failing tests'
-  code paths have no overlap with the diff at all.
-- The `sudo` failures are a known, deterministic sandbox limitation (`dev`
-  has no passwordless sudo) unrelated to any code change.
+### Spec-to-code traceability
+Re-read `docs/spec.md`'s Goals, Proposed approach §1-5, Edge cases, and all
+7 acceptance-criteria checkboxes against the actual `app/app.py` diff
+(`git diff main -- app/app.py`, full hunk-by-hunk read this session, not
+re-trusted from the prior cycle):
+- New `do_GET` branch (`self.path == "/" or _TEAM_PAGE_PATH_RE.match(self.path)`)
+  matches spec §1 exactly — same static shell, no project-name validation at
+  this layer, `re` already imported (no new import needed, contrary to the
+  spec's own hedge that one might be needed).
+- Bottom-of-script router matches spec §2's sketch verbatim, including the
+  `decodeURIComponent` on the matched path segment.
+- `renderTeamPageBody()` (the extraction of the old `teamRow()`) is the
+  single implementation both `renderTeamPage()` and — indirectly, since the
+  dashboard's new `teamRow()` no longer calls it at all — no duplicate
+  exists; grepped for a second definition of any of the sub-renderer names
+  spec §3 lists (`renderTeamStatusStrip`, `renderEscalationPanel`, etc.) —
+  none found, single implementation confirmed by absence of a fork, not
+  merely spy-tested.
+- Dashboard's new compact `teamRow()` (`TEAM_STATUS_LABELS` + status badge +
+  link) matches spec §4 and `docs/design.md`'s own sketch line-for-line
+  (including that neither the spec nor the implementation adds a
+  `.team-status.status-idle` CSS color rule — idle intentionally renders in
+  the base `.team-status` color, matching design's own sketch, not an
+  oversight).
+- `#team-page` container, `hideDashboardChromeForTeamPage()`, and the new
+  CSS rules match spec §5 / design's "Page Container Styling" section.
+- All 7 acceptance-criteria checkboxes have a corresponding test case in the
+  table above — no gaps found.
 
-`python3 tests/test_team_routes.py::TeamStartEndpointTests::test_happy_path_tier2_default_lead_persisted_correctly`
-and `::test_valid_submitted_composition_used_instead_of_default_and_persisted`
-(the two tests most directly relevant to acceptance criteria #3/#4) were
-also run individually — both PASS.
+### Correctness review
+- `_TEAM_PAGE_PATH_RE = re.compile(r"^/team/[^/]+/?$")` correctly requires at
+  least one non-slash character (rejects bare `/team` and `/team/`, both
+  exercised by `test_paths_that_merely_resemble_the_team_route_do_not_match`)
+  and rejects further path segments (`/team/x/y` doesn't match, since
+  `[^/]+/?$` only allows one optional trailing slash) — consistent with the
+  spec's "one path segment" assumption.
+- `refreshCurrentView()`/`TEAM_PAGE_PROJECT` (the developer's self-flagged
+  beyond-spec addition) is a straightforward null-check dispatcher; every
+  call site converted from `refresh()` was traced in the prior cycle and
+  re-confirmed unchanged in this cycle's diff — no new call sites introduced
+  by the Defect-1 fix itself (the fix touched only test files).
+- `renderTeamPage()` correctly re-fetches `/status` on every call (each 4s
+  tick and on initial load) rather than reusing stale dashboard state — same
+  pattern `refresh()` already uses.
+- No off-by-one or state-leak issues found in the `teamPageMatch` regex
+  handling, `TEAM_STATUS_LABELS` fallback (`|| 'Unknown'`, defensive against
+  an unrecognized status value), or `hideDashboardChromeForTeamPage()`'s
+  direct `getElementById` calls (all target ids that were verifiably added
+  to `PAGE_TEMPLATE` in this same diff).
 
-`python3 -m py_compile app/app.py` → compiles cleanly, no syntax errors.
+### Security review
+- `esc()` is applied to every piece of user/server-controlled string
+  interpolated into the new HTML (`teamRow()`'s `status` value,
+  `teamPageHeader()`'s `name`, `renderTeamPageNotFound()`'s `projectName`) —
+  no unescaped interpolation found in the new code.
+- The new `do_GET` branch serves a byte-identical, session-free static shell
+  regardless of the URL's project-name segment — verified at the HTTP level
+  this session (`test_team_page_shell_matches_render_page_directly` compares
+  against `render_page()` directly) — no path-traversal or filesystem access
+  keyed off the URL segment; every other GET route remains gated by
+  `_authed()` (`do_GET`'s existing code, unchanged by this diff).
+- No new secrets, credentials, or logging of sensitive data introduced.
 
-**Verdict: testing pass clean.** Proceeding to review.
+### Simplicity / scope review
+- The diff stays inside the existing single-file convention (no new build
+  tooling, no new dependency), matches the spec's explicit non-goals (no new
+  backend routes, no `app/teams.py` changes, no event-envelope changes) —
+  confirmed via `git diff --stat main` showing changes confined to
+  `app/app.py` and test files.
+- `refreshCurrentView()` is flagged by the developer as beyond the spec's
+  literal sketch; on inspection it's a minimal, necessary fix for a real gap
+  (stale team page on any handler-triggered re-render) rather than
+  speculative generality — a single 4-line function, not a new abstraction
+  layer. Not scope creep.
+- The 5-file test-fixture fix for Defect 1 is the minimal correct diff: one
+  stub line + a comment per file, no shared helper module invented, matching
+  the codebase's existing per-file test-fixture convention.
+- `.aider.chat.history.md` is an untracked, incidental local file (8 lines,
+  just aider startup banner text, no secrets) — not part of this diff, not
+  staged, no action needed.
 
-## Spec coverage
-All 8 acceptance criteria in `docs/spec.md` are implemented and covered by
-a test I ran and observed pass this session:
-- Stale-Set clearing on Lead change — implemented (`app/app.py:3684-3692`), tested (case 1).
-- Disabled-not-hidden rendering — implemented (`app/app.py:3744-3758`), tested (case 2/8).
-- Valid-composition Start success/error surfacing — unchanged, re-verified (case 3).
-- Screenshot repro (no 2nd bug) — investigated, confirmed, tested (case 4).
-- Idle-state discoverability hint — implemented (`app/app.py:4428-4436`), tested (case 5/6).
-- Smoke check helper text — implemented (`app/app.py:3464-3475`), tested (case 7).
-- Test file line-639 update — done, passes (case 2/8).
-- No regressions in `test_team_frontend.js`/`test_teams_composition.py` — confirmed (115/115 and 24/24).
+### Findings
+No must-fix or should-fix findings. One optional observation, not a
+blocker:
 
-No acceptance criterion is unimplemented or untested.
-
-## Findings (most severe first)
-
-### 1. `docs/implementation.md`'s stated pre-existing-failure count is inaccurate — nit
-- File: `docs/implementation.md:44-50`
-- Issue: states "two `blocked_ask_user` vs. `finished` timing-sensitive
-  assertions and two `sudo`-requiring CLI subprocess tests" (4 total). Actual
-  count observed this session is 4 timing-sensitive failures (2 in
-  `test_team_routes.py`, 2 in `test_teams_lead.py`) + 2 sudo failures (in
-  `test_teams_lifecycle.py`) = 6 total.
-- Failure scenario: none functionally — this is a documentation-accuracy
-  gap only. Independently confirmed (see Regression check) that all 6 are
-  pre-existing and unrelated to this diff regardless of the miscount, so it
-  does not affect the correctness of the shipped code. Worth a one-line
-  correction in `docs/implementation.md` for anyone reading it later as a
-  baseline reference, but not blocking.
-
-### 2. "Rapid Lead switching" test doesn't exercise the deletion step on a genuinely-stale value — nit
-- File: `tests/test_team_frontend.js:715-752`
-- Issue: the spec's edge case (`docs/spec.md:273-276`) is "Rapid Lead
-  switching back and forth between two engines, **each previously checked
-  as a teammate**." The test built checks only `helper` (which is never
-  itself made Lead) and switches Lead among `e1`/`e2`, neither of which is
-  ever checked as a teammate first — so `members.delete(lead.name)` is a
-  no-op on every switch in this test, and the test never actually exercises
-  a real stale-value deletion mid-sequence. It does correctly prove a
-  related but distinct property: an unrelated engine's legitimate
-  membership survives unrelated Lead switches.
-- Failure scenario: none currently — manually traced `onTeamLeadChange()`
-  (`app/app.py:3684-3692`): the fix is `members.delete(lead.name)`, a
-  single-key `Set.delete()` call, which is structurally incapable of
-  touching any other key regardless of history, so the missing test case
-  cannot be masking a real bug here. Recommended follow-up (non-blocking):
-  extend the test to check both `e1` and `e2` as teammates before switching
-  Lead between them, so the assertion is doing real work rather than
-  relying on this reviewer's manual trace.
-
-## Follow-ups (non-blocking)
-- Correct the failure count in `docs/implementation.md`'s "Root cause"
-  section (Finding 1).
-- Strengthen the "rapid Lead switching" test to actually pre-check both
-  engines as teammates before switching Lead between them (Finding 2).
+- **Nit:** `docs/spec.md`'s "Proposed approach" §1 hedges that `re` "if not
+  [already imported], this is the one new import this whole feature
+  requires" — the implementation found `re` was already imported and needed
+  no new import. This is already correctly documented in
+  `docs/implementation.md`'s "Changes by file" section; no action needed,
+  noting only for completeness.
 
 ## Overall verdict
-**Approve.** All acceptance criteria are implemented and independently
-verified via tests I ran and observed pass this session; the full relevant
-regression suite is clean (only pre-existing, diff-unrelated sandbox
-failures, confirmed via code-path inspection since `git stash` was denied);
-the diff is minimal and matches the spec's proposed approach with no scope
-creep; no security concerns (static copy only, server-derived smoke-check
-URL, no new user input paths); CSS/copy reuse claims in
-`docs/implementation.md` were spot-checked against actual line numbers and
-confirmed accurate. Two non-blocking nits noted above as follow-ups.
+**Approve.** Defect 1 is genuinely and completely resolved — all 6 frontend
+test files pass at their claimed counts (134/134, 11/11, 8/8, 9/9, 19/19,
+8/8), re-run for real this session, and the Python suite's pre-existing
+failure set (45 errors/2 failures) was independently re-established against
+a fresh `main` baseline this session and matches byte-for-byte by test name.
+The independent review pass — spec-to-code traceability across all 7
+acceptance criteria, correctness, security, and simplicity/scope — turned up
+no must-fix or should-fix issues against the actual diff. Hands back to the
+orchestrator for commit + PR.

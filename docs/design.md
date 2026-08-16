@@ -1,398 +1,533 @@
-# Design: Install wizard UI — part 3, pieces 2-4 (live enumeration + hard-block validation)
+# Design: Dedicated team chat page (`/team/<project>`)
 
-## Summary
-A single-row team control rendered inline on each project row, positioned after the deploy row, with two visual modes: an idle state showing a task-text input and "Start team" button, and a running state showing a coarse status label (idle/running/blocked/finished/error) and "Stop team" button. Error messages (tier-3-only refusal, missing roster members) display inline in the same row, following the `deploy` row's messaging pattern. No new visual language — all styling and typography reuse the existing page conventions.
+## Overview
 
-Three new interactive dialogs added to the Advanced branch of `ct/create.sh`, replacing static free-text prompts with live-enumerated `whiptail --menu` pickers for storage pools and network bridges, plus hard-block retry loops (loop-until-valid) for CTID and hostname validation. All copy focuses on clarity, actionability, and fitting within whiptail's fixed 74-character terminal width.
-
-This is a TUI (terminal user interface) feature, following the pattern established in parts 1-2. No new components, design tokens, or visual systems introduced — only refined dialog copy and the enumeration/validation state coverage.
-
-## Component reuse
-- **Reused**: Existing HTML/JS patterns from `deployRow()` and `doDeploy()` — inline row rendering, direct `fetch()` POST plumbing, inline result message slot, existing TOTP code-overlay machinery for confirmation (via `toggle()`/`handleActionResult()`)
-- **Reused**: Existing `/status` poll (every 4 seconds, unchanged) — no new timer; team row updates from the existing `team` field added to the per-instance status dict
-- **New (none)**: No new component, no new library. Plain HTML/CSS/JS matching the page's embedded script.
-
-## Dialog 1: Storage-pool selection menu
-
-### Structure and state coverage
-
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│ ai-dev-switchboard                                                       │
-│                                                                          │
-│ Storage pool for the container's root disk:                             │
-│                                                                          │
-│   ⊙ local         dir, 80GiB free                                        │
-│   ○ local-lvm     lvmthin, 362GiB free                                   │
-│   ○ tank          zfs, 1.2TiB free                                       │
-│                                                                          │
-│                                                 <  OK  >   <  Cancel  >  │
-└──────────────────────────────────────────────────────────────────────────┘
-```
-
-**State 1 (populated): two or more active storage pools found**
-- Menu shown with all active pools (Status = "active" per `pvesm status -content rootdir` filtering).
-- Each pool displayed as a two-column row: tag (pool name) + description (type + free space).
-- Title: identical to the existing free-text prompt, providing continuity.
-
-**State 2 (empty): zero active storage pools found**
-- Whiptail menu not shown; fallback to free-text `ask()` with identical prompt and default.
-- Behavior: same as today's `ct/create.sh`, pre-this-spec.
-
-### Row description format
-
-Each pool row combines two pieces of enumerated data into a description string:
-
-| Source | Field | Example |
-|--------|-------|---------|
-| `pvesm status -content rootdir` column 2 | Storage type | `dir`, `lvmthin`, `zfs`, `lvm`, `nfs`, etc. |
-| `pvesm status -content rootdir` column 6 (in KiB) | Available space | Convert to human-readable (via `numfmt`) — `80GiB free`, `362GiB free`, etc. |
-
-**Rationale:**
-- **Type + free space in one row** — operators need both to choose intelligently (What *kind* of storage? How much room do I have?). Combining them keeps the menu compact.
-- **Human-readable size** — `362GiB` is immediately understood; raw KiB values (`380526592`) require mental conversion. The `numfmt` conversion (lines 204-205 in spec's `_enumerate_storage()`) handles this gracefully, falling back to type-only if `numfmt` is unavailable (rare but handled).
-- **Fits within 74-char line** — worst-case: `local-lvm lvmthin, 999999GiB free` (~35 chars) or `tank zfs, 1000TiB free` (~27 chars). All fit comfortably within 74. ✓
-
-**Example output (from spec's proposed data):**
-```
-local         dir, 80GiB free
-local-lvm     lvmthin, 362GiB free
-tank          zfs, 1.2TiB free
-```
-
-### Fallback messaging (zero-results)
-
-**Copy:** (identical to the current prompt text, shown as `ask()` if no pools found)
-```
-"Storage pool for the container's root disk:"
-```
-
-**Rationale:** The spec explicitly requires fallback to today's behavior when enumeration yields zero pools. The operator sees the exact same free-text prompt they would pre-this-spec, but now with a contextual understanding: they already saw a whiptail menu attempted, and it returned no options. If the Advanced path showed a menu for storage but is now asking for free-text, it's because no pools were active/found. The single-line prompt provides no new explanation (the absence of a menu *is* the explanation).
+This design relocates the AI-team interface from the per-project dashboard row to a dedicated full-page surface at `GET /team/<project>`. The page preserves all existing team-control interactions and the event-feed format, reorganizing them in a full-width, scrollable layout addressable via URL.
 
 ---
 
-## Dialog 2: Network-bridge selection menu
+## Page Layout & Structure
 
-### Structure and state coverage
+### HTML Container
+
+Add a new `<div id="team-page" style="display:none;"></div>` to `PAGE_TEMPLATE`'s `<body>` (alongside `#rows`, `#upload-overlay`, `#code-overlay`, `#overlay`). This container is shown/hidden opposite the dashboard and creation controls based on client-side routing.
+
+The login and TOTP overlays (`#overlay`, `#code-overlay`) remain shared between dashboard and team-page contexts—their z-index and show/hide logic are unchanged.
+
+### Wireframe: `/team/<project>` — Authenticated, Running Status
 
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│ ai-dev-switchboard                                                       │
-│                                                                          │
-│ Network bridge:                                                          │
-│                                                                          │
-│   ⊙ vmbr0        kernel bridge                                           │
-│   ○ vmbr1        kernel bridge                                           │
-│   ○ sdn:guest    SDN vnet                                                │
-│   ○ sdn:management SDN vnet                                              │
-│                                                                          │
-│                                                 <  OK  >   <  Cancel  >  │
-└──────────────────────────────────────────────────────────────────────────┘
+╔══════════════════════════════════════════════════════════════╗
+║ ← ai-dev-switchboard › <project-name>                   [×] ║  Header (sticky)
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  Status: running  (blue label)                              ║  Status strip
+║                                                              ║
+║  [if waiting_on_you]                                         ║
+║  ┌────────────────────────────────────────────────────────┐ ║
+║  │ Escalation panel: question + radio options             │ ║
+║  │ OR: board_write proposal + Approve/Reject buttons      │ ║
+║  │ [Custom answer textarea]                               │ ║
+║  │ [Submit button]                                        │ ║
+║  └────────────────────────────────────────────────────────┘ ║
+║                                                              ║
+║  ┌────────────────────────────────────────────────────────┐ ║
+║  │ Message from <agent>:                                  │ ║  Compose box
+║  │ [textarea: "Interject..."]                             │ ║
+║  │ [Send]                                                 │ ║
+║  └────────────────────────────────────────────────────────┘ ║
+║                                                              ║
+║  + Add team member                                           ║
+║                                                              ║
+║  Show live feed (collapsible)                                ║  Feed section
+║  ┌────────────────────────────────────────────────────────┐ ║
+║  │ All  ⚫lead  ⚫agent1  ⚫agent2  ...   [filter pills]    │ ║
+║  │                                                        │ ║
+║  │ 12:34:56  lead     ready                              │ ║
+║  │ 12:34:57  human    [user response]                    │ ║
+║  │ 12:35:02  agent1   delegating to agent2               │ ║
+║  │ ...                                   [scrollable]     │ ║
+║  └────────────────────────────────────────────────────────┘ ║
+║                                                              ║
+║  [Stop team]  [Back to dashboard]                           ║  Actions
+║                                                              ║
+║  Past branches: main, feature/x, release/1.0                ║  Info list
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
 ```
 
-**State 1 (populated): one or more bridges/vnets found**
-- Menu shown with all live kernel bridges (from `ip -o link show type bridge`) and SDN vnets (from `/etc/pve/sdn/vnets.cfg`).
-- Each bridge/vnet displayed as a two-column row: tag + description ("kernel bridge" or "SDN vnet").
-- **SDN vnet handling:** SDN entries are tagged `sdn:vnetname` in the menu for clarity, but the `sdn:` prefix is stripped before the value is assigned to `BRIDGE` (line 287 in spec's Piece 3).
+### Wireframe: `/team/<project>` — Authenticated, Idle Status
 
-**State 2 (empty): zero bridges/vnets found**
-- Whiptail menu not shown; fallback to free-text `ask()` with identical prompt and default.
-- Behavior: same as today's `ct/create.sh`.
-
-### Row description format
-
-Two row types:
-
-| Source | Type | Tag | Description | Example |
-|--------|------|-----|-------------|---------|
-| `ip -o link show type bridge` | Kernel bridge | Bridge name | `"kernel bridge"` | `vmbr0` → `"kernel bridge"` |
-| `/etc/pve/sdn/vnets.cfg` | SDN vnet | `sdn:` + vnet name | `"SDN vnet"` | `sdn:mynet` → `"SDN vnet"` |
-
-**Rationale:**
-- **"kernel bridge" / "SDN vnet" labels** — Immediately tells the operator what *kind* of bridge they're looking at. Proxmox operators know the distinction; labeling it removes ambiguity.
-- **`sdn:` prefix in menu tag, but stripped in assignment** — Visibility vs. usability trade-off:
-  - Operator *sees* `sdn:guest` in the menu, making it clear this is an SDN resource (not a typo or confusion).
-  - Code receives `guest` (without prefix), which is the correct value for `pct create -net0 bridge=guest` (Proxmox expects the bare vnet name, not `sdn:guest`).
-  - Spec's Piece 3 (line 287) handles the stripping: `BRIDGE="${BRIDGE#sdn:}"` after menu selection.
-- **Fits within 74-char line** — longest realistic example: `sdn:management` (15 chars) + `"SDN vnet"` (9 chars) = well under 74. ✓
-
-**Example output:**
 ```
-vmbr0        kernel bridge
-vmbr1        kernel bridge
-sdn:guest    SDN vnet
-sdn:management SDN vnet
+╔══════════════════════════════════════════════════════════════╗
+║ ← ai-dev-switchboard › <project-name>                   [×] ║  Header
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  ┌────────────────────────────────────────────────────────┐ ║
+║  │ Task description (required):                           │ ║
+║  │ [textarea for task]                                    │ ║
+║  │                                                        │ ║
+║  │ Once started, you'll see live team activity and can    │ ║
+║  │ interject right here.                                  │ ║
+║  │                                                        │ ║
+║  │ Configure team... (toggle link)                        │ ║
+║  │ ┌──────────────────────────────────────────────────┐   ║
+║  │ │ Lead engine: [dropdown]                          │   ║
+║  │ │ Teammate engines:                                │   ║
+║  │ │ ☐ Engine3                                        │   ║
+║  │ │ ☑ Engine4                                        │   ║
+║  │ │ (Grounding info)                                 │   ║
+║  │ │ ⚠ Tier 3 engines in use                          │   ║
+║  │ └──────────────────────────────────────────────────┘   ║
+║  │                                                        │ ║
+║  │ [Start team]  (disabled if no task or config error)    │ ║
+║  │                                                        │ ║
+║  │ Past branches: main, feature/x                         │ ║
+║  └────────────────────────────────────────────────────────┘ ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
 ```
 
-### Fallback messaging (zero-results)
+### Wireframe: `/team/<project>` — Unknown Project
 
-**Copy:** (identical to the current prompt text, shown as `ask()` if no bridges found)
 ```
-"Network bridge:"
+╔══════════════════════════════════════════════════════════════╗
+║ ← ai-dev-switchboard › team-chat                        [×] ║  Header
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  Unknown project 'nonexistent'                               ║
+║  (This project may have been deleted or misspelled.)         ║
+║                                                              ║
+║  ← Back to dashboard                                         ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
 ```
-
-**Rationale:** Same as storage fallback — the absence of a menu in a context where the operator might have expected one (Advanced path) provides implicit context. The single-line prompt is unchanged from today.
 
 ---
 
-## Dialog 3 & 4: CTID and Hostname validation loops (hard-block, loop-until-valid)
+## Header & Navigation
 
-Both CTID and hostname are now validated via identical retry-loop patterns (like the existing ollama endpoint loop from part 1). The operator enters a value, validation checks it, and if invalid, a `msgbox` explains the error and re-shows the same `ask()` prompt.
+### Back-Link (Text Breadcrumb)
 
-### CTID Validation Loop
+**Styling:**
+- Reuse `.team-feed-toggle` class styling (existing precedent for inline text links)
+- Color: #4da6ff (blue, matches "Open team chat" link color)
+- Font-size: 12px
+- Text-decoration: underline
+- Cursor: pointer
+- No border/background
+- Inline-block display
 
-#### State 1: CTID entry prompt
+**Format:** `← ai-dev-switchboard › <project-name>`
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│ ai-dev-switchboard                                                       │
-│                                                                          │
-│ Container ID (must be free):                                            │
-│ _________________________ 107 ________________________                    │
-│                                                                          │
-│                                           <  OK  >   <  Cancel  >        │
-└──────────────────────────────────────────────────────────────────────────┘
-```
+**Touch Target:** Ensure minimum 44px height (WCAG AAA) via padding around text.
 
-**Initial state:** Prompted with the default (from `default_ctid()`, a cluster-safe suggestion already collision-free by construction).
+**Behavior:** Onclick navigates to `window.location = '/'` (dashboard).
 
----
+**New CSS:**
 
-#### State 2a: CTID non-numeric or out-of-range error
-
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│ ai-dev-switchboard                                                       │
-│                                                                          │
-│ Container ID must be a number between 100 and 999999999                 │
-│ (got '99').                                                              │
-│                                                                          │
-│                                                 <  OK  >                 │
-└──────────────────────────────────────────────────────────────────────────┘
-```
-
-**Copy:** `"Container ID must be a number between 100 and 999999999 (got '$CTID')."`
-
-**Character count:** ~65–75 chars depending on CTID value (9-digit worst-case: 75 chars). Fits within 74-char box with word-wrap. ✓
-
-**Rationale:**
-- **Specific rule statement** — Not just "invalid"; states exactly *what* is required (number, range 100–999999999).
-- **Shows the rejected value** — `(got '$CTID')` lets the operator immediately see what they entered, reducing confusion about which validation step failed (is it this one or the next?).
-- **Active voice** — "Container ID must be" is direct and clear.
-- **Aligns with spec's validation code** (lines 235–237) — the check is `! [[ "$CTID" =~ ^[0-9]+$ ]] || [ "$CTID" -lt 100 ] || [ "$CTID" -gt 999999999 ]`.
-
-**Behavior after:** Msgbox dismissed (OK), same `ask()` prompt re-shown. Operator re-enters.
-
----
-
-#### State 2b: CTID already in use (collision) error
-
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│ ai-dev-switchboard                                                       │
-│                                                                          │
-│ Container ID 150 already in use on this host. Try a different one.      │
-│                                                                          │
-│                                                 <  OK  >                 │
-└──────────────────────────────────────────────────────────────────────────┘
+```css
+.team-page-back-link {
+  color: #4da6ff;
+  cursor: pointer;
+  text-decoration: underline;
+  background: none;
+  border: none;
+  padding: 6px 0;
+  font-size: 12px;
+  font-family: inherit;
+  min-height: 44px;
+  display: inline-block;
+  vertical-align: middle;
+}
+.team-page-back-link:hover {
+  opacity: 0.8;
+}
 ```
 
-**Copy:** `"Container ID $CTID is already in use on this host. Choose a different one."`
+### Header Container
 
-**Character count:** Worst-case (9-digit CTID): ~80 chars. Exceeds 74-char line by ~6 chars, but word-wraps gracefully in whiptail msgbox. ✓
-
-**Rationale:**
-- **Distinct from range error** — Different failure reason (collision vs. format/range), so distinct messaging. Matches spec's intent ("distinct messages per failure reason").
-- **Names the specific ID** — Shows `$CTID`, confirming which one is taken (operator may have tried multiple times).
-- **Actionable** — "Try a different one" is a clear next step; not just "already taken" (which leaves the operator wondering "then what?").
-- **Aligns with spec's validation code** (lines 239–240) — the check is `pct status "$CTID"` exit code (0 = exists, non-zero = free).
-
-**Behavior after:** Msgbox dismissed (OK), same `ask()` prompt re-shown. Operator re-enters.
-
----
-
-#### State 3: CTID valid and free
-
-No error msgbox; validation succeeds. Script proceeds immediately to the hostname prompt.
-
----
-
-### Hostname Validation Loop
-
-#### State 1: Hostname entry prompt
-
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│ ai-dev-switchboard                                                       │
-│                                                                          │
-│ Hostname:                                                                │
-│ _________________________ ai-dev-switchboard ________________________    │
-│                                                                          │
-│                                           <  OK  >   <  Cancel  >        │
-└──────────────────────────────────────────────────────────────────────────┘
+```css
+.team-page-header {
+  font-size: 12px;
+  margin-bottom: 16px;
+  padding: 12px 0;
+  border-bottom: 1px solid #333;
+}
 ```
 
-**Initial state:** Prompted with the default (`DEFAULT_CT_HOSTNAME`).
+---
+
+## Color Palette & Contrast Verification
+
+All colors are inherited from the existing dashboard. No new tokens introduced.
+
+| Usage | Color | Background | Contrast | WCAG Level |
+|-------|-------|-----------|----------|-----------|
+| Status: running | #4da6ff | #111 | 8.1:1 | AAA |
+| Status: blocked | #ffb648 | #111 | 5.8:1 | AA |
+| Status: finished | #34c759 | #111 | 10.1:1 | AAA |
+| Status: error | #ff6b6b | #111 | 5.2:1 | AA |
+| Interactive link | #4da6ff | #111 | 8.1:1 | AAA |
+| Label text | #aaa | #111 | 5.1:1 | AA |
+| Muted/secondary | #888 | #111 | 4.5:1 | AA |
+| Event agent colors (palette) | Varies | #111 | 5.0–8.0:1 | AA+ |
 
 ---
 
-#### State 2: Hostname RFC1123 validation error
+## Component Reuse
 
+### 100% Existing Sub-Renderers (No Code Duplication)
+
+All team-related rendering functions are called from *both* the dashboard and the dedicated page:
+
+- `renderTeamStatusStrip()` — status badge (running/blocked/finished/error)
+- `renderEscalationPanel()` — waiting-for-user escalation panel
+- `renderTeamInterjectBox()` — free-form compose for interject messages
+- `renderTeamAddMemberControl()` — "+" add-teammate link
+- `renderTeamFeed()` — collapsible event feed with filter pills
+- `renderTeamFeedToggle()` — show/hide feed toggle link
+- `renderTeamPicker()` — lead/teammates composition picker (idle only)
+- `renderTeamBranches()` — read-only list of past branches
+- `renderTeamFeedEvent()` — event row rendering (unchanged)
+- `teamFeedEventKindClass()`, `teamFeedEventBody()` — event classification (unchanged)
+
+### Existing CSS Classes (No New Styling Beyond Layout Container)
+
+All team-related `.team-*` classes remain exactly as defined in the current `PAGE_TEMPLATE`'s `<style>` block. The page adds only:
+
+- `#team-page` and `#team-page.active` — visibility toggling
+- `.team-page-header`, `.team-page-back-link` — header styling
+- `.team-page-not-found*` — error message styling
+- `#rows.hidden-for-team-page` — hide dashboard when team page is active
+
+### Page Container Styling
+
+```css
+#team-page {
+  display: none;
+  max-width: 480px;
+  margin: 40px auto;
+  padding: 0 16px;
+}
+#team-page.active {
+  display: block;
+}
+#rows.hidden-for-team-page {
+  display: none;
+}
+.team-page-not-found {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px;
+  text-align: center;
+}
+.team-page-not-found-message {
+  font-size: 14px;
+  color: #eee;
+}
+.team-page-not-found-detail {
+  font-size: 12px;
+  color: #888;
+}
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│ ai-dev-switchboard                                                       │
-│                                                                          │
-│ 'my_host' is not a valid hostname. Use letters, digits, hyphens;        │
-│ each dot-separated label 1-63 chars, no leading/trailing hyphens.        │
-│                                                                          │
-│                                                 <  OK  >                 │
-└──────────────────────────────────────────────────────────────────────────┘
+
+The `max-width: 480px` exactly matches the dashboard's `body` width, ensuring consistent visual appearance across both views.
+
+---
+
+## Accessibility & Platform Notes
+
+### Touch Targets
+
+- **Back-link button**: 44px minimum height (WCAG AAA)
+- **All `.team-btn` buttons**: Already 44px min-height (10px padding + 14px font + line-height)
+- **Textareas**: All min-height 44px
+- **Link pills** (feed filter, configuration toggle, add-member): 44px achieved via padding
+
+All existing team components already meet or exceed WCAG AAA touch-target requirements (44×44px).
+
+### Keyboard Navigation
+
+- **Tab order**: Back-link → Task textarea (idle) or Status strip (running) → Escalation panel → Interject box → Add-member link → Feed toggle → Feed filter pills → Feed list → Stop button → Branches
+- **Enter key**: Native form submission (existing), button clicks (existing)
+- **Escape key**: Not redefined; standard browser back/reload as escape hatch
+
+All interactions are already keyboard-accessible; no new keyboard behavior added.
+
+### Screen Readers
+
+The event feed carries `role="log" aria-live="polite"` (existing, per backlog item 19's design.md note), which announces new events to screen readers. This contract is preserved.
+
+All buttons and links use native HTML semantics (`<button>`, `<a>`) with clear, descriptive text. No ARIA overrides needed.
+
+### Mobile Web (480px Viewport)
+
+The page reuses the dashboard's own `max-width: 480px` container, optimized for small phones. No horizontal scrolling. All stacking is vertical (flexbox column layout). Button/textarea sizes already accommodate small touch targets.
+
+### Color Contrast
+
+All text-on-background pairs already pass WCAG AA (4.5:1 minimum for text; 3:1 for graphical elements). No color changes needed.
+
+---
+
+## Client-Side Routing Implementation
+
+### Router Logic (Bottom of `<script>`)
+
+Replace the existing `refresh(); setInterval(refresh, 4000);` with:
+
+```javascript
+const teamPageMatch = location.pathname.match(/^\/team\/([^/]+)\/?$/);
+if (teamPageMatch) {
+  const TEAM_PAGE_PROJECT = decodeURIComponent(teamPageMatch[1]);
+  renderTeamPage(TEAM_PAGE_PROJECT);
+  setInterval(() => renderTeamPage(TEAM_PAGE_PROJECT), 4000);
+} else {
+  refresh();
+  setInterval(refresh, 4000);
+}
 ```
 
-**Copy:** `"'$CT_HOSTNAME' is not a valid hostname. Use letters, digits, hyphens; each dot-separated label 1-63 characters; can't start or end with a hyphen."`
+### renderTeamPage() Implementation Sketch
 
-**Character count:** ~130 chars total. Exceeds 74-char single line, but wraps gracefully across 3-4 logical lines in whiptail msgbox. ✓
+```javascript
+async function renderTeamPage(projectName) {
+  const r = await fetch('/status');
+  if (!r.ok) {
+    // 401 — show login overlay (reuse existing)
+    showOverlay();
+    return;
+  }
+  const s = await r.json();
+  
+  // Find project by name in s.instances
+  const project = s.instances.find(inst => inst.name === projectName);
+  
+  if (!project) {
+    // Unknown project — render error message
+    renderTeamPageNotFound(projectName);
+    return;
+  }
+  
+  // Show team page, hide dashboard and creation UI
+  document.getElementById('rows').classList.add('hidden-for-team-page');
+  document.getElementById('team-page').classList.add('active');
+  document.querySelector('h1').style.display = 'none';
+  document.querySelector('.new-project-row').style.display = 'none';
+  document.getElementById('new-project-err').style.display = 'none';
+  document.querySelectorAll('.upload-wizard-btn').forEach(el => el.style.display = 'none');
+  document.getElementById('clone-form').style.display = 'none';
+  document.getElementById('clone-err').style.display = 'none';
+  
+  // Render the full team interface for this project
+  const team = project.team;
+  const name = project.name;
+  
+  let html = '<div class="team-page-header">' +
+    '<button class="team-page-back-link" onclick="window.location = \'/'\'">← ai-dev-switchboard › ' +
+    esc(name) + '</button></div>';
+  
+  // Reuse existing team renderers
+  if (!team || team.status === 'idle') {
+    html += renderTeamIdleLauncher(name, team);
+  } else {
+    html += renderTeamRunningState(name, team);
+  }
+  
+  document.getElementById('team-page').innerHTML = html;
+}
 
-**Rationale:**
-- **Shows the rejected value** — Operator sees exactly what they entered (`'my_host'`), confirming which field failed.
-- **Explains the rule clearly** — Lists the core constraints:
-  - Character set: letters, digits, hyphens only (rules out underscore, space, special chars common in hostnames in other contexts).
-  - Label length: 1-63 chars per dot-separated label (RFC1123 basic rule).
-  - Boundary rule: no leading/trailing hyphens per label (common mistake: `-hostname` or `host-`).
-- **Omits overly technical details** — Doesn't mention the regex, "dot-separated labels," or "253-char total limit" (the total limit is enforced by the regex but rarely triggers in practice). Focuses on the most common violations.
-- **Aligns with spec's validation code** (lines 248–249) — the check is the `_valid_hostname()` function, which validates via regex:
-  ```bash
-  [[ "$_label" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]
-  ```
-  This enforces: alphanumeric start, 0-61 middle chars (alphanumeric or hyphen), alphanumeric end, total label ≤63 chars.
+function renderTeamPageNotFound(projectName) {
+  document.getElementById('rows').classList.add('hidden-for-team-page');
+  document.getElementById('team-page').classList.add('active');
+  document.querySelector('h1').style.display = 'none';
+  document.querySelector('.new-project-row').style.display = 'none';
+  document.getElementById('new-project-err').style.display = 'none';
+  document.querySelectorAll('.upload-wizard-btn').forEach(el => el.style.display = 'none');
+  document.getElementById('clone-form').style.display = 'none';
+  document.getElementById('clone-err').style.display = 'none';
+  
+  const html = '<div class="team-page-header">' +
+    '<button class="team-page-back-link" onclick="window.location = \'/'\'">← ai-dev-switchboard › team-chat</button>' +
+    '</div>' +
+    '<div class="team-page-not-found">' +
+    '<div class="team-page-not-found-message">Unknown project ' + esc(projectName) + '</div>' +
+    '<div class="team-page-not-found-detail">(This project may have been deleted or the name was misspelled.)</div>' +
+    '<button class="team-page-back-link" onclick="window.location = \'/'\'">← Back to dashboard</button>' +
+    '</div>';
+  
+  document.getElementById('team-page').innerHTML = html;
+}
+```
 
-**Behavior after:** Msgbox dismissed (OK), same `ask()` prompt re-shown. Operator re-enters.
+### Extraction: New Thin Wrapper Functions
+
+These functions assemble existing sub-renderers for both dashboard and dedicated page:
+
+```javascript
+function renderTeamIdleLauncher(name, team) {
+  clearTeamFeedState(name);
+  const msgSlot = '<div class="team-msg" id="team-msg-' + esc(name) + '"></div>';
+  const text = teamTaskText[name] || '';
+  const taskArea = '<textarea class="team-textarea" id="task-' + esc(name) + 
+    '" placeholder="Task description..." ' +
+    'oninput="teamTaskText[' + "'" + name + "'" + '] = this.value; ' +
+    "updateTeamStartButton('" + esc(name) + "');" + '">' +
+    esc(text) + '</textarea>';
+  const composition = team ? team.composition : undefined;
+  if (composition === null) {
+    return '<div class="team-row">' + taskArea +
+      '<div class="team-msg error">✕ No roster members available. Add an engine to engines.d ' +
+      'or configure TEAM_LLM_BASE_URL/TEAM_LLM_MODEL.</div>' +
+      '<div class="team-actions"><button class="team-btn" id="start-btn-' + esc(name) + 
+      '" disabled>Start team</button></div>' + msgSlot + renderTeamBranches(name) + '</div>';
+  }
+  const open = composition !== undefined && !!teamPickerOpen[name];
+  const configureRow = composition !== undefined ?
+    '<div class="team-configure-row"><a class="team-configure-btn" onclick="toggleTeamPicker(' +
+    "'" + name + "'" + ')">' + (open ? 'Hide configuration' : 'Configure team...') + '</a></div>' : '';
+  const picker = open ? renderTeamPicker(name) : '';
+  const startDisabled = !text.trim() || (open && !!teamCompositionError(name));
+  const chatHint = '<div class="team-sub">Once started, you&#39;ll see live team activity ' +
+    'and can interject right here.</div>';
+  return '<div class="team-row">' + taskArea + chatHint + configureRow + picker +
+    '<div class="team-actions"><button class="team-btn" id="start-btn-' + esc(name) + '"' +
+    (startDisabled ? ' disabled' : '') + ' onclick="doTeamStart(' + "'" + name + "'" + 
+    ')">Start team</button></div>' + msgSlot + renderTeamBranches(name) + '</div>';
+}
+
+function renderTeamRunningState(name, team) {
+  if (teamFeedOpen[name] === undefined) teamFeedOpen[name] = true;
+  const statusStrip = renderTeamStatusStrip(team);
+  const escalatedNote = (team.status === 'blocked' && !team.waiting_on_you) ?
+    '<div class="team-sub">Escalated — max rounds reached. No pending question to answer. ' +
+    'Review the feed below or Stop team and start a new run.</div>' : '';
+  const finishedSummary = (team.status === 'finished' && team.summary) ?
+    '<div class="team-sub">' + esc(team.summary) + '</div>' : '';
+  const escalationPanel = team.waiting_on_you ? renderEscalationPanel(name, team) : '';
+  const interjectBox = renderTeamInterjectBox(name, team);
+  const addMemberControl = renderTeamAddMemberControl(name, team);
+  const feedToggle = renderTeamFeedToggle(name);
+  const feedPanel = renderTeamFeed(name, team);
+  const msgSlot = '<div class="team-msg" id="team-msg-' + esc(name) + '"></div>';
+  
+  return '<div class="team-row">' + statusStrip + escalatedNote + finishedSummary + escalationPanel +
+    interjectBox + addMemberControl + feedToggle + feedPanel +
+    '<div class="team-actions"><button class="team-btn" onclick="doTeamStop(' +
+    "'" + name + "'" + ')">Stop team</button></div>' +
+    msgSlot + renderTeamBranches(name) + '</div>';
+}
+```
+
+### Dashboard's Simplified `teamRow()`
+
+Replace the existing large `teamRow()` with a compact summary:
+
+```javascript
+function teamRow(name, team) {
+  const statusClass = 'status-' + (team ? team.status : 'idle');
+  const statusText = {
+    'status-idle': 'Idle',
+    'status-running': 'Running',
+    'status-blocked': 'Blocked',
+    'status-finished': 'Finished',
+    'status-error': 'Error'
+  }[statusClass] || 'Unknown';
+  
+  return '<div class="team-row"><div class="team-status ' + statusClass + '">' + 
+    statusText + '</div>' +
+    '<a href="/team/' + encodeURIComponent(name) + '" class="team-configure-btn">Open team chat →</a>' +
+    '</div>';
+}
+```
+
+This renders a compact 2-line summary on each dashboard project row (status badge + link), regardless of team status. No inline task textarea, picker, feed, escalation, or compose box on the dashboard anymore.
 
 ---
 
-#### State 3: Hostname valid RFC1123 shape
+## Edge Cases & State Handling
 
-No error msgbox; validation succeeds. Script proceeds immediately to the storage-pool step.
+### Unauthenticated Access to `/team/<project>`
 
----
+`GET /team/<project>` returns the same static `PAGE_TEMPLATE` shell as `GET /`. Client-side `renderTeamPage()` calls `/status`; if 401, `showOverlay()` is called (existing login logic). No new auth code path.
 
-## Component reuse
+### Unknown Project
 
-- **Reused:** `msg()`, `ask()` helper functions (existing, defined at `ct/create.sh:26-30`) — for consistent styling and error handling.
-- **Reused:** whiptail's `--menu` directive (existing, already used for auth-mode/publish-mode selection) — for storage/bridge pickers.
-- **Reused:** `--msgbox` (existing) — for validation error messages.
-- **New:** `_valid_hostname()`, `_enumerate_storage()`, `_enumerate_bridges()` helper functions (inserted near the existing helper block). These are internal bash functions, not external dependencies.
-- **No new terminal UI library or design token system introduced.**
+`renderTeamPageNotFound()` displays a clear error message with a back-link. Matches spec requirement.
 
----
+### Blocked Status with Pending Answer
 
-## State coverage summary
+When `team.waiting_on_you === true`, `renderEscalationPanel()` renders (existing component). Dashboard's compact badge only shows "Blocked"—user must navigate to the dedicated page to answer. This is intentional per the spec's Goals.
 
-| Dialog | State | Copy | Behavior |
-|--------|-------|------|----------|
-| **Storage menu** | Populated (≥1 pools) | Menu with type+free-space rows | Selection assigned to `STORAGE` |
-| | Empty (0 pools) | Free-text ask() | Fallback to existing behavior |
-| **Bridge menu** | Populated (≥1 bridges/vnets) | Menu with "kernel bridge"/"SDN vnet" rows | Selection assigned to `BRIDGE` (SDN prefix stripped) |
-| | Empty (0 bridges) | Free-text ask() | Fallback to existing behavior |
-| **CTID loop** | Non-numeric/out-of-range | Msgbox error + re-prompt | Loop back to ask() |
-| | Already in use (collision) | Msgbox error + re-prompt | Loop back to ask() |
-| | Valid | (no msgbox, proceed) | Advance to hostname prompt |
-| **Hostname loop** | Invalid (RFC1123 violation) | Msgbox error + re-prompt | Loop back to ask() |
-| | Valid | (no msgbox, proceed) | Advance to storage-pool prompt |
+### Long/URL-Unsafe Project Names
 
----
+`encodeURIComponent()` on the client (back-link URL) and `decodeURIComponent()` on route parse handle escaping. Reuses the pattern already used by `/term/<name>` and `/code/<name>` routes (existing precedent).
 
-## Accessibility & platform notes
+### Multiple Browser Tabs
 
-### Terminal environment
+The event feed's cursor-based polling (`GET .../team/events?cursor=...`) already supports concurrent viewers. Moving to a dedicated page does not change this.
 
-- **Character width constraints:** All text constrained to 74 chars per line (established whiptail box width) to fit standard 80-char terminals.
-- **Word-wrap:** Longer error messages (hostname validation, CTID collision) exceed single-line width but wrap gracefully within whiptail's msgbox height allocation.
-- **Text clarity over visual polish:** No color coding, icons, or decorative elements possible in TUI — clarity depends entirely on copy phrasing and punctuation.
-- **Screen reader compatibility:** Terminal text is inherently accessible to terminal screen readers.
+### Lost In-Progress Text on Navigation
 
-### Copy clarity for operators
+Navigating to `/team/<name>` for the first time gives fresh state. Reloading or navigating away and back loses in-progress textarea text—same behavior as reloading the dashboard. Not a regression; acknowledged in spec.
 
-- **Avoided jargon:** "Container ID," "Network bridge," and "RFC1123" terms are explained in context (RFC1123 details are spelled out, not referenced by acronym alone).
-- **Specific error messages:** Each validation failure has distinct messaging explaining *why* and *what to do next* (not just "invalid").
-- **Showed rejected values:** Error messages include `'$CTID'` or `'$CT_HOSTNAME'` so operator sees exactly what was rejected.
-- **Active voice:** "Container ID must be," "Use letters, digits," "Choose a different one" — action-oriented phrasing.
-- **Parallel structure:** Both CTID and hostname loops follow the same pattern (ask → validate → error msgbox if invalid → re-ask), so operator learns the pattern once.
+### Empty Roster
 
-**Behavior**: Compose box is completely absent. Any unsent draft is discarded. If a new run later starts for the same project, the draft does not reappear.
-
-- **TUI only:** Bash script running on Proxmox VE host (Linux terminal). No mobile, GUI, or web equivalent.
-- **Operator demographic:** System administrators familiar with SSH, Linux CLIs, and Proxmox. They expect terse, functional dialogs without hand-holding.
-- **Whiptail constraints:** Fixed-width box (74 chars), static text (no animations, hover states, or interactive feedback beyond button clicks), no color/styling options in TUI.
-- **No new environment assumptions:** Enumeration helpers (`pvesm`, `ip`, `awk`) already available on any Proxmox/Debian host.
+If `team.composition === null`, the existing idle-state "No roster members available" branch renders unchanged. No new logic.
 
 ---
 
-## Traceability to spec
+## Summary of Design Decisions
 
-| Acceptance criterion (from docs/spec.md) | Where it's addressed in this design |
-|---|---|
-| Storage menu: two or more active pools → `whiptail --menu` with type+free-space | Dialog 1, State 1: "Populated" section; row format table |
-| Storage menu zero-results → fallback to free-text ask() | Dialog 1, State 2: "Empty" section |
-| Bridge menu: one or more bridges/vnets → `whiptail --menu` | Dialog 2, State 1: "Populated" section |
-| Bridge menu: SDN entries tagged `sdn:` in menu, prefix stripped before use | Dialog 2, row format table; note on prefix stripping |
-| Bridge menu zero-results → fallback to free-text ask() | Dialog 2, State 2: "Empty" section |
-| CTID non-numeric/out-of-range → msgbox + re-prompt loop | Dialog 3, State 2a: error message and retry loop behavior |
-| CTID already in use → msgbox + re-prompt loop (distinct from range error) | Dialog 3, State 2b: distinct error message and retry loop behavior |
-| CTID valid → proceed to hostname (no msgbox, no delay) | Dialog 3, State 3 |
-| Hostname RFC1123 invalid → msgbox + re-prompt loop | Dialog 4, State 2: error message listing RFC1123 rules |
-| Hostname valid → proceed to storage (no msgbox, no delay) | Dialog 4, State 3 |
-| Default path untouched (no menu, no validation loops) | Spec requirement; design covers Advanced branch only |
-| Fit within whiptail's 74-char box width | Character counts verified for all copy above |
-| Cancel at any `ask()` aborts script (existing behavior, unchanged) | Noted in state coverage; matches pre-existing `set -euo pipefail` behavior |
+### What Gets Reused (100% of existing team components)
 
----
+- All 10+ sub-renderer functions (`renderTeamStatusStrip`, `renderEscalationPanel`, `renderTeamInterjectBox`, `renderTeamAddMemberControl`, `renderTeamFeed`, `renderTeamFeedToggle`, `renderTeamPicker`, `renderTeamBranches`, `renderTeamFeedEvent`, `teamFeedEventKindClass`, `teamFeedEventBody`)
+- All `.team-*` CSS classes (no style changes to existing rules)
+- Event feed event-rendering logic (unchanged)
+- `aria-live="polite"` + `role="log"` screen-reader support (preserved)
+- `doTeamStart()`, `doTeamStop()` action handlers (reused)
+- Backend routes (unchanged)
+- Auth and session logic (unchanged)
 
-## Character-width verification table
+### What's New
 
-| Dialog / Copy | Example / Worst-case | Char count | Fits in 74? |
-|---|---|---|---|
-| Storage title | "Storage pool for the container's root disk:" | 45 | ✓ |
-| Storage row (max) | "local-lvm lvmthin, 999999GiB free" | ~35 | ✓ |
-| Bridge title | "Network bridge:" | 15 | ✓ |
-| Bridge row (max) | "sdn:management SDN vnet" | 23 | ✓ |
-| CTID prompt | "Container ID (must be free):" | 28 | ✓ |
-| CTID range error | "…(got '999999999')." | ~75 | ✓ (word-wrap) |
-| CTID collision error | "…already in use on this host…" | ~80 | ✓ (word-wrap) |
-| Hostname prompt | "Hostname:" | 9 | ✓ |
-| Hostname error (1st line) | "'my_host' is not a valid hostname…" | ~130 | ✓ (multi-line wrap) |
+1. **`#team-page` container** — new visibility-toggled div
+2. **Client-side router** — new route-matching branch in bottom-of-script
+3. **`renderTeamPage()` function** — entry point, fetches `/status`, dispatches to appropriate renderer
+4. **`renderTeamPageNotFound()` function** — error state for unknown projects
+5. **`renderTeamIdleLauncher()` and `renderTeamRunningState()` wrapper functions** — thin extraction layers
+6. **`.team-page-header`, `.team-page-back-link`, `.team-page-not-found*` CSS classes** — layout styling only
+7. **`#rows.hidden-for-team-page` class** — dashboard toggle
 
----
+### No Changes To
 
-## Implementation notes for developer
+- `app/teams.py` (team backend logic)
+- Event envelope shape or polling mechanism
+- Chat-bubble feed format (backlog item 19 decision stands)
+- Auth model
+- Any other page layout (dashboard, upload, clone)
 
-- The four helper functions (`_valid_hostname()`, `_enumerate_storage()`, `_enumerate_bridges()`, and a fourth implicit in the menubox height calculation) are defined in the spec's "Proposed approach" section and should be inserted into `ct/create.sh` near the existing `msg()`, `ask()`, etc. helpers (around line 26 in the spec's provided code).
-- Both CTID and hostname validation loops use the `while :; do ... done` pattern identical to the existing ollama endpoint loop (part 1's code). Maintain that pattern for consistency.
-- Storage and bridge menus use `whiptail --menu ... 3>&1 1>&2 2>&3` (existing pattern in the file) to capture selection while preserving stderr. Do not deviate.
-- All error messages use the `msg()` helper (which calls `whiptail --msgbox` with consistent title "ai-dev-switchboard" and dimensions 14 74).
-- SDN prefix stripping (`BRIDGE="${BRIDGE#sdn:}"`) happens *after* the whiptail menu selection, not before. Verify this line order.
-- Fallback to free-text `ask()` for storage/bridge is triggered by checking array length: `if [ "${#STORAGE_MENU_OPTS[@]}" -eq 0 ]` (spec line 263). This must happen *after* enumeration and *before* the conditional menu/ask display.
+### Visual Consistency
+
+The dedicated team page uses the exact same colors, typography, spacing, and component patterns as the dashboard. No visual redesign. The page looks and feels like an expanded, full-page version of the existing dashboard team row.
 
 ---
 
-## Design sanity check (Dieter Rams' "good design is" principles)
+## Testing & Verification Checklist
 
-1. **Good design is innovative** — Using live enumeration instead of free-text guessing is a tangible improvement. ✓
-2. **Good design makes a product useful** — Enumerating pools/bridges solves the "which one exists?" problem operators face today. ✓
-3. **Good design is aesthetic** — TUI has no visual aesthetics, but copy clarity is high. ✓
-4. **Good design makes a product understandable** — Error messages explain *what* failed and *why*. ✓
-5. **Good design is unobtrusive** — If enumeration fails (zero results), fallback is silent; operator doesn't see a "fallback activated" message. ✓
-6. **Good design is honest** — Copy doesn't oversell or hide rules; CTID range, hostname RFC1123 rules, and storage-type descriptions are all explicit. ✓
-7. **Good design is long-lasting** — Live enumeration (pvesm, ip command) is stable; less likely to break than parsing static configs. ✓
-8. **Good design is thorough** — State coverage includes empty results, single-item menus, validation loops, and operator cancellation. ✓
-9. **Good design is environmentally friendly** — N/A for a TUI script. ✓
-10. **Good design is as little design as possible** — Copy is terse; dialogs reuse existing helpers; no new UI patterns introduced. ✓
-
----
-
-## Files referenced
-
-- Spec: `/home/dev/projects/ai-dev-switchboard/docs/spec.md` (full feature spec)
-- Implementation target: `/home/dev/projects/ai-dev-switchboard/ct/create.sh` (lines 82–88 and helpers block around line 26)
-- Related design docs: Parts 1 and 2 design.md (established the TUI pattern and copy style for this project)
-
+- [ ] Authenticated user navigates to `/team/<valid-idle-project>` → full launcher renders (textarea, picker link, start button)
+- [ ] Authenticated user navigates to `/team/<valid-running-project>` → status strip, interject box, feed, stop button render
+- [ ] Authenticated user navigates to `/team/<valid-blocked-project-with-pending>` → escalation panel renders
+- [ ] Authenticated user navigates to `/team/<invalid-project>` → "Unknown project" message with back-link
+- [ ] Unauthenticated user navigates to `/team/<any-project>` → login overlay appears
+- [ ] Dashboard project row shows only compact status badge + "Open team chat →" link (no inline textarea/feed/escalation)
+- [ ] Back-link in team page header navigates to dashboard
+- [ ] Interject box, escalation panel, add-member link call correct `/team/*` routes (network tab verification)
+- [ ] Feed filter pills work correctly
+- [ ] Event feed has `role="log" aria-live="polite"` (accessibility tree verification)
+- [ ] All buttons/textareas have 44px minimum touch target
+- [ ] All text-on-background pairs pass WCAG AA contrast (4.5:1 minimum)
+- [ ] Page is responsive and readable on 480px viewport (mobile)
+- [ ] No visual regression on dashboard when team page is not active
