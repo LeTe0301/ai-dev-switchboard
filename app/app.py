@@ -2453,7 +2453,7 @@ def active_sessions(project_name: str) -> list[dict]:
     checked fresh here on every call, not just relied on via the periodic
     _reap_dead_state() sweep. A plain dict preserves insertion order, so
     the returned list is oldest-spawned first / most-recently-spawned last
-    -- relied on by /status's back-compat fields and
+    -- relied on by /status's `sessions` array and
     _latest_session_url_for_project() below to deterministically pick "the
     newest session" for a project."""
     with _sessions_lock:
@@ -2711,11 +2711,12 @@ def _latest_session_url_for_project(name: str) -> str | None:
 def instance_start(name: str, engine_name: str = "claude") -> str | None:
     """Starts an ADDITIONAL session for `name` -- no "already running" guard
     here (docs/spec.md "instance_start -> returns a session_id, no longer
-    guards on already running"): multiplicity is now the point. The route
-    layer re-adds an equivalent guard for the legacy /on endpoint only, to
-    preserve its exact back-compat behavior (see the /on route below).
-    Returns the new session's session_id, or None if the engine name is
-    unknown or the project directory doesn't exist.
+    guards on already running"): multiplicity is now the point, exercised
+    directly by the POST /instance/<name>/spawn route (part 1's legacy
+    /on/off shim -- which used to re-add an "already running" guard of its
+    own -- was removed in part 2, docs/spec.md "Routes" §6). Returns the
+    new session's session_id, or None if the engine name is unknown or the
+    project directory doesn't exist.
     """
     engines = load_engines()
     engine = engines.get(engine_name)
@@ -2756,17 +2757,6 @@ def instance_stop_session(session_id: str) -> None:
     _session_urls.pop(session_id, None)
     _ttyd_stop(session_id)
     subprocess.run(TMUX + ["kill-session", "-t", session_id], capture_output=True)
-
-
-def instance_stop(name: str) -> None:
-    """Legacy bulk-stop, kept only for the back-compat POST /instance/
-    <name>/off route (docs/spec.md "Routes"): stops EVERY live session for
-    `name`, mirroring the pre-spec "kill every engine's session for this
-    project" loop, generalized from "every engine" to "every session". Part
-    2 removes this once the frontend stops calling /off.
-    """
-    for s in active_sessions(name):
-        instance_stop_session(s["session_id"])
 
 
 def _reap_dead_state():
@@ -2968,6 +2958,24 @@ PAGE_TEMPLATE = """<!doctype html>
      "Resource badge: informational tone, not warning"). */
   .badge.gitea-resources { color: #66d9ff; }
   .sub { font-size: 12px; color: #888; margin-top: 4px; word-break: break-all; }
+  /* Per-session list (concurrent sessions per project, part 2 --
+     docs/design.md "New CSS classes"). .sessions-list reuses .team-picker's
+     own nested-container pattern (border + darker background) for subtle
+     visual separation without heavyweight card styling. */
+  .sessions-list { display: flex; flex-direction: column; gap: 8px; margin-top: 8px;
+                    padding: 8px 10px; border: 1px solid #333; border-radius: 8px;
+                    background: #181818; }
+  .session-item { display: flex; align-items: center; gap: 8px; }
+  .session-status { font-size: 12px; color: #888; }
+  .session-status a { color: #4da6ff; }
+  /* .session-stop-btn is its OWN class (not a literal reuse of
+     .deploy-btn/.team-btn), per this file's own established "one class per
+     distinct button role" precedent (see .team-btn's own doc comment
+     below) -- red (#ff6b6b) signals a destructive per-session action,
+     distinct from the green spawn button. */
+  .session-stop-btn { font-size: 14px; padding: 8px 14px; border-radius: 8px; border: none;
+                       background: #ff6b6b; color: #111; font-weight: 600; cursor: pointer;
+                       white-space: nowrap; }
   .taiga-err { color: #ff6b6b; }
   .gitea-err { color: #ff6b6b; }
   .taiga-starting-spinner { display: inline-block; width: 12px; height: 12px;
@@ -3000,7 +3008,11 @@ PAGE_TEMPLATE = """<!doctype html>
      deploy-map entry must never render anything class="deploy-btn" at all
      (tests/test_deploy_frontend.js's own existing, reviewer-approved
      assertion), and every project unconditionally renders a team control. */
-  .deploy-btn, .team-btn { font-size: 14px; padding: 10px 16px; border-radius: 10px; border: none;
+  /* .session-spawn-btn ("+ Start session", concurrent sessions per project
+     part 2 -- docs/design.md "Button styling (reused)") shares this exact
+     shape byte-for-byte too, same "own class, not a literal reuse" pattern
+     .team-btn's own comment above already established. */
+  .deploy-btn, .team-btn, .session-spawn-btn { font-size: 14px; padding: 10px 16px; border-radius: 10px; border: none;
                 background: #34c759; color: #111; font-weight: 600; cursor: pointer;
                 white-space: nowrap; }
   .deploy-msg { font-size: 12px; color: #888; margin: 4px 0 0; min-height: 14px; word-break: break-all; }
@@ -3499,8 +3511,18 @@ async function refresh() {
   for (const inst of s.instances) {
     if (inst.deploy) DEPLOY_TARGETS[inst.name] = inst.deploy;
     TEAM_BY_NAME[inst.name] = inst.team;
-    html += row(inst.name, inst.on, inst.url, 'inst', inst.name, inst.desc, inst.engine,
-               inst.code_on, inst.code_url, undefined, undefined, inst.gitea_sync, inst.deploy, inst.team);
+    // Session identity, part 2 (docs/spec.md "Proposed approach" §5): reads
+    // `inst.sessions` (part 1's real, non-back-compat array) instead of the
+    // now-removed singular `inst.on`/`inst.url`/`inst.engine` fields.
+    // `newestUrl` reuses row()'s existing `url` slot for smokeCheckRow's
+    // own "does this project have a captured URL to check" gate (spec's
+    // Non-goals: smoke-check stays project-level, targeting the newest
+    // session, exactly as part 1's own backend resolver already does).
+    const sessions = inst.sessions || [];
+    const newestUrl = sessions.length ? sessions[sessions.length - 1].url : null;
+    html += row(inst.name, false, newestUrl, 'inst', inst.name, inst.desc, sessions,
+               inst.code_on, inst.code_url, instSessionsSub(sessions), undefined,
+               inst.gitea_sync, inst.deploy, inst.team);
     // Live event feed polling (backlog item 6f part 2, docs/spec.md
     // "Proposed approach" §3) -- folded into this existing 4s cycle, no new
     // setInterval. teamFeedOpen[inst.name] is only ever set once row()'s
@@ -3531,20 +3553,52 @@ function pickEngine(name, engine) {
   engineChoice[name] = engine;
   refresh();
 }
-function engineRow(name, on, engine) {
+// Always the picker now (concurrent sessions, docs/spec.md "Proposed
+// approach" §1) -- multiplicity means "what to spawn next" is relevant
+// regardless of what's already running, so the old `if (on) { Running
+// badge }` branch is gone; there is no longer a single "on" flag for this
+// row to branch on. The "+ Start session" button lives right here too
+// (spec §2, docs/design.md "Placement within the row"), sharing this same
+// empty-roster guard -- a spawn button with nothing to pick from would be
+// broken/empty (docs/spec.md acceptance criteria).
+function engineRow(name) {
   // Only real per-project instances get an engine choice — the host row (if
   // enabled) uses a single fixed engine, no picker needed there.
   const names = Object.keys(ENGINE_LABELS);
   if (names.length === 0) return '';
-  if (on) {
-    return '<div class="engine-label">Running</div>' +
-      '<div class="badge">' + esc(ENGINE_LABELS[engine] || engine) + '</div>';
-  }
   const chosen = engineChoice[name] || names[0];
   return '<div class="engine-label">Start with</div>' +
     '<div class="engine-picker">' + names.map(e =>
     '<span class="pill' + (e === chosen ? ' active' : '') + '" onclick="pickEngine(' +
-    "'" + name + "','" + e + "'" + ')">' + esc(ENGINE_LABELS[e]) + '</span>').join('') + '</div>';
+    "'" + name + "','" + e + "'" + ')">' + esc(ENGINE_LABELS[e]) + '</span>').join('') +
+    '<button class="session-spawn-btn" onclick="toggle(' +
+    "'session-spawn','" + name + "'" + ', true, null)">+ Start session</button></div>';
+}
+// New per-session list (docs/spec.md "Proposed approach" §3, docs/design.md
+// "sessionsRow(name, sessions)") -- one .session-item per entry in this
+// project's /status `sessions` array, each independently stoppable.
+// Omitted entirely (not an empty list with a header) when there are zero
+// sessions, matching docs/design.md State 1/2.
+function sessionsRow(name, sessions) {
+  if (!sessions || sessions.length === 0) return '';
+  return '<div class="sessions-list">' + sessions.map(s =>
+    '<div class="session-item">' +
+    '<span class="badge">' + esc(ENGINE_LABELS[s.engine] || s.engine) + '</span>' +
+    '<span class="session-status">' +
+    (s.url ? '<a href="' + s.url + '" target="_blank" rel="noopener">open</a>' : 'starting…') +
+    '</span>' +
+    '<button class="session-stop-btn" onclick="stopSession(' +
+    "'" + name + "','" + s.session_id + "'" + ')">Stop</button></div>').join('') + '</div>';
+}
+// The row's own "sub" text for a multi-session project (docs/design.md
+// "Sub text for multi-session rows") -- computed once per refresh(), same
+// "subOverride" plumbing singletonToggleSub() already supplies for Taiga/
+// Gitea (row()'s own generic on/url ternary would no longer make sense
+// here now that there's no single on/url pair for an 'inst' row).
+function instSessionsSub(sessions) {
+  if (!sessions || sessions.length === 0) return 'stopped';
+  const newest = sessions[sessions.length - 1];
+  return newest.url ? 'running — newest: <a href="' + newest.url + '" target="_blank">open</a>' : 'running';
 }
 function codeRow(name, codeOn, codeUrl) {
   // VS Code (code-server) is independent of the engine switch — spawnable
@@ -3586,8 +3640,10 @@ function deployRow(name, deploy) {
 // typing.
 let smokeCheckExpect = {};
 // HTTP-level smoke check (backlog item 18, docs/spec.md). Rendered only
-// when this project currently has a captured hosted URL (inst.url
-// non-null) -- mirrors deployRow()'s own "return '' if not present" shape
+// when this project currently has a captured hosted URL (the `url`
+// param -- refresh()'s newest-session resolver, part 2's replacement for
+// the removed `inst.url` back-compat field -- non-null) -- mirrors
+// deployRow()'s own "return '' if not present" shape
 // -- since a direct POST with no captured URL is still handled cleanly
 // server-side, but there is nothing useful to click otherwise. Reused-
 // message slot (.smoke-check-msg) is always rendered empty here;
@@ -4615,11 +4671,12 @@ function teamRow(name, team) {
     "'" + name + "'" + ')">Stop team</button></div>' +
     msgSlot + renderTeamBranches(name) + '</div>';
 }
-function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverride, showBadge, gitSync, deploy, team, toggleDisabled) {
+function row(label, on, url, kind, name, desc, sessions, codeOn, codeUrl, subOverride, showBadge, gitSync, deploy, team, toggleDisabled) {
   // subOverride lets a singleton-toggle row (Taiga/Gitea — see refresh())
-  // supply its own starting/running/stopped/error text instead of this
-  // generic on/off computation — every other kind (inst/host/code) omits it
-  // and keeps the plain behavior unchanged. showBadge + SINGLETON_TOGGLE_CONFIG
+  // or a multi-session 'inst' row (docs/design.md "Sub text for
+  // multi-session rows") supply its own starting/running/stopped/error
+  // text instead of this generic on/off computation — 'host'/'code' omit
+  // it and keep the plain behavior unchanged. showBadge + SINGLETON_TOGGLE_CONFIG
   // (keyed by kind) supply that row's own resource-cost badge text/class.
   // toggleDisabled likewise only ever comes from a singleton-toggle row's own
   // singletonToggleSub() result (see its "disabled" doc comment) — every
@@ -4630,19 +4687,42 @@ function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverr
   const cfg = SINGLETON_TOGGLE_CONFIG[kind];
   const arg = name ? "'" + kind + "','" + name + "'" : "'" + kind + "',null";
   return '<div class="row"><div><div class="label">' + esc(label) + '</div>' +
-    (kind === 'inst' ? engineRow(name, on, engine) : '') +
+    (kind === 'inst' ? engineRow(name) : '') +
     (showBadge && cfg ? '<div class="badge ' + cfg.badgeClass + '">' + cfg.badgeText + '</div>' : '') +
     (desc ? '<div class="desc">' + esc(desc) + '</div>' : '') +
     '<div class="sub">' + sub + '</div>' +
+    (kind === 'inst' ? sessionsRow(name, sessions) : '') +
     (kind === 'inst' ? codeRow(name, codeOn, codeUrl) : '') +
     (kind === 'inst' ? smokeCheckRow(name, url) : '') +
     (kind === 'inst' ? deployRow(name, deploy) : '') +
     (kind === 'inst' ? teamRow(name, team) : '') +
     '</div>' +
-    '<label class="switch"><input type="checkbox" ' + (on ? 'checked' : '') + (toggleDisabled ? ' disabled' : '') +
-    ' onchange="toggle(' + arg + ', this.checked, this)"><span class="slider"></span></label></div>';
+    // Concurrent sessions per project, part 2 (docs/spec.md "Proposed
+    // approach" §4): a single on/off checkbox no longer represents an
+    // 'inst' row's state (multiplicity) -- the engine picker + "+ Start
+    // session" button + per-session Stop controls above cover its role
+    // entirely. Host/Taiga/Gitea rows are unaffected, unchanged.
+    (kind !== 'inst' ? '<label class="switch"><input type="checkbox" ' + (on ? 'checked' : '') +
+    (toggleDisabled ? ' disabled' : '') +
+    ' onchange="toggle(' + arg + ', this.checked, this)"><span class="slider"></span></label>' : '') +
+    '</div>';
 }
 let pendingToggle = null;  // {kind, name, on, checkboxEl} — only set while the code overlay is up
+// Per-session Stop side-channel (docs/spec.md "Proposed approach" §3,
+// docs/design.md "Side-channel state pattern") -- name -> session_id, set
+// BEFORE toggle()'s first (optimistic, no-code) POST fires and read back by
+// actionPath()'s 'session-stop' case, following team-add-member's own exact
+// precedent (see doTeamAddMember()'s doc comment): toggle()'s own
+// name/on/checkboxEl parameters have no slot for a second value (which
+// session to stop), so it survives a 428-then-retry round trip here instead.
+let pendingSessionStop = {};
+// stopSession() is sessionsRow()'s own onclick target -- sets
+// pendingSessionStop[name] BEFORE toggle() fires, same discipline
+// doTeamAddMember() already establishes for teamAddMemberChoice.
+function stopSession(name, sessionId) {
+  pendingSessionStop[name] = sessionId;
+  toggle('session-stop', name, true, null);
+}
 
 function actionPath(kind, name, on) {
   if (kind === 'host') return '/host/' + (on ? 'on' : 'off');
@@ -4658,12 +4738,25 @@ function actionPath(kind, name, on) {
   if (kind === 'team-interject') return '/projects/' + encodeURIComponent(name) + '/team/interject';
   if (kind === 'team-add-member') return '/projects/' + encodeURIComponent(name) + '/team/add-member';
   if (kind === 'smoke-check') return '/projects/' + encodeURIComponent(name) + '/smoke-check';
-  return '/instance/' + encodeURIComponent(name) + '/' + (on ? 'on' : 'off');
+  // Concurrent sessions per project, part 2 (docs/spec.md "Proposed
+  // approach" §2/§3, docs/design.md "Implementation notes"): the legacy
+  // /instance/<name>/on|off shim this fallback used to build for kind ===
+  // 'inst' is gone -- nothing dispatches that kind anymore (the checkbox
+  // for 'inst' rows no longer exists), so 'session-spawn'/'session-stop'
+  // are the only per-project instance actions left.
+  if (kind === 'session-spawn') return '/instance/' + encodeURIComponent(name) + '/spawn';
+  if (kind === 'session-stop') return '/instance/' + encodeURIComponent(name) + '/session/' +
+    encodeURIComponent(pendingSessionStop[name]) + '/stop';
 }
 function actionBody(kind, name, on, code) {
   const body = {};
   if (code) body.code = code;
-  if (on && kind === 'inst') body.engine = engineChoice[name] || Object.keys(ENGINE_LABELS)[0];
+  // "+ Start session" (docs/spec.md "Proposed approach" §2) -- same
+  // {engine: ...} shape the removed 'inst' branch used to build, re-keyed
+  // to the new 'session-spawn' kind. 'session-stop' needs no body fields
+  // beyond the optional TOTP code above -- which session to stop is
+  // encoded in actionPath()'s own URL via pendingSessionStop[name].
+  if (kind === 'session-spawn') body.engine = engineChoice[name] || Object.keys(ENGINE_LABELS)[0];
   if (kind === 'newproject') body.name = name;
   // Clone-from-URL (backlog item 16, docs/spec.md/docs/design.md) -- reads
   // straight from the still-live inputs, same "survives a TOTP retry"
@@ -4769,6 +4862,12 @@ async function handleActionResult(r, ctx) {
       kind === 'team-add-member' ? 'Adding teammate: ' + (name || 'this') :
       kind === 'smoke-check' ? 'Smoke checking: ' + (name || 'this') :
       kind === 'clone' ? 'Cloning from URL' :
+      // Both new per-session actions dispatch with on=true (docs/spec.md
+      // "Proposed approach" §2/§3) -- without their own label case here,
+      // Stop would misleadingly fall through to the generic "Turning on:"
+      // text below.
+      kind === 'session-spawn' ? 'Starting a session: ' + (name || 'this') :
+      kind === 'session-stop' ? 'Stopping session: ' + (name || 'this') :
       (on ? 'Turning on: ' : 'Turning off: ') + (name || 'this');
     document.getElementById('action-code').value = '';
     document.getElementById('err-code').textContent = '';
@@ -4977,6 +5076,12 @@ async function handleActionResult(r, ctx) {
     return;
   }
   if (kind === 'newproject') document.getElementById('new-project-name').value = '';
+  // Session Stop's own side-channel state (docs/design.md "Implementation
+  // notes" -- "delete pendingSessionStop[name]") -- cleared once the
+  // dispatch has actually resolved (this generic fallback path), same
+  // "delete after handleActionResult() completes" discipline
+  // teamAddMemberChoice's own cleanup already follows above.
+  if (kind === 'session-stop') delete pendingSessionStop[name];
   hideCodeOverlay();
   setTimeout(refresh, 1500);
 }
@@ -6087,33 +6192,28 @@ class Handler(BaseHTTPRequestHandler):
             deploy_map = _load_deploy_map()
             instances = []
             for n in instance_names():
-                # Session identity, part 1 (docs/spec.md "/status JSON --
-                # additive"): `sessions` is the real, new data shape --
-                # one entry per live session for this project, in
-                # insertion (oldest-first) order. `on`/`engine`/`url`
-                # stay too, unchanged in meaning, as a temporary
-                # back-compat shim for today's still-unmodified checkbox
-                # frontend -- derived from the most-recently-started
-                # session (last entry), or all-None/False when there are
-                # none. Part 2 removes these three fields once nothing
-                # reads them.
+                # Session identity (docs/spec.md "/status JSON -- additive"):
+                # `sessions` is the real data shape -- one entry per live
+                # session for this project, in insertion (oldest-first)
+                # order. Part 1's temporary back-compat `on`/`engine`/`url`
+                # singular fields (derived from the newest session, for the
+                # since-removed checkbox frontend) are gone as of part 2
+                # (docs/spec.md "Routes" §6) -- the frontend now reads
+                # `sessions` directly.
                 proj_sessions = active_sessions(n)
                 sessions_field = [
                     {"session_id": s["session_id"], "engine": s["engine"],
                      "url": _resolve_session_url(s["session_id"], s["engine"])}
                     for s in proj_sessions]
-                latest = sessions_field[-1] if sessions_field else None
-                inst = {"name": n, "on": latest is not None,
-                       "engine": latest["engine"] if latest else None,
-                       "url": latest["url"] if latest else None,
+                inst = {"name": n,
                        "sessions": sessions_field,
                        "desc": get_description(n, os.path.join(PROJECTS_DIR, n)),
                        "code_on": code_running(n), "code_url": _code_urls.get(n)}
                 # Team session lifecycle, part 2a (backlog item 6d,
                 # docs/spec.md §5) -- always present (unlike deploy/
                 # gitea_sync, which are only attached when configured), same
-                # "always-present" treatment on/engine already get. A fresh
-                # read on every poll -- deliberately unthrottled, unlike
+                # "always-present" treatment `sessions` above already gets.
+                # A fresh read on every poll -- deliberately unthrottled, unlike
                 # sweep_dead_teams() below (see _team_reap_if_due()) --
                 # since a team started seconds ago must not still show
                 # "idle".
@@ -6561,26 +6661,6 @@ class Handler(BaseHTTPRequestHandler):
             status, payload = confirm_upload(
                 body.get("token", ""), body.get("mode", ""), body.get("selected") or [])
             self._json(payload, status)
-        elif parts[0] == "instance" and len(parts) == 3 and parts[2] in ("on", "off"):
-            # Legacy back-compat shim (docs/spec.md "Routes" §6 -- removed
-            # in part 2 once the frontend stops calling these): /on is a
-            # no-op if the project already has ANY live session (today's
-            # exact "already running" guard, generalized from "exactly one"
-            # to "any"); /off stops ALL of them (today's "kill every
-            # engine's session" loop, generalized from "every engine" to
-            # "every session").
-            name = parts[1]
-            if name not in instance_names():
-                return self._json({"error": "unknown instance"}, 404)
-            if parts[2] == "on":
-                if not active_sessions(name):
-                    engines = load_engines()
-                    default_engine = next(iter(engines), "claude")
-                    engine = body.get("engine") if body.get("engine") in engines else default_engine
-                    instance_start(name, engine)
-            else:
-                instance_stop(name)
-            self._json({"ok": True})
         elif parts[0] == "instance" and len(parts) == 3 and parts[2] == "spawn":
             # New session-identity route (docs/spec.md "Routes" §6): starts
             # an ADDITIONAL session regardless of whether others are

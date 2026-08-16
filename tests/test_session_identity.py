@@ -1,13 +1,16 @@
 """
 Tests for the concurrent-sessions-per-project session-identity backend
-(part 1, docs/spec.md): `_new_session_id()`'s shape/uniqueness, the
+(parts 1 and 2, docs/spec.md): `_new_session_id()`'s shape/uniqueness, the
 `_sessions` registry (`_sessions_add`/`_sessions_pop`/`active_sessions()`),
-`instance_start()`/`instance_stop_session()`/`instance_stop()`/
-`_reap_dead_state()`'s per-session semantics, `/status`'s new `sessions`
-array plus its back-compat `on`/`engine`/`url` fields, the new
+`instance_start()`/`instance_stop_session()`/`_reap_dead_state()`'s
+per-session semantics, `/status`'s `sessions` array, the
 `POST /instance/<name>/spawn` + `POST /instance/<name>/session/<id>/stop`
-routes, the legacy `/on`/`/off` back-compat shim's generalized semantics,
-and `smoke_check_run()`'s deterministic newest-session URL resolution.
+routes, and `smoke_check_run()`'s deterministic newest-session URL
+resolution. Part 1's temporary `instance_stop()` legacy bulk-stop helper
+and the `/on`/`/off` back-compat shim it backed (along with `/status`'s
+back-compat `on`/`engine`/`url` singular fields) were removed in part 2
+(docs/spec.md "Routes" §6) once the frontend stopped calling them -- this
+file no longer exercises any of that removed surface.
 
 Three tiers, same split as tests/test_teams_headless.py:
 
@@ -23,7 +26,7 @@ see `_patch_ttyd_popen()`) since sudo/ttyd aren't available/safe to invoke
 for real in a test sandbox, while `_ttyd_port()`'s own real (pure) port
 allocation and `_publish()`/`_unpublish()`'s real (PUBLISH_MODE=none, so
 no-op) behavior are left untouched: instance_start()/instance_stop_session()
-/instance_stop()/_reap_dead_state()'s actual tmux-session lifecycle.
+/_reap_dead_state()'s actual tmux-session lifecycle.
 
 Tier 3 -- end-to-end HTTP tests against a real ThreadingHTTPServer instance,
 same technique as tests/test_smoke_check.py's SmokeCheckEndpointTests /
@@ -206,7 +209,7 @@ class SessionsRegistryUnitTests(unittest.TestCase):
 # ─── Tier 2: real tmux, ttyd's Popen faked ─────────────────────────────────
 
 class InstanceLifecycleRealTmuxTests(unittest.TestCase):
-    """Exercises instance_start()/instance_stop_session()/instance_stop()/
+    """Exercises instance_start()/instance_stop_session()/
     _reap_dead_state() against real tmux sessions -- same real-tmux
     technique as tests/test_teams_headless.py's RealTmuxHeadlessTests."""
 
@@ -304,17 +307,6 @@ class InstanceLifecycleRealTmuxTests(unittest.TestCase):
         self.assertIn(sid2, appmod._ttyd_urls)
         live = {s["session_id"] for s in appmod.active_sessions(self.project)}
         self.assertEqual(live, {sid2})
-
-    def test_legacy_instance_stop_stops_every_session_for_the_project(self):
-        sid1 = self._start("claude")
-        sid2 = self._start("codex")
-        appmod.instance_stop(self.project)
-        self.assertFalse(appmod.tmux_has(sid1))
-        self.assertFalse(appmod.tmux_has(sid2))
-        self.assertEqual(appmod.active_sessions(self.project), [])
-
-    def test_legacy_instance_stop_on_a_project_with_zero_sessions_is_a_no_op(self):
-        appmod.instance_stop(self.project)  # must not raise
 
     def test_instance_start_unknown_engine_returns_none(self):
         self.assertIsNone(appmod.instance_start(self.project, "no-such-engine"))
@@ -521,64 +513,43 @@ class SessionIdentityEndpointTests(unittest.TestCase):
         # never had ownership of it, so it must never touch it.
         self.assertTrue(appmod.tmux_has(team_session))
 
-    def test_legacy_on_route_is_a_noop_when_a_session_is_already_running(self):
+    def test_legacy_on_route_no_longer_exists(self):
+        """Regression for part 2 (docs/spec.md "Routes" §6 / acceptance
+        criteria): the /on back-compat shim route is gone entirely -- an
+        unmatched POST falls through do_POST()'s own final `else` branch, a
+        bare 404 with no JSON body (self.send_response(404);
+        self.end_headers()), same as any other unrecognized route."""
         cookie, code = self._authed()
-        sid = self._spawn(cookie, code, "claude")
-        status, payload = self._post(f"/instance/{self.project}/on", cookie,
-                                     {"code": code, "engine": "codex"})
-        self.assertEqual(status, 200)
-        self.assertTrue(payload["ok"])
-        # No second session was spawned -- still exactly the one from
-        # _spawn() above.
-        ids = {s["session_id"] for s in appmod.active_sessions(self.project)}
-        self.assertEqual(ids, {sid})
+        status, _ = self._post(f"/instance/{self.project}/on", cookie,
+                               {"code": code, "engine": "claude"})
+        self.assertEqual(status, 404)
 
-    def test_legacy_on_route_starts_a_session_when_none_are_running(self):
+    def test_legacy_off_route_no_longer_exists(self):
         cookie, code = self._authed()
-        status, payload = self._post(f"/instance/{self.project}/on", cookie,
-                                     {"code": code, "engine": "claude"})
-        self.assertEqual(status, 200)
-        self.assertTrue(payload["ok"])
-        sessions = appmod.active_sessions(self.project)
-        self.assertEqual(len(sessions), 1)
-        self._spawned.append(sessions[0]["session_id"])
+        status, _ = self._post(f"/instance/{self.project}/off", cookie, {"code": code})
+        self.assertEqual(status, 404)
 
-    def test_legacy_off_route_stops_every_session_for_the_project(self):
+    def test_status_no_longer_includes_the_removed_back_compat_fields(self):
+        """Regression for part 2 (docs/spec.md acceptance criteria):
+        `/status`'s per-project JSON no longer includes `on`/`engine`/`url`
+        -- only `sessions` (plus desc/code_on/code_url/deploy/gitea_sync/
+        team, unaffected)."""
         cookie, code = self._authed()
         self._spawn(cookie, code, "claude")
         self._spawn(cookie, code, "codex")
-        status, payload = self._post(f"/instance/{self.project}/off", cookie, {"code": code})
-        self.assertEqual(status, 200)
-        self.assertTrue(payload["ok"])
-        self.assertEqual(appmod.active_sessions(self.project), [])
-
-    def test_legacy_off_route_on_zero_sessions_is_a_no_op(self):
-        cookie, code = self._authed()
-        status, payload = self._post(f"/instance/{self.project}/off", cookie, {"code": code})
-        self.assertEqual(status, 200)
-        self.assertTrue(payload["ok"])
-
-    def test_status_back_compat_fields_reflect_the_most_recently_started_session(self):
-        cookie, code = self._authed()
-        self._spawn(cookie, code, "claude")
-        sid2 = self._spawn(cookie, code, "codex")
         s = self._get_status(cookie)
         by_name = {i["name"]: i for i in s["instances"]}
         inst = by_name[self.project]
-        self.assertTrue(inst["on"])
-        self.assertEqual(inst["engine"], "codex")
-        # sid2 is the newest -- its ttyd URL (both engines lack url_regex
-        # here) must be the one surfaced in the back-compat `url` field.
-        self.assertEqual(inst["url"], appmod._ttyd_urls.get(sid2))
+        self.assertNotIn("on", inst)
+        self.assertNotIn("engine", inst)
+        self.assertNotIn("url", inst)
+        self.assertEqual(len(inst["sessions"]), 2)
 
     def test_status_reports_zero_sessions_cleanly(self):
         cookie, code = self._authed()
         s = self._get_status(cookie)
         by_name = {i["name"]: i for i in s["instances"]}
         inst = by_name[self.project]
-        self.assertFalse(inst["on"])
-        self.assertIsNone(inst["engine"])
-        self.assertIsNone(inst["url"])
         self.assertEqual(inst["sessions"], [])
 
     def test_latest_session_url_for_project_picks_the_newest_session(self):
