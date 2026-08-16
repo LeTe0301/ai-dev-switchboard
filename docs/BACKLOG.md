@@ -2897,6 +2897,36 @@ indefinitely. Not yet confirmed as of this writing.
    down this session or the old container's decommissioning unless the
    user explicitly raises it.
 
+### Repo migration progress (2026-08-16): 3/5 landed clean, 2 needed a second round
+
+`ai-dev-switchboard`, `birdiely`, `receipt-digitalizer-and-sorter` all
+confirmed as real, fully-registered projects on CT110 (created via
+`/projects/new`'s Gitea-backed flow, not orphan Gitea imports), full
+history intact — peer force-pushed each bundle-derived clone's real
+branches over Gitea's auto-init placeholder, then cleaned up two
+resulting artifacts per repo (a stray `HEAD` branch from the push
+refspec glob, and — for the two `master`-based repos — `default_branch`
+still pointed at the now-empty `main`, both fixed via the Gitea API), then
+re-synced each `PROJECTS_DIR` local clone to match. Also caught that
+Gitea's branch-list API paginates at 30 items by default — an
+unpaginated call on `ai-dev-switchboard` (34 branches) looked
+misleadingly short.
+
+`streakline`/`remote-dev-container` could not use clone-from-URL as
+originally briefed — both 404 on GitHub, confirmed independently via the
+unauthenticated API and a direct anonymous `git clone` bypassing the app
+entirely. Verified locally in this sandbox: both are in sync with
+`origin/main` with no divergence, meaning they've been pushed
+successfully before — so this is "private, not actually public" (GitHub
+returns 404, not 403, for private repos to unauthenticated requests, by
+design, indistinguishable from nonexistent), not "never pushed." Applied
+the same fix as the first 3: bundled both with full history, served over
+a second temporary HTTP listener — **required asking the user again**,
+since the classifier's permission gate doesn't carry over from one
+AskUserQuestion approval to the next actual tool invocation, confirmed
+this explicitly rather than assuming the earlier approval covered it.
+Briefed to the peer, not yet confirmed as of this writing.
+
 ---
 
 ## Items 39-43: found by E2E round 6 real test on fresh CT110 (2026-08-16)
