@@ -161,7 +161,7 @@ functional or test impact.
 - Add `rel="noopener"` to `instSessionsSub()`'s link for consistency with `sessionsRow()` (Finding 3) — while at it, the pre-existing `sub`/singleton-row link sites could pick it up too, but that's outside this cycle's scope.
 - Recompute/correct `docs/design.md`'s contrast figures if that file is revisited for any other reason (Finding 2) — not worth a dedicated cycle on its own.
 
-## Overall verdict
+## Overall verdict (original cycle)
 **Approve.** All 8 acceptance criteria implemented and independently
 verified this session (not inferred from the developer's report); the
 entire frontend suite (183 tests across 7 files, including the new
@@ -174,3 +174,126 @@ a real revert-and-watch-it-fail check, not just re-read. Both developer-
 flagged deviations checked out as disclosed and correctly scoped, not
 covers for missed cases. Findings above are all nits with zero blocking
 impact — safe to hand back to product-manager for the next iteration.
+
+---
+
+## Fix-up round: `pendingSessionStop` overwrite on concurrent Stop clicks (hotfix/ad-9, PR #3)
+
+Scope: this round verifies **only** the fix described in
+`docs/implementation.md`'s "Fix-up round: `pendingSessionStop` overwrite on
+concurrent Stop clicks" section (found by an independent `/code-review` pass
+after this cycle's original approval above) and its blast radius — not a
+from-scratch re-review of the whole feature, which stands as approved above.
+Also carries forward that this branch already has part 1's own separate
+fix-up round (PR #2/Taiga #8: session-registration race, self-healing sweep,
+lock-guard reap, engines-load dedup, test isolation) merged in and previously
+verified; nothing in that round is re-litigated here.
+
+### Bug recap and root cause
+Two Stop clicks on **different sessions of the same project**, both awaiting
+the shared TOTP/428 code overlay, used to silently drop the earlier one:
+`pendingSessionStop[name]` was a single value, so the second click's
+session_id clobbered the first's before `submitActionCode()`'s single
+`performAction()` retry ever fired, and `actionPath()` re-read that
+now-clobbered value at fetch time — see `docs/implementation.md` for the
+full trace. Fix: `pendingSessionStop[name]` is now a per-project queue; the
+session_id each dispatch targets is threaded explicitly through
+`toggle()`/`performAction()`/`actionPath()` instead of re-read from the
+dict; a new `submitSessionStopRetries()` sequentially retries every queued
+id against one typed code; `handleActionResult()`'s fallback cleanup and
+`cancelActionCode()` were both updated to operate on the queue rather than a
+scalar.
+
+### Test cases (this round)
+
+| # | Case | Method | Result | Evidence |
+|---|---|---|---|---|
+| 1 | Two Stop clicks (different sessions, same project) both pending on one 428/TOTP overlay → one code submission retries **both**, sequentially, neither dropped | Automated, actually run + traced | pass | `test_multi_session_frontend.js` "two concurrent Stop clicks..." — ran, PASS. Traced the retry logic by hand: `submitActionCode()` now special-cases `kind === 'session-stop'` and calls `submitSessionStopRetries(name, on, code)`, which walks `(pendingSessionStop[name] \|\| []).slice()` and calls `performAction('session-stop', name, on, code, sessionId)` once per queued id, in a `for...of` (sequential, `await`ed each iteration) — confirmed this is genuinely sequential, not `Promise.all`, by the test's own assertion that exactly 1 fetch is in flight at a time |
+| 2 | Wrong code submitted after queuing two stops → both remain queued, neither silently marked done, UI shows "Wrong code — try again." | Automated, actually run | pass | `test_multi_session_frontend.js` "a wrong TOTP code during a two-session-stop retry batch..." — ran, PASS. Confirmed via reading `submitSessionStopRetries()`: on `r.status === 403` it sets `err-code` text and `return`s immediately, before the `filter()` that would remove an id from the queue — so both ids are untouched; a later correct-code submission re-walks the full original queue |
+| 3 | `cancelActionCode()` clears the whole per-project queue, not just the session attached to `pendingToggle` | Automated, actually run (test written this round) + revert-and-watch-it-fail | pass | New test added this round: "cancelling the code overlay while TWO stops are queued for the same project abandons the WHOLE queue..." (`tests/test_multi_session_frontend.js`) — queues stops for sessions A and B, asserts `pendingSessionStop.proj` is `['claude-proj-A','codex-proj-B']` (read directly off the vm sandbox), calls `cancelActionCode()`, asserts the whole entry is `undefined`, then confirms a fresh Stop on A dispatches a brand-new un-queued request. Ran clean (16/16). **Revert check**: temporarily removed the 3-line `if (pendingToggle && pendingToggle.kind === 'session-stop') { delete pendingSessionStop[pendingToggle.name]; }` block from `cancelActionCode()` in `app/app.py`, re-ran — this new test failed exactly as expected (`cancelling must abandon the WHOLE per-project queue...`), all 15 others still passed; restored the fix, re-ran clean (16/16) — confirms the test is non-tautological and this specific fix line is load-bearing |
+| 4 | `sessionId` threading through `toggle()`/`performAction()`/`actionPath()` is a no-op for every kind besides `session-stop` | Manual code read (grep + trace), cross-checked against existing passing suites | pass | `grep -n "sessionId" app/app.py`: `actionPath()` only reads `sessionId` inside its `kind === 'session-stop'` branch; `actionBody()` never references it at all; every other `toggle(...)` call site in the file (`code`, `deploy`, `smoke-check`, `team-start`, `team-stop`, `newproject`, `clone`, `team-resolve`, `team-board-resolve`, `team-interject`, `team-add-member`, plus the generic `onchange="toggle(...)"` for host/taiga/gitea/code checkboxes) still calls `toggle()` with exactly its pre-fix-up 4 args, so `sessionId` is `undefined` for all of them — `ctx.sessionId` ends up `undefined` in `handleActionResult()` for those kinds too, which is harmless since the only place that reads `ctx.sessionId` (the session-stop-only cleanup branch) is gated on `kind === 'session-stop'`. Cross-checked against actual runs: `test_singleton_toggle_frontend.js` 19/19, `test_team_frontend.js` 115/115, `test_clone_frontend.js` 8/8, `test_deploy_frontend.js` 9/9, `test_smoke_check_frontend.js` 11/11, `test_upload_frontend.js` 8/8 — all pass unmodified this round, confirming no other kind's dispatch behavior changed |
+| 5 | Deviation: queue-and-retry-all vs. reject-second-click — does a queued stop for a session already independently stopped by retry time cause a confusing error? | Manual code read (backend route) + existing backend test | pass | `POST /instance/<name>/session/<id>/stop` (`app/app.py` route handler): `if any(s["session_id"] == parts[3] for s in active_sessions(name)): instance_stop_session(parts[3])` then unconditionally `self._json({"ok": True})` — an already-gone id is a silent no-op, never a 404/500, by explicit design (route's own comment: "Idempotent -- an already-gone session_id... is a normal race, never a 404/500"). Confirmed this is actually tested server-side, not just commented: `tests/test_session_identity.py::test_session_stop_route_on_already_gone_id_returns_ok_true_not_404` (part of the 37/37 that ran clean this round). So a queued retry for a session someone else already stopped resolves as an ordinary success, no error surfaced to the operator — the developer's "server is source of truth, poll and reconcile" reasoning holds |
+
+### Regression check (this round, all actually executed)
+```
+python3 -m py_compile app/app.py                → clean
+node tests/test_multi_session_frontend.js        → 16/16 (15 developer + 1 added this round)
+node tests/test_clone_frontend.js                → 8/8
+node tests/test_deploy_frontend.js               → 9/9
+node tests/test_singleton_toggle_frontend.js     → 19/19
+node tests/test_smoke_check_frontend.js          → 11/11
+node tests/test_team_frontend.js                 → 115/115
+node tests/test_upload_frontend.js               → 8/8
+python3 tests/test_session_identity.py           → Ran 37 tests ... OK
+python3 -m unittest discover -s tests            → Ran 1314 tests ... FAILED (failures=35, errors=79, skipped=42)
+```
+All counts match `docs/implementation.md`'s claims exactly. The full-suite
+failure/error tally was independently re-extracted and tallied per file
+(`test_team_routes` ×47, `test_teams_lifecycle` ×34,
+`test_new_project_from_url` ×12, `test_new_project_from_gitea` ×6,
+`test_gitea_sync_project` ×5, `test_new_project_from_upload` ×4,
+`test_teams_grounding` ×3, `test_teams_lead` ×2, `test_taiga_push` ×1 — sums
+to 114 = 35+79) — the exact same 9 pre-existing/environmental files as the
+original cycle's own baseline, confirming no new regression file.
+
+**Revert-and-watch-it-fail, developer's own two new tests**: `git stash
+push -m ... -- app/app.py` (isolating just the fix, keeping the updated test
+file), re-ran `test_multi_session_frontend.js` → both of the developer's
+new regression tests failed exactly as the bug report describes ("session
+A's retry must not be dropped" / wrong session (B) retried first), all 13
+pre-existing tests in the file still passed; `git stash pop` restored the
+fix, re-ran → clean 15/15 (16/16 once this round's own added test is
+included). Confirms both tests are non-tautological and genuinely exercise
+this fix, not just its presence.
+
+### Deviation review (queue-and-retry-all vs. reject-second-click)
+Confirmed sound — see test case 5 above. The chosen "queue and retry all
+with one code" shape resolves both sessions from a single operator action
+with no extra click, is consistent with the codebase's established
+"server is source of truth, poll and reconcile" pattern (matches, e.g., how
+`refresh()` always re-derives row state from `/status` rather than trusting
+client-side optimism), and the one edge case that shape could plausibly get
+wrong — retrying a stop for a session someone/something else already tore
+down in the interim — is handled gracefully by the pre-existing idempotent
+stop route, not newly introduced or newly risky. The "reject a second Stop
+click" alternative would have required new UI (a disabled-state signal on
+the other sessions' Stop buttons) for strictly worse operator experience
+(an extra click-and-retry cycle) with no correctness advantage. No
+objection to the developer's choice.
+
+### Spec/scope check
+This fix-up touches only `session-stop`'s own code paths
+(`pendingSessionStop`, `stopSession()`, `actionPath()`'s session-stop
+branch, `performAction()`'s new optional `sessionId` param, `toggle()`'s new
+optional `sessionId` param, `handleActionResult()`'s fallback cleanup,
+`cancelActionCode()`, new `submitSessionStopRetries()`) — no acceptance
+criterion from the original `docs/spec.md` is touched or reopened, and no
+scope creep beyond the bug report was found in the diff. The one
+pre-existing "Known limitation carried forward" the developer notes
+(cross-*project* `pendingToggle` collisions, e.g. Project X spawn + Project
+Y stop both 428'ing before either code is typed) is explicitly out of scope
+for this bug report (which is scoped to same-project, multi-session) and is
+a pre-existing architectural property of `pendingToggle` unrelated to this
+diff — correctly left alone, not a gap in this round's coverage.
+
+### Findings (this round)
+None. No must-fix, should-fix, or nit findings against the fix-up diff
+itself. (The three nit-level findings from the original cycle's review above
+remain open as non-blocking follow-ups; none of them intersect this diff.)
+
+### Overall verdict (fix-up round)
+**Approve.** The concurrency bug is genuinely closed: traced the actual
+retry logic (not just the test assertions) and independently reproduced
+both the original bug (via revert-and-watch-it-fail on the developer's two
+tests) and its fix; added and verified one more regression test of my own
+for `cancelActionCode()`'s queue-clearing behavior, including its own
+revert-and-watch-it-fail check. `sessionId` threading is confirmed a true
+no-op for every kind besides `session-stop`, cross-checked against all 6
+other frontend suites running unmodified. The queue-vs-reject deviation
+holds up, including its one plausible edge case (already-independently-
+stopped session), which resolves gracefully via the pre-existing idempotent
+stop route. All claimed test counts (16/16 frontend multi-session, 37/37
+session-identity, 1314-test full suite with the same 35/79/42
+pre-existing baseline across the same 9 files, all other frontend suites
+unchanged) were independently re-run and match exactly. Approval stands —
+safe to hand back to product-manager for the next iteration.

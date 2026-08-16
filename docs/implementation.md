@@ -225,3 +225,139 @@ Host/Taiga/Gitea rows are untouched (still a checkbox).
    one, confirm only it disappears on the next 4s poll while the other's
    own state is untouched; confirm Host/Taiga/Gitea rows (if enabled)
    still show their checkbox exactly as before.
+
+## Fix-up round: `pendingSessionStop` overwrite on concurrent Stop clicks (hotfix/ad-9)
+
+An independent `/code-review` pass found a real bug on top of the already
+reviewer-approved cycle above: `pendingSessionStop[name]` was a single value
+(`name -> one session_id`), following `team-add-member`'s own side-channel
+precedent — but unlike `team-add-member` (nothing in the UI lets you queue a
+second "add" before the first resolves), nothing disabled a project's *other*
+sessions' Stop buttons while one session's Stop was already sitting on the
+shared 428/TOTP code overlay. Scenario: project `proj` has sessions A and B
+running. Click Stop on A → `stopSession()` sets `pendingSessionStop['proj'] =
+'A'`, fires the POST, server responds 428 (first mutating action in this
+browser session, TOTP required), code overlay shows ("Stopping session:
+proj" — no session id shown, by design). Before typing the code, click Stop
+on B → `stopSession()` **overwrites** `pendingSessionStop['proj'] = 'B'`,
+fires a second POST, also gets 428. The user types one code, submits once:
+`submitActionCode()` re-read `pendingSessionStop[name]` at retry time — now
+`'B'` — and retried *only* B's stop. A's original (no-code) POST had already
+gotten its own 428 and was never automatically retried once its own
+session_id was clobbered, so A's stop was silently dropped: the session kept
+running with no error shown to the operator. The `tests/
+test_multi_session_frontend.js` test in place before this round ("a 428
+mid-stop...") only ever exercised a single-session project and never
+triggered the interleaving.
+
+### Root cause
+Two separate problems compounded:
+1. `actionPath()`'s `'session-stop'` case re-read `pendingSessionStop[name]`
+   **at fetch time** (both for the original dispatch and, implicitly, for
+   any retry), instead of using the specific session_id each individual
+   click actually meant to target. A later click's write silently redirected
+   an earlier click's still-in-flight request.
+2. `submitActionCode()`'s retry path fires exactly **one** `performAction()`
+   call per code submission, driven by the single global `pendingToggle`
+   context — there was no way for a second, concurrent 428 (same kind, same
+   project, different session) to be remembered as "also still pending" once
+   `pendingToggle` had already been claimed by the first.
+
+### Fix
+- `pendingSessionStop[name]` is now an **array** (a per-project queue of
+  session ids that have an in-flight-or-TOTP-pending stop request), not a
+  single value. `stopSession()` pushes (deduped) onto the queue instead of
+  overwriting it.
+- The session_id each individual dispatch actually targets is now threaded
+  **explicitly** through the call chain — `toggle(kind, name, on,
+  checkboxEl, sessionId)` → `performAction(kind, name, on, code, sessionId)`
+  → `actionPath(kind, name, on, sessionId)` — captured once, synchronously,
+  at the moment `stopSession()` is called (before any other click handler
+  can run, since JS is single-threaded up to the next `await`). `actionPath`
+  no longer reads `pendingSessionStop[name]` at all for URL-building; the
+  dict is now purely bookkeeping for "which ids are still owed a retry."
+- New `submitSessionStopRetries(name, on, code)`, called from
+  `submitActionCode()` instead of the single generic `performAction()` call
+  whenever `pendingToggle.kind === 'session-stop'`: walks the *entire*
+  `pendingSessionStop[name]` queue and retries every still-queued session_id
+  with the one code the operator typed, sequentially (not
+  `Promise.all`/parallel — TOTP is validated once per browser session
+  server-side, so a 403 on the first retry means every other queued id would
+  fail identically; the loop stops immediately on a 403 rather than firing
+  the rest, leaving the whole queue intact for a correct retry). A 401 (full
+  re-auth needed) aborts the batch the same way `handleActionResult()`'s own
+  401 branch does elsewhere, leaving every remaining id queued. Each
+  successfully-resolved id (success or a non-retryable 4xx like an
+  already-gone session) is removed from the queue as it resolves.
+- `handleActionResult()`'s generic-fallback cleanup (used when a stop
+  succeeds *without* ever needing a TOTP retry) now removes only its own
+  `ctx.sessionId` from the queue, not the whole project's entry — so two
+  concurrent, TOTP-already-cleared stops on the same project don't clobber
+  each other's bookkeeping either.
+- `cancelActionCode()` now clears the whole `pendingSessionStop[name]` entry
+  for a canceled session-stop overlay (nothing was actually stopped
+  server-side yet, per the existing 428-before-touching-anything contract
+  every other kind's own cancel-branch already relies on), so a later,
+  unrelated code retry can't accidentally resurrect an abandoned stop.
+
+This is the "hold more than one pending action at a time" option from the
+bug report's two suggested fix shapes (rather than "reject/queue a second
+Stop click with a UI signal") — it fully resolves both sessions from a
+single code entry with no extra click required from the operator, and only
+touches the `session-stop` kind's own code paths (the shared `pendingToggle`/
+`toggle()`/`performAction()` plumbing every other kind uses is otherwise
+unchanged; `toggle()`'s new `sessionId` parameter is optional and `undefined`
+for every kind besides `session-stop`).
+
+### Regression tests added (`tests/test_multi_session_frontend.js`, now 15 tests)
+- *"two concurrent Stop clicks on different sessions of the SAME project,
+  both pending on the same shared 428/TOTP overlay, are BOTH retried by a
+  single code submission -- neither is silently dropped"* — reproduces the
+  bug's exact scenario (Stop A → 428, Stop B → 428, submit one code) and
+  asserts both `/instance/proj/session/claude-proj-A/stop` and `/instance/
+  proj/session/codex-proj-B/stop` are retried with the typed code, in
+  sequence.
+- *"a wrong TOTP code during a two-session-stop retry batch leaves BOTH
+  sessions queued for another attempt (no partial silent drop)"* — asserts a
+  403 on the first retry doesn't fire the second, and that a subsequent
+  correct-code submission still retries both.
+- Verified both new tests actually catch the bug: temporarily reverted only
+  `app/app.py` (`git stash push -- app/app.py`, keeping the new test file)
+  and re-ran — both new tests failed (`session A's retry must not be
+  dropped` / wrong session retried first) exactly as the bug report
+  describes; restored the fix (`git stash pop`) and re-ran clean.
+
+### Verification (this round)
+- `python3 -m py_compile app/app.py` — no syntax errors.
+- `node --check <extracted <script>>` — no syntax errors in the rendered
+  page script (same portable-Node-20 setup as the original cycle).
+- `node tests/test_multi_session_frontend.js` — **15/15 pass** (13 existing
+  + 2 new).
+- All other frontend test files re-run, unmodified, no regressions:
+  `test_clone_frontend.js` 8/8, `test_deploy_frontend.js` 9/9,
+  `test_singleton_toggle_frontend.js` 19/19, `test_smoke_check_frontend.js`
+  11/11, `test_team_frontend.js` 115/115, `test_upload_frontend.js` 8/8.
+- `python3 tests/test_session_identity.py` — 37/37 pass (this file grew from
+  32 to 37 between this round and the original cycle via the intervening
+  team-launcher hotfix round already merged into this branch; unrelated to
+  this fix).
+- Full suite: `python3 -m unittest discover -s tests` → `Ran 1314 tests ...
+  FAILED (failures=35, errors=79, skipped=42)` — the exact same 35/79/42
+  tally, across the exact same 9 pre-existing/environmental files
+  (`test_team_routes`, `test_teams_lifecycle`, `test_new_project_from_url`,
+  `test_new_project_from_gitea`, `test_gitea_sync_project`,
+  `test_new_project_from_upload`, `test_teams_grounding`,
+  `test_teams_lead`, `test_taiga_push`) already documented above. Test count
+  is 1314 (1309 documented above + 5 from the intervening team-launcher
+  hotfix round's own additions to `test_session_identity.py`-adjacent
+  suites, + this round's own 2 new frontend tests, which aren't part of this
+  Python-only count) — no new failures/errors anywhere in this run.
+
+### Known limitation carried forward
+The same class of "single shared `pendingToggle` slot" issue could in
+principle also occur across **different projects** (e.g. Project X's spawn
+and Project Y's stop both 428'ing before either code is typed) — out of
+scope for this fix-up, which is scoped exactly to the bug report's "two
+sessions of the same project" case. `pendingToggle` itself remains a single
+global for every other kind, unchanged; only `session-stop`'s own queue
+(`pendingSessionStop`) was generalized to hold more than one entry.

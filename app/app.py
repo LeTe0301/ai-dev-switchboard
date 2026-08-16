@@ -4782,24 +4782,43 @@ function row(label, on, url, kind, name, desc, sessions, codeOn, codeUrl, subOve
     ' onchange="toggle(' + arg + ', this.checked, this)"><span class="slider"></span></label>' : '') +
     '</div>';
 }
-let pendingToggle = null;  // {kind, name, on, checkboxEl} — only set while the code overlay is up
+let pendingToggle = null;  // {kind, name, on, checkboxEl, sessionId} — only set while the code overlay is up
 // Per-session Stop side-channel (docs/spec.md "Proposed approach" §3,
-// docs/design.md "Side-channel state pattern") -- name -> session_id, set
-// BEFORE toggle()'s first (optimistic, no-code) POST fires and read back by
-// actionPath()'s 'session-stop' case, following team-add-member's own exact
-// precedent (see doTeamAddMember()'s doc comment): toggle()'s own
-// name/on/checkboxEl parameters have no slot for a second value (which
-// session to stop), so it survives a 428-then-retry round trip here instead.
+// docs/design.md "Side-channel state pattern") -- name -> ARRAY of
+// session_ids that currently have an in-flight or TOTP-pending stop request
+// for that project.
+//
+// Fix-up (hotfix/ad-9, review round 2): this used to be a single value
+// (name -> one session_id), following team-add-member's own precedent --
+// but unlike team-add-member (one outstanding "add" per project at a time,
+// by construction of the UI), Stop can legitimately be clicked on TWO
+// different sessions of the SAME project before the first click's 428/TOTP
+// code overlay is ever answered (there's nothing in the UI that disables
+// the other sessions' Stop buttons while the overlay is up). A single
+// shared value meant the second click's session_id silently clobbered the
+// first's, and since submitActionCode() only fires ONE retry per code
+// entry, the first session's stop request was dropped on the floor with no
+// error shown -- see docs/implementation.md for the full writeup. Each
+// stopSession() click now pushes onto this project's own queue instead of
+// overwriting a single slot, and the exact session_id each individual POST
+// targets is threaded explicitly through toggle()/performAction()/
+// actionPath() (see their own sessionId parameter below) rather than
+// re-read from this dict at fetch time -- so the dict's only remaining job
+// is letting submitActionCode() know how many sessions are still waiting on
+// the ONE code the operator is about to type, and retry every one of them,
+// not just the most recently clicked.
 let pendingSessionStop = {};
-// stopSession() is sessionsRow()'s own onclick target -- sets
-// pendingSessionStop[name] BEFORE toggle() fires, same discipline
-// doTeamAddMember() already establishes for teamAddMemberChoice.
+// stopSession() is sessionsRow()'s own onclick target -- queues sessionId
+// for this project (deduped) BEFORE toggle() fires, same discipline
+// doTeamAddMember() already establishes for teamAddMemberChoice, extended
+// to a queue per the fix-up comment above.
 function stopSession(name, sessionId) {
-  pendingSessionStop[name] = sessionId;
-  toggle('session-stop', name, true, null);
+  if (!pendingSessionStop[name]) pendingSessionStop[name] = [];
+  if (pendingSessionStop[name].indexOf(sessionId) === -1) pendingSessionStop[name].push(sessionId);
+  toggle('session-stop', name, true, null, sessionId);
 }
 
-function actionPath(kind, name, on) {
+function actionPath(kind, name, on, sessionId) {
   if (kind === 'host') return '/host/' + (on ? 'on' : 'off');
   if (kind in singletonToggleState) return '/' + kind + '/' + (on ? 'on' : 'off');
   if (kind === 'code') return '/instance/' + encodeURIComponent(name) + '/code/' + (on ? 'on' : 'off');
@@ -4820,8 +4839,14 @@ function actionPath(kind, name, on) {
   // for 'inst' rows no longer exists), so 'session-spawn'/'session-stop'
   // are the only per-project instance actions left.
   if (kind === 'session-spawn') return '/instance/' + encodeURIComponent(name) + '/spawn';
+  // Fix-up (hotfix/ad-9): sessionId is now passed in explicitly by the
+  // caller (captured once, synchronously, at the moment this specific
+  // request was dispatched -- see toggle()/submitSessionStopRetries() below)
+  // rather than re-read from the shared pendingSessionStop[name] queue here,
+  // which is exactly what let a second Stop click on a different session
+  // silently steal the URL out from under the first's retry.
   if (kind === 'session-stop') return '/instance/' + encodeURIComponent(name) + '/session/' +
-    encodeURIComponent(pendingSessionStop[name]) + '/stop';
+    encodeURIComponent(sessionId) + '/stop';
 }
 function actionBody(kind, name, on, code) {
   const body = {};
@@ -4830,7 +4855,8 @@ function actionBody(kind, name, on, code) {
   // {engine: ...} shape the removed 'inst' branch used to build, re-keyed
   // to the new 'session-spawn' kind. 'session-stop' needs no body fields
   // beyond the optional TOTP code above -- which session to stop is
-  // encoded in actionPath()'s own URL via pendingSessionStop[name].
+  // encoded in actionPath()'s own URL via its explicit sessionId parameter
+  // (see actionPath()'s own fix-up comment).
   if (kind === 'session-spawn') body.engine = engineChoice[name] || Object.keys(ENGINE_LABELS)[0];
   if (kind === 'newproject') body.name = name;
   // Clone-from-URL (backlog item 16, docs/spec.md/docs/design.md) -- reads
@@ -4902,8 +4928,8 @@ function actionBody(kind, name, on, code) {
   }
   return body;
 }
-async function performAction(kind, name, on, code) {
-  return fetch(actionPath(kind, name, on), {method: 'POST', headers: {'Content-Type': 'application/json'},
+async function performAction(kind, name, on, code, sessionId) {
+  return fetch(actionPath(kind, name, on, sessionId), {method: 'POST', headers: {'Content-Type': 'application/json'},
                                             body: JSON.stringify(actionBody(kind, name, on, code))});
 }
 // TOTP is verified once per session server-side (see session_totp_ok in
@@ -5156,11 +5182,21 @@ async function handleActionResult(r, ctx) {
   // dispatch has actually resolved (this generic fallback path), same
   // "delete after handleActionResult() completes" discipline
   // teamAddMemberChoice's own cleanup already follows above.
-  if (kind === 'session-stop') delete pendingSessionStop[name];
+  //
+  // Fix-up (hotfix/ad-9): pendingSessionStop[name] is now a queue (see its
+  // own declaration comment) -- this generic fallback only ever runs for a
+  // stop that succeeded (or hard-failed) WITHOUT ever needing a TOTP retry,
+  // so it must remove just its OWN session_id, not the whole project's
+  // queue, in case a second Stop for a different session of the same
+  // project is still independently in flight.
+  if (kind === 'session-stop' && pendingSessionStop[name]) {
+    pendingSessionStop[name] = pendingSessionStop[name].filter((id) => id !== ctx.sessionId);
+    if (pendingSessionStop[name].length === 0) delete pendingSessionStop[name];
+  }
   hideCodeOverlay();
   setTimeout(refresh, 1500);
 }
-async function toggle(kind, name, on, checkboxEl) {
+async function toggle(kind, name, on, checkboxEl, sessionId) {
   if (kind in singletonToggleState) {
     const st = singletonToggleState[kind];
     // Optimistic, ahead of the POST resolving (docs/design.md "Starting
@@ -5177,9 +5213,14 @@ async function toggle(kind, name, on, checkboxEl) {
       st.offPendingCount++;
     }
   }
-  const ctx = {kind, name, on, checkboxEl};
+  // sessionId (only meaningful for kind === 'session-stop') is captured
+  // into ctx right here, synchronously, before any other click handler can
+  // run -- see pendingSessionStop's own declaration comment for why this
+  // (rather than re-reading a shared dict at fetch/retry time) is what
+  // actually fixes the two-concurrent-stops bug.
+  const ctx = {kind, name, on, checkboxEl, sessionId};
   try {
-    const r = await performAction(kind, name, on, null);
+    const r = await performAction(kind, name, on, null, sessionId);
     handleActionResult(r, ctx);
   } finally {
     // A network-level failure (performAction's fetch() rejects, not just a
@@ -5336,6 +5377,15 @@ function cancelActionCode() {
     errEl.textContent = '';
     errEl.className = 'clone-err';
   }
+  // Fix-up (hotfix/ad-9): nothing actually stopped server-side for ANY
+  // queued session either (same 428-before-touching-anything reasoning as
+  // every other kind above) -- abandon the whole per-project queue rather
+  // than leaving stale entries around that a later, unrelated Stop click
+  // (or a later, unrelated code retry for a different kind) could
+  // accidentally resurrect.
+  if (pendingToggle && pendingToggle.kind === 'session-stop') {
+    delete pendingSessionStop[pendingToggle.name];
+  }
   hideCodeOverlay();
 }
 async function submitActionCode() {
@@ -5358,6 +5408,17 @@ async function submitActionCode() {
   if (!pendingToggle) return;
   const {kind, name, on} = pendingToggle;
   const code = document.getElementById('action-code').value;
+  // Fix-up (hotfix/ad-9): pendingToggle only ever remembers ONE {kind, name}
+  // context, but two Stop clicks on different sessions of the SAME project
+  // can both be awaiting this SAME code overlay (see pendingSessionStop's
+  // own declaration comment) -- so a single performAction() call here, keyed
+  // off pendingToggle alone, would only ever retry whichever session_id was
+  // clicked last, silently dropping any earlier one(s). Retry every
+  // session_id still queued for this project instead of just one.
+  if (kind === 'session-stop') {
+    await submitSessionStopRetries(name, on, code);
+    return;
+  }
   if (kind in singletonToggleState && !on) {
     // This retry (after a 428 asked for a TOTP code) is the request that
     // actually triggers <kind>_run("down") server-side — the first attempt
@@ -5377,6 +5438,55 @@ async function submitActionCode() {
       singletonToggleState[kind].offPendingCount = Math.max(0, singletonToggleState[kind].offPendingCount - 1);
     }
   }
+}
+// Fix-up (hotfix/ad-9): the code-overlay retry for 'session-stop' has to
+// cover every session_id queued in pendingSessionStop[name], not just the
+// one that happens to be attached to pendingToggle -- see submitActionCode()
+// and pendingSessionStop's own declaration comment for the full context.
+// Sequential, not parallel/Promise.all: session_totp_ok is validated once
+// server-side per browser session, so if the FIRST retry reveals a wrong
+// code (403), every other queued id would fail identically -- no point
+// firing them, and stopping early keeps "Wrong code — try again." accurate
+// (nothing partially-applied gets silently treated as done).
+async function submitSessionStopRetries(name, on, code) {
+  const ids = (pendingSessionStop[name] || []).slice();
+  for (const sessionId of ids) {
+    let r;
+    try {
+      r = await performAction('session-stop', name, on, code, sessionId);
+    } catch (e) {
+      // Network-level failure -- leave this id queued (not removed below),
+      // move on to the next one rather than aborting the whole batch.
+      continue;
+    }
+    if (r.status === 401) {
+      // Full re-auth needed -- same as handleActionResult()'s own 401
+      // branch elsewhere; abort the batch, leave every remaining id queued
+      // for whenever the operator retries after logging back in.
+      hideCodeOverlay();
+      showOverlay();
+      return;
+    }
+    if (r.status === 403) {
+      // Wrong code -- every other queued id would fail the exact same way
+      // (one shared TOTP check per browser session), so stop here rather
+      // than firing the rest. Nothing in the queue is removed: the code
+      // overlay stays up (pendingToggle is still set) so the operator can
+      // just retype and resubmit, covering every still-queued id again.
+      document.getElementById('err-code').textContent = 'Wrong code — try again.';
+      return;
+    }
+    // Success, or a non-retryable error (400/404/etc, e.g. the session was
+    // already gone) -- either way this id is resolved, remove it from the
+    // queue so a later retry batch (for some OTHER still-queued id) doesn't
+    // resend it.
+    if (pendingSessionStop[name]) {
+      pendingSessionStop[name] = pendingSessionStop[name].filter((x) => x !== sessionId);
+    }
+  }
+  if (pendingSessionStop[name] && pendingSessionStop[name].length === 0) delete pendingSessionStop[name];
+  hideCodeOverlay();
+  setTimeout(refresh, 1500);
 }
 document.getElementById('action-code').addEventListener('keydown', e => { if (e.key === 'Enter') submitActionCode(); });
 

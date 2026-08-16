@@ -413,6 +413,140 @@ test('a 428 mid-stop shows the code overlay, and pendingSessionStop survives the
   await p2;
 });
 
+test('two concurrent Stop clicks on different sessions of the SAME project, both pending on the same shared 428/TOTP overlay, are BOTH retried by a single code submission -- neither is silently dropped (hotfix/ad-9 regression)', async () => {
+  const c = await setupCase([
+    { name: 'proj', sessions: [
+      { session_id: 'claude-proj-A', engine: 'claude', url: 'http://127.0.0.1:3001/' },
+      { session_id: 'codex-proj-B', engine: 'codex', url: 'http://127.0.0.1:3002/' },
+    ], desc: '', code_on: false, code_url: null },
+  ]);
+  // Click Stop on session A -- fires immediately, gets a 428 (TOTP required).
+  const pA = c.call('stopSession', 'proj', 'claude-proj-A');
+  await tick();
+  assert.strictEqual(c.pendingFetches.length, 1);
+  assert.strictEqual(c.pendingFetches[0].url, '/instance/proj/session/claude-proj-A/stop');
+  c.resolveFetch((f) => f.url === '/instance/proj/session/claude-proj-A/stop', 428, { error: 'totp_required' });
+  await pA;
+  await tick();
+
+  const label = c.elements.get('code-overlay-label');
+  assert.strictEqual(label.textContent, 'Stopping session: proj');
+
+  // BEFORE typing the code, click Stop on session B (same project, different
+  // session) -- this must NOT clobber session A's pending retry.
+  const pB = c.call('stopSession', 'proj', 'codex-proj-B');
+  await tick();
+  assert.strictEqual(c.pendingFetches.length, 1);
+  assert.strictEqual(c.pendingFetches[0].url, '/instance/proj/session/codex-proj-B/stop');
+  c.resolveFetch((f) => f.url === '/instance/proj/session/codex-proj-B/stop', 428, { error: 'totp_required' });
+  await pB;
+  await tick();
+
+  // One code, submitted once, must retry BOTH sessions -- not just
+  // whichever was clicked last.
+  c.elements.get('action-code').value = '111222';
+  const p2 = c.call('submitActionCode');
+  await tick();
+  assert.strictEqual(c.pendingFetches.length, 1, 'expected exactly one retry in flight at a time (sequential), got: ' +
+    c.pendingFetches.map((f) => f.url).join(', '));
+  assert.strictEqual(c.pendingFetches[0].url, '/instance/proj/session/claude-proj-A/stop',
+    "session A's retry must not be dropped");
+  let body = JSON.parse(c.pendingFetches[0].opts.body);
+  assert.strictEqual(body.code, '111222');
+  c.resolveFetch((f) => f.url === '/instance/proj/session/claude-proj-A/stop', 200, { ok: true });
+  await tick();
+
+  assert.strictEqual(c.pendingFetches.length, 1, 'expected session B to be retried next, got: ' +
+    c.pendingFetches.map((f) => f.url).join(', '));
+  assert.strictEqual(c.pendingFetches[0].url, '/instance/proj/session/codex-proj-B/stop',
+    "session B's retry must not be dropped either");
+  body = JSON.parse(c.pendingFetches[0].opts.body);
+  assert.strictEqual(body.code, '111222');
+  c.resolveFetch((f) => f.url === '/instance/proj/session/codex-proj-B/stop', 200, { ok: true });
+  await p2;
+});
+
+test('a wrong TOTP code during a two-session-stop retry batch leaves BOTH sessions queued for another attempt (no partial silent drop)', async () => {
+  const c = await setupCase([
+    { name: 'proj', sessions: [
+      { session_id: 'claude-proj-A', engine: 'claude', url: 'http://127.0.0.1:3001/' },
+      { session_id: 'codex-proj-B', engine: 'codex', url: 'http://127.0.0.1:3002/' },
+    ], desc: '', code_on: false, code_url: null },
+  ]);
+  const pA = c.call('stopSession', 'proj', 'claude-proj-A');
+  await tick();
+  c.resolveFetch((f) => f.url === '/instance/proj/session/claude-proj-A/stop', 428, { error: 'totp_required' });
+  await pA;
+  await tick();
+  const pB = c.call('stopSession', 'proj', 'codex-proj-B');
+  await tick();
+  c.resolveFetch((f) => f.url === '/instance/proj/session/codex-proj-B/stop', 428, { error: 'totp_required' });
+  await pB;
+  await tick();
+
+  c.elements.get('action-code').value = '000000';
+  const p2 = c.call('submitActionCode');
+  await tick();
+  assert.strictEqual(c.pendingFetches[0].url, '/instance/proj/session/claude-proj-A/stop');
+  c.resolveFetch((f) => f.url === '/instance/proj/session/claude-proj-A/stop', 403, { error: 'wrong_code' });
+  await p2;
+  await tick();
+
+  assert.strictEqual(c.pendingFetches.length, 0, 'must not fire session B once the code is already known wrong');
+  assert.strictEqual(c.elements.get('err-code').textContent, 'Wrong code — try again.');
+
+  // Retry with the correct code -- BOTH sessions must still be queued.
+  c.elements.get('action-code').value = '654321';
+  const p3 = c.call('submitActionCode');
+  await tick();
+  assert.strictEqual(c.pendingFetches.length, 1);
+  assert.strictEqual(c.pendingFetches[0].url, '/instance/proj/session/claude-proj-A/stop',
+    "session A must still be queued after a wrong-code attempt");
+  c.resolveFetch((f) => f.url === '/instance/proj/session/claude-proj-A/stop', 200, { ok: true });
+  await tick();
+  assert.strictEqual(c.pendingFetches.length, 1);
+  assert.strictEqual(c.pendingFetches[0].url, '/instance/proj/session/codex-proj-B/stop',
+    "session B must still be queued after a wrong-code attempt");
+  c.resolveFetch((f) => f.url === '/instance/proj/session/codex-proj-B/stop', 200, { ok: true });
+  await p3;
+});
+
+test('cancelling the code overlay while TWO stops are queued for the same project abandons the WHOLE queue, not just the one attached to pendingToggle (reviewer regression check, hotfix/ad-9)', async () => {
+  const c = await setupCase([
+    { name: 'proj', sessions: [
+      { session_id: 'claude-proj-A', engine: 'claude', url: 'http://127.0.0.1:3001/' },
+      { session_id: 'codex-proj-B', engine: 'codex', url: 'http://127.0.0.1:3002/' },
+    ], desc: '', code_on: false, code_url: null },
+  ]);
+  const pA = c.call('stopSession', 'proj', 'claude-proj-A');
+  await tick();
+  c.resolveFetch((f) => f.url === '/instance/proj/session/claude-proj-A/stop', 428, { error: 'totp_required' });
+  await pA;
+  await tick();
+  const pB = c.call('stopSession', 'proj', 'codex-proj-B');
+  await tick();
+  c.resolveFetch((f) => f.url === '/instance/proj/session/codex-proj-B/stop', 428, { error: 'totp_required' });
+  await pB;
+  await tick();
+
+  assert.deepStrictEqual(Array.from(vm.runInContext('pendingSessionStop.proj', c.sandbox)), ['claude-proj-A', 'codex-proj-B']);
+
+  c.call('cancelActionCode');
+
+  assert.strictEqual(vm.runInContext('pendingSessionStop.proj', c.sandbox), undefined,
+    'cancelling must abandon the WHOLE per-project queue (nothing actually stopped server-side yet for EITHER session), not just the session attached to pendingToggle');
+
+  // A fresh Stop on session A afterward must dispatch a brand-new,
+  // un-queued request -- proof the abandoned entry can't resurrect a stale
+  // retry later.
+  const pA2 = c.call('stopSession', 'proj', 'claude-proj-A');
+  await tick();
+  assert.strictEqual(c.pendingFetches.length, 1);
+  assert.strictEqual(c.pendingFetches[0].url, '/instance/proj/session/claude-proj-A/stop');
+  c.resolveFetch((f) => f.url === '/instance/proj/session/claude-proj-A/stop', 200, { ok: true });
+  await pA2;
+});
+
 // ─── Host/Taiga/Gitea rows unaffected ───────────────────────────────────
 
 test('Host/Taiga/Gitea rows keep their checkbox unchanged -- this spec is scoped to kind=inst only', async () => {
