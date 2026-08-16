@@ -2722,6 +2722,27 @@ renders model-generated text into the DOM). Approved, no findings.
 Committed as `391865c` on `backlog/e2e-fixes-round6`, pushed to both
 remotes, still under PR #33.
 
+User then chose one more live E2E round (round 11) before migration,
+consistent with how every other fix in this loop got a hands-on
+confirmation. Re-briefed `pve-sparkling-meadow`: reproduce the same
+no-engine-CLI dead end that triggered item 45, confirm `/status`/
+dashboard now surface `summary` when the lead calls `finish` with one, a
+light general sanity pass on top (not a full 39-44 re-walk, given three
+straight clean rounds already). If clean, proceed straight to
+backup+migration (steps 3-5 under "The plan, in order") without asking
+again — the user has already indicated that's the trigger.
+
+### To resume if this session is interrupted mid-loop (round 11)
+
+1. Check `ListAgents` for the current pve-side peer session name (may
+   have changed if it died again).
+2. If no round-11 report has arrived yet: wait, or re-send the round-11
+   brief (see note above) to whichever peer is listed.
+3. If a report *has* arrived: read it. Clean → proceed directly to
+   backup+migration steps 3-5 under "The plan, in order" (already
+   user-approved, no need to ask again). Issues found → loop back into
+   the fix pipeline, commit, push, re-brief, repeat.
+
 ---
 
 ## Items 39-43: found by E2E round 6 real test on fresh CT110 (2026-08-16)
