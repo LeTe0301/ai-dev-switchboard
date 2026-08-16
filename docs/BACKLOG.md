@@ -2224,3 +2224,694 @@ already uses (per item 35), not a stale/separately-computed value.
 Worth checking why `run.json`'s `project` field ends up `null` in the
 same run as a first step, since it may point at the same underlying
 write path being incomplete or racy.
+
+---
+
+## Round 6 fixes (2026-08-15): items 30, 37, 38
+
+Closes the two remaining crash/staleness bugs from round-5 verification
+(item 30's crash-loop root cause, item 38's stuck `/status`) plus the
+security-hygiene regression item 37 found (the tool that was supposed to
+warn about a loose config file instead silently reverting item 29's ACL
+fix).
+
+- **30**: root cause was startup-ordering, not a transient port-bind
+  race — `taiga-gateway`'s bundled nginx resolves `taiga-front` once at
+  container-start with no `resolver` directive, so if `taiga-front` isn't
+  attached to the network yet it exits immediately and its port
+  reservation wedges every subsequent recreate. `install.sh`'s
+  `docker-compose.override.yml` now gives `taiga-front` a healthcheck
+  (`wget --spider http://127.0.0.1/` — not `localhost`, confirmed
+  hands-on that BusyBox wget on this image resolves `localhost` to `::1`
+  first and gets connection-refused) and upgrades `taiga-gateway`'s
+  `depends_on` on it to `condition: service_healthy`, entirely inside the
+  override file this repo already regenerates every run — no changes
+  inside the pinned third-party `taiga-docker` checkout. `taiga-up.sh`
+  also gained a settle-window recheck (`TAIGA_UP_SETTLE_SECONDS`,
+  default 5s): a gateway reporting `running` that dies before the window
+  elapses is now treated as a failed attempt rather than a false-positive
+  success. `app.py`'s `TAIGA_UP_SCRIPT` timeout was raised 180s→220s (and
+  the paired frontend `SINGLETON_TOGGLE_CONFIG.taiga.timeoutMs` in
+  lockstep) to keep comfortable margin over the new worst-case retry
+  arithmetic (175s of pure sleep across up to 5 attempts).
+- **37**: `_check_config_permissions` in `scripts/taiga_push_spec.py` is
+  now ACL-aware — when an extended ACL is present it reads `getfacl`'s
+  `other::` entry (the one bit that's still a genuine leak regardless of
+  named-user grants) instead of misreading the recomputed ACL mask in
+  `st_mode`'s group bits as a loose group permission. It no longer prints
+  a `chmod`-based remediation for an ACL'd file (which would collapse the
+  item-29 grant); a genuinely loose ACL'd file now gets `setfacl`-based
+  remediation instead. Falls back to the original plain `st_mode` check
+  when `getfacl` is unavailable or the file has no extended ACL, so
+  today's behavior is unchanged for the un-migrated case.
+- **38**: added a single `TEAM_TERMINAL_STATUSES` constant to
+  `app/teams.py`, replacing three previously-duplicated inline literal
+  tuples (`stop_team()`, `sweep_dead_teams()`, `interject()`). `/status`
+  now exposes an additive `team.terminal` boolean sourced from that same
+  constant, so a poller can detect `escalated_max_rounds`/`finished`/
+  `error`/`stopped` completion directly instead of inferring it from the
+  coarser `status`/`waiting_on_you` fields (which is what let a poller
+  hang indefinitely on an `escalated_max_rounds` run). The `"project":
+  null` observation from item 38's original report was investigated
+  fresh against current code and does not reproduce — no code path
+  anywhere writes a literal `"project"` key (only `"project_name"`);
+  treated as resolved-by-explanation, most likely a terminology slip in
+  the original report.
+
+Reviewed via a full developer→reviewer cycle, approved with one
+non-blocking follow-up (this entry). Full test suite passes at 1232
+tests with the same 3 pre-existing failures (untracked `CLAUDE.md` in
+the repo root, unrelated to this round, confirmed via `git stash`).
+
+---
+
+## In-progress process (2026-08-15): full E2E verification loop + container migration
+
+**Status of round 6**: implemented, reviewed (approved), committed as
+`140a2ae` on branch `backlog/e2e-fixes-round6`, pushed to both remotes,
+opened as [PR #33](https://github.com/LeTe0301/ai-dev-switchboard/pull/33)
+— **still open/unmerged** as of this writing.
+
+### The plan, in order
+
+1. **Full hands-on E2E test pass** on a fresh Proxmox LXC container,
+   covering every feature and every UI part (not just smoke-testing) —
+   run by a separate Claude Code session connected via Remote Control
+   (peer session, reachable through `ListAgents`/`SendMessage`, not a
+   subagent of this session). That session creates its own fresh test
+   container, installs `ai-dev-switchboard` with every optional feature
+   flag on, exercises the full feature surface hands-on, writes a
+   BACKLOG-style report (real repro evidence, not guesses), sends the
+   report back here, then **destroys its own test container** (cleanup
+   rule applies only to its own throwaway test containers, never to
+   anything else on the host).
+2. **On receiving a report with issues**: run the normal
+   product-manager→ux-designer(if needed)→developer→reviewer pipeline
+   (same as every round above) to fix them, commit, then re-brief the
+   E2E session to test again against a new fresh container. Repeat until
+   a report comes back clean.
+3. **Once a report comes back fully clean**: this session (the
+   orchestrator, working out of the `dev` sandbox) performs a **backup of
+   all repos first** — explicitly stated as priority #1, no data loss —
+   then creates a **new container** that is an exact clone of this whole
+   environment, **including the Claude/agent configuration**
+   (`~/.claude/CLAUDE.md`, agent definitions, memory files, settings —
+   not just the raw git repos), transfers everything over, and confirms
+   `ai-dev-switchboard` is available and working on the new container.
+4. **Only after that backup+transfer is confirmed complete**, the E2E
+   session (the pve-side Remote Control peer) shuts down *this*
+   orchestrator session — not the other way around, and not itself.
+5. **The new destination container is never deleted** — the
+   destroy-after-use cleanup habit from step 1 applies only to the E2E
+   session's own disposable test containers, never to the real migration
+   target.
+
+### State as of this writing (not yet actioned further)
+
+- An E2E testing brief (full text: create fresh container → install with
+  all features on → hands-on test every feature/UI part → write a
+  BACKLOG-style report → send back → destroy own test container → wait)
+  was sent twice to two different Remote-Control-connected peer sessions
+  on the pve host, in sequence: first to `pve-wiggly-cosmos`, which died
+  before reporting back (any container it left behind should be checked
+  for and cleaned up by whichever session picks this up next); then,
+  after re-checking `ListAgents`, to its replacement `pve-lively-hopper`
+  (also briefed to check for and clean up anything `pve-wiggly-cosmos`
+  left orphaned). **As of this writing, no report has been received
+  back yet from either.**
+- Sessions on the pve host have died/reconnected under new names before
+  (`pve-wiggly-cosmos` → `pve-lively-hopper`) — if picking this up again,
+  check `ListAgents` first; if the name has changed again, re-send the
+  same E2E brief to whichever peer is currently listed (it has no memory
+  of prior instructions — the brief must be resent in full, not assumed
+  known).
+- **Host-control SSH channel not yet usable from the `dev` sandbox**:
+  this repo's optional `host-agent` feature (`host-agent/README.md`) uses
+  a narrowly-scoped SSH key (`~/.ssh/host_control_ed25519` in this
+  sandbox, public half `ssh-ed25519
+  AAAAC3NzaC1lZDI1NTE5AAAAIDrTBlfcslf03bbcmtYAa80pSy9j0mrfVIlrsRxB9y67
+  dev-ct-host-control`) to run exactly
+  `sudo ai-dev-switchboard-host-{start,stop,status}.sh` on the pve host
+  (`192.168.178.100`, port 8006 = Proxmox web UI, port 22 = SSH). Tried
+  as both `root@` and `switchboard@` — both rejected
+  ("Permission denied (publickey,password)"), meaning this key's public
+  half is not yet authorized on either account on the real host. The
+  user asked to add it to `root`'s `authorized_keys` but did not have
+  host access at the time to do so. This channel was a secondary
+  path (not currently load-bearing for the E2E loop, which runs over the
+  already-connected Remote Control peer sessions instead) — only revisit
+  if the Remote Control path stalls and direct host-agent control becomes
+  necessary.
+
+### Update (2026-08-16)
+
+- `ListAgents` showed the pve-side peer under yet another new name,
+  `pve-sparkling-meadow` — neither `pve-wiggly-cosmos` nor
+  `pve-lively-hopper` is listed anymore, and no report had arrived from
+  either. Re-sent the full E2E brief (create fresh container → install
+  with all optional feature flags → hands-on test every feature/UI part
+  → write a BACKLOG-style report → send back → destroy own test
+  container → wait) to `pve-sparkling-meadow`, including the
+  cleanup-check instruction to find/destroy any orphaned container left
+  behind by the two prior dead sessions. **Report received back the same
+  day** — see "Items 39-43" below. Not a clean report, so per step 2 of
+  "The plan, in order" above, looping back into the fix pipeline
+  (product-manager → developer → reviewer) rather than proceeding to
+  backup+migration. `pve-sparkling-meadow` destroyed its own test
+  container (CT110) after sending the report; no orphaned containers from
+  the two prior dead sessions were found on the host.
+
+### Round 7 fix cycle: complete (2026-08-16)
+
+Items 39-43 were fixed via the normal product-manager → developer →
+reviewer pipeline (no ux-designer needed — backend/install-script only),
+approved with 2 non-blocking nits, committed as `5292112` on
+`backlog/e2e-fixes-round6`, pushed to both remotes, still under PR #33.
+Re-briefed `pve-sparkling-meadow` (same peer as round 6) for another
+fresh-container retest round, specifically targeting all 5 fixed items
+plus anything skipped last round (upload-from-folder, GitHub-origin
+AI-reviewer path).
+
+### Round 7 retest report (2026-08-16): 4/5 confirmed fixed, item 43 still broken (new mechanism, root cause now pinned down)
+
+Tested `a6991c2` on a second fresh CT110 (destroyed after report), with
+`AUTH_MODE=pve` + `PVE_HOST` pre-seeded before `install.sh --yes`.
+
+- **#39 (AUTH_MODE)** — confirmed fixed. `switchboard.env` correctly kept
+  `AUTH_MODE=pve`; verified `pve_login()` genuinely hits the real PVE
+  ticket API and the login page/401 path both behave correctly. (A real
+  end-to-end login with live PVE credentials wasn't completed — creating
+  even a throwaway PVE-realm test account was blocked by the tester's own
+  session permission classifier as a production-auth-state change, and it
+  correctly didn't try to work around that. Verified via code-path
+  inspection instead, which the tester flagged explicitly as a
+  lower-confidence substitute for a real login round-trip.)
+- **#40 (Gitea 403)** — confirmed fixed. Reproduced the exact original
+  trigger (throwaway admin created first, then the real admin) —
+  `gitea-configure-api.sh` succeeded cleanly on the first try.
+- **#41 (code-server path)** — confirmed fixed. `CODE_SERVER_BIN`
+  correctly resolved to `/bin/code-server`; toggling "Code" on now starts
+  a real process, `/status` shows `code_on: true`, URL returns real `302`.
+- **#42 (silent ok:true)** — confirmed fixed. `POST /host/on` with no
+  target configured now returns `502` with real `stderr`
+  ("...ssh: Could not resolve hostname...").
+- **#43 (taiga-gateway race)** — **still broken, different mechanism**.
+  The new plain-`up -d` fallback (added in round 7) now reports
+  `200 {"ok": true}` after ~2m45s, but `taiga-gateway` crashes seconds
+  later: `nginx: [emerg] host not found in upstream "taiga-front"`.
+  `/status` eventually shows `taiga: false` correctly, but the toggle
+  response itself lies again, via a new mechanism (the fallback's own
+  code comment says "no settle-window recheck on this one extra attempt —
+  keep it simple", so it can catch the container in a brief pre-crash
+  "running" window).
+
+  **Root cause now pinned down** (round 6 left this open): `taiga-gateway`
+  own bundled nginx does `proxy_pass http://taiga-front/;` — a bare
+  hostname resolved once at config-load/startup, not lazily. If Docker's
+  embedded DNS (127.0.0.11) hasn't registered `taiga-front` yet when nginx
+  starts, config load fails and nginx exits(1) immediately, no internal
+  retry — this is a narrow, deterministic startup-time DNS race, not
+  something blind retrying can fully close (only narrow). Matches why a
+  manual `docker compose up -d taiga-gateway` run well after the automated
+  attempts have been retrying for 2+ minutes reliably succeeds (the race
+  window has long closed by then).
+
+  Standard nginx fix suggested: lazy DNS resolution instead of
+  startup-time — add `resolver 127.0.0.11 valid=10s;` and reference the
+  upstream via a variable (`set $upstream_front taiga-front; proxy_pass
+  http://$upstream_front/;`) instead of a literal hostname. This would
+  need to land in `taiga-gateway`'s nginx config, which lives inside the
+  pinned third-party `taigaio/taiga-docker` checkout at `$TAIGA_DIR` —
+  **this directly conflicts with the explicit item-30 architecture
+  decision** (install.sh ~line 452-455) to *not* patch
+  taiga.conf/docker-compose.yml inside that pinned checkout, and instead
+  only health-gate via the repo-owned `docker-compose.override.yml`. That
+  decision predates this round's finding that the health-gate approach
+  doesn't actually close the race — worth revisiting, possibly via a
+  volume-mounted custom `taiga.conf` from *our* override file (same
+  spirit as the existing override — never editing the pinned checkout's
+  own files directly) rather than reversing the decision outright.
+  Cheap stopgap in the meantime, called out by the tester: have the
+  item-43 fallback reuse the same settle-and-recheck the main retry loop
+  already has, so it stops reporting `{"ok": true}` for a container about
+  to crash — doesn't close the race, just stops the toggle lying about it.
+
+Everything else (upload-from-folder, GitHub-origin AI-reviewer, real
+engine CLI sessions) — not re-tested this round, same as round 6.
+
+### Round 8 fix cycle: complete (2026-08-16)
+
+Item 43's real fix (nginx lazy DNS resolution via a repo-owned,
+bind-mounted `taiga.conf` — never touching the pinned `taiga-docker`
+checkout, preserving item 30's original constraint) plus a
+settle-and-recheck stopgap for the round-7 fallback, via the normal
+product-manager → developer → reviewer pipeline (no ux-designer —
+backend/infra only). Approved with one non-blocking nit, committed as
+`edb4619` on `backlog/e2e-fixes-round6`, pushed to both remotes, still
+under PR #33. Reviewer independently live-reproduced the original DNS
+crash and confirmed the fix conf stays up under the same condition,
+using real Docker containers rather than trusting the implementation
+report. Re-briefed `pve-sparkling-meadow`, item-43-focused this round
+(asked for several `/taiga/on` runs across fresh installs, since the
+original race was timing-dependent).
+
+### Round 8 retest report (2026-08-16): DNS race genuinely fixed (0/4 crashes), but a new item — 44 — found: port publishing silently fails
+
+Tested `4cb4946` (includes `edb4619`) on a fresh CT110, `install.sh --yes
+--with-taiga`. Ran 4 separate `POST /taiga/on` trials (2 toggle-cycles on
+an already-up stack, 1 from a completely fresh state) plus a live
+runtime-resilience check (stopped `taiga-front` out from under an
+already-running gateway — it stayed up, confirming resolution really is
+lazy/runtime, not just a race window that happened to close in time).
+
+**Item 43 confirmed genuinely fixed**: 0/4 trials hit the old `nginx:
+[emerg] host not found in upstream "taiga-front"` crash. Confirmed the new
+`resolver`/variable-indirection config is live in the running container.
+No retry-loop messages fired at all in any trial — clean first-attempt
+success every time, ~2m50s being genuine Taiga stack startup time, not
+retry overhead.
+
+### 44. `taiga-gateway`'s host port never actually gets published — Taiga is 100% unreachable in every trial despite `{"ok": true}` and `/status` reporting `taiga: true`
+
+Repro (deterministic, hit 4/4, not timing-dependent): after any `POST
+/taiga/on` that reports success, `curl http://127.0.0.1:9000/` →
+`curl: (7) Failed to connect`, and `docker port
+...taiga-gateway-1` prints nothing. Manually re-running the exact `up -d`
+surfaces the real error, never seen or checked by `taiga-up.sh`/app.py:
+`Error response from daemon: failed to set up container networking: ...
+failed to bind host port 127.0.0.1:9000/tcp: address already in use`.
+
+Root cause: the item-30 `docker-compose.override.yml` (see install.sh's
+own comment at ~line 436, present since round 6) adds `ports: -
+"127.0.0.1:${TAIGA_PORT}:80"` for `taiga-gateway` specifically *because*
+the pinned upstream `docker-compose.yml` already publishes an
+unrestricted `ports: - "9000:80"` (`0.0.0.0`) for that same service, which
+conflicts with this project's "everything binds 127.0.0.1 only" rule.
+Unlike `volumes:` (which Compose merges by target path across `-f`
+files — confirmed and relied on by round 8's own taiga.conf fix), `ports:`
+is a plain list field that Compose **concatenates**, not de-dupes/replaces
+across files. So the merged config ends up with two competing bindings
+for host port 9000; Docker fails the second bind but doesn't crash the
+container over it, so `taiga-gateway` ends up **running with no port
+published at all**, silently. `taiga-up.sh`'s own success check (`docker
+compose ps` state == `running`) is blind to this.
+
+This bug has existed since round 6 (item 30) but was never caught before
+because `taiga-gateway` was crash-looping from the DNS race (item 43)
+every time, so nobody got far enough to notice the port never published
+either — round 8 fixing item 43 is what made this visible for the first
+time. Arguably worse than the pre-round-8 state: previously the failure
+was obvious (crash-loop); now everything reports healthy while being
+completely unreachable.
+
+Verified (not just theorized): removing the override's conflicting
+`ports:` block and recreating just `taiga-gateway` immediately fixes
+reachability (`docker port` shows `80/tcp -> 0.0.0.0:9000`, `curl` → `200`)
+— but that falls back to the base file's original *unrestricted*
+`0.0.0.0:9000` binding, reopening the wider exposure the override's
+`ports:` line was clearly added to close in the first place. Compose has
+no "replace" semantics for list fields like `ports` across override
+files (unlike `volumes`, which does support target-path override) — so
+actually tightening the binding to loopback-only needs a different
+mechanism than the override-file idiom that worked for item 43's
+`taiga.conf` fix. Two candidate directions, neither applied yet: (a)
+scripted `sed`-patching of the pinned checkout's own `docker-compose.yml`
+`ports:` line at install time (mirrors "generate config via script, never
+hand-edit the shipped file" — but note this would touch the pinned
+checkout's `docker-compose.yml` directly, which item 30's original
+architecture decision explicitly ruled out doing for *both*
+`taiga.conf`/`docker-compose.yml`, since the override-file idiom was
+believed sufficient for everything, before this round's finding that it
+mechanically can't work for `ports:` specifically); or (b) drop the
+override's `ports:` line and accept the base file's `0.0.0.0:9000`
+exposure (matches whatever posture other services on this host already
+have — worth checking whether any of them already deal with this same
+class of "third-party image publishes to 0.0.0.0" problem). Whether
+loopback-only binding for Taiga is a hard requirement or a nice-to-have is
+worth confirming before picking a direction, since (a) revisits the
+item-30 architecture decision a second time in as many rounds and (b) is
+a real (if narrow) security posture regression.
+
+### Round 9 fix (2026-08-16): direction (a) — narrow, idempotent `sed`-patch of the pinned checkout's own `ports:` line
+
+Implemented per `docs/spec.md`/`docs/implementation.md`: `install.sh` now
+grep-gates-then-`sed`-patches `$TAIGA_DIR/docker-compose.yml`'s
+`taiga-gateway` `ports: - "9000:80"` line to
+`"127.0.0.1:${TAIGA_PORT}:80"` directly, unconditionally on every run (so
+a pre-fix install gets patched on its next re-run too), and warns loudly
+instead of silently no-op-ing if the expected line isn't found. The
+now-redundant, actively-conflicting `ports:` entry is dropped from
+`docker-compose.override.yml`, which keeps only `volumes:`/`depends_on:`
+for `taiga-gateway` (item 43's mechanism, untouched). Verified against the
+real upstream `taigaio/taiga-docker` `stable` branch `docker-compose.yml`
+content and via `docker compose config` that the merged result has
+exactly one `ports:` entry, bound to `127.0.0.1:9000` — see
+`docs/implementation.md` for the full verification method and its limits
+(no live `$TAIGA_DIR` install available in this sandbox; still needs a
+hands-on pve-peer retest to confirm against a real install, same caveat
+pattern round 8 used). Not yet retest-confirmed — do not mark item 44
+"confirmed fixed" until a retest report comes back clean.
+
+**Round 9 fix cycle: complete.** Reviewed (independently re-derived the
+Compose merge-semantics claim from real `docker compose config` runs
+rather than trusting the spec, confirmed idempotency, confirmed item 43's
+mechanism untouched), approved with one non-blocking nit, committed as
+`1de9710` on `backlog/e2e-fixes-round6`, pushed to both remotes, still
+under PR #33. Re-briefed `pve-sparkling-meadow`, item-44-focused (real
+reachability check, item-43 non-regression check, and an idempotency
+check via re-running `install.sh` on the same box rather than only a
+fresh one).
+
+### Round 9 retest report (2026-08-16): clean — all three asks confirmed, no new issues
+
+Tested `1de9710` on a fresh CT110. All three asks came back clean:
+
+1. **Port binding fixed, real reachability confirmed**: `docker port` shows
+   `80/tcp -> 127.0.0.1:9000` (genuinely loopback-only, not falling back to
+   `0.0.0.0`), `curl` → real `200`. Sed patch landed cleanly on the real
+   upstream file with no warning fired (pattern matched first try); the
+   dead `ports:` block is gone from the override.
+2. **Item 43 stays fixed**: 4 `/taiga/on` events total (fresh install + 3
+   toggle cycles), zero DNS crashes. Bonus signal: each toggle now
+   completes in ~13s instead of the ~2m50s every prior round took — no
+   retry-loop/fallback firing at all anymore, independent corroboration
+   the underlying race is actually closed, not just no-longer-crashing.
+3. **Re-run idempotency confirmed against a real re-run** (not just a
+   fresh install): ran `install.sh --yes --with-taiga` a second time on
+   the already-patched box — clean exit, `docker-compose.yml` still has
+   exactly one `ports:` entry, not doubled/corrupted, gateway stayed
+   reachable throughout.
+
+No new issues found this round. **All of items 39-44 are now confirmed
+fixed** (39-42 in round 7, 43 in round 8, 44 in round 9) — three rounds
+in a row of targeted retests, zero regressions.
+
+**Not yet a basis for "fully clean" under step 3 of "The plan, in
+order"**, though: rounds 7-9 were all targeted retests scoped to specific
+items, not a full hands-on pass across the whole feature surface the way
+round 6 was. Round 6's own "Explicitly skipped / not confirmed" list is
+still open: no real browser/UI pass, upload-from-folder project creation,
+GitHub-origin AI-reviewer path, and a genuine `AUTH_MODE=pve` login
+round-trip with real credentials (round 7 verified this via code-path
+inspection only, explicitly flagged as lower-confidence). Given this
+loop's own track record — every round so far has surfaced at least one
+real issue, including one (item 44) that was completely invisible until
+a *different* bug got fixed out from under it — proceeding straight to
+backup+migration off three narrowly-scoped clean reports would be
+premature. Requested one more full-scope pass (round 10, matching round
+6's original breadth) before treating the loop as done.
+
+### Round 10 report (2026-08-16): genuine full-scope pass, clean except one honestly-flagged, non-confirmed observation
+
+Tested `4128fc1` on a fresh CT110, `AUTH_MODE=pve` pre-seeded again, all
+six flags. Not another targeted retest — every prior round's clean path
+re-exercised on top of items 39-44's fixes, plus the three gaps every
+prior round had left open:
+
+- **`AUTH_MODE=pve` real login**: still couldn't complete one — re-tried
+  creating a throwaway PVE-realm test account specifically to
+  re-confirm rather than assume, still blocked by the tester's own
+  session permission classifier, same as round 7. Fell back to the same
+  code-path verification (persists correctly, `pve_login()` genuinely
+  wired, bogus-credential 401s through the real PVE ticket API).
+- **Upload-from-folder**: exercised for the first time this loop, full
+  two-phase protocol, worked cleanly end-to-end.
+- **GitHub-origin AI-reviewer path**: still skipped, no PAT available —
+  confirmed the constraint rather than silently omitting it.
+- **Real browser pass**: still not available, checked explicitly this
+  round rather than assumed.
+- Items 22-27, 39-44 all re-confirmed clean, zero regressions. "+New
+  project"→Gitea, clone-from-URL, deploy-target, team `stop` cleanup —
+  all clean.
+
+### 45. Team run that fails to delegate to any available engine reports `status: "finished"` with no error — indistinguishable from a real success in `/status`
+
+Not confirmed as a code regression — flagged plainly by the tester as
+possibly local-8B-model (`qwen3:8b`) tool-choice variance rather than an
+app.py change, since round 6 hit the identical dead end (aider then
+claude both unavailable) and got a real `ask_user` escalation instead.
+This round, the lead instead emitted a `tool_use` reporting "Failed to
+delegate task to unavailable agents... Please check agent availability or
+use manual intervention", and the run ended `status: "finished"`,
+`terminal: true`, `error: None` — no LICENSE file created (the task was
+"add a LICENSE file"). `/status` shows this identically to a genuinely
+successful finish; nothing distinguishes it except manually opening
+`run.json` to read the `summary` field, which plainly describes the
+failure.
+
+Real gap regardless of root cause: nothing in `/status`'s team block lets
+a user watching the dashboard tell "actually done" apart from "gave up
+and said so in a summary nobody's shown." Two directions suggested, not
+scoped/decided yet: (a) a distinct `give_up`/`error` tool for the lead,
+separate from a success-reporting `finish`; (b) surface `summary` in
+`/status`'s team block for every terminal status, not just
+escalated/error ones. **Not treated as blocking** — single occurrence,
+plausibly model-dependent, distinct in kind from items 39-44 (which were
+all deterministic, reproducible, root-caused code bugs in the install/
+service-toggle path). Worth a future round, not a chase-it-now regression.
+
+**Verdict**: genuinely clean full-scope pass. The orchestrator is pausing
+here to confirm with the user before proceeding into "The plan, in
+order" steps 3-5 (backup of all repos, new container, full environment
+transfer, this session's own shutdown) — that phase is high-stakes and
+hard to reverse, warranting explicit sign-off rather than autonomous
+continuation even though a clean report was the originally-stated
+trigger for it.
+
+### To resume if this session is interrupted mid-loop
+
+1. Check `ListAgents` for the current pve-side peer session name (may
+   have changed if it died again).
+2. Round 10 came back clean (see report above) — item 45 is logged but
+   not blocking. If the user hasn't yet confirmed proceeding to
+   backup+migration: ask them before doing anything under "The plan, in
+   order" steps 3-5 (creating a new container, transferring the
+   environment, and this session being shut down afterward are all
+   hard-to-reverse/high-blast-radius — don't infer approval from the
+   clean report alone).
+3. Once the user confirms: proceed to backup+migration steps 3-5 above.
+4. If the user instead wants item 45 investigated first, or wants another
+   E2E round for any reason: treat it like any other found issue — loop
+   back into the fix pipeline (product-manager → developer → reviewer) if
+   it's to be fixed, or just re-brief the peer for another round if it's
+   to be re-tested first.
+
+### Item 45: investigated and fixed (2026-08-16)
+
+User chose to investigate item 45 before deciding on backup+migration.
+product-manager read the actual code (`app/teams.py`, `app/app.py`)
+rather than theorizing from the E2E report, and confirmed this is a
+real, root-cause-independent gap: the lead's `finish` tool has no
+success/failure distinction, `team_step()` unconditionally sets
+`status: "finished"` when called, and `summary` was already being
+captured on every `finish` call but never surfaced anywhere in `/status`
+or the frontend — the app's own status model conflates "completed" and
+"gave up and said so" regardless of which round's specific tool choice
+triggered it. Rejected inventing a new `give_up`/error tool (same
+unreliable-model-judgment-call problem as choosing `finish` vs
+`ask_user` today, and would still need this same surfacing fix on top);
+fixed by surfacing `summary` universally in `/status`'s team block and
+adding a small frontend display (reusing the existing `escalatedNote`/
+`.team-sub` pattern) — explicitly scoped as additive display only, not
+a failure classifier, and explicitly not extended to `error` status
+(non-goal, flagged as a possible cheap follow-up later). Full
+product-manager → developer → reviewer pipeline (no ux-designer — reused
+an existing frontend pattern 1:1). Reviewer confirmed the escaping is
+safe against injection via a real `<script>`-content test (the field now
+renders model-generated text into the DOM). Approved, no findings.
+Committed as `391865c` on `backlog/e2e-fixes-round6`, pushed to both
+remotes, still under PR #33.
+
+User then chose one more live E2E round (round 11) before migration,
+consistent with how every other fix in this loop got a hands-on
+confirmation. Re-briefed `pve-sparkling-meadow`: reproduce the same
+no-engine-CLI dead end that triggered item 45, confirm `/status`/
+dashboard now surface `summary` when the lead calls `finish` with one, a
+light general sanity pass on top (not a full 39-44 re-walk, given three
+straight clean rounds already). If clean, proceed straight to
+backup+migration (steps 3-5 under "The plan, in order") without asking
+again — the user has already indicated that's the trigger.
+
+### To resume if this session is interrupted mid-loop (round 11)
+
+1. Check `ListAgents` for the current pve-side peer session name (may
+   have changed if it died again).
+2. If no round-11 report has arrived yet: wait, or re-send the round-11
+   brief (see note above) to whichever peer is listed.
+3. If a report *has* arrived: read it. Clean → proceed directly to
+   backup+migration steps 3-5 under "The plan, in order" (already
+   user-approved, no need to ask again). Issues found → loop back into
+   the fix pipeline, commit, push, re-brief, repeat.
+
+---
+
+## Items 39-43: found by E2E round 6 real test on fresh CT110 (2026-08-16)
+
+Found by `pve-sparkling-meadow` (Remote Control peer session on the pve
+host) testing branch `backlog/e2e-fixes-round6` @ `140a2ae` (PR #33) on a
+genuinely fresh Proxmox LXC (CT110, Debian 12, 4 vCPU/4GB/32GB), installed
+via `install.sh --yes` with all six optional feature flags
+(`--with-git-hosting --with-code-server --with-host-control
+--with-deploy-target --with-taiga --with-ollama`), linked against a real
+LAN Ollama endpoint. Items 22-27 from the previous round were reconfirmed
+still fixed. Full report kept verbatim below; CT110 was destroyed after
+the report was sent, no orphaned containers left on the host.
+
+### 39. `install.sh --yes` ignores a pre-seeded `AUTH_MODE` — always installs in `simple` auth, never `pve`
+
+`ct/create.sh`'s automated path writes `AUTH_MODE=pve` + `PVE_HOST` into
+`switchboard.env` before invoking `install.sh --yes`, expecting it
+honored (the printed summary even promises "Web UI login: your existing
+Proxmox VE credentials"). It never is. Repro: pre-seed `switchboard.env`
+with `AUTH_MODE=pve` + `PVE_HOST=192.168.178.100`, run `install.sh --yes
+...`. Result: `AUTH_MODE=simple`, auto-generated password — pre-seeded
+value silently discarded.
+
+Root cause: `RUN_USER`/`SVC_USER` correctly default from `get_env
+"$ENV_FILE" ...` (survives `--yes`), but `AUTH_MODE`'s default is the
+literal string `"simple"`:
+```bash
+AUTH_MODE=$(prompt "Auth mode: simple (username+password) or pve (Proxmox VE login)" "simple")
+```
+(install.sh ~line 327). Under `--yes`, `prompt()` always returns that
+hardcoded default, never consulting `switchboard.env`.
+
+Shape of the fix: default to `$(get_env "$ENV_FILE" AUTH_MODE)`, falling
+back to `"simple"` only when empty — same pattern `RUN_USER_DEFAULT`
+already uses two lines above it.
+
+### 40. Gitea admin bootstrap: any admin account that isn't literally Gitea's first-ever user gets `must_change_password=true`, blocking all API access with an unhelpful 403
+
+`install.sh`'s printed step: `docker exec --user git
+ai-dev-switchboard-gitea gitea admin user create --admin --username
+<name> --password <password> --email <email>`, followed by
+`scripts/gitea-configure-api.sh`. Repro: run the printed command exactly
+as documented, but not as Gitea's first-ever user (a prior throwaway
+account, a retry after a typo). `gitea-configure-api.sh` fails
+verification:
+```
+Verifying the token actually works (GET /user)...
+Verification failed -- Gitea didn't accept the new token. Output was:
+curl: (22) The requested URL returned error: 403
+```
+Manually hitting the API with the token shows the real reason, never
+surfaced by the script: `{"message":"You must change your password.
+Change it at: .../user/change_password"}`.
+
+Root cause: Gitea's CLI defaults `--must-change-password` to `true` for
+every user "except the first one" (`gitea admin user create --help`) —
+and that account is not guaranteed to be Gitea's first user in practice.
+Confirmed live: clearing the flag via `gitea admin user change-password
+--must-change-password=false` immediately fixed it, same token, same
+script, no other change.
+
+Shape of the fix: add `--must-change-password=false` to the command
+install.sh prints. Consider having `gitea-configure-api.sh`'s
+verification special-case this exact 403 with a pointer to the real fix.
+
+### 41. `--with-code-server` is completely non-functional out of the box — wrong hardcoded binary path, fails silently on every toggle
+
+Repro: fresh install with `--with-code-server`, then toggle "Code" on for
+any project. Response is `{"ok": true}`, but no process ever starts,
+`code_on` stays `false`.
+
+Root cause: code-server.dev's installer (what install.sh itself runs)
+installs a real `.deb` on Debian 12, landing the binary at
+`/usr/bin/code-server` (confirmed: `dpkg -l` shows `code-server 4.132.0`,
+binary present/executable there, symlinked from `/bin/code-server`). But
+both install.sh's idempotency check (`[ ! -x /usr/local/bin/code-server
+]`) and app.py's hardcoded default (`CODE_SERVER_BIN =
+os.environ.get("CODE_SERVER_BIN", "/usr/local/bin/code-server")`) look
+in `/usr/local/bin/`, which never exists. Confirmed directly: `sudo -u
+dev /usr/local/bin/code-server ...` → `sudo: /usr/local/bin/code-server:
+command not found`. `_code_start()` launches it via
+`subprocess.Popen(..., stdout=DEVNULL, stderr=DEVNULL)` with nothing
+surfaced, so the toggle silently no-ops every time — and install.sh
+re-downloads/reinstalls code-server on every single run since its own
+existence-check is also looking in the wrong place.
+
+Shape of the fix: point both checks at the real install location. Safest
+fix is resolving via `command -v code-server` at runtime in both places
+rather than hardcoding a path that already changed once upstream.
+
+### 42. `POST /host/on`, `/host/off` (and `/taiga/on` when its retry budget is exhausted) report `{"ok": true}` unconditionally, regardless of whether the underlying action actually succeeded
+
+`host_run()` (app.py ~line 2677) runs `subprocess.run([...ssh...],
+capture_output=True, ...)` and returns `r.stdout.strip()` — never checks
+`r.returncode`, never surfaces `r.stderr`. The POST handler ignores the
+return value: `host_run("start" if ... else "stop"); self._json({"ok":
+True})`. Repro: with no `HOST_CONTROL_KEY`/target configured (the normal
+state right after `--with-host-control`, which only provisions the
+receiving end), `POST /host/on` returns `200 {"ok": true}` instantly, no
+ssh attempt visible in the journal. `GET /status` (which calls
+`host_run("status")` fresh every poll) correctly reports `host: false` a
+moment later — the toggle response itself is the only thing lying.
+
+Same pattern hits Taiga harder: `POST /taiga/on` blocked for 2m44s
+(taiga-up.sh's full 5-attempt/150s-backoff budget), the script exited 1
+with `"taiga-gateway failed to come up after 5 attempts"` on stderr — HTTP
+response was still `{"ok": true}`. See item 43 for the underlying race
+this exposed live.
+
+Shape of the fix: check `returncode`/exit status in both `host_run`'s and
+`taiga_run`/`gitea_run`'s callers; return a real error + captured stderr
+instead of an unconditional `{"ok": true}` on failure.
+
+### 43. Round 6's taiga-gateway health-gate retry fix (item 30) is still flaky — reproduced live, all 5 attempts exhausted, while a plain manual `docker compose up -d taiga-gateway` immediately afterward succeeded in 3 seconds with no error at all
+
+Repro: fresh `--with-taiga` install, `POST /taiga/on`. All 8 other
+containers (db, back, async(+rabbitmq), events(+rabbitmq), front,
+protected) came up healthy; `taiga-gateway` — "the stack's only public
+entrypoint" per taiga-up.sh's own comment — never got past Docker's
+`Created` state through all 5 retries (`up -d` + `rm -f taiga-gateway` +
+backoff 10/20/40/80s). Script exits 1 to stderr as designed, but per item
+42 that never reaches the caller. Manually running the exact same command
+the script already retries (`docker compose up -d taiga-gateway`, no
+flags, no `rm -f` first) right afterward succeeded in ~3s, completely
+clean nginx logs.
+
+Whatever the real race is (item 30's own comment says "root cause wasn't
+pinned down"), round 6's retry strategy isn't actually closing it — a bare
+extra `up -d` after the loop gives up would likely have succeeded, going
+by this one live repro. Treating item 30 as still open; worth trying "one
+more plain `up -d`, no `rm -f`" as the very last step before declaring
+failure.
+
+### What worked cleanly (round 6 re-verification)
+
+- Login (simple auth) + session cookie + once-per-session TOTP gate
+  (`428` → `403` on wrong code → `200` on correct code) all exactly as
+  documented.
+- "+ New project" → real Gitea repo → local clone → `gitea_sync: synced`
+  worked end-to-end once item 40 was worked around.
+- Clone-from-URL worked cleanly against a real public GitHub repo
+  (octocat/Hello-World).
+- `--with-ollama` against a real LAN Ollama endpoint linked correctly;
+  roster/composition reflected it as a real tier-1 lead candidate.
+- Deploy-target provisioning matched its documented end state exactly.
+- The multi-agent team lifecycle genuinely works end-to-end, driven by a
+  real linked Ollama lead: `team/start` → real `qwen3:8b` lead delegated
+  to `aider` (recorded failure — CLI not installed in this throwaway
+  sandbox, expected) → delegated to `claude` (same) → correctly issued a
+  real `ask_user` tool call → `/status` correctly showed `status:
+  "blocked"`, `waiting_on_you: true`, `escalation_kind: "ask_user"`,
+  right run_id/project → `team/resolve` accepted an answer →
+  `team/stop` cleanly tore down the tmux session and all three worktrees.
+  (Note: `/status`'s `instances` array is alphabetically sorted, not
+  most-recent-first — a red herring during testing, not a bug.)
+- Items 22-27 all reconfirmed still fixed on this fresh install.
+
+### Explicitly skipped / not confirmed this round
+
+- No real Claude Code / aider / Codex CLI session exercised (none of the
+  three engine CLIs are installed by install.sh itself, left to the
+  operator) — the Ollama-lead team path was exercised instead.
+- No real browser available in this headless peer session — everything
+  above drove the same JSON API the frontend calls, not the rendered
+  HTML/JS/CSS. Visual/layout correctness not assessed this round.
+- Upload-from-folder project creation not exercised (time-boxed).
+- GitHub-origin AI-reviewer path not tested (needs a real GitHub PAT +
+  target repo).
+- `AUTH_MODE=pve` itself never actually exercised end-to-end, precisely
+  because of item 39 — tested via the auto-generated simple-mode
+  credentials instead.

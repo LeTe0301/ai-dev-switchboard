@@ -168,6 +168,15 @@ TEAM_WORKTREE_OP_TIMEOUT_SECONDS = float(os.environ.get("TEAM_WORKTREE_OP_TIMEOU
 # docstring and docs/spec.md "Open questions".
 TEAM_SESSION_STALE_TTL_SECONDS = int(os.environ.get("TEAM_SESSION_STALE_TTL_SECONDS", "86400"))
 
+# The 4 terminal run statuses -- a run in one of these is done, one way
+# or another, and nothing further will ever drive it. Single source of
+# truth for stop_team()/sweep_dead_teams()/interject()'s existing inline
+# checks (item 38: previously duplicated verbatim in three places, and
+# NOT what /status's own separately-written team_status mapping used,
+# which is the root cause of escalated_max_rounds runs reporting
+# "blocked" forever with no terminal signal at all).
+TEAM_TERMINAL_STATUSES = ("finished", "escalated_max_rounds", "error", "stopped")
+
 # Overwatch feed + escalation inbox (backlog item 6f part 1, docs/spec.md).
 # Per-file, per-poll byte cap for GET .../team/events -- tail_jsonl_events()
 # never reads more than this many new bytes past a file's own cursor on any
@@ -4086,7 +4095,7 @@ def stop_team(run_id: str) -> dict:
             remaining_worktrees[agent] = path
     state["worktrees"] = remaining_worktrees
 
-    if state["status"] not in ("finished", "escalated_max_rounds", "error", "stopped"):
+    if state["status"] not in TEAM_TERMINAL_STATUSES:
         state["status"] = "stopped"
     _persist(state)
 
@@ -4331,7 +4340,7 @@ def sweep_dead_teams() -> list:
                                 "detail": state["error"]})
             continue  # never sweep worktrees/session in this same pass
 
-        if status not in ("finished", "escalated_max_rounds", "error", "stopped"):
+        if status not in TEAM_TERMINAL_STATUSES:
             continue  # some other/unknown status -- nothing this sweep does
 
         try:
@@ -4503,7 +4512,7 @@ def interject(run_id: str, text: str) -> dict:
     except FileNotFoundError:
         return {"ok": False, "error": f"no such run_id: {run_id}"}
     status = state.get("status")
-    if status in ("finished", "escalated_max_rounds", "error", "stopped"):
+    if status in TEAM_TERMINAL_STATUSES:
         return {"ok": False,
                 "error": f"run {run_id} is not accepting messages (status={status})"}
     envelope = {"ts": _now_iso(), "agent": "human", "seq": _next_human_seq(run_id),

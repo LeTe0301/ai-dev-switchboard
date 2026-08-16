@@ -131,12 +131,33 @@ GITEA_PORT="${GITEA_PORT:-3000}"
 
 echo
 echo "Verifying the token actually works (GET /user)..."
-VERIFY_OUTPUT=$(curl -fsS -H "Authorization: token $GITEA_API_TOKEN" \
-    "http://127.0.0.1:${GITEA_PORT}/api/v1/user" 2>&1) || {
-    echo "Verification failed -- Gitea didn't accept the new token. Output was:" >&2
-    echo "$VERIFY_OUTPUT" >&2
+# Deliberately no -f here (docs/BACKLOG.md item 40): -f suppresses the
+# response body on a non-2xx, which is exactly what we need to inspect to
+# tell a plain "token rejected" from Gitea's specific "you must change your
+# password first" 403 -- the latter happens when the admin account (see
+# install.sh's printed step 1) was created without --must-change-password=
+# false and isn't literally Gitea's first-ever user. Appending the HTTP
+# status via -w lets us branch on it without -f's crude "curl exits
+# nonzero" signal.
+VERIFY_RAW=$(curl -sS -w '\n%{http_code}' -H "Authorization: token $GITEA_API_TOKEN" \
+    "http://127.0.0.1:${GITEA_PORT}/api/v1/user" 2>&1) && CURL_EXIT=0 || CURL_EXIT=$?
+VERIFY_STATUS="${VERIFY_RAW##*$'\n'}"
+VERIFY_OUTPUT="${VERIFY_RAW%$'\n'*}"
+if [ "$CURL_EXIT" -ne 0 ] || [ "$VERIFY_STATUS" != "200" ]; then
+    echo "Verification failed -- Gitea didn't accept the new token (HTTP ${VERIFY_STATUS:-unknown})." >&2
+    if [ "$VERIFY_STATUS" = "403" ] && printf '%s' "$VERIFY_OUTPUT" | grep -qi "must change"; then
+        echo "Cause: the '$GITEA_ADMIN_USER' account still has Gitea's must-change-password flag set" >&2
+        echo "(it was likely created without --must-change-password=false -- see install.sh's" >&2
+        echo "printed step 1). Fix it with:" >&2
+        echo "  docker exec --user git $GITEA_CONTAINER gitea admin user change-password \\" >&2
+        echo "    --username $GITEA_ADMIN_USER --password <password> --must-change-password=false" >&2
+        echo "then re-run this script." >&2
+    else
+        echo "Output was:" >&2
+        echo "$VERIFY_OUTPUT" >&2
+    fi
     exit 1
-}
+fi
 VERIFIED_LOGIN=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('login',''))" <<<"$VERIFY_OUTPUT" 2>/dev/null || true)
 if [ -z "$VERIFIED_LOGIN" ]; then
     echo "Verification failed -- couldn't parse a username out of Gitea's /user response:" >&2

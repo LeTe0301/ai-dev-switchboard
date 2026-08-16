@@ -24,6 +24,7 @@ import datetime
 import json
 import os
 import stat
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -142,17 +143,71 @@ def _load_config(path: str) -> dict:
     return cfg
 
 
+def _parse_acl_other_bits(getfacl_output: str) -> dict | None:
+    """Parses `getfacl -p <path>` output. Returns None if the file has only
+    a minimal ACL (no `mask::` line -- st_mode's group/other bits are then
+    accurate and the plain check below applies unchanged). Returns
+    {"other": 0-7 int, "other_str": "r--"} from the `other::` line when an
+    extended ACL is present -- the only entry that reflects genuine
+    world-exposure once a mask entry exists (item 37: the group-class bits
+    stat() reports become the ACL mask, not real group permissions, once
+    any named user/group ACL entry -- e.g. item 29's switchboard-svc:r --
+    is present, so they must never drive this warning)."""
+    lines = getfacl_output.splitlines()
+    if not any(l.startswith("mask::") for l in lines):
+        return None
+    other_line = next((l for l in lines if l.startswith("other::")), None)
+    if other_line is None:
+        return None
+    other_str = other_line.split("::", 1)[1].strip()
+    bits = (4 if "r" in other_str else 0) | (2 if "w" in other_str else 0) | (1 if "x" in other_str else 0)
+    return {"other": bits, "other_str": other_str}
+
+
+def _read_getfacl(path: str) -> str | None:
+    """The one seam this ACL check monkeypatches in tests (mirrors
+    _taiga_request's own "one seam per shelled-out call" convention).
+    Returns None (not a raised exception) if `getfacl` isn't installed or
+    the call otherwise fails -- best-effort, same as taiga-configure-
+    push.sh's own `command -v setfacl` fallback -- so a host without the
+    'acl' package degrades to the plain st_mode check below, not a crash."""
+    try:
+        result = subprocess.run(["getfacl", "-p", path], capture_output=True,
+                                 text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
 def _check_config_permissions(path: str) -> None:
     """docs/spec.md "Edge cases": a config file mode looser than 600 is a
     loud warning, not a hard block -- this file holds a live, standalone
     Taiga password with no other secret co-located to notice a leak via,
-    unlike switchboard.env."""
+    unlike switchboard.env. Item 37: once the file carries an extended ACL
+    (e.g. item 29's `setfacl -m u:switchboard-svc:r` grant), stat()'s
+    group-class bits report the ACL *mask*, not real group permissions --
+    so this consults `getfacl`'s `other::` entry instead whenever an ACL is
+    present, rather than misreading the mask as a loose group grant and
+    recommending a `chmod` that would collapse it."""
     try:
         mode = stat.S_IMODE(os.stat(path).st_mode)
     except OSError:
         return
+    raw = _read_getfacl(path)
+    acl = _parse_acl_other_bits(raw) if raw is not None else None
+    if acl is not None:
+        if acl["other"] != 0:
+            print(
+                f"WARNING: {path} is readable/writable by 'other' via its ACL "
+                f"(other::{acl['other_str']}) — it holds a live Taiga password. "
+                f"Run: setfacl -m o::--- {path}  (do NOT run chmod -- with an ACL "
+                f"present, chmod recomputes the ACL mask and can silently break "
+                f"a legitimate named grant, e.g. a service account's read access).",
+                file=sys.stderr,
+            )
+        return  # ACL present and other:: clean -- narrowly-ACL'd, not loose
     if mode & 0o077:
-        print(
+        print(  # unchanged from today
             f"WARNING: {path} is readable by group/other (mode {oct(mode)}) — it holds a "
             f"live Taiga password. Run: chmod 600 {path}",
             file=sys.stderr,

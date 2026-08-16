@@ -830,10 +830,15 @@ class TeamStopEndpointTests(_RealHTTPTeamTestCase):
         # part 2) is additive too -- None, no run at all. "members"/"lead"
         # (backlog item 21 part 2) are additive too -- []/None, no run at
         # all (run is None, so both fall to their no-run defaults).
+        # "terminal" (item 38) is additive too -- False, no run at all.
+        # "summary" (backlog item 45) is additive too -- None, no run at
+        # all (run is None, so it falls to the same no-run default every
+        # other run-scoped field in this dict already uses).
         self.assertEqual(by_name[_PROJ]["team"],
                          {"status": "idle", "run_id": None, "composition": None,
                           "waiting_on_you": False, "escalation_kind": None,
-                          "members": [], "lead": None})
+                          "terminal": False, "members": [], "lead": None,
+                          "summary": None})
 
     def test_stop_on_blocked_board_write_now_actually_stops(self):
         # docs/spec.md §4 (backlog item 7 part 2) -- the disclosed no-op gap
@@ -1009,6 +1014,83 @@ class StatusRosterAndCompositionTests(_RealHTTPTeamTestCase):
             s = self._get_status(cookie)
             by_name = {i["name"]: i for i in s["instances"]}
             self.assertEqual(by_name[_PROJ]["team"]["escalation_kind"], expected, raw_status)
+
+    def test_terminal_field(self):
+        # Item 38, docs/spec.md: additive-only field, True iff the
+        # project's LATEST run status is one of
+        # teams.TEAM_TERMINAL_STATUSES ("finished", "escalated_max_rounds",
+        # "error", "stopped") -- sourced from the same single source of
+        # truth stop_team()/sweep_dead_teams()/interject() already use,
+        # unlike team_status's own coarser "blocked" bucket which
+        # deliberately can't distinguish escalated_max_rounds (terminal)
+        # from blocked_ask_user/blocked_board_write (not terminal). Every
+        # existing /status field/value stays byte-for-byte unchanged (this
+        # test only checks the one new key).
+        repo = self._project(_PROJ)
+        result = teamsmod.launch_team(repo, "task", {"kind": "ollama", "name": "m", "tier": 1}, [])
+        run_id = result["run_id"]
+        cookie = self._login()
+        cases = {
+            "running": False, "blocked_ask_user": False,
+            "blocked_board_write": False,
+            "escalated_max_rounds": True, "finished": True,
+            "error": True, "stopped": True,
+        }
+        for raw_status, expected in cases.items():
+            state = teamsmod._load_state(run_id)
+            state["status"] = raw_status
+            teamsmod._persist(state)
+            s = self._get_status(cookie)
+            by_name = {i["name"]: i for i in s["instances"]}
+            self.assertEqual(by_name[_PROJ]["team"]["terminal"], expected, raw_status)
+
+    def test_terminal_field_false_when_no_run_ever_started(self):
+        self._project(_PROJ)
+        cookie = self._login()
+        s = self._get_status(cookie)
+        by_name = {i["name"]: i for i in s["instances"]}
+        self.assertFalse(by_name[_PROJ]["team"]["terminal"])
+
+    def test_summary_field(self):
+        # Backlog item 45, docs/spec.md "Proposed approach" (Backend):
+        # additive-only field, read straight off state["summary"] --
+        # non-None only for a "finished" run whose lead actually called
+        # finish(summary=...) (the only branch of team_step() that ever
+        # sets it); every other terminal/non-terminal status leaves it at
+        # its _new_state() default of None, mirroring
+        # test_escalation_kind_field's multi-status-case-dict style.
+        repo = self._project(_PROJ)
+        result = teamsmod.launch_team(repo, "task", {"kind": "ollama", "name": "m", "tier": 1}, [])
+        run_id = result["run_id"]
+        cookie = self._login()
+        cases = {
+            "running": None, "blocked_ask_user": None,
+            "blocked_board_write": None,
+            "escalated_max_rounds": None, "error": None, "stopped": None,
+        }
+        for raw_status, expected in cases.items():
+            state = teamsmod._load_state(run_id)
+            state["status"] = raw_status
+            teamsmod._persist(state)
+            s = self._get_status(cookie)
+            by_name = {i["name"]: i for i in s["instances"]}
+            self.assertEqual(by_name[_PROJ]["team"]["summary"], expected, raw_status)
+        # The one status that DOES carry a summary -- the finish() path.
+        state = teamsmod._load_state(run_id)
+        state["status"] = "finished"
+        state["summary"] = "Could not complete: build tool unavailable."
+        teamsmod._persist(state)
+        s = self._get_status(cookie)
+        by_name = {i["name"]: i for i in s["instances"]}
+        self.assertEqual(by_name[_PROJ]["team"]["summary"],
+                          "Could not complete: build tool unavailable.")
+
+    def test_summary_field_none_when_no_run_ever_started(self):
+        self._project(_PROJ)
+        cookie = self._login()
+        s = self._get_status(cookie)
+        by_name = {i["name"]: i for i in s["instances"]}
+        self.assertIsNone(by_name[_PROJ]["team"]["summary"])
 
     def test_team_max_members_top_level_field(self):
         # Backlog item 21 part 2, docs/spec.md "Proposed approach" §1 -- a

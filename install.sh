@@ -228,10 +228,26 @@ if [ ! -x /usr/local/bin/ttyd ]; then
     fi
 fi
 
-if [ "$WITH_CODE_SERVER" -eq 1 ] && [ ! -x /usr/local/bin/code-server ]; then
+# Item 41 (docs/BACKLOG.md): the code-server.dev installer actually puts
+# the binary at /usr/bin/code-server on a real Debian 12 box, not
+# /usr/local/bin/code-server -- a hardcoded /usr/local/bin/ path here made
+# this idempotency check re-trigger the install every single run. Detect
+# "does a usable code-server already exist anywhere on PATH" via `command
+# -v` instead of one specific location.
+if [ "$WITH_CODE_SERVER" -eq 1 ] && ! command -v code-server >/dev/null 2>&1; then
     echo "-- Installing code-server --"
     curl -fsSL https://code-server.dev/install.sh | sh
 fi
+# Resolve the real installed path once, here, and keep every other
+# reference (the sudoers rule below, and app.py's CODE_SERVER_BIN) in sync
+# with this single resolved value -- a mismatch between this and the
+# sudoers rule would trade "silent no-op" for "permission denied", still
+# broken (docs/spec.md Item 41). Falls back to the pre-existing literal
+# default only when `command -v` finds nothing (WITH_CODE_SERVER=0, or a
+# fresh box with code-server disabled), so this never errors out here.
+CODE_SERVER_BIN="$(command -v code-server 2>/dev/null || true)"
+CODE_SERVER_BIN="${CODE_SERVER_BIN:-/usr/local/bin/code-server}"
+set_env "$ENV_FILE" CODE_SERVER_BIN "$CODE_SERVER_BIN"
 
 echo "-- Users --"
 RUN_USER_DEFAULT="$(get_env "$ENV_FILE" RUN_USER)"; RUN_USER_DEFAULT="${RUN_USER_DEFAULT:-dev}"
@@ -324,7 +340,8 @@ if [ -z "$TOTP_SECRET" ]; then
     set_env "$ENV_FILE" TOTP_SECRET "$TOTP_SECRET"
 fi
 
-AUTH_MODE=$(prompt "Auth mode: simple (username+password) or pve (Proxmox VE login)" "simple")
+AUTH_MODE_DEFAULT="$(get_env "$ENV_FILE" AUTH_MODE)"; AUTH_MODE_DEFAULT="${AUTH_MODE_DEFAULT:-simple}"
+AUTH_MODE=$(prompt "Auth mode: simple (username+password) or pve (Proxmox VE login)" "$AUTH_MODE_DEFAULT")
 set_env "$ENV_FILE" AUTH_MODE "$AUTH_MODE"
 SIMPLE_PASSWORD_SHOWN=""
 if [ "$AUTH_MODE" = "pve" ]; then
@@ -382,7 +399,38 @@ if [ "$WITH_TAIGA" -eq 1 ]; then
         TAIGA_FRESH_CLONE=1
     fi
 
-    # 3. Config — taiga-docker ships a real (not .example) .env file with
+    # 3. Item 44 (round 9): patch the pinned checkout's own
+    # docker-compose.yml `ports:` line for taiga-gateway directly, in place
+    # -- Compose merges list fields like `ports:` by *concatenation*, not by
+    # replacement (unlike `volumes:`, which item 43 below relies on merging
+    # by container target path), so a docker-compose.override.yml `ports:`
+    # entry can never actually close the upstream file's own unrestricted
+    # "9000:80" binding; it just adds a second, losing bind, and
+    # taiga-gateway ends up running with no port published at all
+    # (docs/spec.md "Background / current state", item 44). This is a
+    # narrow, explicit exception to item 30's "don't patch the pinned
+    # checkout" decision (see step 5 below) -- scoped to exactly this one
+    # `ports:` line; taiga.conf (item 43) stays entirely on the
+    # override-file/bind-mount mechanism, untouched here. Runs
+    # unconditionally on every install.sh invocation (not gated on
+    # TAIGA_FRESH_CLONE), so a pre-fix $TAIGA_DIR cloned before this change
+    # shipped still gets patched on its next re-run, not just a brand-new
+    # clone. grep-gated before the sed so a second/third run against an
+    # already-patched checkout is a clean, byte-identical no-op instead of a
+    # double-patch; warns loudly to stderr (does not fail the install) if
+    # neither the expected original line nor the already-patched form is
+    # found, in case a future re-clone of a newer upstream commit changes
+    # this line's exact format. ${TAIGA_PORT} in the replacement is
+    # single-quoted/literal on purpose -- Compose (not this shell) resolves
+    # it from $TAIGA_DIR/.env at `docker compose` time.
+    TAIGA_COMPOSE_YML="$TAIGA_DIR/docker-compose.yml"
+    if grep -q '^[[:space:]]*-[[:space:]]*"9000:80"[[:space:]]*$' "$TAIGA_COMPOSE_YML"; then
+        sed -i 's|^\([[:space:]]*-[[:space:]]*\)"9000:80"[[:space:]]*$|\1"127.0.0.1:${TAIGA_PORT}:80"|' "$TAIGA_COMPOSE_YML"
+    elif ! grep -q '"127\.0\.0\.1:\${TAIGA_PORT}:80"' "$TAIGA_COMPOSE_YML"; then
+        echo "WARNING: expected taiga-gateway's 'ports: - \"9000:80\"' line in $TAIGA_COMPOSE_YML but didn't find it (upstream taiga-docker format may have changed) -- taiga-gateway's host port may end up published on all interfaces (0.0.0.0) instead of loopback-only. Check $TAIGA_COMPOSE_YML's taiga-gateway service manually." >&2
+    fi
+
+    # 4. Config — taiga-docker ships a real (not .example) .env file with
     # insecure placeholder defaults (SECRET_KEY="taiga-secret-key", etc.),
     # so unlike switchboard.env's TOTP_SECRET there's no "empty means
     # generate one" signal to key off of. Only randomize secrets right after
@@ -409,29 +457,190 @@ if [ "$WITH_TAIGA" -eq 1 ]; then
     set_env "$TAIGA_ENV" TAIGA_DOMAIN "$TAIGA_DOMAIN_VALUE"
     # TAIGA_PORT also lives in taiga-docker's own .env (not just
     # switchboard.env below) — Compose auto-loads .env from the project
-    # directory for variable substitution, which is what lets the
-    # docker-compose.override.yml below reference ${TAIGA_PORT} without the
-    # wrapper scripts needing to export anything themselves.
+    # directory for variable substitution, which is what lets
+    # docker-compose.yml's own taiga-gateway ports: line (patched in step 3
+    # above) reference ${TAIGA_PORT} without the wrapper scripts needing to
+    # export anything themselves.
     set_env "$TAIGA_ENV" TAIGA_PORT "$TAIGA_PORT"
 
-    # 4. Loopback-only binding — taiga-gateway's own docker-compose.yml
-    # binds "9000:80" on all interfaces, which conflicts with this project's
-    # "everything binds 127.0.0.1 only" rule. Compose auto-merges
-    # docker-compose.yml + docker-compose.override.yml in the same
-    # directory, so this override never conflicts with a future manual
-    # `git pull` in $TAIGA_DIR. Regenerated deterministically every run,
-    # like the systemd unit / sudoers file below. The single-quoted heredoc
-    # is deliberate: ${TAIGA_PORT} must stay literal here so Compose (not
-    # this shell) substitutes it from $TAIGA_DIR/.env at `docker compose`
-    # time.
+    # 5. (item 30) Health-gating taiga-gateway's startup on taiga-front
+    # actually being resolvable — taiga-gateway's own docker-compose.yml
+    # binds "9000:80" on all interfaces by default (now patched to
+    # loopback-only at the source, in step 3 above — item 44), and its
+    # taiga.conf does `proxy_pass http://taiga-front/;` with no `resolver`
+    # directive, so nginx resolves that hostname once at startup — if
+    # taiga-front isn't attached to the network yet (an ordinary Compose
+    # startup-ordering race; upstream's own `depends_on: [taiga-front, ...]`
+    # only waits for it to *start*, not to be ready), taiga-gateway crashes
+    # immediately and, because the exited container retains its port
+    # reservation, every remove+recreate collides on the same port and can
+    # never recover (docs/BACKLOG.md item 30). taiga-front has no healthcheck
+    # upstream, so one is added here, and taiga-gateway's depends_on for it
+    # is upgraded to `condition: service_healthy` (the same long-form
+    # depends_on/condition syntax upstream's own docker-compose.yml already
+    # uses for taiga-back -> taiga-db, proven compatible with this stack) —
+    # Compose won't start taiga-gateway until taiga-front is genuinely
+    # healthy, eliminating the race instead of retrying into it. This is
+    # deliberately done here, in the override file this repo already
+    # regenerates deterministically every run, and not by patching
+    # taiga.conf/docker-compose.yml inside the pinned, third-party
+    # taiga-docker checkout itself (docs/spec.md "Proposed approach" —
+    # Item 30 architecture decision; step 3 above's `ports:` patch is a
+    # narrow, explicit, later exception to this for exactly one line —
+    # item 44, round 9). The healthcheck test command uses
+    # `http://127.0.0.1/`, not `http://localhost/` — confirmed hands-on
+    # against the real taigaio/taiga-front:latest image that its bundled
+    # nginx only listens on 0.0.0.0:80 (no IPv6 listener), so BusyBox wget
+    # resolving "localhost" to ::1 first gets "Connection refused" even
+    # though the server is up; 127.0.0.1 sidesteps that entirely (BusyBox
+    # wget has no -4/--prefer-family flag to force IPv4 for a "localhost"
+    # URL instead). Compose merges depends_on per-service-key across -f
+    # files, so listing all three of taiga-gateway's existing dependencies
+    # here (only taiga-front's condition actually changes) is both correct
+    # and self-documenting. Compose auto-merges docker-compose.yml +
+    # docker-compose.override.yml in the same directory, so this override
+    # never conflicts with a future manual `git pull` in $TAIGA_DIR.
+    # Regenerated deterministically every run, like the systemd unit /
+    # sudoers file below.
+    #
+    # Item 43 (round 8): item 30's healthcheck above narrows the DNS race
+    # for taiga-front specifically but doesn't close it — nginx still
+    # resolves all 4 of taiga-gateway's proxy_pass upstream hostnames
+    # (taiga-front, taiga-back x2, taiga-events, taiga-protected) exactly
+    # once, at config-load time, so a `service_healthy` gate that only
+    # covers taiga-front's own container being up doesn't guarantee
+    # taiga-front's (or any of the other three, which have no healthcheck
+    # at all) DNS record has actually propagated through Docker's embedded
+    # resolver (127.0.0.11) at that exact instant — confirmed live: gateway
+    # still crashed with the identical taiga-front DNS error even with the
+    # healthcheck gate in place. The real fix is nginx-side: make it resolve
+    # those hostnames lazily, at request time, instead of once at startup.
+    # docker-compose.override.taiga-gateway.conf (written just below) is
+    # upstream's own taiga-gateway/taiga.conf with a `resolver 127.0.0.11
+    # valid=10s;` directive added and each bare-hostname proxy_pass target
+    # rewritten to a `set $upstream_x <host>; proxy_pass
+    # http://$upstream_x...;` variable indirection — nginx only performs the
+    # DNS lookup for a variable proxy_pass target at request time, honoring
+    # `resolver`'s TTL, which is nginx's own documented fix for this exact
+    # class of Docker-Compose startup-DNS race. It's bind-mounted over the
+    # pinned checkout's own taiga.conf via the `volumes:` entry added to
+    # taiga-gateway below — Compose merges `volumes:` entries by container
+    # target path across -f files, so this single entry *replaces only* the
+    # /etc/nginx/conf.d/default.conf mount; the base file's
+    # taiga-static-data/taiga-media-data mounts on the same service are left
+    # untouched. This is the same override-file idiom already used for
+    # depends_on above, just extended to volumes — the pinned checkout's own
+    # $TAIGA_DIR/taiga-gateway/taiga.conf (as opposed to its
+    # docker-compose.yml, which step 3 above does patch for item 44) is
+    # never opened for writing. Item 30's healthcheck/service_healthy gate
+    # is kept in place as defense-in-depth alongside this fix, not replaced
+    # by it.
+    cat > "$TAIGA_DIR/docker-compose.override.taiga-gateway.conf" <<'NGINX'
+server {
+    listen 80 default_server;
+
+    client_max_body_size 100M;
+    charset utf-8;
+
+    resolver 127.0.0.11 valid=10s;
+
+    # Frontend
+    location / {
+        set $upstream_front taiga-front;
+        proxy_pass http://$upstream_front/;
+        proxy_pass_header Server;
+        proxy_set_header Host $http_host;
+        proxy_redirect off;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Scheme $scheme;
+    }
+
+    # API
+    location /api/ {
+        set $upstream_back taiga-back;
+        proxy_pass http://$upstream_back:8000/api/;
+        proxy_pass_header Server;
+        proxy_set_header Host $http_host;
+        proxy_redirect off;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Scheme $scheme;
+    }
+
+    # Admin
+    location /admin/ {
+        set $upstream_back taiga-back;
+        proxy_pass http://$upstream_back:8000/admin/;
+        proxy_pass_header Server;
+        proxy_set_header Host $http_host;
+        proxy_redirect off;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Scheme $scheme;
+    }
+
+    # Static
+    location /static/ {
+        alias /taiga/static/;
+    }
+
+    # Media
+    location /_protected/ {
+        internal;
+        alias /taiga/media/;
+        add_header Content-disposition "attachment";
+    }
+
+    # Unprotected section
+    location /media/exports/ {
+        alias /taiga/media/exports/;
+        add_header Content-disposition "attachment";
+    }
+
+    location /media/ {
+        set $upstream_protected taiga-protected;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Scheme $scheme;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_pass http://$upstream_protected:8003/;
+        proxy_redirect off;
+    }
+
+    # Events
+    location /events {
+        set $upstream_events taiga-events;
+        proxy_pass http://$upstream_events:8888/events;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_connect_timeout 7d;
+        proxy_send_timeout 7d;
+        proxy_read_timeout 7d;
+    }
+}
+NGINX
     cat > "$TAIGA_DIR/docker-compose.override.yml" <<'YAML'
 services:
+  taiga-front:
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1/ || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
   taiga-gateway:
-    ports:
-      - "127.0.0.1:${TAIGA_PORT}:80"
+    volumes:
+      - ./docker-compose.override.taiga-gateway.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      taiga-front:
+        condition: service_healthy
+      taiga-back:
+        condition: service_started
+      taiga-events:
+        condition: service_started
 YAML
 
-    # 5. Pre-pull images at install time, not first toggle — otherwise the
+    # 6. Pre-pull images at install time, not first toggle — otherwise the
     # first UI toggle-on blocks on pulling 9 images over the network.
     # Warn-and-continue (not fatal) if there's no network right now; the
     # first toggle-on will simply be slow instead.
@@ -442,7 +651,7 @@ YAML
         fi
     fi
 
-    # 6. Wrapper scripts (root-run, zero arguments — see docs/spec.md
+    # 7. Wrapper scripts (root-run, zero arguments — see docs/spec.md
     # "Crossing the privilege boundary"). Sudoers entries for these are
     # added below, alongside every other sudoers rule this installer
     # generates.
@@ -450,7 +659,7 @@ YAML
     install -m 755 "$REPO_DIR/scripts/taiga-down.sh" /usr/local/bin/ai-dev-switchboard-taiga-down.sh
     install -m 755 "$REPO_DIR/scripts/taiga-status.sh" /usr/local/bin/ai-dev-switchboard-taiga-status.sh
 
-    # 7. switchboard.env — TAIGA_DIR is also recorded here (beyond what
+    # 8. switchboard.env — TAIGA_DIR is also recorded here (beyond what
     # app.py itself reads) because the wrapper scripts above source this
     # same file for it, exactly like new-project-from-upload.sh already
     # sources RUN_USER/PROJECTS_DIR from it.
@@ -522,7 +731,12 @@ SUDOERS=/etc/sudoers.d/ai-dev-switchboard
 {
     echo "$SVC_USER ALL=($RUN_USER) NOPASSWD: /usr/bin/tmux *"
     echo "$SVC_USER ALL=($RUN_USER) NOPASSWD: /usr/local/bin/ttyd *"
-    echo "$SVC_USER ALL=($RUN_USER) NOPASSWD: /usr/local/bin/code-server *"
+    # Item 41: must reference the same resolved $CODE_SERVER_BIN persisted
+    # above, not a hardcoded literal -- sudo only matches a rule against
+    # the exact command path invoked, so a mismatch here would turn a
+    # silent no-op into a loud "permission denied" instead of actually
+    # fixing the toggle.
+    echo "$SVC_USER ALL=($RUN_USER) NOPASSWD: $CODE_SERVER_BIN *"
     if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
         # Poll-triggered sync-on-push (backlog item 2c, part 1 —
         # docs/spec.md "The sync decision") — grouped with the other
@@ -962,7 +1176,8 @@ if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
     echo "stack has finished starting:"
     echo "  1. Create Gitea's own admin account (a single non-interactive command):"
     echo "       docker exec --user git ai-dev-switchboard-gitea gitea admin user create \\"
-    echo "         --admin --username <name> --password <password> --email <email>"
+    echo "         --admin --username <name> --password <password> --email <email> \\"
+    echo "         --must-change-password=false"
     echo "  2. Run scripts/gitea-configure-api.sh once (as root) to mint an API token"
     echo "     for the web UI to use — see docs/GIT_HOSTING.md."
 fi

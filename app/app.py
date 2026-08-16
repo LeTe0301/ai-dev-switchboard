@@ -114,7 +114,17 @@ DESC_LLM_MODEL = os.environ.get("DESC_LLM_MODEL", "")
 DESC_CACHE_FILE = os.environ.get("DESC_CACHE_FILE", "/var/lib/ai-dev-switchboard/descriptions.json")
 
 TTYD_BIN = os.environ.get("TTYD_BIN", "/usr/local/bin/ttyd")
-CODE_SERVER_BIN = os.environ.get("CODE_SERVER_BIN", "/usr/local/bin/code-server")
+# Item 41 (docs/BACKLOG.md): code-server.dev's installer actually puts the
+# binary at /usr/bin/code-server on a real Debian 12 box, not
+# /usr/local/bin/code-server. install.sh now resolves and persists the
+# real path into CODE_SERVER_BIN via switchboard.env for a fresh/re-run
+# install (see install.sh's own WITH_CODE_SERVER block), but an existing
+# install upgrading its code without re-running install.sh would still see
+# no CODE_SERVER_BIN in its environment at all -- resolve via shutil.which
+# first so that case self-heals on a plain code restart too, falling back
+# to the pre-existing literal only when code-server isn't on PATH either.
+CODE_SERVER_BIN = os.environ.get(
+    "CODE_SERVER_BIN", shutil.which("code-server") or "/usr/local/bin/code-server")
 
 # Self-hosted Taiga (backlog item 1a) — a singleton on/off toggle row like
 # host-control above, not a per-project row like ttyd/code-server. Off
@@ -2674,6 +2684,20 @@ def _reap_dead_state():
     _team_reap_if_due()
 
 
+class SingletonActionError(Exception):
+    """Item 42 (docs/BACKLOG.md): raised by host_run()/taiga_run()/
+    gitea_run() when a mutating action ("start"/"stop"/"up"/"down") exits
+    nonzero, so do_POST's /host,/taiga,/gitea on/off routes can return a
+    real error instead of an unconditional {"ok": true}. Deliberately never
+    raised for the "status" action (see each function's own docstring) --
+    /status and create_project()'s own status check must keep degrading to
+    "reported off" on a transient failure, not start throwing from a
+    read-only poll."""
+    def __init__(self, message: str, stderr: str = ""):
+        super().__init__(message)
+        self.stderr = stderr
+
+
 def host_run(action: str) -> str:
     assert action in ("start", "stop", "status")
     r = subprocess.run(
@@ -2682,6 +2706,12 @@ def host_run(action: str) -> str:
          f"sudo /usr/local/bin/ai-dev-switchboard-host-{action}.sh"],
         capture_output=True, text=True, timeout=30,
     )
+    # "status" keeps today's contract unchanged (str, never raises) -- the
+    # 4 existing /status + create_project() call sites parse its stdout
+    # directly and must keep self-correcting to "reported off" on a
+    # transient failure rather than start throwing from a read-only poll.
+    if action != "status" and r.returncode != 0:
+        raise SingletonActionError(f"host {action} failed", stderr=r.stderr)
     return r.stdout.strip()
 
 
@@ -2706,21 +2736,36 @@ def taiga_run(action: str) -> str:
     # give that retry loop room to run to exhaustion; "down"/"status" never
     # retry, so their timeouts are unchanged.
     #
-    # Margin arithmetic (docs/test-review.md round-5 Finding 2): 180s total
-    # minus the 150s worst-case pure `sleep` above leaves ~30s for the loop's
-    # 14 real subprocess calls (5x `up -d` + 5x `ps` + 4x `rm -f`), ~2.1s/call
-    # average if spread evenly. That's thin for the exact degraded-Docker
-    # scenario this retry loop exists to survive, but this ceiling is a
-    # last-resort safety net, not the loop's primary defense -- the retry
-    # loop's own 5-attempt/exponential-backoff logic is what actually
-    # recovers from a slow daemon; this timeout only guards against the
-    # subprocess wedging entirely (e.g. a hung `docker compose` call that
-    # never returns). Widen this (and SINGLETON_TOGGLE_CONFIG.taiga.timeoutMs
-    # below, which is deliberately kept >= this value -- see its own comment)
-    # together if real-world margin turns out to be too thin.
-    timeout = 180 if action == "up" else (10 if action == "status" else 90)
+    # Item 30 (round 6): the script also gained a settle-window recheck --
+    # after an attempt's initial `ps` reports "running", it sleeps
+    # TAIGA_UP_SETTLE_SECONDS (default 5s) and rechecks before trusting it,
+    # treating a die-before-settled as a failed attempt like any other. That
+    # adds up to TAIGA_UP_MAX_ATTEMPTS x TAIGA_UP_SETTLE_SECONDS = 5x5 = 25s
+    # of additional worst-case pure `sleep` (only paid on attempts whose
+    # initial check reported "running", so this is the ceiling, not the
+    # typical case) on top of the 150s backoff above. Raised to 220s.
+    #
+    # Margin arithmetic (docs/test-review.md round-5 Finding 2, updated for
+    # round 6's settle window): 220s total minus the 175s worst-case pure
+    # `sleep` (150s backoff + 25s settle windows) leaves ~45s for the loop's
+    # up to 19 real subprocess calls (5x `up -d` + up to 10x `ps` now that
+    # each attempt can call it twice + 4x `rm -f`), ~2.4s/call average if
+    # spread evenly -- comparable margin-per-call to the previous 180s/14-call
+    # budget (~2.1s/call). That's thin for the exact degraded-Docker scenario
+    # this retry loop exists to survive, but this ceiling is a last-resort
+    # safety net, not the loop's primary defense -- the retry loop's own
+    # 5-attempt/exponential-backoff logic is what actually recovers from a
+    # slow daemon; this timeout only guards against the subprocess wedging
+    # entirely (e.g. a hung `docker compose` call that never returns). Widen
+    # this (and SINGLETON_TOGGLE_CONFIG.taiga.timeoutMs below, which is
+    # deliberately kept >= this value -- see its own comment) together if
+    # real-world margin turns out to be too thin.
+    timeout = 220 if action == "up" else (10 if action == "status" else 90)
     r = subprocess.run(["sudo", script], capture_output=True, text=True,
                        timeout=timeout)
+    # See host_run()'s own comment: "status" stays str/never-raises.
+    if action != "status" and r.returncode != 0:
+        raise SingletonActionError(f"taiga {action} failed", stderr=r.stderr)
     return r.stdout.strip()
 
 
@@ -2743,6 +2788,9 @@ def gitea_run(action: str) -> str:
               "status": GITEA_STATUS_SCRIPT}[action]
     r = subprocess.run(["sudo", script], capture_output=True, text=True,
                        timeout=(10 if action == "status" else 90))
+    # See host_run()'s own comment: "status" stays str/never-raises.
+    if action != "status" and r.returncode != 0:
+        raise SingletonActionError(f"gitea {action} failed", stderr=r.stderr)
     return r.stdout.strip()
 
 
@@ -3231,10 +3279,13 @@ let singletonToggleState = {
 // flips to "error" while the backend POST is still legitimately in flight
 // (docs/test-review.md round-5 Finding 1 — this broke once, when the
 // backend's "up" timeout was raised to 180s for item 30's retry-loop fix but
-// this value was left at the old 90000). Gitea's own backend timeout is
-// unchanged (still 90s), so its timeoutMs stays 90000 too.
+// this value was left at the old 90000). Round 6 raised the backend "up"
+// timeout again, to 220s, to cover taiga-up.sh's new settle-window recheck
+// (see taiga_run()'s own comment) — kept in sync here for the same reason.
+// Gitea's own backend timeout is unchanged (still 90s), so its timeoutMs
+// stays 90000 too.
 const SINGLETON_TOGGLE_CONFIG = {
-  taiga: {timeoutMs: 180000, badgeText: '⚠ ~3–5 GB RAM when running',
+  taiga: {timeoutMs: 220000, badgeText: '⚠ ~3–5 GB RAM when running',
           badgeClass: 'taiga-ram', errClass: 'taiga-err', spinnerClass: 'taiga-starting-spinner'},
   gitea: {timeoutMs: 90000, badgeText: 'ℹ ~1 GB RAM when running',
           badgeClass: 'gitea-resources', errClass: 'gitea-err', spinnerClass: 'gitea-starting-spinner'},
@@ -4357,6 +4408,16 @@ function teamRow(name, team) {
   const escalatedNote = (team.status === 'blocked' && !team.waiting_on_you) ?
     '<div class="team-sub">Escalated — max rounds reached. No pending question to answer. ' +
     'Review the feed below or Stop team and start a new run.</div>' : '';
+  // Backlog item 45, docs/spec.md "Proposed approach" (Frontend) -- a
+  // sibling block under the status strip, exactly like escalatedNote above,
+  // surfacing the lead's own finish() summary so a self-reported-failure
+  // finish doesn't look identical to a real success on the dashboard. Only
+  // rendered for a finished run with a non-empty summary (deliberately not
+  // rendered for status !== 'finished' regardless of team.summary's value,
+  // and deliberately not shown for an empty-string summary -- no
+  // classification of success vs. failure, just visibility of the text).
+  const finishedSummary = (team.status === 'finished' && team.summary) ?
+    '<div class="team-sub">' + esc(team.summary) + '</div>' : '';
   const escalationPanel = team.waiting_on_you ? renderEscalationPanel(name, team) : '';
   // Chat-UI compose surface (backlog item 19 part 2, docs/spec.md "Proposed
   // approach" §1) -- positioned between the escalation panel and the feed
@@ -4372,7 +4433,7 @@ function teamRow(name, team) {
   const addMemberControl = renderTeamAddMemberControl(name, team);
   const feedToggle = renderTeamFeedToggle(name);
   const feedPanel = renderTeamFeed(name, team);
-  return '<div class="team-row">' + statusStrip + escalatedNote + escalationPanel +
+  return '<div class="team-row">' + statusStrip + escalatedNote + finishedSummary + escalationPanel +
     interjectBox + addMemberControl + feedToggle + feedPanel +
     '<div class="team-actions"><button class="team-btn" onclick="doTeamStop(' +
     "'" + name + "'" + ')">Stop team</button></div>' +
@@ -5936,9 +5997,20 @@ class Handler(BaseHTTPRequestHandler):
                     "ask_user" if run is not None and run["status"] == "blocked_ask_user" else
                     "board_write" if run is not None and run["status"] == "blocked_board_write" else
                     None)
+                # terminal (item 38, docs/spec.md) -- additive only. Sourced
+                # from teams.TEAM_TERMINAL_STATUSES, the same single source
+                # of truth stop_team()/sweep_dead_teams()/interject() already
+                # use, so a poller has an unambiguous "is this run actually
+                # done" signal instead of having to infer it from the
+                # coarser team_status/waiting_on_you combination above --
+                # which is exactly what let escalated_max_rounds runs (which
+                # stay under the "blocked" team_status bucket, deliberately,
+                # per waiting_on_you's own comment above) look stuck forever
+                # to a caller that only checked status/waiting_on_you.
+                terminal = run is not None and run["status"] in teams.TEAM_TERMINAL_STATUSES
                 inst["team"] = {"status": team_status, "run_id": run["run_id"] if run else None,
                                 "composition": composition, "waiting_on_you": waiting_on_you,
-                                "escalation_kind": escalation_kind,
+                                "escalation_kind": escalation_kind, "terminal": terminal,
                                 # Backlog item 21 part 2, docs/spec.md
                                 # "Proposed approach" §1 -- the run's LIVE
                                 # roster/lead, read directly off the
@@ -5951,7 +6023,17 @@ class Handler(BaseHTTPRequestHandler):
                                 # own "next round boundary" delivery
                                 # semantics.
                                 "members": run.get("members", []) if run is not None else [],
-                                "lead": run.get("lead") if run is not None else None}
+                                "lead": run.get("lead") if run is not None else None,
+                                # Backlog item 45, docs/spec.md "Proposed
+                                # approach" (Backend) -- the run's
+                                # `finish`-provided summary, read straight
+                                # off the persisted state dict like
+                                # members/lead above. Only ever set via the
+                                # `finish` tool (team_step()); every other
+                                # terminal status leaves it None, so no
+                                # extra status-gating is needed here -- the
+                                # frontend decides when to render it.
+                                "summary": run.get("summary") if run is not None else None}
                 sync_entry = gitea_sync_by_name.get(n)
                 if sync_entry is not None:
                     inst["gitea_sync"] = {"state": sync_entry.get("sync_state"),
@@ -6233,27 +6315,39 @@ class Handler(BaseHTTPRequestHandler):
         if parts[0] == "host" and len(parts) == 2 and parts[1] in ("on", "off"):
             if not HOST_CONTROL_ENABLED:
                 return self._json({"error": "host control disabled"}, 404)
-            host_run("start" if parts[1] == "on" else "stop")
+            try:
+                host_run("start" if parts[1] == "on" else "stop")
+            except SingletonActionError as e:
+                return self._json(
+                    {"error": str(e), "stderr": (e.stderr or "").strip()[-200:]}, 502)
             self._json({"ok": True})
         elif parts[0] == "taiga" and len(parts) == 2 and parts[1] in ("on", "off"):
             if not TAIGA_ENABLED:
                 return self._json({"error": "taiga disabled"}, 404)
-            if parts[1] == "on":
-                taiga_run("up")
-                _publish(TAIGA_URL_PATH, TAIGA_PORT)
-            else:
-                _unpublish(TAIGA_URL_PATH)
-                taiga_run("down")
+            try:
+                if parts[1] == "on":
+                    taiga_run("up")
+                    _publish(TAIGA_URL_PATH, TAIGA_PORT)
+                else:
+                    _unpublish(TAIGA_URL_PATH)
+                    taiga_run("down")
+            except SingletonActionError as e:
+                return self._json(
+                    {"error": str(e), "stderr": (e.stderr or "").strip()[-200:]}, 502)
             self._json({"ok": True})
         elif parts[0] == "gitea" and len(parts) == 2 and parts[1] in ("on", "off"):
             if not GITEA_ENABLED:
                 return self._json({"error": "gitea disabled"}, 404)
-            if parts[1] == "on":
-                gitea_run("up")
-                _publish(GITEA_URL_PATH, GITEA_PORT)
-            else:
-                _unpublish(GITEA_URL_PATH)
-                gitea_run("down")
+            try:
+                if parts[1] == "on":
+                    gitea_run("up")
+                    _publish(GITEA_URL_PATH, GITEA_PORT)
+                else:
+                    _unpublish(GITEA_URL_PATH)
+                    gitea_run("down")
+            except SingletonActionError as e:
+                return self._json(
+                    {"error": str(e), "stderr": (e.stderr or "").strip()[-200:]}, 502)
             self._json({"ok": True})
         elif parts[0] == "projects" and len(parts) == 2 and parts[1] == "new":
             ok, err = create_project((body.get("name") or "").strip())

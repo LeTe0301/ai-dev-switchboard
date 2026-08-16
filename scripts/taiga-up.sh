@@ -23,6 +23,12 @@ CONFIG=/etc/ai-dev-switchboard/switchboard.env
 TAIGA_DIR="${TAIGA_DIR:-/opt/ai-dev-switchboard-taiga}"
 TAIGA_UP_MAX_ATTEMPTS="${TAIGA_UP_MAX_ATTEMPTS:-5}"
 TAIGA_UP_RETRY_BACKOFF_SECONDS="${TAIGA_UP_RETRY_BACKOFF_SECONDS:-10}"
+# Item 30: the original success check was a single point-in-time read right
+# after `up -d` returns -- round 5 saw the gateway report "running" for
+# under a second before crashing. Sleep this long and re-check before
+# trusting a "running" read; a die-before-settled is treated as a failed
+# attempt, same as any other (docs/spec.md "Proposed approach" Item 30).
+TAIGA_UP_SETTLE_SECONDS="${TAIGA_UP_SETTLE_SECONDS:-5}"
 # Item 30 (v2): a full `systemctl restart docker` was the only 100%-
 # reliable recovery found on the verification host, but it restarts
 # EVERY Docker container on this machine, not just Taiga's -- a real,
@@ -42,9 +48,15 @@ while [ "$attempt" -le "$TAIGA_UP_MAX_ATTEMPTS" ]; do
     "${COMPOSE[@]}" up -d
     state=$("${COMPOSE[@]}" ps taiga-gateway --format '{{.State}}' 2>/dev/null)
     if [ "$state" = "running" ]; then
-        exit 0
+        sleep "$TAIGA_UP_SETTLE_SECONDS"
+        state=$("${COMPOSE[@]}" ps taiga-gateway --format '{{.State}}' 2>/dev/null)
+        if [ "$state" = "running" ]; then
+            exit 0
+        fi
+        echo "taiga-up: taiga-gateway was running but died within the ${TAIGA_UP_SETTLE_SECONDS}s settle window (state: ${state:-<none>}), attempt $attempt/$TAIGA_UP_MAX_ATTEMPTS" >&2
+    else
+        echo "taiga-up: taiga-gateway didn't come up cleanly (state: ${state:-<none>}), attempt $attempt/$TAIGA_UP_MAX_ATTEMPTS" >&2
     fi
-    echo "taiga-up: taiga-gateway didn't come up cleanly (state: ${state:-<none>}), attempt $attempt/$TAIGA_UP_MAX_ATTEMPTS" >&2
     if [ "$attempt" -lt "$TAIGA_UP_MAX_ATTEMPTS" ]; then
         "${COMPOSE[@]}" rm -f taiga-gateway >/dev/null 2>&1 || true
         sleep "$backoff"
@@ -52,6 +64,35 @@ while [ "$attempt" -le "$TAIGA_UP_MAX_ATTEMPTS" ]; do
     fi
     attempt=$((attempt + 1))
 done
+
+# Item 43 (round 7): round 6's retry loop still reproduced flaky under live
+# testing on a fresh CT110 -- all attempts exhausted, but a bare `docker
+# compose up -d` (no `rm -f` first) run manually right afterward succeeded
+# in ~3s with clean logs. Root cause still not pinned down; this is the
+# cheapest concrete fallback the live repro points at, tried before the
+# (opt-in, heavier, host-wide) full-Docker-daemon-restart path below and
+# before giving up.
+# Item 43 (round 8): round 7's retest found this fallback *does* report
+# "running" now (catching the container in a brief pre-crash window), but
+# taiga-gateway still crashed seconds later from the same nginx DNS race
+# this round's real fix (install.sh's lazy-resolver taiga-gateway conf
+# override) targets -- so the toggle response went back to lying about the
+# exact failure item 42 was meant to stop lying about, just via a new
+# mechanism. This one extra attempt now gets the identical
+# settle-and-recheck window the main retry loop already has above, kept as
+# defense-in-depth even after the nginx fix lands, in case that fix needs a
+# second round to land cleanly.
+echo "taiga-up: all $TAIGA_UP_MAX_ATTEMPTS attempts exhausted -- trying one plain 'docker compose up -d' with no rm -f first, as a last resort before giving up" >&2
+"${COMPOSE[@]}" up -d
+state=$("${COMPOSE[@]}" ps taiga-gateway --format '{{.State}}' 2>/dev/null)
+if [ "$state" = "running" ]; then
+    sleep "$TAIGA_UP_SETTLE_SECONDS"
+    state=$("${COMPOSE[@]}" ps taiga-gateway --format '{{.State}}' 2>/dev/null)
+    if [ "$state" = "running" ]; then
+        exit 0
+    fi
+    echo "taiga-up: last-resort attempt reported running but died within the ${TAIGA_UP_SETTLE_SECONDS}s settle window (state: ${state:-<none>})" >&2
+fi
 
 if [ "$TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION" -eq 1 ]; then
     echo "taiga-up: all $TAIGA_UP_MAX_ATTEMPTS attempts exhausted -- TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION=1, restarting the Docker daemon itself (affects every container on this host) and trying once more" >&2

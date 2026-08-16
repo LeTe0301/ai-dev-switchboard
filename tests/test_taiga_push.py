@@ -125,6 +125,156 @@ class ConfigPermissionsTests(_TmpDirCase):
             tps._check_config_permissions(os.path.join(self.tmp, "nope.env"))
         self.assertEqual(buf.getvalue(), "")
 
+    # ── item 37: ACL-aware -- an item-29-style narrow ACL grant must not ──
+    # ── be misread as a loose group permission via the recomputed mask.   ──
+    # ── _read_getfacl is the one seam these tests monkeypatch, same style ──
+    # ── as _taiga_request above (docs/spec.md's own note). ────────────────
+
+    def setUp(self):
+        super().setUp()
+        self._orig_read_getfacl = tps._read_getfacl
+
+    def tearDown(self):
+        tps._read_getfacl = self._orig_read_getfacl
+        super().tearDown()
+
+    def test_item29_style_acl_grant_prints_no_warning(self):
+        # mode 600 + `setfacl -m u:switchboard-svc:r` recomputes the ACL
+        # mask to `r--`, so stat() now reports mode 0640 even though the
+        # file's real other:: exposure is still `---`.
+        write_config(self.config_path)
+        os.chmod(self.config_path, 0o640)
+        getfacl_output = (
+            "# file: taiga-push.env\n"
+            "# owner: root\n"
+            "# group: root\n"
+            "user::rw-\n"
+            "user:switchboard-svc:r--\n"
+            "group::---\n"
+            "mask::r--\n"
+            "other::---\n"
+        )
+        tps._read_getfacl = lambda path: getfacl_output
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            tps._check_config_permissions(self.config_path)
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_item29_style_acl_grant_output_never_contains_chmod_600(self):
+        write_config(self.config_path)
+        os.chmod(self.config_path, 0o640)
+        getfacl_output = (
+            "user::rw-\nuser:switchboard-svc:r--\ngroup::---\nmask::r--\nother::---\n"
+        )
+        tps._read_getfacl = lambda path: getfacl_output
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            tps._check_config_permissions(self.config_path)
+        self.assertNotIn("chmod 600", buf.getvalue())
+
+    def test_genuinely_loose_acl_warns_with_setfacl_remediation_not_chmod(self):
+        write_config(self.config_path)
+        os.chmod(self.config_path, 0o644)
+        getfacl_output = (
+            "user::rw-\nuser:switchboard-svc:r--\ngroup::---\nmask::r--\nother::r--\n"
+        )
+        tps._read_getfacl = lambda path: getfacl_output
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            tps._check_config_permissions(self.config_path)
+        out = buf.getvalue()
+        self.assertIn("WARNING", out)
+        self.assertIn("Run: setfacl", out)
+        # The remediation itself is setfacl-based; "chmod" may still appear
+        # as part of an explicit "do NOT run chmod" safety note, but never
+        # as the recommended command.
+        self.assertNotIn("Run: chmod", out)
+
+    def test_no_acl_at_all_behaves_exactly_as_before(self):
+        # getfacl output with no extended ACL (no mask:: line) -- the plain
+        # st_mode path applies unchanged.
+        write_config(self.config_path)
+        os.chmod(self.config_path, 0o644)
+        getfacl_output = "user::rw-\ngroup::r--\nother::r--\n"
+        tps._read_getfacl = lambda path: getfacl_output
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            tps._check_config_permissions(self.config_path)
+        self.assertIn("chmod 600", buf.getvalue())
+
+    def test_getfacl_unavailable_falls_back_to_plain_st_mode_check(self):
+        write_config(self.config_path)
+        os.chmod(self.config_path, 0o644)
+        tps._read_getfacl = lambda path: None
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            tps._check_config_permissions(self.config_path)  # must not raise
+        self.assertIn("chmod 600", buf.getvalue())
+
+    def test_getfacl_unavailable_mode_600_prints_no_warning(self):
+        write_config(self.config_path)
+        os.chmod(self.config_path, 0o600)
+        tps._read_getfacl = lambda path: None
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            tps._check_config_permissions(self.config_path)
+        self.assertEqual(buf.getvalue(), "")
+
+
+# ─── _parse_acl_other_bits / _read_getfacl ──────────────────────────────────
+class ParseAclOtherBitsTests(unittest.TestCase):
+    def test_no_mask_line_returns_none(self):
+        self.assertIsNone(tps._parse_acl_other_bits("user::rw-\ngroup::r--\nother::r--\n"))
+
+    def test_mask_present_extracts_other_bits(self):
+        out = tps._parse_acl_other_bits(
+            "user::rw-\nuser:svc:r--\ngroup::---\nmask::r--\nother::---\n"
+        )
+        self.assertEqual(out, {"other": 0, "other_str": "---"})
+
+    def test_mask_present_other_rw_extracts_nonzero_bits(self):
+        out = tps._parse_acl_other_bits(
+            "user::rw-\nuser:svc:r--\ngroup::---\nmask::rw-\nother::rw-\n"
+        )
+        self.assertEqual(out, {"other": 6, "other_str": "rw-"})
+
+    def test_mask_present_but_no_other_line_returns_none(self):
+        self.assertIsNone(tps._parse_acl_other_bits("user::rw-\nmask::r--\n"))
+
+
+class ReadGetfaclTests(unittest.TestCase):
+    """Monkeypatches the module-level subprocess (imported by
+    taiga_push_spec.py itself), same restore-in-tearDown technique
+    TaigaRunTests in tests/test_taiga.py uses for appmod's subprocess.run."""
+
+    def setUp(self):
+        self._orig_run = tps.subprocess.run
+
+    def tearDown(self):
+        tps.subprocess.run = self._orig_run
+
+    def test_missing_getfacl_binary_returns_none(self):
+        def fake_run(*a, **k):
+            raise FileNotFoundError()
+        tps.subprocess.run = fake_run
+        self.assertIsNone(tps._read_getfacl("/some/path"))
+
+    def test_getfacl_timeout_returns_none(self):
+        def fake_run(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="getfacl", timeout=5)
+        tps.subprocess.run = fake_run
+        self.assertIsNone(tps._read_getfacl("/some/path"))
+
+    def test_nonzero_returncode_returns_none(self):
+        fake = subprocess.CompletedProcess(["getfacl"], 1, stdout="", stderr="err")
+        tps.subprocess.run = lambda *a, **k: fake
+        self.assertIsNone(tps._read_getfacl("/some/path"))
+
+    def test_success_returns_stdout(self):
+        fake = subprocess.CompletedProcess(["getfacl"], 0, stdout="user::rw-\n", stderr="")
+        tps.subprocess.run = lambda *a, **k: fake
+        self.assertEqual(tps._read_getfacl("/some/path"), "user::rw-\n")
+
 
 # ─── _build_subject_and_description ────────────────────────────────────────
 class BuildSubjectAndDescriptionTests(unittest.TestCase):

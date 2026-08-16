@@ -371,6 +371,45 @@ test('finished and error render their own status classes, no subtitle', async ()
   assert.ok(he.includes('status-error'));
 });
 
+// Backlog item 45, docs/spec.md "Proposed approach" (Frontend) / "Acceptance
+// criteria" -- the finishedSummary sibling block under the status strip,
+// reusing the escalatedNote/.team-sub pattern verbatim.
+test('finished + non-empty summary shows "Finished" and a .team-sub summary line', async () => {
+  const c = await setupCase([inst('proj', {
+    status: 'finished', run_id: 'run-1', summary: 'Could not complete: build tool unavailable.',
+  })]);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('status-finished'));
+  assert.ok(html.includes('>Finished'), 'expected the unchanged "Finished" strip label, got: ' + html);
+  assert.ok(/<div class="team-sub">Could not complete: build tool unavailable\.<\/div>/.test(html),
+    'expected a .team-sub summary line, got: ' + html);
+});
+
+test('finished + empty-string summary renders no summary line (unchanged "Finished" only)', async () => {
+  const c = await setupCase([inst('proj', { status: 'finished', run_id: 'run-1', summary: '' })]);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(html.includes('status-finished'));
+  const subCount = (html.match(/class="team-sub"/g) || []).length;
+  assert.strictEqual(subCount, 0, 'expected no .team-sub block for an empty summary, got: ' + html);
+});
+
+test('finished + a summary containing HTML is escaped, not injected raw', async () => {
+  const c = await setupCase([inst('proj', {
+    status: 'finished', run_id: 'run-1', summary: '<script>alert(1)</script>',
+  })]);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(!html.includes('<script>alert(1)</script>'), 'raw HTML must not be injected, got: ' + html);
+  assert.ok(html.includes('&lt;script&gt;'), 'expected the summary to be HTML-escaped, got: ' + html);
+});
+
+test('a non-finished status never renders a summary line even if team.summary happens to be set', async () => {
+  const c = await setupCase([inst('proj', {
+    status: 'running', run_id: 'run-1', summary: 'should never show',
+  })]);
+  const html = c.instanceRowHtml('proj');
+  assert.ok(!html.includes('should never show'), 'summary must only render for status === "finished", got: ' + html);
+});
+
 // Regression guard mirroring test_deploy_frontend.js's own HTML-injection
 // deviation check: a project name is already NAME_RE-restricted, but the
 // task textarea's own typed CONTENT is fully operator-controlled and must
