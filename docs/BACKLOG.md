@@ -2621,20 +2621,80 @@ backup+migration off three narrowly-scoped clean reports would be
 premature. Requested one more full-scope pass (round 10, matching round
 6's original breadth) before treating the loop as done.
 
+### Round 10 report (2026-08-16): genuine full-scope pass, clean except one honestly-flagged, non-confirmed observation
+
+Tested `4128fc1` on a fresh CT110, `AUTH_MODE=pve` pre-seeded again, all
+six flags. Not another targeted retest — every prior round's clean path
+re-exercised on top of items 39-44's fixes, plus the three gaps every
+prior round had left open:
+
+- **`AUTH_MODE=pve` real login**: still couldn't complete one — re-tried
+  creating a throwaway PVE-realm test account specifically to
+  re-confirm rather than assume, still blocked by the tester's own
+  session permission classifier, same as round 7. Fell back to the same
+  code-path verification (persists correctly, `pve_login()` genuinely
+  wired, bogus-credential 401s through the real PVE ticket API).
+- **Upload-from-folder**: exercised for the first time this loop, full
+  two-phase protocol, worked cleanly end-to-end.
+- **GitHub-origin AI-reviewer path**: still skipped, no PAT available —
+  confirmed the constraint rather than silently omitting it.
+- **Real browser pass**: still not available, checked explicitly this
+  round rather than assumed.
+- Items 22-27, 39-44 all re-confirmed clean, zero regressions. "+New
+  project"→Gitea, clone-from-URL, deploy-target, team `stop` cleanup —
+  all clean.
+
+### 45. Team run that fails to delegate to any available engine reports `status: "finished"` with no error — indistinguishable from a real success in `/status`
+
+Not confirmed as a code regression — flagged plainly by the tester as
+possibly local-8B-model (`qwen3:8b`) tool-choice variance rather than an
+app.py change, since round 6 hit the identical dead end (aider then
+claude both unavailable) and got a real `ask_user` escalation instead.
+This round, the lead instead emitted a `tool_use` reporting "Failed to
+delegate task to unavailable agents... Please check agent availability or
+use manual intervention", and the run ended `status: "finished"`,
+`terminal: true`, `error: None` — no LICENSE file created (the task was
+"add a LICENSE file"). `/status` shows this identically to a genuinely
+successful finish; nothing distinguishes it except manually opening
+`run.json` to read the `summary` field, which plainly describes the
+failure.
+
+Real gap regardless of root cause: nothing in `/status`'s team block lets
+a user watching the dashboard tell "actually done" apart from "gave up
+and said so in a summary nobody's shown." Two directions suggested, not
+scoped/decided yet: (a) a distinct `give_up`/`error` tool for the lead,
+separate from a success-reporting `finish`; (b) surface `summary` in
+`/status`'s team block for every terminal status, not just
+escalated/error ones. **Not treated as blocking** — single occurrence,
+plausibly model-dependent, distinct in kind from items 39-44 (which were
+all deterministic, reproducible, root-caused code bugs in the install/
+service-toggle path). Worth a future round, not a chase-it-now regression.
+
+**Verdict**: genuinely clean full-scope pass. The orchestrator is pausing
+here to confirm with the user before proceeding into "The plan, in
+order" steps 3-5 (backup of all repos, new container, full environment
+transfer, this session's own shutdown) — that phase is high-stakes and
+hard to reverse, warranting explicit sign-off rather than autonomous
+continuation even though a clean report was the originally-stated
+trigger for it.
+
 ### To resume if this session is interrupted mid-loop
 
 1. Check `ListAgents` for the current pve-side peer session name (may
    have changed if it died again).
-2. If no round-10 report has arrived yet: wait, or re-send the round-10
-   full-scope brief (see message sent to `pve-sparkling-meadow` after
-   this report — reconstruct from "The plan, in order" step 1 plus the
-   still-open skipped-items list above if needed) to whichever peer is
-   listed.
-3. If round 10 comes back fully clean (genuinely full-scope, not just a
-   targeted retest): proceed to the backup+migration steps (3-5) under
-   "The plan, in order" above. Issues found → loop back into the fix
-   pipeline (product-manager → developer → reviewer), commit, push,
-   re-brief with another full-scope round, repeat.
+2. Round 10 came back clean (see report above) — item 45 is logged but
+   not blocking. If the user hasn't yet confirmed proceeding to
+   backup+migration: ask them before doing anything under "The plan, in
+   order" steps 3-5 (creating a new container, transferring the
+   environment, and this session being shut down afterward are all
+   hard-to-reverse/high-blast-radius — don't infer approval from the
+   clean report alone).
+3. Once the user confirms: proceed to backup+migration steps 3-5 above.
+4. If the user instead wants item 45 investigated first, or wants another
+   E2E round for any reason: treat it like any other found issue — loop
+   back into the fix pipeline (product-manager → developer → reviewer) if
+   it's to be fixed, or just re-brief the peer for another round if it's
+   to be re-tested first.
 
 ---
 
