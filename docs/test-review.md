@@ -201,3 +201,86 @@ The independent review pass — spec-to-code traceability across all 7
 acceptance criteria, correctness, security, and simplicity/scope — turned up
 no must-fix or should-fix issues against the actual diff. Hands back to the
 orchestrator for commit + PR.
+
+## Post-approval fix-up round (independent `/code-review` finding, commit
+`ed6f934`)
+
+**Scope of this round.** After the approval above, a separate `/code-review`
+pass (outside this pipeline) caught a real spec violation the testing and
+review passes above did not exercise: `renderTeamPage()`'s 401 branch called
+only `showOverlay()`, never `hideDashboardChromeForTeamPage()` — so a
+bookmarked/shared `/team/<project>` link opened with no valid session (fresh
+browser, expired cookie) left the dashboard's project-creation chrome
+(title, "+ New project" row, upload/clone buttons) visible behind the
+translucent login overlay, contradicting `docs/spec.md` §5 ("only the
+login/TOTP overlays are shared between both contexts"). This is a narrow,
+single-issue fix-up review, not a full re-review of the whole feature — the
+rest of the feature was already verified clean above and is unaffected by
+this one-line change.
+
+**Fix verified for real, this session**, against commit `ed6f934` checked
+out directly (`app/app.py` line 5865: `if (r.status === 401) {
+hideDashboardChromeForTeamPage(); showOverlay(); return; }`, matching every
+other exit path's ordering — `renderTeamPageNotFound()` and the
+found-project path both already called `hideDashboardChromeForTeamPage()`
+before this fix):
+
+- `tests/test_team_frontend.js` → **ALL PASS (135/135)**, run fresh this
+  session (was 134; +1 for the new regression test
+  `renderTeamPage(): a 401 from /status also hides the dashboard chrome, not
+  just the overlay`).
+- **Revert-and-watch-it-fail, performed independently this session** (not
+  reused from the developer's own claim): temporarily reverted just the
+  one-line `app/app.py` fix back to `if (r.status === 401) { showOverlay();
+  return; }` and re-ran the file — exactly 1 test failed
+  (`renderTeamPage(): a 401 from /status also hides the dashboard chrome,
+  not just the overlay`, `1/135 test(s) FAILED`), all 134 others still
+  passed. Restored the fix (`git diff` empty afterward, confirming a clean
+  revert) and re-ran — back to 135/135. Confirms the new test is a genuine,
+  non-tautological regression test for this exact fix.
+- The 5 sibling frontend files, unaffected by this change, re-run to
+  confirm no regression: `test_smoke_check_frontend.js` 11/11,
+  `test_clone_frontend.js` 8/8, `test_deploy_frontend.js` 9/9,
+  `test_singleton_toggle_frontend.js` 19/19, `test_upload_frontend.js` 8/8
+  — all match the documented baseline exactly.
+- `tests.test_team_routes.TeamPageRouteTests` → 6/6 `OK` (this class only
+  covers the unauthenticated static shell, not the client-side 401 branch,
+  so it needed no new case — correctly unaffected).
+- Full `tests.test_team_routes` suite → `Ran 137 tests ... FAILED
+  (failures=2, errors=45)`, same 2 flaky CLI-timing `FAIL`s
+  (`test_orphan_check_firing_once_does_not_permanently_disrupt_a_live_cli_run`,
+  `test_cli_team_start_with_explicit_tier3_lead_succeeds_unaffected_by_web_default_refusal`)
+  and same 45 environmental `ERROR`s (git-identity-less sandbox), byte-for-byte
+  identical to the baseline already documented above — zero new regressions.
+- `python3 -m py_compile app/app.py` and `node --check
+  tests/test_team_frontend.js` — both clean.
+
+**Independent review of the diff itself** (`app/app.py` +1/-1 line,
+`tests/test_team_frontend.js` +31 lines, `docs/implementation.md` doc-only):
+`hideDashboardChromeForTeamPage()` only sets `style.display` on independent
+elements and toggles `#rows`/`#team-page` classes; `showOverlay()` only
+touches `#overlay`/`#err-creds`/`#login-pass` — the two functions share no
+target elements, so the ordering is provably inert either way and the fix
+introduces no new risk. The diff is minimal and scoped exactly to the
+reported finding — no unrelated changes, no scope creep. No security
+concerns (no new user input, no new interpolation). Confirmed all 7
+acceptance criteria from the original pass still hold; this fix closes a gap
+in edge-case coverage for the "Unauthenticated access to `/team/<project>`"
+edge case (`docs/spec.md` "Edge cases") that neither the original
+implementation nor the original testing pass had exercised at this level of
+detail (the original 401 test only asserted the overlay showed, not that
+dashboard chrome was hidden).
+
+### Findings
+None. No must-fix, should-fix, or nit issues found in this fix-up round.
+
+### Verdict for this round
+**Approve.** The fix is real, minimal, and correctly verified: the new
+regression test was independently confirmed non-tautological via
+revert-and-watch-it-fail (fails pre-fix, passes post-fix), the full 6-file
+frontend suite plus the Python route suite show zero regressions against
+the already-documented baseline, and the diff itself is small enough that a
+line-by-line read found no further issues. The original approval above
+stands; this round supersedes it only insofar as it closes the one gap the
+independent `/code-review` pass found. Hands control back to the
+orchestrator for merge/PR — no further build cycle needed for Taiga #10.
