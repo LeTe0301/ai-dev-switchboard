@@ -109,6 +109,37 @@ class GiteaRunTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             appmod.gitea_run("frobnicate")
 
+    # ── item 42: nonzero returncode on a mutating action raises ─────────
+
+    def _fake_run_nonzero(self, stderr):
+        def _fake(cmd, **kwargs):
+            self.calls.append((cmd, kwargs))
+            return subprocess.CompletedProcess(cmd, 1, "", stderr)
+        subprocess.run = _fake
+
+    def test_up_nonzero_returncode_raises_singleton_action_error_with_stderr(self):
+        self._fake_run_nonzero("docker: connection refused")
+        with self.assertRaises(appmod.SingletonActionError) as ctx:
+            appmod.gitea_run("up")
+        self.assertEqual(ctx.exception.stderr, "docker: connection refused")
+
+    def test_down_nonzero_returncode_raises_singleton_action_error(self):
+        self._fake_run_nonzero("boom")
+        with self.assertRaises(appmod.SingletonActionError):
+            appmod.gitea_run("down")
+
+    def test_status_nonzero_returncode_never_raises_returns_stdout(self):
+        # "status" must keep its today-unchanged str/never-raises contract
+        # (docs/spec.md Edge cases item 42) -- a transient failed status
+        # check degrades to "reported off" via the caller's own
+        # `out[0] == "on"` parsing, not a raised exception.
+        def _fake(cmd, **kwargs):
+            self.calls.append((cmd, kwargs))
+            return subprocess.CompletedProcess(cmd, 1, "", "transient error")
+        subprocess.run = _fake
+        out = appmod.gitea_run("status")
+        self.assertEqual(out, "")
+
 
 class GiteaDisplayUrlTests(unittest.TestCase):
     def setUp(self):
@@ -289,6 +320,35 @@ class GiteaEndpointTests(unittest.TestCase):
         self.assertEqual(status2, 200)
         self.assertTrue(payload2.get("ok"))
         self.assertEqual(self.gitea_state, "off")
+
+    def test_toggle_on_failure_returns_502_with_error_and_stderr(self):
+        # Item 42: a failed gitea_run("up") must surface as a real error,
+        # not an unconditional {"ok": true} (docs/spec.md Item 42
+        # acceptance criteria).
+        def _fake(action):
+            if action == "up":
+                raise appmod.SingletonActionError("gitea up failed", stderr="disk full")
+            return self.gitea_state
+        appmod.gitea_run = _fake
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/gitea/on", cookie, {"code": code})
+        self.assertEqual(status, 502)
+        self.assertIn("error", payload)
+        self.assertEqual(payload.get("stderr"), "disk full")
+
+    def test_toggle_off_failure_returns_502_with_error_and_stderr(self):
+        def _fake(action):
+            if action == "down":
+                raise appmod.SingletonActionError("gitea down failed", stderr="timeout")
+            return self.gitea_state
+        appmod.gitea_run = _fake
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/gitea/off", cookie, {"code": code})
+        self.assertEqual(status, 502)
+        self.assertIn("error", payload)
+        self.assertEqual(payload.get("stderr"), "timeout")
 
     def test_disabled_returns_404_and_never_calls_gitea_run(self):
         called = []

@@ -114,7 +114,17 @@ DESC_LLM_MODEL = os.environ.get("DESC_LLM_MODEL", "")
 DESC_CACHE_FILE = os.environ.get("DESC_CACHE_FILE", "/var/lib/ai-dev-switchboard/descriptions.json")
 
 TTYD_BIN = os.environ.get("TTYD_BIN", "/usr/local/bin/ttyd")
-CODE_SERVER_BIN = os.environ.get("CODE_SERVER_BIN", "/usr/local/bin/code-server")
+# Item 41 (docs/BACKLOG.md): code-server.dev's installer actually puts the
+# binary at /usr/bin/code-server on a real Debian 12 box, not
+# /usr/local/bin/code-server. install.sh now resolves and persists the
+# real path into CODE_SERVER_BIN via switchboard.env for a fresh/re-run
+# install (see install.sh's own WITH_CODE_SERVER block), but an existing
+# install upgrading its code without re-running install.sh would still see
+# no CODE_SERVER_BIN in its environment at all -- resolve via shutil.which
+# first so that case self-heals on a plain code restart too, falling back
+# to the pre-existing literal only when code-server isn't on PATH either.
+CODE_SERVER_BIN = os.environ.get(
+    "CODE_SERVER_BIN", shutil.which("code-server") or "/usr/local/bin/code-server")
 
 # Self-hosted Taiga (backlog item 1a) — a singleton on/off toggle row like
 # host-control above, not a per-project row like ttyd/code-server. Off
@@ -2674,6 +2684,20 @@ def _reap_dead_state():
     _team_reap_if_due()
 
 
+class SingletonActionError(Exception):
+    """Item 42 (docs/BACKLOG.md): raised by host_run()/taiga_run()/
+    gitea_run() when a mutating action ("start"/"stop"/"up"/"down") exits
+    nonzero, so do_POST's /host,/taiga,/gitea on/off routes can return a
+    real error instead of an unconditional {"ok": true}. Deliberately never
+    raised for the "status" action (see each function's own docstring) --
+    /status and create_project()'s own status check must keep degrading to
+    "reported off" on a transient failure, not start throwing from a
+    read-only poll."""
+    def __init__(self, message: str, stderr: str = ""):
+        super().__init__(message)
+        self.stderr = stderr
+
+
 def host_run(action: str) -> str:
     assert action in ("start", "stop", "status")
     r = subprocess.run(
@@ -2682,6 +2706,12 @@ def host_run(action: str) -> str:
          f"sudo /usr/local/bin/ai-dev-switchboard-host-{action}.sh"],
         capture_output=True, text=True, timeout=30,
     )
+    # "status" keeps today's contract unchanged (str, never raises) -- the
+    # 4 existing /status + create_project() call sites parse its stdout
+    # directly and must keep self-correcting to "reported off" on a
+    # transient failure rather than start throwing from a read-only poll.
+    if action != "status" and r.returncode != 0:
+        raise SingletonActionError(f"host {action} failed", stderr=r.stderr)
     return r.stdout.strip()
 
 
@@ -2733,6 +2763,9 @@ def taiga_run(action: str) -> str:
     timeout = 220 if action == "up" else (10 if action == "status" else 90)
     r = subprocess.run(["sudo", script], capture_output=True, text=True,
                        timeout=timeout)
+    # See host_run()'s own comment: "status" stays str/never-raises.
+    if action != "status" and r.returncode != 0:
+        raise SingletonActionError(f"taiga {action} failed", stderr=r.stderr)
     return r.stdout.strip()
 
 
@@ -2755,6 +2788,9 @@ def gitea_run(action: str) -> str:
               "status": GITEA_STATUS_SCRIPT}[action]
     r = subprocess.run(["sudo", script], capture_output=True, text=True,
                        timeout=(10 if action == "status" else 90))
+    # See host_run()'s own comment: "status" stays str/never-raises.
+    if action != "status" and r.returncode != 0:
+        raise SingletonActionError(f"gitea {action} failed", stderr=r.stderr)
     return r.stdout.strip()
 
 
@@ -6259,27 +6295,39 @@ class Handler(BaseHTTPRequestHandler):
         if parts[0] == "host" and len(parts) == 2 and parts[1] in ("on", "off"):
             if not HOST_CONTROL_ENABLED:
                 return self._json({"error": "host control disabled"}, 404)
-            host_run("start" if parts[1] == "on" else "stop")
+            try:
+                host_run("start" if parts[1] == "on" else "stop")
+            except SingletonActionError as e:
+                return self._json(
+                    {"error": str(e), "stderr": (e.stderr or "").strip()[-200:]}, 502)
             self._json({"ok": True})
         elif parts[0] == "taiga" and len(parts) == 2 and parts[1] in ("on", "off"):
             if not TAIGA_ENABLED:
                 return self._json({"error": "taiga disabled"}, 404)
-            if parts[1] == "on":
-                taiga_run("up")
-                _publish(TAIGA_URL_PATH, TAIGA_PORT)
-            else:
-                _unpublish(TAIGA_URL_PATH)
-                taiga_run("down")
+            try:
+                if parts[1] == "on":
+                    taiga_run("up")
+                    _publish(TAIGA_URL_PATH, TAIGA_PORT)
+                else:
+                    _unpublish(TAIGA_URL_PATH)
+                    taiga_run("down")
+            except SingletonActionError as e:
+                return self._json(
+                    {"error": str(e), "stderr": (e.stderr or "").strip()[-200:]}, 502)
             self._json({"ok": True})
         elif parts[0] == "gitea" and len(parts) == 2 and parts[1] in ("on", "off"):
             if not GITEA_ENABLED:
                 return self._json({"error": "gitea disabled"}, 404)
-            if parts[1] == "on":
-                gitea_run("up")
-                _publish(GITEA_URL_PATH, GITEA_PORT)
-            else:
-                _unpublish(GITEA_URL_PATH)
-                gitea_run("down")
+            try:
+                if parts[1] == "on":
+                    gitea_run("up")
+                    _publish(GITEA_URL_PATH, GITEA_PORT)
+                else:
+                    _unpublish(GITEA_URL_PATH)
+                    gitea_run("down")
+            except SingletonActionError as e:
+                return self._json(
+                    {"error": str(e), "stderr": (e.stderr or "").strip()[-200:]}, 502)
             self._json({"ok": True})
         elif parts[0] == "projects" and len(parts) == 2 and parts[1] == "new":
             ok, err = create_project((body.get("name") or "").strip())

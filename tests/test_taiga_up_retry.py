@@ -168,8 +168,12 @@ class TaigaUpRetryTests(unittest.TestCase):
             success_at=99, max_attempts=3
         )
         self.assertEqual(result.returncode, 1)
-        self.assertEqual(up_calls, 3)
-        # rm -f is only run *between* attempts, never after the last one.
+        # Item 43: 3 normal attempts + 1 item-43 fallback `up -d` that also
+        # never comes up running (see TaigaUpRetryTests' own dedicated
+        # fallback tests below for that step's success/failure coverage).
+        self.assertEqual(up_calls, 4)
+        # rm -f is only run *between* the loop's own attempts, never after
+        # the last one and never for the item-43 fallback step.
         self.assertEqual(rm_calls, 2)
         self.assertIn(
             "taiga-up: taiga-gateway failed to come up after 3 attempts",
@@ -180,6 +184,60 @@ class TaigaUpRetryTests(unittest.TestCase):
         self.assertIn("docker network ls", result.stderr)
         self.assertIn("disk space", result.stderr)
 
+    # ── item 43: one plain fallback `up -d` (no rm -f) after exhaustion ──
+
+    def test_fallback_up_after_exhaustion_succeeds(self):
+        # All TAIGA_UP_MAX_ATTEMPTS normal attempts fail (success_at is one
+        # past max_attempts), but the extra item-43 fallback call (the
+        # (max_attempts+1)th `up -d`) succeeds -- proves the fallback step
+        # is reached, runs exactly once, and a success there is honored
+        # with exit 0 instead of falling through to the final failure.
+        result, up_calls, rm_calls, _sleeps = self._run(
+            success_at=4, max_attempts=3
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(up_calls, 4)
+        # rm -f only ever runs *between* the loop's own attempts (2 gaps
+        # across 3 attempts) -- the fallback step never calls it.
+        self.assertEqual(rm_calls, 2)
+        self.assertIn(
+            "taiga-up: all 3 attempts exhausted -- trying one plain "
+            "'docker compose up -d'", result.stderr,
+        )
+        self.assertNotIn("taiga-up: taiga-gateway failed to come up", result.stderr)
+
+    def test_fallback_up_after_exhaustion_also_fails_exits_1(self):
+        # Fallback attempt (the 4th `up -d`) also never reports "running"
+        # -- the script must still fail loudly with its existing message,
+        # not swallow the failure (docs/spec.md Edge cases item 43).
+        result, up_calls, rm_calls, _sleeps = self._run(
+            success_at=99, max_attempts=3
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(up_calls, 4)  # 3 normal attempts + 1 fallback
+        self.assertEqual(rm_calls, 2)
+        self.assertIn(
+            "taiga-up: all 3 attempts exhausted -- trying one plain "
+            "'docker compose up -d'", result.stderr,
+        )
+        self.assertIn(
+            "taiga-up: taiga-gateway failed to come up after 3 attempts",
+            result.stderr,
+        )
+
+    def test_fallback_not_reached_when_normal_attempts_already_succeed(self):
+        # Sanity check on the counting scheme itself: when the loop
+        # succeeds within its normal attempts, up_calls must stay at
+        # success_at, not success_at+1 -- proving the fallback step is
+        # genuinely unreachable on the already-covered exit-0 paths inside
+        # the loop (docs/spec.md Edge cases item 43).
+        result, up_calls, rm_calls, _sleeps = self._run(
+            success_at=2, max_attempts=3
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(up_calls, 2)
+        self.assertNotIn("all 3 attempts exhausted -- trying one plain", result.stderr)
+
     # ── TAIGA_UP_MAX_ATTEMPTS is honored when overridden ────────────────
 
     def test_max_attempts_env_override_is_honored(self):
@@ -187,7 +245,8 @@ class TaigaUpRetryTests(unittest.TestCase):
             success_at=99, max_attempts=5
         )
         self.assertEqual(result.returncode, 1)
-        self.assertEqual(up_calls, 5)
+        # Item 43: 5 normal attempts + 1 fallback `up -d`.
+        self.assertEqual(up_calls, 6)
         self.assertEqual(rm_calls, 4)
         self.assertIn("after 5 attempts", result.stderr)
 

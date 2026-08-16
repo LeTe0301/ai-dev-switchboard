@@ -65,6 +65,21 @@ while [ "$attempt" -le "$TAIGA_UP_MAX_ATTEMPTS" ]; do
     attempt=$((attempt + 1))
 done
 
+# Item 43 (round 7): round 6's retry loop still reproduced flaky under live
+# testing on a fresh CT110 -- all attempts exhausted, but a bare `docker
+# compose up -d` (no `rm -f` first) run manually right afterward succeeded
+# in ~3s with clean logs. Root cause still not pinned down; this is the
+# cheapest concrete fallback the live repro points at, tried before the
+# (opt-in, heavier, host-wide) full-Docker-daemon-restart path below and
+# before giving up. No settle-window recheck on this one extra attempt --
+# keep it simple, matching the live repro's own literal suggestion.
+echo "taiga-up: all $TAIGA_UP_MAX_ATTEMPTS attempts exhausted -- trying one plain 'docker compose up -d' with no rm -f first, as a last resort before giving up" >&2
+"${COMPOSE[@]}" up -d
+state=$("${COMPOSE[@]}" ps taiga-gateway --format '{{.State}}' 2>/dev/null)
+if [ "$state" = "running" ]; then
+    exit 0
+fi
+
 if [ "$TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION" -eq 1 ]; then
     echo "taiga-up: all $TAIGA_UP_MAX_ATTEMPTS attempts exhausted -- TAIGA_UP_DOCKER_RESTART_ON_EXHAUSTION=1, restarting the Docker daemon itself (affects every container on this host) and trying once more" >&2
     systemctl restart docker

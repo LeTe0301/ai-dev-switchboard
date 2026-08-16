@@ -103,6 +103,35 @@ class TaigaRunTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             appmod.taiga_run("frobnicate")
 
+    # ── item 42: nonzero returncode on a mutating action raises ─────────
+
+    def _fake_run_nonzero(self, stderr):
+        def _fake(cmd, **kwargs):
+            self.calls.append((cmd, kwargs))
+            return subprocess.CompletedProcess(cmd, 1, "", stderr)
+        subprocess.run = _fake
+
+    def test_up_nonzero_returncode_raises_singleton_action_error_with_stderr(self):
+        self._fake_run_nonzero("all attempts exhausted")
+        with self.assertRaises(appmod.SingletonActionError) as ctx:
+            appmod.taiga_run("up")
+        self.assertEqual(ctx.exception.stderr, "all attempts exhausted")
+
+    def test_down_nonzero_returncode_raises_singleton_action_error(self):
+        self._fake_run_nonzero("boom")
+        with self.assertRaises(appmod.SingletonActionError):
+            appmod.taiga_run("down")
+
+    def test_status_nonzero_returncode_never_raises_returns_stdout(self):
+        # "status" must keep its today-unchanged str/never-raises contract
+        # (docs/spec.md Edge cases item 42).
+        def _fake(cmd, **kwargs):
+            self.calls.append((cmd, kwargs))
+            return subprocess.CompletedProcess(cmd, 1, "", "transient error")
+        subprocess.run = _fake
+        out = appmod.taiga_run("status")
+        self.assertEqual(out, "")
+
 
 class TaigaDisplayUrlTests(unittest.TestCase):
     def setUp(self):
@@ -237,6 +266,35 @@ class TaigaEndpointTests(unittest.TestCase):
         self.assertEqual(status2, 200)
         self.assertTrue(payload2.get("ok"))
         self.assertEqual(self.taiga_state, "off")
+
+    def test_toggle_on_failure_returns_502_with_error_and_stderr(self):
+        # Item 42: a failed taiga_run("up") must surface as a real error,
+        # not an unconditional {"ok": true} (docs/spec.md Item 42
+        # acceptance criteria).
+        def _fake(action):
+            if action == "up":
+                raise appmod.SingletonActionError("taiga up failed", stderr="all attempts exhausted")
+            return self.taiga_state
+        appmod.taiga_run = _fake
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/taiga/on", cookie, {"code": code})
+        self.assertEqual(status, 502)
+        self.assertIn("error", payload)
+        self.assertEqual(payload.get("stderr"), "all attempts exhausted")
+
+    def test_toggle_off_failure_returns_502_with_error_and_stderr(self):
+        def _fake(action):
+            if action == "down":
+                raise appmod.SingletonActionError("taiga down failed", stderr="timeout")
+            return self.taiga_state
+        appmod.taiga_run = _fake
+        cookie = self._login()
+        code = self._totp_code()
+        status, payload = self._post("/taiga/off", cookie, {"code": code})
+        self.assertEqual(status, 502)
+        self.assertIn("error", payload)
+        self.assertEqual(payload.get("stderr"), "timeout")
 
     def test_disabled_returns_404_and_never_calls_taiga_run(self):
         called = []

@@ -228,10 +228,26 @@ if [ ! -x /usr/local/bin/ttyd ]; then
     fi
 fi
 
-if [ "$WITH_CODE_SERVER" -eq 1 ] && [ ! -x /usr/local/bin/code-server ]; then
+# Item 41 (docs/BACKLOG.md): the code-server.dev installer actually puts
+# the binary at /usr/bin/code-server on a real Debian 12 box, not
+# /usr/local/bin/code-server -- a hardcoded /usr/local/bin/ path here made
+# this idempotency check re-trigger the install every single run. Detect
+# "does a usable code-server already exist anywhere on PATH" via `command
+# -v` instead of one specific location.
+if [ "$WITH_CODE_SERVER" -eq 1 ] && ! command -v code-server >/dev/null 2>&1; then
     echo "-- Installing code-server --"
     curl -fsSL https://code-server.dev/install.sh | sh
 fi
+# Resolve the real installed path once, here, and keep every other
+# reference (the sudoers rule below, and app.py's CODE_SERVER_BIN) in sync
+# with this single resolved value -- a mismatch between this and the
+# sudoers rule would trade "silent no-op" for "permission denied", still
+# broken (docs/spec.md Item 41). Falls back to the pre-existing literal
+# default only when `command -v` finds nothing (WITH_CODE_SERVER=0, or a
+# fresh box with code-server disabled), so this never errors out here.
+CODE_SERVER_BIN="$(command -v code-server 2>/dev/null || true)"
+CODE_SERVER_BIN="${CODE_SERVER_BIN:-/usr/local/bin/code-server}"
+set_env "$ENV_FILE" CODE_SERVER_BIN "$CODE_SERVER_BIN"
 
 echo "-- Users --"
 RUN_USER_DEFAULT="$(get_env "$ENV_FILE" RUN_USER)"; RUN_USER_DEFAULT="${RUN_USER_DEFAULT:-dev}"
@@ -324,7 +340,8 @@ if [ -z "$TOTP_SECRET" ]; then
     set_env "$ENV_FILE" TOTP_SECRET "$TOTP_SECRET"
 fi
 
-AUTH_MODE=$(prompt "Auth mode: simple (username+password) or pve (Proxmox VE login)" "simple")
+AUTH_MODE_DEFAULT="$(get_env "$ENV_FILE" AUTH_MODE)"; AUTH_MODE_DEFAULT="${AUTH_MODE_DEFAULT:-simple}"
+AUTH_MODE=$(prompt "Auth mode: simple (username+password) or pve (Proxmox VE login)" "$AUTH_MODE_DEFAULT")
 set_env "$ENV_FILE" AUTH_MODE "$AUTH_MODE"
 SIMPLE_PASSWORD_SHOWN=""
 if [ "$AUTH_MODE" = "pve" ]; then
@@ -565,7 +582,12 @@ SUDOERS=/etc/sudoers.d/ai-dev-switchboard
 {
     echo "$SVC_USER ALL=($RUN_USER) NOPASSWD: /usr/bin/tmux *"
     echo "$SVC_USER ALL=($RUN_USER) NOPASSWD: /usr/local/bin/ttyd *"
-    echo "$SVC_USER ALL=($RUN_USER) NOPASSWD: /usr/local/bin/code-server *"
+    # Item 41: must reference the same resolved $CODE_SERVER_BIN persisted
+    # above, not a hardcoded literal -- sudo only matches a rule against
+    # the exact command path invoked, so a mismatch here would turn a
+    # silent no-op into a loud "permission denied" instead of actually
+    # fixing the toggle.
+    echo "$SVC_USER ALL=($RUN_USER) NOPASSWD: $CODE_SERVER_BIN *"
     if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
         # Poll-triggered sync-on-push (backlog item 2c, part 1 —
         # docs/spec.md "The sync decision") — grouped with the other
@@ -1005,7 +1027,8 @@ if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
     echo "stack has finished starting:"
     echo "  1. Create Gitea's own admin account (a single non-interactive command):"
     echo "       docker exec --user git ai-dev-switchboard-gitea gitea admin user create \\"
-    echo "         --admin --username <name> --password <password> --email <email>"
+    echo "         --admin --username <name> --password <password> --email <email> \\"
+    echo "         --must-change-password=false"
     echo "  2. Run scripts/gitea-configure-api.sh once (as root) to mint an API token"
     echo "     for the web UI to use — see docs/GIT_HOSTING.md."
 fi

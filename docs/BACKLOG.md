@@ -2282,3 +2282,287 @@ Reviewed via a full developer→reviewer cycle, approved with one
 non-blocking follow-up (this entry). Full test suite passes at 1232
 tests with the same 3 pre-existing failures (untracked `CLAUDE.md` in
 the repo root, unrelated to this round, confirmed via `git stash`).
+
+---
+
+## In-progress process (2026-08-15): full E2E verification loop + container migration
+
+**Status of round 6**: implemented, reviewed (approved), committed as
+`140a2ae` on branch `backlog/e2e-fixes-round6`, pushed to both remotes,
+opened as [PR #33](https://github.com/LeTe0301/ai-dev-switchboard/pull/33)
+— **still open/unmerged** as of this writing.
+
+### The plan, in order
+
+1. **Full hands-on E2E test pass** on a fresh Proxmox LXC container,
+   covering every feature and every UI part (not just smoke-testing) —
+   run by a separate Claude Code session connected via Remote Control
+   (peer session, reachable through `ListAgents`/`SendMessage`, not a
+   subagent of this session). That session creates its own fresh test
+   container, installs `ai-dev-switchboard` with every optional feature
+   flag on, exercises the full feature surface hands-on, writes a
+   BACKLOG-style report (real repro evidence, not guesses), sends the
+   report back here, then **destroys its own test container** (cleanup
+   rule applies only to its own throwaway test containers, never to
+   anything else on the host).
+2. **On receiving a report with issues**: run the normal
+   product-manager→ux-designer(if needed)→developer→reviewer pipeline
+   (same as every round above) to fix them, commit, then re-brief the
+   E2E session to test again against a new fresh container. Repeat until
+   a report comes back clean.
+3. **Once a report comes back fully clean**: this session (the
+   orchestrator, working out of the `dev` sandbox) performs a **backup of
+   all repos first** — explicitly stated as priority #1, no data loss —
+   then creates a **new container** that is an exact clone of this whole
+   environment, **including the Claude/agent configuration**
+   (`~/.claude/CLAUDE.md`, agent definitions, memory files, settings —
+   not just the raw git repos), transfers everything over, and confirms
+   `ai-dev-switchboard` is available and working on the new container.
+4. **Only after that backup+transfer is confirmed complete**, the E2E
+   session (the pve-side Remote Control peer) shuts down *this*
+   orchestrator session — not the other way around, and not itself.
+5. **The new destination container is never deleted** — the
+   destroy-after-use cleanup habit from step 1 applies only to the E2E
+   session's own disposable test containers, never to the real migration
+   target.
+
+### State as of this writing (not yet actioned further)
+
+- An E2E testing brief (full text: create fresh container → install with
+  all features on → hands-on test every feature/UI part → write a
+  BACKLOG-style report → send back → destroy own test container → wait)
+  was sent twice to two different Remote-Control-connected peer sessions
+  on the pve host, in sequence: first to `pve-wiggly-cosmos`, which died
+  before reporting back (any container it left behind should be checked
+  for and cleaned up by whichever session picks this up next); then,
+  after re-checking `ListAgents`, to its replacement `pve-lively-hopper`
+  (also briefed to check for and clean up anything `pve-wiggly-cosmos`
+  left orphaned). **As of this writing, no report has been received
+  back yet from either.**
+- Sessions on the pve host have died/reconnected under new names before
+  (`pve-wiggly-cosmos` → `pve-lively-hopper`) — if picking this up again,
+  check `ListAgents` first; if the name has changed again, re-send the
+  same E2E brief to whichever peer is currently listed (it has no memory
+  of prior instructions — the brief must be resent in full, not assumed
+  known).
+- **Host-control SSH channel not yet usable from the `dev` sandbox**:
+  this repo's optional `host-agent` feature (`host-agent/README.md`) uses
+  a narrowly-scoped SSH key (`~/.ssh/host_control_ed25519` in this
+  sandbox, public half `ssh-ed25519
+  AAAAC3NzaC1lZDI1NTE5AAAAIDrTBlfcslf03bbcmtYAa80pSy9j0mrfVIlrsRxB9y67
+  dev-ct-host-control`) to run exactly
+  `sudo ai-dev-switchboard-host-{start,stop,status}.sh` on the pve host
+  (`192.168.178.100`, port 8006 = Proxmox web UI, port 22 = SSH). Tried
+  as both `root@` and `switchboard@` — both rejected
+  ("Permission denied (publickey,password)"), meaning this key's public
+  half is not yet authorized on either account on the real host. The
+  user asked to add it to `root`'s `authorized_keys` but did not have
+  host access at the time to do so. This channel was a secondary
+  path (not currently load-bearing for the E2E loop, which runs over the
+  already-connected Remote Control peer sessions instead) — only revisit
+  if the Remote Control path stalls and direct host-agent control becomes
+  necessary.
+
+### Update (2026-08-16)
+
+- `ListAgents` showed the pve-side peer under yet another new name,
+  `pve-sparkling-meadow` — neither `pve-wiggly-cosmos` nor
+  `pve-lively-hopper` is listed anymore, and no report had arrived from
+  either. Re-sent the full E2E brief (create fresh container → install
+  with all optional feature flags → hands-on test every feature/UI part
+  → write a BACKLOG-style report → send back → destroy own test
+  container → wait) to `pve-sparkling-meadow`, including the
+  cleanup-check instruction to find/destroy any orphaned container left
+  behind by the two prior dead sessions. **Report received back the same
+  day** — see "Items 39-43" below. Not a clean report, so per step 2 of
+  "The plan, in order" above, looping back into the fix pipeline
+  (product-manager → developer → reviewer) rather than proceeding to
+  backup+migration. `pve-sparkling-meadow` destroyed its own test
+  container (CT110) after sending the report; no orphaned containers from
+  the two prior dead sessions were found on the host.
+
+### To resume if this session is interrupted mid-fix
+
+1. Check whether items 39-43 below have all been fixed, reviewed, and
+   committed yet (see git log on `backlog/e2e-fixes-round6` or its
+   successor branch).
+2. If not: continue/resume the product-manager → developer → reviewer
+   pipeline for whichever items are still open.
+3. Once fixed, reviewed, and pushed: check `ListAgents` for the current
+   pve-side peer session name (may have changed again) and re-send the
+   full E2E brief for another fresh-container round.
+4. If a future report comes back fully clean: proceed to the
+   backup+migration steps (3-5) under "The plan, in order" above.
+
+---
+
+## Items 39-43: found by E2E round 6 real test on fresh CT110 (2026-08-16)
+
+Found by `pve-sparkling-meadow` (Remote Control peer session on the pve
+host) testing branch `backlog/e2e-fixes-round6` @ `140a2ae` (PR #33) on a
+genuinely fresh Proxmox LXC (CT110, Debian 12, 4 vCPU/4GB/32GB), installed
+via `install.sh --yes` with all six optional feature flags
+(`--with-git-hosting --with-code-server --with-host-control
+--with-deploy-target --with-taiga --with-ollama`), linked against a real
+LAN Ollama endpoint. Items 22-27 from the previous round were reconfirmed
+still fixed. Full report kept verbatim below; CT110 was destroyed after
+the report was sent, no orphaned containers left on the host.
+
+### 39. `install.sh --yes` ignores a pre-seeded `AUTH_MODE` — always installs in `simple` auth, never `pve`
+
+`ct/create.sh`'s automated path writes `AUTH_MODE=pve` + `PVE_HOST` into
+`switchboard.env` before invoking `install.sh --yes`, expecting it
+honored (the printed summary even promises "Web UI login: your existing
+Proxmox VE credentials"). It never is. Repro: pre-seed `switchboard.env`
+with `AUTH_MODE=pve` + `PVE_HOST=192.168.178.100`, run `install.sh --yes
+...`. Result: `AUTH_MODE=simple`, auto-generated password — pre-seeded
+value silently discarded.
+
+Root cause: `RUN_USER`/`SVC_USER` correctly default from `get_env
+"$ENV_FILE" ...` (survives `--yes`), but `AUTH_MODE`'s default is the
+literal string `"simple"`:
+```bash
+AUTH_MODE=$(prompt "Auth mode: simple (username+password) or pve (Proxmox VE login)" "simple")
+```
+(install.sh ~line 327). Under `--yes`, `prompt()` always returns that
+hardcoded default, never consulting `switchboard.env`.
+
+Shape of the fix: default to `$(get_env "$ENV_FILE" AUTH_MODE)`, falling
+back to `"simple"` only when empty — same pattern `RUN_USER_DEFAULT`
+already uses two lines above it.
+
+### 40. Gitea admin bootstrap: any admin account that isn't literally Gitea's first-ever user gets `must_change_password=true`, blocking all API access with an unhelpful 403
+
+`install.sh`'s printed step: `docker exec --user git
+ai-dev-switchboard-gitea gitea admin user create --admin --username
+<name> --password <password> --email <email>`, followed by
+`scripts/gitea-configure-api.sh`. Repro: run the printed command exactly
+as documented, but not as Gitea's first-ever user (a prior throwaway
+account, a retry after a typo). `gitea-configure-api.sh` fails
+verification:
+```
+Verifying the token actually works (GET /user)...
+Verification failed -- Gitea didn't accept the new token. Output was:
+curl: (22) The requested URL returned error: 403
+```
+Manually hitting the API with the token shows the real reason, never
+surfaced by the script: `{"message":"You must change your password.
+Change it at: .../user/change_password"}`.
+
+Root cause: Gitea's CLI defaults `--must-change-password` to `true` for
+every user "except the first one" (`gitea admin user create --help`) —
+and that account is not guaranteed to be Gitea's first user in practice.
+Confirmed live: clearing the flag via `gitea admin user change-password
+--must-change-password=false` immediately fixed it, same token, same
+script, no other change.
+
+Shape of the fix: add `--must-change-password=false` to the command
+install.sh prints. Consider having `gitea-configure-api.sh`'s
+verification special-case this exact 403 with a pointer to the real fix.
+
+### 41. `--with-code-server` is completely non-functional out of the box — wrong hardcoded binary path, fails silently on every toggle
+
+Repro: fresh install with `--with-code-server`, then toggle "Code" on for
+any project. Response is `{"ok": true}`, but no process ever starts,
+`code_on` stays `false`.
+
+Root cause: code-server.dev's installer (what install.sh itself runs)
+installs a real `.deb` on Debian 12, landing the binary at
+`/usr/bin/code-server` (confirmed: `dpkg -l` shows `code-server 4.132.0`,
+binary present/executable there, symlinked from `/bin/code-server`). But
+both install.sh's idempotency check (`[ ! -x /usr/local/bin/code-server
+]`) and app.py's hardcoded default (`CODE_SERVER_BIN =
+os.environ.get("CODE_SERVER_BIN", "/usr/local/bin/code-server")`) look
+in `/usr/local/bin/`, which never exists. Confirmed directly: `sudo -u
+dev /usr/local/bin/code-server ...` → `sudo: /usr/local/bin/code-server:
+command not found`. `_code_start()` launches it via
+`subprocess.Popen(..., stdout=DEVNULL, stderr=DEVNULL)` with nothing
+surfaced, so the toggle silently no-ops every time — and install.sh
+re-downloads/reinstalls code-server on every single run since its own
+existence-check is also looking in the wrong place.
+
+Shape of the fix: point both checks at the real install location. Safest
+fix is resolving via `command -v code-server` at runtime in both places
+rather than hardcoding a path that already changed once upstream.
+
+### 42. `POST /host/on`, `/host/off` (and `/taiga/on` when its retry budget is exhausted) report `{"ok": true}` unconditionally, regardless of whether the underlying action actually succeeded
+
+`host_run()` (app.py ~line 2677) runs `subprocess.run([...ssh...],
+capture_output=True, ...)` and returns `r.stdout.strip()` — never checks
+`r.returncode`, never surfaces `r.stderr`. The POST handler ignores the
+return value: `host_run("start" if ... else "stop"); self._json({"ok":
+True})`. Repro: with no `HOST_CONTROL_KEY`/target configured (the normal
+state right after `--with-host-control`, which only provisions the
+receiving end), `POST /host/on` returns `200 {"ok": true}` instantly, no
+ssh attempt visible in the journal. `GET /status` (which calls
+`host_run("status")` fresh every poll) correctly reports `host: false` a
+moment later — the toggle response itself is the only thing lying.
+
+Same pattern hits Taiga harder: `POST /taiga/on` blocked for 2m44s
+(taiga-up.sh's full 5-attempt/150s-backoff budget), the script exited 1
+with `"taiga-gateway failed to come up after 5 attempts"` on stderr — HTTP
+response was still `{"ok": true}`. See item 43 for the underlying race
+this exposed live.
+
+Shape of the fix: check `returncode`/exit status in both `host_run`'s and
+`taiga_run`/`gitea_run`'s callers; return a real error + captured stderr
+instead of an unconditional `{"ok": true}` on failure.
+
+### 43. Round 6's taiga-gateway health-gate retry fix (item 30) is still flaky — reproduced live, all 5 attempts exhausted, while a plain manual `docker compose up -d taiga-gateway` immediately afterward succeeded in 3 seconds with no error at all
+
+Repro: fresh `--with-taiga` install, `POST /taiga/on`. All 8 other
+containers (db, back, async(+rabbitmq), events(+rabbitmq), front,
+protected) came up healthy; `taiga-gateway` — "the stack's only public
+entrypoint" per taiga-up.sh's own comment — never got past Docker's
+`Created` state through all 5 retries (`up -d` + `rm -f taiga-gateway` +
+backoff 10/20/40/80s). Script exits 1 to stderr as designed, but per item
+42 that never reaches the caller. Manually running the exact same command
+the script already retries (`docker compose up -d taiga-gateway`, no
+flags, no `rm -f` first) right afterward succeeded in ~3s, completely
+clean nginx logs.
+
+Whatever the real race is (item 30's own comment says "root cause wasn't
+pinned down"), round 6's retry strategy isn't actually closing it — a bare
+extra `up -d` after the loop gives up would likely have succeeded, going
+by this one live repro. Treating item 30 as still open; worth trying "one
+more plain `up -d`, no `rm -f`" as the very last step before declaring
+failure.
+
+### What worked cleanly (round 6 re-verification)
+
+- Login (simple auth) + session cookie + once-per-session TOTP gate
+  (`428` → `403` on wrong code → `200` on correct code) all exactly as
+  documented.
+- "+ New project" → real Gitea repo → local clone → `gitea_sync: synced`
+  worked end-to-end once item 40 was worked around.
+- Clone-from-URL worked cleanly against a real public GitHub repo
+  (octocat/Hello-World).
+- `--with-ollama` against a real LAN Ollama endpoint linked correctly;
+  roster/composition reflected it as a real tier-1 lead candidate.
+- Deploy-target provisioning matched its documented end state exactly.
+- The multi-agent team lifecycle genuinely works end-to-end, driven by a
+  real linked Ollama lead: `team/start` → real `qwen3:8b` lead delegated
+  to `aider` (recorded failure — CLI not installed in this throwaway
+  sandbox, expected) → delegated to `claude` (same) → correctly issued a
+  real `ask_user` tool call → `/status` correctly showed `status:
+  "blocked"`, `waiting_on_you: true`, `escalation_kind: "ask_user"`,
+  right run_id/project → `team/resolve` accepted an answer →
+  `team/stop` cleanly tore down the tmux session and all three worktrees.
+  (Note: `/status`'s `instances` array is alphabetically sorted, not
+  most-recent-first — a red herring during testing, not a bug.)
+- Items 22-27 all reconfirmed still fixed on this fresh install.
+
+### Explicitly skipped / not confirmed this round
+
+- No real Claude Code / aider / Codex CLI session exercised (none of the
+  three engine CLIs are installed by install.sh itself, left to the
+  operator) — the Ollama-lead team path was exercised instead.
+- No real browser available in this headless peer session — everything
+  above drove the same JSON API the frontend calls, not the rendered
+  HTML/JS/CSS. Visual/layout correctness not assessed this round.
+- Upload-from-folder project creation not exercised (time-boxed).
+- GitHub-origin AI-reviewer path not tested (needs a real GitHub PAT +
+  target repo).
+- `AUTH_MODE=pve` itself never actually exercised end-to-end, precisely
+  because of item 39 — tested via the auto-generated simple-mode
+  credentials instead.
