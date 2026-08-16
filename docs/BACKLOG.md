@@ -2475,17 +2475,116 @@ report. Re-briefed `pve-sparkling-meadow`, item-43-focused this round
 (asked for several `/taiga/on` runs across fresh installs, since the
 original race was timing-dependent).
 
+### Round 8 retest report (2026-08-16): DNS race genuinely fixed (0/4 crashes), but a new item — 44 — found: port publishing silently fails
+
+Tested `4cb4946` (includes `edb4619`) on a fresh CT110, `install.sh --yes
+--with-taiga`. Ran 4 separate `POST /taiga/on` trials (2 toggle-cycles on
+an already-up stack, 1 from a completely fresh state) plus a live
+runtime-resilience check (stopped `taiga-front` out from under an
+already-running gateway — it stayed up, confirming resolution really is
+lazy/runtime, not just a race window that happened to close in time).
+
+**Item 43 confirmed genuinely fixed**: 0/4 trials hit the old `nginx:
+[emerg] host not found in upstream "taiga-front"` crash. Confirmed the new
+`resolver`/variable-indirection config is live in the running container.
+No retry-loop messages fired at all in any trial — clean first-attempt
+success every time, ~2m50s being genuine Taiga stack startup time, not
+retry overhead.
+
+### 44. `taiga-gateway`'s host port never actually gets published — Taiga is 100% unreachable in every trial despite `{"ok": true}` and `/status` reporting `taiga: true`
+
+Repro (deterministic, hit 4/4, not timing-dependent): after any `POST
+/taiga/on` that reports success, `curl http://127.0.0.1:9000/` →
+`curl: (7) Failed to connect`, and `docker port
+...taiga-gateway-1` prints nothing. Manually re-running the exact `up -d`
+surfaces the real error, never seen or checked by `taiga-up.sh`/app.py:
+`Error response from daemon: failed to set up container networking: ...
+failed to bind host port 127.0.0.1:9000/tcp: address already in use`.
+
+Root cause: the item-30 `docker-compose.override.yml` (see install.sh's
+own comment at ~line 436, present since round 6) adds `ports: -
+"127.0.0.1:${TAIGA_PORT}:80"` for `taiga-gateway` specifically *because*
+the pinned upstream `docker-compose.yml` already publishes an
+unrestricted `ports: - "9000:80"` (`0.0.0.0`) for that same service, which
+conflicts with this project's "everything binds 127.0.0.1 only" rule.
+Unlike `volumes:` (which Compose merges by target path across `-f`
+files — confirmed and relied on by round 8's own taiga.conf fix), `ports:`
+is a plain list field that Compose **concatenates**, not de-dupes/replaces
+across files. So the merged config ends up with two competing bindings
+for host port 9000; Docker fails the second bind but doesn't crash the
+container over it, so `taiga-gateway` ends up **running with no port
+published at all**, silently. `taiga-up.sh`'s own success check (`docker
+compose ps` state == `running`) is blind to this.
+
+This bug has existed since round 6 (item 30) but was never caught before
+because `taiga-gateway` was crash-looping from the DNS race (item 43)
+every time, so nobody got far enough to notice the port never published
+either — round 8 fixing item 43 is what made this visible for the first
+time. Arguably worse than the pre-round-8 state: previously the failure
+was obvious (crash-loop); now everything reports healthy while being
+completely unreachable.
+
+Verified (not just theorized): removing the override's conflicting
+`ports:` block and recreating just `taiga-gateway` immediately fixes
+reachability (`docker port` shows `80/tcp -> 0.0.0.0:9000`, `curl` → `200`)
+— but that falls back to the base file's original *unrestricted*
+`0.0.0.0:9000` binding, reopening the wider exposure the override's
+`ports:` line was clearly added to close in the first place. Compose has
+no "replace" semantics for list fields like `ports` across override
+files (unlike `volumes`, which does support target-path override) — so
+actually tightening the binding to loopback-only needs a different
+mechanism than the override-file idiom that worked for item 43's
+`taiga.conf` fix. Two candidate directions, neither applied yet: (a)
+scripted `sed`-patching of the pinned checkout's own `docker-compose.yml`
+`ports:` line at install time (mirrors "generate config via script, never
+hand-edit the shipped file" — but note this would touch the pinned
+checkout's `docker-compose.yml` directly, which item 30's original
+architecture decision explicitly ruled out doing for *both*
+`taiga.conf`/`docker-compose.yml`, since the override-file idiom was
+believed sufficient for everything, before this round's finding that it
+mechanically can't work for `ports:` specifically); or (b) drop the
+override's `ports:` line and accept the base file's `0.0.0.0:9000`
+exposure (matches whatever posture other services on this host already
+have — worth checking whether any of them already deal with this same
+class of "third-party image publishes to 0.0.0.0" problem). Whether
+loopback-only binding for Taiga is a hard requirement or a nice-to-have is
+worth confirming before picking a direction, since (a) revisits the
+item-30 architecture decision a second time in as many rounds and (b) is
+a real (if narrow) security posture regression.
+
+### Round 9 fix (2026-08-16): direction (a) — narrow, idempotent `sed`-patch of the pinned checkout's own `ports:` line
+
+Implemented per `docs/spec.md`/`docs/implementation.md`: `install.sh` now
+grep-gates-then-`sed`-patches `$TAIGA_DIR/docker-compose.yml`'s
+`taiga-gateway` `ports: - "9000:80"` line to
+`"127.0.0.1:${TAIGA_PORT}:80"` directly, unconditionally on every run (so
+a pre-fix install gets patched on its next re-run too), and warns loudly
+instead of silently no-op-ing if the expected line isn't found. The
+now-redundant, actively-conflicting `ports:` entry is dropped from
+`docker-compose.override.yml`, which keeps only `volumes:`/`depends_on:`
+for `taiga-gateway` (item 43's mechanism, untouched). Verified against the
+real upstream `taigaio/taiga-docker` `stable` branch `docker-compose.yml`
+content and via `docker compose config` that the merged result has
+exactly one `ports:` entry, bound to `127.0.0.1:9000` — see
+`docs/implementation.md` for the full verification method and its limits
+(no live `$TAIGA_DIR` install available in this sandbox; still needs a
+hands-on pve-peer retest to confirm against a real install, same caveat
+pattern round 8 used). Not yet retest-confirmed — do not mark item 44
+"confirmed fixed" until a retest report comes back clean.
+
 ### To resume if this session is interrupted mid-loop
 
 1. Check `ListAgents` for the current pve-side peer session name (may
    have changed if it died again).
-2. If no round-8 report has arrived yet: wait, or re-send the round-8
-   retest brief (see "Round 8 fix cycle" above) to whichever peer is
-   listed.
-3. If a report *has* arrived: read it. Clean report → proceed to the
-   backup+migration steps (3-5) under "The plan, in order" above. Issues
-   found → loop back into the fix pipeline (product-manager → developer
-   → reviewer), commit, push, re-brief, repeat.
+2. If item 44's fix above isn't yet reviewed/pushed: continue/resume the
+   developer → reviewer pipeline for it (implementation done, see "Round
+   9 fix" above; reviewer still needs to run its own testing pass before
+   this can be pushed).
+3. Once reviewed and pushed: re-send an item-44-focused retest brief to
+   whichever peer is listed (also worth asking them to confirm item 43
+   stays fixed, since this round's fix touches the same override file).
+4. If a future report comes back fully clean: proceed to the
+   backup+migration steps (3-5) under "The plan, in order" above.
 
 ---
 

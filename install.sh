@@ -399,7 +399,38 @@ if [ "$WITH_TAIGA" -eq 1 ]; then
         TAIGA_FRESH_CLONE=1
     fi
 
-    # 3. Config — taiga-docker ships a real (not .example) .env file with
+    # 3. Item 44 (round 9): patch the pinned checkout's own
+    # docker-compose.yml `ports:` line for taiga-gateway directly, in place
+    # -- Compose merges list fields like `ports:` by *concatenation*, not by
+    # replacement (unlike `volumes:`, which item 43 below relies on merging
+    # by container target path), so a docker-compose.override.yml `ports:`
+    # entry can never actually close the upstream file's own unrestricted
+    # "9000:80" binding; it just adds a second, losing bind, and
+    # taiga-gateway ends up running with no port published at all
+    # (docs/spec.md "Background / current state", item 44). This is a
+    # narrow, explicit exception to item 30's "don't patch the pinned
+    # checkout" decision (see step 5 below) -- scoped to exactly this one
+    # `ports:` line; taiga.conf (item 43) stays entirely on the
+    # override-file/bind-mount mechanism, untouched here. Runs
+    # unconditionally on every install.sh invocation (not gated on
+    # TAIGA_FRESH_CLONE), so a pre-fix $TAIGA_DIR cloned before this change
+    # shipped still gets patched on its next re-run, not just a brand-new
+    # clone. grep-gated before the sed so a second/third run against an
+    # already-patched checkout is a clean, byte-identical no-op instead of a
+    # double-patch; warns loudly to stderr (does not fail the install) if
+    # neither the expected original line nor the already-patched form is
+    # found, in case a future re-clone of a newer upstream commit changes
+    # this line's exact format. ${TAIGA_PORT} in the replacement is
+    # single-quoted/literal on purpose -- Compose (not this shell) resolves
+    # it from $TAIGA_DIR/.env at `docker compose` time.
+    TAIGA_COMPOSE_YML="$TAIGA_DIR/docker-compose.yml"
+    if grep -q '^[[:space:]]*-[[:space:]]*"9000:80"[[:space:]]*$' "$TAIGA_COMPOSE_YML"; then
+        sed -i 's|^\([[:space:]]*-[[:space:]]*\)"9000:80"[[:space:]]*$|\1"127.0.0.1:${TAIGA_PORT}:80"|' "$TAIGA_COMPOSE_YML"
+    elif ! grep -q '"127\.0\.0\.1:\${TAIGA_PORT}:80"' "$TAIGA_COMPOSE_YML"; then
+        echo "WARNING: expected taiga-gateway's 'ports: - \"9000:80\"' line in $TAIGA_COMPOSE_YML but didn't find it (upstream taiga-docker format may have changed) -- taiga-gateway's host port may end up published on all interfaces (0.0.0.0) instead of loopback-only. Check $TAIGA_COMPOSE_YML's taiga-gateway service manually." >&2
+    fi
+
+    # 4. Config — taiga-docker ships a real (not .example) .env file with
     # insecure placeholder defaults (SECRET_KEY="taiga-secret-key", etc.),
     # so unlike switchboard.env's TOTP_SECRET there's no "empty means
     # generate one" signal to key off of. Only randomize secrets right after
@@ -426,15 +457,16 @@ if [ "$WITH_TAIGA" -eq 1 ]; then
     set_env "$TAIGA_ENV" TAIGA_DOMAIN "$TAIGA_DOMAIN_VALUE"
     # TAIGA_PORT also lives in taiga-docker's own .env (not just
     # switchboard.env below) — Compose auto-loads .env from the project
-    # directory for variable substitution, which is what lets the
-    # docker-compose.override.yml below reference ${TAIGA_PORT} without the
-    # wrapper scripts needing to export anything themselves.
+    # directory for variable substitution, which is what lets
+    # docker-compose.yml's own taiga-gateway ports: line (patched in step 3
+    # above) reference ${TAIGA_PORT} without the wrapper scripts needing to
+    # export anything themselves.
     set_env "$TAIGA_ENV" TAIGA_PORT "$TAIGA_PORT"
 
-    # 4. Loopback-only binding, and (item 30) health-gating taiga-gateway's
-    # startup on taiga-front actually being resolvable — taiga-gateway's own
-    # docker-compose.yml binds "9000:80" on all interfaces (conflicts with
-    # this project's "everything binds 127.0.0.1 only" rule), and its
+    # 5. (item 30) Health-gating taiga-gateway's startup on taiga-front
+    # actually being resolvable — taiga-gateway's own docker-compose.yml
+    # binds "9000:80" on all interfaces by default (now patched to
+    # loopback-only at the source, in step 3 above — item 44), and its
     # taiga.conf does `proxy_pass http://taiga-front/;` with no `resolver`
     # directive, so nginx resolves that hostname once at startup — if
     # taiga-front isn't attached to the network yet (an ordinary Compose
@@ -453,7 +485,9 @@ if [ "$WITH_TAIGA" -eq 1 ]; then
     # regenerates deterministically every run, and not by patching
     # taiga.conf/docker-compose.yml inside the pinned, third-party
     # taiga-docker checkout itself (docs/spec.md "Proposed approach" —
-    # Item 30 architecture decision). The healthcheck test command uses
+    # Item 30 architecture decision; step 3 above's `ports:` patch is a
+    # narrow, explicit, later exception to this for exactly one line —
+    # item 44, round 9). The healthcheck test command uses
     # `http://127.0.0.1/`, not `http://localhost/` — confirmed hands-on
     # against the real taigaio/taiga-front:latest image that its bundled
     # nginx only listens on 0.0.0.0:80 (no IPv6 listener), so BusyBox wget
@@ -467,9 +501,7 @@ if [ "$WITH_TAIGA" -eq 1 ]; then
     # docker-compose.override.yml in the same directory, so this override
     # never conflicts with a future manual `git pull` in $TAIGA_DIR.
     # Regenerated deterministically every run, like the systemd unit /
-    # sudoers file below. The single-quoted heredoc is deliberate:
-    # ${TAIGA_PORT} must stay literal here so Compose (not this shell)
-    # substitutes it from $TAIGA_DIR/.env at `docker compose` time.
+    # sudoers file below.
     #
     # Item 43 (round 8): item 30's healthcheck above narrows the DNS race
     # for taiga-front specifically but doesn't close it — nginx still
@@ -497,10 +529,12 @@ if [ "$WITH_TAIGA" -eq 1 ]; then
     # /etc/nginx/conf.d/default.conf mount; the base file's
     # taiga-static-data/taiga-media-data mounts on the same service are left
     # untouched. This is the same override-file idiom already used for
-    # depends_on/ports above, just extended to volumes — the pinned
-    # checkout's own $TAIGA_DIR/taiga-gateway/taiga.conf is never opened for
-    # writing. Item 30's healthcheck/service_healthy gate is kept in place
-    # as defense-in-depth alongside this fix, not replaced by it.
+    # depends_on above, just extended to volumes — the pinned checkout's own
+    # $TAIGA_DIR/taiga-gateway/taiga.conf (as opposed to its
+    # docker-compose.yml, which step 3 above does patch for item 44) is
+    # never opened for writing. Item 30's healthcheck/service_healthy gate
+    # is kept in place as defense-in-depth alongside this fix, not replaced
+    # by it.
     cat > "$TAIGA_DIR/docker-compose.override.taiga-gateway.conf" <<'NGINX'
 server {
     listen 80 default_server;
@@ -595,8 +629,6 @@ services:
       retries: 30
       start_period: 5s
   taiga-gateway:
-    ports:
-      - "127.0.0.1:${TAIGA_PORT}:80"
     volumes:
       - ./docker-compose.override.taiga-gateway.conf:/etc/nginx/conf.d/default.conf
     depends_on:
@@ -608,7 +640,7 @@ services:
         condition: service_started
 YAML
 
-    # 5. Pre-pull images at install time, not first toggle — otherwise the
+    # 6. Pre-pull images at install time, not first toggle — otherwise the
     # first UI toggle-on blocks on pulling 9 images over the network.
     # Warn-and-continue (not fatal) if there's no network right now; the
     # first toggle-on will simply be slow instead.
@@ -619,7 +651,7 @@ YAML
         fi
     fi
 
-    # 6. Wrapper scripts (root-run, zero arguments — see docs/spec.md
+    # 7. Wrapper scripts (root-run, zero arguments — see docs/spec.md
     # "Crossing the privilege boundary"). Sudoers entries for these are
     # added below, alongside every other sudoers rule this installer
     # generates.
@@ -627,7 +659,7 @@ YAML
     install -m 755 "$REPO_DIR/scripts/taiga-down.sh" /usr/local/bin/ai-dev-switchboard-taiga-down.sh
     install -m 755 "$REPO_DIR/scripts/taiga-status.sh" /usr/local/bin/ai-dev-switchboard-taiga-status.sh
 
-    # 7. switchboard.env — TAIGA_DIR is also recorded here (beyond what
+    # 8. switchboard.env — TAIGA_DIR is also recorded here (beyond what
     # app.py itself reads) because the wrapper scripts above source this
     # same file for it, exactly like new-project-from-upload.sh already
     # sources RUN_USER/PROJECTS_DIR from it.
