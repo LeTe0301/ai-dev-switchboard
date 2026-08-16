@@ -1958,7 +1958,13 @@ def smoke_check_run(name: str, expect_contains: str) -> dict:
       content_ok is None (never False) when `expect_contains` was empty --
       "not checked" must stay visibly distinct from "checked and failed".
     """
-    url = _latest_session_url_for_project(name)
+    # Loaded once here and threaded through to _latest_session_url_for_project
+    # -> _resolve_session_url (fix-up, docs/test-review.md finding #4) --
+    # this route only ever resolves a single session's URL, but the two
+    # helpers below would otherwise each reload load_engines() independently
+    # for that one lookup; one call here is the correct amount of work.
+    engines = load_engines()
+    url = _latest_session_url_for_project(name, engines)
     if url is None:
         return {"ok": False, "error": "no captured URL for this project"}
 
@@ -2431,7 +2437,7 @@ def _new_session_id(engine_name: str, project_name: str) -> str:
 # in-memory dict -- that lock's own comment notes this exact defect class
 # has been found and fixed four separate times in this codebase's team
 # subsystem) -- every mutation and every liveness-deciding read of
-# _sessions goes through one of the three functions below, nothing else
+# _sessions goes through one of the four functions below, nothing else
 # touches _sessions directly.
 _sessions: dict[str, dict] = {}   # session_id -> {"project": str, "engine": str}
 _sessions_lock = threading.Lock()
@@ -2445,6 +2451,20 @@ def _sessions_add(session_id: str, project: str, engine: str) -> None:
 def _sessions_pop(session_id: str) -> dict | None:
     with _sessions_lock:
         return _sessions.pop(session_id, None)
+
+
+def _sessions_ids() -> list[str]:
+    """Fix-up (docs/test-review.md finding #3): lock-guarded snapshot of
+    EVERY registered session_id across all projects, for _reap_dead_state()'s
+    global sweep below. A 4th sanctioned accessor alongside _sessions_add/
+    _sessions_pop/active_sessions() -- _reap_dead_state() previously did
+    `for session_id in list(_sessions):` directly, unguarded by
+    _sessions_lock, violating this module's own stated "nothing else
+    touches _sessions directly" invariant. Returns REGISTERED ids, not
+    necessarily live ones -- same as active_sessions(), the caller still
+    checks tmux_has() itself against each one."""
+    with _sessions_lock:
+        return list(_sessions)
 
 
 def active_sessions(project_name: str) -> list[dict]:
@@ -2667,7 +2687,8 @@ def run_startup_watch(session: str, name: str, engine: "Engine", timeout: int = 
             break
 
 
-def _resolve_session_url(session_id: str, engine_name: str) -> str | None:
+def _resolve_session_url(session_id: str, engine_name: str,
+                          engines: dict | None = None) -> str | None:
     """Single source of truth for "what URL represents this session" --
     shared by /status's per-session `sessions` array, its back-compat `url`
     field, and _latest_session_url_for_project() below (docs/spec.md
@@ -2676,8 +2697,18 @@ def _resolve_session_url(session_id: str, engine_name: str) -> str | None:
     the old per-project /status line already used: the engine's own
     captured hosted link (_session_urls) if it has one (url_regex), else
     the ttyd-hosted terminal URL (_ttyd_urls) as the fallback.
+
+    `engines` (fix-up, docs/test-review.md finding #4): the caller's own
+    already-loaded load_engines() dict, when it has one -- /status loads it
+    once per poll and was otherwise paying for one full, uncached
+    os.listdir(ENGINES_DIR)-plus-parse PER LIVE SESSION by letting this
+    function reload it independently every time, scaling with total
+    concurrent session count. Falls back to loading it fresh only for a
+    standalone caller with no pre-loaded dict of its own.
     """
-    engine = load_engines().get(engine_name)
+    if engines is None:
+        engines = load_engines()
+    engine = engines.get(engine_name)
     if engine is None:
         return None
     return _session_urls.get(session_id) if engine.url_regex else _ttyd_urls.get(session_id)
@@ -2694,18 +2725,25 @@ def _latest_session_for_project(name: str) -> dict | None:
     return sessions[-1] if sessions else None
 
 
-def _latest_session_url_for_project(name: str) -> str | None:
+def _latest_session_url_for_project(name: str, engines: dict | None = None) -> str | None:
     """Preserves smoke_check_run()'s pre-spec single-URL contract
     mechanically (docs/spec.md "Smoke-check preserved via a resolver, not
     touched otherwise"): externally identical to today for the common
     single-session case; for multi-session projects, deterministically
     targets the newest session's resolved URL, never an
     arbitrary/undefined one.
+
+    `engines`: threaded straight through to _resolve_session_url() below
+    (see its own docstring, fix-up docs/test-review.md finding #4) -- loaded
+    fresh here only when the caller (e.g. a direct test call) has none of
+    its own.
     """
     latest = _latest_session_for_project(name)
     if latest is None:
         return None
-    return _resolve_session_url(latest["session_id"], latest["engine"])
+    if engines is None:
+        engines = load_engines()
+    return _resolve_session_url(latest["session_id"], latest["engine"], engines)
 
 
 def instance_start(name: str, engine_name: str = "claude") -> str | None:
@@ -2723,7 +2761,6 @@ def instance_start(name: str, engine_name: str = "claude") -> str | None:
     if engine is None or not os.path.isdir(workdir):
         return None
     session_id = _new_session_id(engine_name, name)
-    _sessions_add(session_id, name, engine_name)
     _session_urls.pop(session_id, None)
     cmd = engine.cmd.format(name=shlex.quote(name))
     # Run the engine command directly as the tmux session's own command (not
@@ -2735,6 +2772,28 @@ def instance_start(name: str, engine_name: str = "claude") -> str | None:
     # bare leftover shell.
     subprocess.run(TMUX + ["new-session", "-d", "-s", session_id, "-c", workdir,
                            "bash", "-lc", cmd])
+    if not tmux_has(session_id):
+        # tmux failed to actually bring the session up (a fast-failing cmd,
+        # tmux itself erroring, ...) -- report failure the same clean way
+        # an unknown engine/project does above, rather than registering
+        # bookkeeping for a session_id that was never really live.
+        return None
+    # Fix-up (docs/test-review.md finding #1): registration is deliberately
+    # deferred to HERE, after tmux has confirmed the session exists, not
+    # before subprocess.run above. Registering earlier left a window where
+    # a concurrent /status poll's _reap_dead_state() (a separate thread --
+    # ThreadingHTTPServer) could see this session_id in _sessions while
+    # tmux_has() was still false (tmux hadn't finished creating it yet),
+    # call instance_stop_session() on it, and pop it back out of _sessions/
+    # _session_urls -- moments before this function's own subprocess.run
+    # above actually finished creating the real tmux session (and started
+    # ttyd below). The result was a live tmux+ttyd process registered in
+    # neither _sessions nor any of the ttyd bookkeeping dicts: invisible to
+    # /status, unstoppable via any route, leaked until a process restart.
+    # Deferring registration until the session is confirmed to exist closes
+    # that race at the source -- there is no longer any window where
+    # _sessions can name a session_id that tmux doesn't yet back.
+    _sessions_add(session_id, name, engine_name)
     if engine.startup or engine.url_regex:
         run_startup_watch(session_id, session_id, engine)
     if not engine.url_regex:
@@ -2788,14 +2847,30 @@ def _reap_dead_state():
     tmux_has() call. instance_stop_session() is idempotent and safe to race
     against a concurrent explicit /session/<id>/stop -- both go through
     _sessions_pop(), guarded by _sessions_lock, so the loser's pop returns
-    None and short-circuits with no double teardown.
+    None and short-circuits with no double teardown. The session_id list
+    itself is read through _sessions_ids() (fix-up, docs/test-review.md
+    finding #3), not `list(_sessions)` directly, so this walk is guarded by
+    _sessions_lock like every other read of _sessions.
+
+    A second, INDEPENDENT sweep below walks the ttyd/_session_urls
+    bookkeeping dicts themselves, by their own keys -- restored (fix-up,
+    docs/test-review.md finding #2) from the pre-session-identity version of
+    this function, which independently cleaned up ttyd/URL bookkeeping even
+    when it had drifted out of sync with the primary liveness registry
+    (there, active_engine(); here, _sessions). Without this second sweep, a
+    bookkeeping entry that ends up outside _sessions for any reason (a race,
+    a future bug) is permanently unreachable by the sweep above, since that
+    one only ever walks _sessions' own keys.
 
     Also sweeps abandoned upload-wizard staging directories (docs/spec.md
     "Two-phase protocol" — TTL/idle cleanup for abandoned uploads), reusing
     this same "opportunistic cleanup on a request that already happens
     often" precedent rather than a dedicated background thread/timer.
     """
-    for session_id in list(_sessions):
+    for session_id in _sessions_ids():
+        if not tmux_has(session_id):
+            instance_stop_session(session_id)
+    for session_id in set(_ttyd_urls) | set(_ttyd_procs) | set(_session_urls):
         if not tmux_has(session_id):
             instance_stop_session(session_id)
     for name in list(_code_procs):
@@ -6100,7 +6175,7 @@ class Handler(BaseHTTPRequestHandler):
                 proj_sessions = active_sessions(n)
                 sessions_field = [
                     {"session_id": s["session_id"], "engine": s["engine"],
-                     "url": _resolve_session_url(s["session_id"], s["engine"])}
+                     "url": _resolve_session_url(s["session_id"], s["engine"], engines)}
                     for s in proj_sessions]
                 latest = sessions_field[-1] if sessions_field else None
                 inst = {"name": n, "on": latest is not None,

@@ -162,9 +162,15 @@ class SmokeCheckRunTests(unittest.TestCase):
         # back to its own exact pre-spec behavior (a direct _session_urls-
         # by-name lookup) for the duration of this class, letting every
         # test below keep writing appmod._session_urls["proj"] = ...
-        # unchanged.
+        # unchanged. Takes an optional second positional `engines` arg (fix-
+        # up, docs/test-review.md finding #4: smoke_check_run() now threads
+        # its own already-loaded engines dict through as a second
+        # positional arg) and ignores it -- a bare `appmod._session_urls.get`
+        # would otherwise silently accept that dict as dict.get()'s own
+        # `default` parameter instead, returning it verbatim as a "URL".
         self._orig_latest_url = appmod._latest_session_url_for_project
-        appmod._latest_session_url_for_project = appmod._session_urls.get
+        appmod._latest_session_url_for_project = (
+            lambda name, engines=None: appmod._session_urls.get(name))
 
     def tearDown(self):
         appmod._session_urls.clear()

@@ -156,6 +156,116 @@ separately, does the UI rewrite and removes the shim).
   `team-*`-named tmux session (spawned directly via `tmux new-session`, not
   through this spec's machinery) is never reachable through this route
   regardless of which project name is in the URL.
+- **Fix-up pass 2 (post-`/code-review`, independent of the reviewer
+  pipeline that already approved this cycle): six bugs fixed, none of them
+  spec gaps — all genuine implementation defects against the design the
+  spec itself already called for.**
+  1. **Resource leak in `instance_start()`** (`app/app.py`): `_sessions_add()`
+     was called *before* `subprocess.run(TMUX + ["new-session", ...])`
+     completed, not after. A concurrent `/status` poll's
+     `_reap_dead_state()` (a separate request thread —
+     `ThreadingHTTPServer`) could see the not-yet-real `session_id` in
+     `_sessions`, observe `tmux_has()` still false, and call
+     `instance_stop_session()` on it — popping it back out of `_sessions`/
+     `_session_urls` moments before this function's own `subprocess.run`
+     actually finished creating the real tmux session (and, if applicable,
+     starting ttyd). The result: a live tmux+ttyd process registered
+     nowhere, invisible to `/status`, unstoppable via any route, leaked
+     until a process restart. Fixed by moving `_sessions_add()` to after a
+     new `tmux_has(session_id)` verification step following
+     `subprocess.run` — `instance_start()` now returns `None` (registering
+     nothing) if that check fails, closing the race at its source rather
+     than narrowing the window. Regression test:
+     `InstanceLifecycleRealTmuxTests::test_instance_start_does_not_register_a_session_that_never_came_up`
+     (forces `tmux_has` to report false and confirms nothing is ever
+     registered).
+  2. **Regression: `_reap_dead_state()` dropped the pre-existing independent
+     sweep over `_ttyd_urls`/`_ttyd_procs`/`_session_urls`** (`app/app.py`):
+     restored as a second, independent loop over
+     `set(_ttyd_urls) | set(_ttyd_procs) | set(_session_urls)`, calling
+     `instance_stop_session()` for any key whose tmux session is dead —
+     same self-healing guarantee the pre-session-identity version of this
+     function had (there, keyed by `active_engine()`; the primary sweep
+     alone only walks `_sessions`' own registered ids, so any bookkeeping
+     entry that drifts outside `_sessions` for any reason — including
+     finding #1's race, or any future bug — would otherwise be permanently
+     unreachable by self-healing). Regression test:
+     `InstanceLifecycleRealTmuxTests::test_reap_dead_state_cleans_orphaned_bookkeeping_not_backed_by_sessions`.
+  3. **Lock discipline violated in `_reap_dead_state()`** (`app/app.py`):
+     it read `_sessions` via a bare `for session_id in list(_sessions):`,
+     unguarded by `_sessions_lock` — violating this module's own stated
+     "every mutation and every liveness-deciding read of `_sessions` goes
+     through one of the [sanctioned] functions below, nothing else touches
+     `_sessions` directly" invariant. Fixed by adding a fourth sanctioned
+     accessor, `_sessions_ids()` (lock-guarded snapshot of every registered
+     id across all projects), and routing this sweep through it; the
+     module-level invariant comment above `_sessions` is updated
+     accordingly ("one of the four functions"). Regression test:
+     `SessionsRegistryUnitTests::test_sessions_ids_returns_every_registered_id_across_all_projects`.
+  4. **Perf: `/status` and `smoke_check_run()` reloaded `load_engines()`
+     redundantly** (`app/app.py`): `_resolve_session_url()` did its own
+     internal `load_engines()` call on every invocation — a full uncached
+     `os.listdir(ENGINES_DIR)`-plus-parse, once *per live session*, even
+     though `/status`'s handler already loads `engines` once near the top
+     of the request. Fixed by giving `_resolve_session_url()` and
+     `_latest_session_url_for_project()` both an optional `engines` param
+     (falls back to a fresh `load_engines()` call only when the caller has
+     none of its own, preserving the direct-test-call signatures both
+     already had), and threading the already-loaded dict through from
+     `/status`'s per-session loop and from `smoke_check_run()` (which now
+     loads `engines` once itself and passes it down, rather than each
+     helper reloading independently for the one lookup it does).
+     `tests/test_smoke_check.py::SmokeCheckRunTests`'s
+     `_latest_session_url_for_project` monkeypatch (see the deviation
+     above) had to be updated in lockstep — a bare `appmod._session_urls.get`
+     would otherwise have silently accepted the newly-threaded `engines`
+     dict as `dict.get()`'s own `default` argument, returning it verbatim
+     as a "URL" (caught immediately by the existing test suite: one
+     `AttributeError` from `urlopen()` trying to treat a dict as a URL).
+     Replaced with `lambda name, engines=None: appmod._session_urls.get(name)`.
+     Regression tests:
+     `ResolveSessionUrlEnginesThreadingTests::test_resolve_session_url_does_not_reload_engines_when_a_dict_is_passed`
+     (forces a fresh `load_engines()` call to raise, proving the passed
+     dict is actually used) and its sibling
+     `test_resolve_session_url_falls_back_to_loading_engines_when_none_passed`.
+  5. **Test bug: `SessionIdentityEndpointTests.setUp()` cleared the wrong
+     global** (`tests/test_session_identity.py`): `appmod.SESSIONS.clear()`
+     clears the pre-existing, unrelated login/auth-cookie store
+     (`app.py:306`), not this class's own intended target, the `_sessions`
+     per-project session-identity registry — two different globals with
+     similarly-named module attributes. Intended per-test isolation of
+     `_sessions` was silently doing nothing (stale entries accumulated
+     across test methods within the class's shared `self.project` scope),
+     while unintentionally invalidating any currently-authenticated login
+     session elsewhere in the shared `app` module on every test's `setUp`.
+     Fixed: `setUp`/`tearDown` now save/clear/restore `appmod._sessions`
+     instead (matching the same pattern `SessionsRegistryUnitTests` already
+     uses), and `SESSIONS.clear()` is dropped entirely — confirmed no test
+     in this class or file depended on that accidental side effect, since
+     every test authenticates fresh via `self._authed()` -> `self._login()`
+     *after* `setUp` runs, installing its own new cookie regardless of
+     `SESSIONS`'s prior contents.
+  6. **Minor: stale `active_engine()` reference in `app/teams.py`**
+     (`_create_team_session()`'s docstring): updated to reference the
+     current guard this codebase actually uses (`app.py`'s legacy `/on`
+     route via `active_sessions()`), since `active_engine()` no longer
+     exists and `instance_start()` itself no longer carries this
+     particular guard (it moved to the `/on` route only, per the original
+     spec's point 6).
+
+  All fixes verified: `python3 -m py_compile app/app.py app/teams.py
+  tests/test_session_identity.py tests/test_smoke_check.py` clean;
+  `tests/test_session_identity.py` (41 tests, 36 original + 5 new for this
+  pass), `tests/test_smoke_check.py`, and
+  `tests/test_teams_headless.py::ActiveEngineHeadlessCollisionTests` all
+  pass (67 tests total across the three files); full suite
+  (`python3 -m unittest discover -s tests`) reports `Ran 1318 tests ...
+  FAILED (failures=35, errors=79, skipped=42)` — identical failure/error/
+  skip tally to the pre-fix-up baseline recorded above (`1313` tests before
+  this pass, `+5` new passing tests, same 9 pre-existing/environmental
+  failing files, confirmed by diffing the failing-test-name set against the
+  prior run: no new failures, no new errors, nothing newly passing that
+  wasn't already passing).
 - No other deviations — routes, JSON shapes, `_reap_dead_state()`'s sweep,
   and the back-compat `/on`/`/off` semantics all match the spec's
   "Proposed approach" code blocks essentially verbatim.
@@ -177,17 +287,19 @@ separately, does the UI rewrite and removes the shim).
 2. `python3 -m unittest discover -s tests -v` (or `python3 -m unittest
    tests.test_session_identity tests.test_smoke_check
    tests.test_teams_headless -v` to just run what this cycle touched) —
-   all of `tests/test_session_identity.py` (36 tests, new — 34 from the
-   original cycle + 2 added in this fix-up pass), all of
-   `tests/test_smoke_check.py`, and `tests/test_teams_headless.py`'s
-   `ActiveEngineHeadlessCollisionTests` pass. Confirmed via a full-suite
-   run against the current working tree: `Ran 1313 tests ... FAILED
-   (failures=35, errors=79, skipped=42)` — the same 35/79/42 pre-existing
-   tally as the unmodified `main` baseline (`1277` tests), confirmed
-   genuinely pre-existing/environmental (e.g. `test_team_routes.py`'s
-   failures are `git commit` exit-128s from no global `git user.email`/
-   `user.name` in this sandbox), plus 36 new passing tests (1277 → 1313
-   total). The pre-existing failures/errors span **9 files**, not just two:
+   all of `tests/test_session_identity.py` (41 tests — 34 from the
+   original cycle, +2 from the first fix-up pass, +5 from the second
+   fix-up pass documented above), all of `tests/test_smoke_check.py`, and
+   `tests/test_teams_headless.py`'s `ActiveEngineHeadlessCollisionTests`
+   pass (67 tests total across the three files). Confirmed via a
+   full-suite run against the current working tree: `Ran 1318 tests ...
+   FAILED (failures=35, errors=79, skipped=42)` — the same 35/79/42
+   pre-existing tally as the unmodified `main` baseline (`1277` tests),
+   confirmed genuinely pre-existing/environmental (e.g.
+   `test_team_routes.py`'s failures are `git commit` exit-128s from no
+   global `git user.email`/`user.name` in this sandbox), plus 41 new
+   passing tests (1277 → 1318 total). The pre-existing failures/errors
+   span **9 files**, not just two:
    `test_gitea_sync_project` (×5), `test_new_project_from_gitea` (×6),
    `test_new_project_from_upload` (×4), `test_new_project_from_url` (×12),
    `test_taiga_push` (×1), `test_team_routes` (×47), `test_teams_grounding`
