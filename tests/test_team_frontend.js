@@ -2567,6 +2567,37 @@ test('renderTeamPage(): a 401 from /status shows the login overlay, same as refr
     'expected the login overlay to be shown on a 401, same as unauthenticated access to "/"');
 });
 
+// Regression test for the /code-review finding on PR #4 (Taiga #10): the
+// 401 branch above only called showOverlay() and returned, so a bookmarked
+// /team/<project> URL loaded with no valid session left the dashboard's
+// project-creation chrome (page title, "+ New project" row, upload/clone
+// buttons) visible behind the translucent overlay -- docs/spec.md §5 says
+// only the login/TOTP overlays are shared between the two contexts, so the
+// dashboard chrome must be hidden regardless of auth state.
+test('renderTeamPage(): a 401 from /status also hides the dashboard chrome, not just the overlay', async () => {
+  const c = createCase();
+  // Drain the auto-bootstrap refresh() call this default ('/') location
+  // triggers at load, same as the previous 401 test does.
+  c.resolveFetch((f) => f.url === '/status', 200, statusWith([]));
+  await tick();
+  await tick();
+  const p = c.call('renderTeamPage', 'proj');
+  c.resolveFetch((f) => f.url === '/status', 401, { error: 'not authenticated' });
+  await p;
+  assert.ok(c.sandbox.document.getElementById('overlay').classList.contains('show'),
+    'expected the login overlay to be shown on a 401');
+  assert.ok(c.sandbox.document.getElementById('rows').classList.contains('hidden-for-team-page'),
+    'expected #rows to be hidden on a 401, same as the found-project and not-found paths');
+  assert.strictEqual(c.sandbox.document.getElementById('page-title').style.display, 'none',
+    'expected the dashboard page title to be hidden on a 401');
+  assert.strictEqual(c.sandbox.document.getElementById('new-project-row').style.display, 'none',
+    'expected the "+ New project" row to be hidden on a 401');
+  assert.strictEqual(c.sandbox.document.getElementById('upload-folder-btn').style.display, 'none',
+    'expected the "Upload folder/.zip" button to be hidden on a 401');
+  assert.strictEqual(c.sandbox.document.getElementById('clone-toggle-btn').style.display, 'none',
+    'expected the "Clone from URL" button to be hidden on a 401');
+});
+
 test('the back-link navigates to the dashboard via a real navigation, not an in-page switch', async () => {
   const c = await setupCase([inst('proj', { status: 'running', run_id: 'run-1' })]);
   c.call('goToDashboard');

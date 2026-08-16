@@ -5862,7 +5862,7 @@ function renderTeamPageNotFound(projectName) {
 // no forked copy of any sub-renderer.
 async function renderTeamPage(projectName) {
   const r = await fetch('/status');
-  if (r.status === 401) { showOverlay(); return; }
+  if (r.status === 401) { hideDashboardChromeForTeamPage(); showOverlay(); return; }
   const s = await r.json();
   ENGINE_LABELS = s.engines || {};
   ROSTER = s.roster || [];

@@ -20,6 +20,24 @@ file" and "How to verify locally" below for the specifics and full re-run
 results (all 6 frontend files now pass 100%, Python suites unchanged/no new
 regressions).
 
+**Post-approval fix-up round (independent `/code-review` finding, PR #4):**
+after `docs/test-review.md` approved the cycle above, a separate
+`/code-review` pass caught a real spec violation in `renderTeamPage()`'s
+401 branch that neither the developer nor the reviewer pass had exercised:
+`if (r.status === 401) { showOverlay(); return; }` only showed the login
+overlay and returned — it never called `hideDashboardChromeForTeamPage()`,
+which every other exit path (found project, unknown project) does call. So
+loading a bookmarked/shared `/team/<project>` URL with no valid session (a
+fresh browser or an expired cookie) left the dashboard's project-creation
+chrome (page title, "+ New project" row, "Upload folder/.zip" and "Clone
+from URL" buttons) rendered and visible behind the translucent overlay,
+contradicting `docs/spec.md` §5's "the plain dashboard chrome ... should
+not render on the team page; only the login/TOTP overlays are shared
+between both contexts." Fixed by calling `hideDashboardChromeForTeamPage()`
+before `showOverlay()` on the 401 path too, so the two calls now match every
+other branch's ordering. See "Changes by file" and "How to verify locally"
+below for the one-line diff and the new regression test.
+
 ## Changes by file
 
 - `app/app.py`
@@ -146,6 +164,28 @@ regressions).
     `location` — it exists purely so the router branch at the bottom of the
     script doesn't throw during sandbox setup.
 
+- `app/app.py` **(post-approval fix-up)**
+  - `renderTeamPage(projectName)`: 401 branch changed from
+    `if (r.status === 401) { showOverlay(); return; }` to
+    `if (r.status === 401) { hideDashboardChromeForTeamPage(); showOverlay();
+    return; }`. `hideDashboardChromeForTeamPage()` only sets `style.display`
+    on independent elements and toggles unrelated classes (`#rows`,
+    `#team-page`), so it's idempotent/order-independent with `showOverlay()`
+    (which only touches `#overlay`/`#err-creds`/`#login-pass`) — no other
+    behavior change.
+
+- `tests/test_team_frontend.js` **(post-approval fix-up)**
+  - New test `renderTeamPage(): a 401 from /status also hides the dashboard
+    chrome, not just the overlay` (right after the pre-existing 401 test),
+    asserting `#rows` carries `hidden-for-team-page` and that
+    `page-title`/`new-project-row`/`upload-folder-btn`/`clone-toggle-btn`
+    all have `style.display === 'none'` after a 401 — the exact chrome
+    elements the finding named. Confirmed non-tautological via
+    revert-and-watch-it-fail: reverted just the one-line `app/app.py` fix
+    and re-ran this file — the new test fails with `AssertionError:
+    expected #rows to be hidden on a 401...` while all other 134 tests
+    still pass; restoring the fix makes it pass again (135/135).
+
 - `tests/test_team_routes.py`
   - New `TeamPageRouteTests` class (6 tests): `GET /team/<project>` returns
     a byte-identical 200 shell to `GET /` unauthenticated; matches
@@ -217,6 +257,35 @@ regressions).
   is unaddressed here, per spec — the same button family is relocated, not
   fixed.
 
+## Fix-up round verification (post-approval `/code-review` finding)
+
+Re-ran the full baseline this round, in this session, against the
+one-line `app/app.py` fix + the one new test in `tests/test_team_frontend.js`:
+
+- `tests/test_team_frontend.js` → **ALL PASS (135/135)** (was 134; +1 for
+  the new 401-hides-chrome regression test)
+- `tests/test_smoke_check_frontend.js` → ALL PASS (11/11), unchanged
+- `tests/test_clone_frontend.js` → ALL PASS (8/8), unchanged
+- `tests/test_deploy_frontend.js` → ALL PASS (9/9), unchanged
+- `tests/test_singleton_toggle_frontend.js` → ALL PASS (19/19), unchanged
+- `tests/test_upload_frontend.js` → ALL PASS (8/8), unchanged
+- `tests.test_team_routes.TeamPageRouteTests` → 6/6 `OK`, unchanged (this
+  class only covers the server-side unauthenticated static shell, not the
+  client-side `/status` 401 branch the finding was about, so it needed no
+  new case)
+- Full `tests.test_team_routes` suite → `Ran 137 tests ... FAILED
+  (failures=2, errors=45)`, byte-identical to `docs/implementation.md`'s
+  already-documented pre-existing baseline (git-identity-less sandbox +
+  2 flaky CLI-timing tests, both unrelated to this change) — zero new
+  regressions
+- `python3 -m py_compile app/app.py` — clean
+- `node --check tests/test_team_frontend.js` — clean
+- Revert-and-watch-it-fail: stashed just the `app/app.py` one-line fix and
+  re-ran `tests/test_team_frontend.js` — the new test fails
+  (`AssertionError: expected #rows to be hidden on a 401...`), all 134
+  other tests still pass; un-stashing restores 135/135 — confirms the new
+  test is a genuine regression test, not tautological.
+
 ## How to verify locally
 
 ```bash
@@ -225,7 +294,7 @@ regressions).
 # sibling frontend suites that extract/execute the same rendered <script>
 # (each one needed the `location` stub fix -- see "Changes by file"):
 NODE=/usr/lib/code-server/lib/node
-"$NODE" tests/test_team_frontend.js              # -> ALL PASS (134/134)
+"$NODE" tests/test_team_frontend.js              # -> ALL PASS (135/135)
 "$NODE" tests/test_smoke_check_frontend.js       # -> ALL PASS (11/11)
 "$NODE" tests/test_clone_frontend.js             # -> ALL PASS (8/8)
 "$NODE" tests/test_deploy_frontend.js            # -> ALL PASS (9/9)
@@ -246,8 +315,10 @@ TOTP_SECRET=JBSWY3DPEHPK3PXP python3 -m unittest tests.test_team_routes -v
 # -> Ran 137 tests ... FAILED (failures=2, errors=45)
 
 # Manual check once the server is running: open /team/<any-project-name> --
-# unauthenticated shows the login overlay; after login, an idle project
-# shows the full task-textarea launcher, a running one shows the status
-# strip/feed/interject box; the dashboard's own row for that project now
-# shows only a status badge + "Open team chat →" link.
+# unauthenticated shows the login overlay AND hides the dashboard's
+# project-creation chrome (page title, "+ New project" row, upload/clone
+# buttons) behind it; after login, an idle project shows the full
+# task-textarea launcher, a running one shows the status strip/feed/interject
+# box; the dashboard's own row for that project now shows only a status
+# badge + "Open team chat →" link.
 ```
