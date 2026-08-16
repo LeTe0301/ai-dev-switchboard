@@ -2572,19 +2572,27 @@ hands-on pve-peer retest to confirm against a real install, same caveat
 pattern round 8 used). Not yet retest-confirmed — do not mark item 44
 "confirmed fixed" until a retest report comes back clean.
 
+**Round 9 fix cycle: complete.** Reviewed (independently re-derived the
+Compose merge-semantics claim from real `docker compose config` runs
+rather than trusting the spec, confirmed idempotency, confirmed item 43's
+mechanism untouched), approved with one non-blocking nit, committed as
+`1de9710` on `backlog/e2e-fixes-round6`, pushed to both remotes, still
+under PR #33. Re-briefed `pve-sparkling-meadow`, item-44-focused (real
+reachability check, item-43 non-regression check, and an idempotency
+check via re-running `install.sh` on the same box rather than only a
+fresh one). Report not yet received as of this writing.
+
 ### To resume if this session is interrupted mid-loop
 
 1. Check `ListAgents` for the current pve-side peer session name (may
    have changed if it died again).
-2. If item 44's fix above isn't yet reviewed/pushed: continue/resume the
-   developer → reviewer pipeline for it (implementation done, see "Round
-   9 fix" above; reviewer still needs to run its own testing pass before
-   this can be pushed).
-3. Once reviewed and pushed: re-send an item-44-focused retest brief to
-   whichever peer is listed (also worth asking them to confirm item 43
-   stays fixed, since this round's fix touches the same override file).
-4. If a future report comes back fully clean: proceed to the
-   backup+migration steps (3-5) under "The plan, in order" above.
+2. If no round-9 report has arrived yet: wait, or re-send the round-9
+   retest brief (see "Round 9 fix cycle" note above) to whichever peer is
+   listed.
+3. If a report *has* arrived: read it. Clean report → proceed to the
+   backup+migration steps (3-5) under "The plan, in order" above. Issues
+   found → loop back into the fix pipeline (product-manager → developer
+   → reviewer), commit, push, re-brief, repeat.
 
 ---
 
