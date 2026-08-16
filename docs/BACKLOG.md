@@ -2381,18 +2381,29 @@ opened as [PR #33](https://github.com/LeTe0301/ai-dev-switchboard/pull/33)
   container (CT110) after sending the report; no orphaned containers from
   the two prior dead sessions were found on the host.
 
-### To resume if this session is interrupted mid-fix
+### Round 7 fix cycle: complete (2026-08-16)
 
-1. Check whether items 39-43 below have all been fixed, reviewed, and
-   committed yet (see git log on `backlog/e2e-fixes-round6` or its
-   successor branch).
-2. If not: continue/resume the product-manager → developer → reviewer
-   pipeline for whichever items are still open.
-3. Once fixed, reviewed, and pushed: check `ListAgents` for the current
-   pve-side peer session name (may have changed again) and re-send the
-   full E2E brief for another fresh-container round.
-4. If a future report comes back fully clean: proceed to the
-   backup+migration steps (3-5) under "The plan, in order" above.
+Items 39-43 were fixed via the normal product-manager → developer →
+reviewer pipeline (no ux-designer needed — backend/install-script only),
+approved with 2 non-blocking nits, committed as `5292112` on
+`backlog/e2e-fixes-round6`, pushed to both remotes, still under PR #33.
+Re-briefed `pve-sparkling-meadow` (same peer as round 6) for another
+fresh-container retest round, specifically targeting all 5 fixed items
+plus anything skipped last round (upload-from-folder, GitHub-origin
+AI-reviewer path). Report not yet received as of this writing.
+
+### To resume if this session is interrupted mid-loop
+
+1. Check `ListAgents` for the current pve-side peer session name (may
+   have changed if it died again).
+2. If no round-7 report has arrived yet: wait, or re-send the round-7
+   retest brief (see "Round 7 fix cycle" above, or reconstruct from
+   `docs/BACKLOG.md`'s "Items 39-43" section) to whichever peer is
+   listed.
+3. If a report *has* arrived: read it. Clean report → proceed to the
+   backup+migration steps (3-5) under "The plan, in order" above. Issues
+   found → loop back into the fix pipeline (product-manager → developer
+   → reviewer) same as round 7, commit, push, re-brief, repeat.
 
 ---
 
