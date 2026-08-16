@@ -205,6 +205,50 @@ class SessionsRegistryUnitTests(unittest.TestCase):
         appmod._sessions_pop("x")
         self.assertIsNone(appmod._sessions_pop("x"))
 
+    def test_sessions_ids_returns_every_registered_id_across_all_projects(self):
+        # Fix-up regression (docs/test-review.md finding #3): _sessions_ids()
+        # is the lock-guarded 4th accessor _reap_dead_state()'s global sweep
+        # now goes through, instead of reading `list(_sessions)` directly.
+        appmod._sessions_add("a", "proj1", "claude")
+        appmod._sessions_add("b", "proj2", "codex")
+        self.assertEqual(set(appmod._sessions_ids()), {"a", "b"})
+
+
+# ─── Tier 1: pure unit -- engines-dict threading into URL resolution ──────
+
+class ResolveSessionUrlEnginesThreadingTests(unittest.TestCase):
+    """Fix-up regression (docs/test-review.md finding #4): _resolve_session_
+    url()/_latest_session_url_for_project() must use a CALLER-SUPPLIED
+    engines dict when given one, not silently reload load_engines() (a full
+    uncached ENGINES_DIR scan+parse) underneath -- proven here by making a
+    fresh load_engines() call raise, then confirming resolution still
+    succeeds using only the dict passed in."""
+
+    def setUp(self):
+        self._orig_ttyd_urls = dict(appmod._ttyd_urls)
+        self._orig_load_engines = appmod.load_engines
+
+    def tearDown(self):
+        appmod._ttyd_urls.clear()
+        appmod._ttyd_urls.update(self._orig_ttyd_urls)
+        appmod.load_engines = self._orig_load_engines
+
+    def test_resolve_session_url_does_not_reload_engines_when_a_dict_is_passed(self):
+        def _boom():
+            raise AssertionError("load_engines() must not be called when engines is provided")
+        appmod.load_engines = _boom
+        appmod._ttyd_urls["sid-x"] = "http://example.invalid/x"
+        fake_engine = appmod.Engine("claude", "Claude", "sleep 100", None, [])
+        result = appmod._resolve_session_url("sid-x", "claude", {"claude": fake_engine})
+        self.assertEqual(result, "http://example.invalid/x")
+
+    def test_resolve_session_url_falls_back_to_loading_engines_when_none_passed(self):
+        appmod._ttyd_urls["sid-y"] = "http://example.invalid/y"
+        appmod.load_engines = lambda: {
+            "claude": appmod.Engine("claude", "Claude", "sleep 100", None, [])}
+        result = appmod._resolve_session_url("sid-y", "claude")
+        self.assertEqual(result, "http://example.invalid/y")
+
 
 # ─── Tier 2: real tmux, ttyd's Popen faked ─────────────────────────────────
 
@@ -308,6 +352,56 @@ class InstanceLifecycleRealTmuxTests(unittest.TestCase):
         live = {s["session_id"] for s in appmod.active_sessions(self.project)}
         self.assertEqual(live, {sid2})
 
+    def test_reap_dead_state_cleans_orphaned_bookkeeping_not_backed_by_sessions(self):
+        # Fix-up regression (docs/test-review.md finding #2): the
+        # independent second sweep over _ttyd_urls/_ttyd_procs/
+        # _session_urls must clean up an entry whose session_id was NEVER
+        # (or is no longer) present in appmod._sessions at all, as long as
+        # its tmux session is dead -- not just entries the primary
+        # _sessions-driven sweep already knows about. Without this sweep,
+        # such an entry (e.g. left behind by a race, or any future bug)
+        # would be permanently unreachable by self-healing.
+        orphan_id = f"orphan-{_SCOPE}"
+        appmod._ttyd_urls[orphan_id] = "http://example.invalid/orphan"
+        appmod._ttyd_procs[orphan_id] = _FakeTtydProc()
+        appmod._session_urls[orphan_id] = "http://example.invalid/orphan"
+        self.assertNotIn(orphan_id, appmod._sessions)
+        self.assertFalse(appmod.tmux_has(orphan_id))
+        appmod._reap_dead_state()
+        self.assertNotIn(orphan_id, appmod._ttyd_urls)
+        self.assertNotIn(orphan_id, appmod._ttyd_procs)
+        self.assertNotIn(orphan_id, appmod._session_urls)
+
+    def test_instance_start_does_not_register_a_session_that_never_came_up(self):
+        # Fix-up regression (docs/test-review.md finding #1): _sessions_add()
+        # must only run AFTER tmux_has() confirms the new session actually
+        # exists, not before subprocess.run -- closing the window where a
+        # concurrent reap sweep could see a registered-but-not-yet-real
+        # session_id and tear it down out from under a still-in-flight
+        # instance_start(), permanently leaking the tmux+ttyd process it
+        # goes on to create. Simulated by forcing tmux_has() to always
+        # report False (as if tmux never actually brought the session up);
+        # a real tmux session named `forced_id` may still get created by
+        # the real `tmux new-session` call underneath (that part of the
+        # mechanism isn't being faked), so it's killed in cleanup
+        # regardless of whether it exists -- tolerant, same as every other
+        # teardown in this file.
+        forced_id = f"claude-{self.project}-forced-{_SCOPE}"
+        orig_new_id = appmod._new_session_id
+        appmod._new_session_id = lambda engine_name, project_name: forced_id
+        self.addCleanup(lambda: setattr(appmod, "_new_session_id", orig_new_id))
+        orig_tmux_has = appmod.tmux_has
+        appmod.tmux_has = lambda sid: False
+        self.addCleanup(lambda: setattr(appmod, "tmux_has", orig_tmux_has))
+        import subprocess
+        self.addCleanup(lambda: subprocess.run(
+            ["tmux", "kill-session", "-t", forced_id], capture_output=True))
+
+        result = appmod.instance_start(self.project, "claude")
+
+        self.assertIsNone(result)
+        self.assertNotIn(forced_id, appmod._sessions)
+
     def test_instance_start_unknown_engine_returns_none(self):
         self.assertIsNone(appmod.instance_start(self.project, "no-such-engine"))
 
@@ -336,7 +430,23 @@ class SessionIdentityEndpointTests(unittest.TestCase):
         cls.server.server_close()
 
     def setUp(self):
-        appmod.SESSIONS.clear()
+        # Fix-up (docs/test-review.md finding #5): this must clear/isolate
+        # appmod._sessions (the per-project session-identity registry this
+        # class's tests actually exercise), NOT appmod.SESSIONS (an
+        # unrelated, pre-existing login/auth-cookie store, app.py:306) --
+        # the two are different globals that happen to have similarly-named
+        # module attributes. The original `appmod.SESSIONS.clear()` here
+        # cleared the wrong one: intended per-test isolation of _sessions
+        # silently did nothing (stale entries accumulated across test
+        # methods in this process), while unintentionally invalidating any
+        # currently-authenticated login session elsewhere in the shared
+        # `app` module every time this setUp ran. Confirmed no test in this
+        # class or file depends on that accidental SESSIONS-clearing side
+        # effect: every test authenticates fresh via self._authed() ->
+        # self._login() after setUp runs, which always installs its own new
+        # cookie/session id regardless of what SESSIONS held beforehand.
+        self._orig_sessions = dict(appmod._sessions)
+        appmod._sessions.clear()
         self.engines_dir = tempfile.mkdtemp(prefix="switchboard-si-endpoint-engines-")
         self.projects_dir = tempfile.mkdtemp(prefix="switchboard-si-endpoint-projects-")
         self._orig_engines_dir = appmod.ENGINES_DIR
@@ -363,6 +473,8 @@ class SessionIdentityEndpointTests(unittest.TestCase):
             subprocess.run(["tmux", "kill-session", "-t", sid], capture_output=True)
         appmod.ENGINES_DIR = self._orig_engines_dir
         appmod.PROJECTS_DIR = self._orig_projects_dir
+        appmod._sessions.clear()
+        appmod._sessions.update(self._orig_sessions)
         shutil.rmtree(self.engines_dir, ignore_errors=True)
         shutil.rmtree(self.projects_dir, ignore_errors=True)
 
