@@ -3004,6 +3004,66 @@ Taiga credentials, and neither does this sandbox (checked: no
 fixtures under `/tmp` from the test suite). Recorded here per this file's
 own established role as the source of truth for this session; orchestrator
 flagged the credential gap to the user rather than fabricating a push.
+**Update**: the same peer later set up push access against CT110's own
+live Taiga instance (using the credentials from the migration) and has
+been filing real tickets there — status of a ticket for this specific
+item not yet confirmed, see item 47 below.
+
+## 47. Taiga frontend under a tailscale-serve subpath renders as raw unstyled markup — pushed live as Taiga ticket #4
+
+Found and fixed by the same peer session, live-verified with a real
+Playwright browser session (not just curl/API) — page title correctly
+changes to route-specific text, zero console errors, zero failed
+requests, successfully created a real user story through the actual
+rendered UI. Two compounding causes: (a) the gateway's `location /`
+(frontend) has the exact same variable-`proxy_pass`-drops-URI-rewrite bug
+items 42/43's `/api/`/`/admin/` had — never caught because the first
+request under a subpath is always literally `/`, so it "worked" by
+coincidence while every other asset request silently got `index.html`
+back instead of the real asset; (b) taiga-front's own `.env` (`SUBPATH`,
+`TAIGA_SCHEME`, `WEBSOCKETS_SCHEME`) is never populated from
+`PUBLISH_MODE`/`BASE_URL` in `install.sh` — taiga-front's Docker image
+has first-class `TAIGA_SUBPATH` support, it's just never wired up. Both
+fixed and confirmed live on CT110. **Not yet reflected in this repo's
+own `install.sh`/nginx-conf generation** — fixed on the running container
+directly; the code fix (matching item 43's own `taiga.conf` bind-mount
+override pattern) still needs to land here. Full repro/fix detail in
+Taiga ticket #4 on CT110's live project.
+
+## 48. Gitea under a subpath generates every link/form-action without the subpath prefix — persisted-volume `app.ini` never re-reads env vars after first container start — pushed live as Taiga ticket #5
+
+Root cause: `GITEA__server__ROOT_URL`/`DOMAIN` are already correctly
+generated in `.env` by `install.sh`, but Gitea's official Docker image
+only applies those env vars to `app.ini` on a container's *first* ever
+start — once `app.ini` exists in the persisted data volume, a plain
+restart (or `docker compose up -d` without a forced recreate) keeps
+using stale values. Hits any install where Gitea gets toggled on before
+(or without) `PUBLISH_MODE=tailscale`+`BASE_URL` being configured, then
+that changes later — not specific to any one session's timeline, a
+structural gap. Fixed via `docker compose up -d --force-recreate server`
+(note for next time: the actual service name in Gitea's compose file is
+`server`, not `gitea` — a plain `... server` guess fails silently as "no
+such service" if you get it wrong). Confirmed with a real Playwright
+login flow landing on the correct dashboard, repo data intact after the
+recreate. **Not yet reflected in `install.sh`** — install.sh should
+probably force-recreate Gitea's `server` container itself whenever
+`ROOT_URL`/`DOMAIN` actually change value between runs, not just write
+the new `.env` and hope a restart picks it up. Full repro/fix detail in
+Taiga ticket #5.
+
+## 49. Dashboard's 4s `/status` poll force-closes any open `<select>` dropdown mid-interaction — hotfixed live on CT110, not yet ticketed
+
+User-reported as "the model selector always closes." The dashboard's poll
+loop does a full `innerHTML` replace of the whole rows container every
+cycle, which forces the browser to close any open native `<select>`
+popup (team-lead/add-member model pickers) the instant its DOM node gets
+replaced — even when the regenerated HTML is identical to what's already
+there. Minimal live patch applied directly to CT110's running `app.py`:
+skip the replace for one cycle if `document.activeElement` is a `<select>`
+inside `#rows`. Unblocks the user immediately; **not yet a permanent code
+fix, and not yet pushed as a Taiga ticket** — orchestrator asked the
+reporting peer to push it themselves as ticket #6 (they already have
+working push access, this session doesn't), pending confirmation.
 
 ---
 
