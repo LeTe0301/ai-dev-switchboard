@@ -2719,7 +2719,8 @@ product-manager → developer → reviewer pipeline (no ux-designer — reused
 an existing frontend pattern 1:1). Reviewer confirmed the escaping is
 safe against injection via a real `<script>`-content test (the field now
 renders model-generated text into the DOM). Approved, no findings.
-Committed as `<pending>`, to be pushed alongside this note.
+Committed as `391865c` on `backlog/e2e-fixes-round6`, pushed to both
+remotes, still under PR #33.
 
 ---
 
