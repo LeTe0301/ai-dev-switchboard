@@ -2824,6 +2824,247 @@ the user: **not** a clone of this whole dev sandbox. Instead:
    down — the user explicitly wants to do that manually, after reviewing
    the new container themselves.
 
+### New container up (2026-08-16): CT110 `ai-dev-switchboard-main`, tested clean
+
+Reported back by `pve-sparkling-meadow`: CTID 110, hostname
+`ai-dev-switchboard-main`, IP `192.168.178.237` (DHCP/LAN), Debian 12
+unprivileged, 4 vCPU/4096MB/32GB, `onboot=0` (not yet auto-starting on
+host reboot — flip via `pct set 110 -onboot 1` once confirmed happy with
+it). Installed from `main` @ `de60bf4`, `install.sh --yes
+--with-git-hosting --with-taiga` only, as requested. Web UI on `8333`
+(loopback-only inside the container, needs an SSH tunnel or similar to
+reach from outside — `ssh -L 8333:127.0.0.1:8333 root@192.168.178.237`).
+Login `admin`/`OjGBDmX0YvD0E13M` (`AUTH_MODE=simple`), TOTP secret
+`632USL5QSHDLGK6C7DCB3YE366SDYHRW`, all in
+`/etc/ai-dev-switchboard/switchboard.env` on CT110. Gitea admin
+`admin`/`GiteaMain-Pass9f3k` (bootstrapped with `--must-change-password=
+false`, item 40's fix, `GITEA_API_TOKEN` already configured). Taiga admin
+`admin`/`TaigaMain-Pass9f3k` (created via `taiga-manage.sh
+createsuperuser` — **note: must run as root, not `RUN_USER`/`dev`**, `dev`
+has no docker-group access by design; install-summary doesn't mention
+this, worth a doc fix later). Tested: clean fresh install, login works,
+Gitea non-first-admin bootstrap clean (item 40), Taiga toggle ~13s bound
+to `127.0.0.1:9000` (items 43/44), a real project created end-to-end then
+removed (own test artifact, cleaned up). One cosmetic-only bug noted, not
+a blocker: the install-summary's printed `Web UI:` line shows
+`http://127.0.0.1::` (missing port) when `LISTEN_PORT` isn't pre-seeded
+in `switchboard.env` before running — the actual bind is correct
+(`8333`, confirmed via `ss -ltnp`), only that one summary-text lookup is
+affected. Worth a one-line fix if anyone's doing further install.sh
+cleanup — not scheduled as its own round right now.
+
+### Repo migration (2026-08-16): in progress
+
+Of the 15 project folders in this dev sandbox, 6 are real git repos.
+`test-project` has zero commits (nothing to migrate, skipped). Of the
+remaining 5: `streakline`/`remote-dev-container` already have public
+GitHub remotes, so briefed the peer to use the new container's own
+"Clone project from URL" for those directly, no transfer needed.
+`ai-dev-switchboard`/`birdiely`/`receipt-digitalizer-and-sorter` only
+have local/private remotes (`/srv/git/repos/*.git` bare repos on this
+dev sandbox) — this sandbox has no network path to the new container's
+loopback-bound Gitea, so bundled each with full history (`git bundle
+create --all`) and served them over a temporary HTTP listener bound to
+this sandbox's own LAN IP (`192.168.178.214`, same `/24` as the pve host
+and the new container). **This required explicit user sign-off** — the
+first attempt to start that listener was blocked by the orchestrator's
+own permission classifier; asked the user, they approved a one-off
+listener. Briefed the peer with fetch URLs
+(`http://192.168.178.214:8899/{ai-dev-switchboard,birdiely,receipt-
+digitalizer-and-sorter}.bundle`) and import instructions (clone the
+bundle locally, push into a Gitea repo created via the container's own
+`GITEA_API_TOKEN`, register as a real ai-dev-switchboard project via
+whichever existing flow fits). Listener is temporary — orchestrator will
+shut it down once the peer confirms all 3 fetched, not left running
+indefinitely. Not yet confirmed as of this writing.
+
+### To resume if this session is interrupted mid-migration (repo transfer)
+
+1. Check `ListAgents` for the current pve-side peer session name.
+2. If the HTTP listener on this sandbox (`192.168.178.214:8899`,
+   `python3 -m http.server` in `/tmp/.../scratchpad/migration-bundles/`)
+   is still running and no confirmation has arrived: check whether it's
+   actually needed still (peer may have fetched already without
+   replying) before deciding whether to re-send/wait. Don't leave it
+   running indefinitely once the transfer's done — `pkill -f "http.server
+   8899"` (or find the PID via `pgrep -fa "http.server 8899"`) once
+   confirmed no longer needed.
+3. If confirmation *has* arrived: verify which of the 5 repos actually
+   landed as real registered projects (not just raw Gitea imports) on the
+   new container, shut down the HTTP listener, then report the full
+   picture back to the user — this was the last step before "let the user
+   know" per their original instruction. Do not discuss/execute shutting
+   down this session or the old container's decommissioning unless the
+   user explicitly raises it.
+
+### Repo migration progress (2026-08-16): 3/5 landed clean, 2 needed a second round
+
+`ai-dev-switchboard`, `birdiely`, `receipt-digitalizer-and-sorter` all
+confirmed as real, fully-registered projects on CT110 (created via
+`/projects/new`'s Gitea-backed flow, not orphan Gitea imports), full
+history intact — peer force-pushed each bundle-derived clone's real
+branches over Gitea's auto-init placeholder, then cleaned up two
+resulting artifacts per repo (a stray `HEAD` branch from the push
+refspec glob, and — for the two `master`-based repos — `default_branch`
+still pointed at the now-empty `main`, both fixed via the Gitea API), then
+re-synced each `PROJECTS_DIR` local clone to match. Also caught that
+Gitea's branch-list API paginates at 30 items by default — an
+unpaginated call on `ai-dev-switchboard` (34 branches) looked
+misleadingly short.
+
+`streakline`/`remote-dev-container` could not use clone-from-URL as
+originally briefed — both 404 on GitHub, confirmed independently via the
+unauthenticated API and a direct anonymous `git clone` bypassing the app
+entirely. Verified locally in this sandbox: both are in sync with
+`origin/main` with no divergence, meaning they've been pushed
+successfully before — so this is "private, not actually public" (GitHub
+returns 404, not 403, for private repos to unauthenticated requests, by
+design, indistinguishable from nonexistent), not "never pushed." Applied
+the same fix as the first 3: bundled both with full history, served over
+a second temporary HTTP listener — **required asking the user again**,
+since the classifier's permission gate doesn't carry over from one
+AskUserQuestion approval to the next actual tool invocation, confirmed
+this explicitly rather than assuming the earlier approval covered it.
+
+**Both landed clean.** Single-branch (`main` only) on both, no
+default-branch repoint needed this time (confirmed via the Gitea API
+post-push, not assumed) — only the same stray `HEAD`-branch cleanup as
+before. `streakline` → `main` @ `c0b117d`, `remote-dev-container` → `main`
+@ `eb8b5bf`, both with real history intact (including a visible merge
+commit from remote-dev-container's own PR #26). Scratch bundle files on
+the container cleaned up after landing. **All 5 repos now confirmed live
+as real Gitea-backed projects on CT110** (`ai-dev-switchboard-main`,
+`192.168.178.237`): `ai-dev-switchboard`, `birdiely`,
+`receipt-digitalizer-and-sorter`, `remote-dev-container`, `streakline`.
+
+### Migration phase: done (2026-08-16)
+
+Full sequence complete: PR #33 merged into `main` (`50ef05e`) → fresh
+local backup of all 15 project repos taken (`~/backups/
+2026-08-16_095558/`) → new persistent container provisioned and tested
+clean (CT110 `ai-dev-switchboard-main`, `192.168.178.237`, `main` @
+`de60bf4`, `--with-git-hosting --with-taiga`) → all 5 real git repos
+migrated in with full history and confirmed registered. Reporting back to
+the user now per their original instruction — **no auto-shutdown of this
+session or removal of anything was done or will be done without the
+user's explicit go-ahead**, per their explicit "I'll end it myself when
+ready" instruction from earlier in this same session.
+
+## 46. `PUBLISH_MODE=tailscale` silently fails end-to-end — `tailscale serve` needs an explicit operator grant `install.sh` never makes, and `_publish()`/`_unpublish()` swallow the failure
+
+Found by a separate peer session (`Verify dev container repos migrated to
+AI dev switch`), asked by the user to bring CT110 up to feature parity
+with this dev sandbox's own tailscale-publish setup — a genuine code gap,
+not just an unconfigured-feature difference, and never exercised by any
+E2E round in this whole session (every round so far tested
+`PUBLISH_MODE=none`/loopback only).
+
+Repro: fresh install with `PUBLISH_MODE=tailscale` + `BASE_URL` set,
+`tailscale up` already run/authorized. Toggle "Code" on for any project:
+`{"ok": true}`, `/status` shows a plausible `code_url`
+(`https://<tailnet-host>/code/<project>`) — completely dead, because the
+underlying `tailscale serve --set-path=...` publish never took effect.
+
+Root cause: `_publish()` (app.py) runs `subprocess.run(["tailscale",
+"serve", "--bg", f"--set-path={path}", f"http://127.0.0.1:{port}"],
+capture_output=True)` — the same unchecked-returncode/discarded-stderr
+pattern items 42/43 already had before their fixes. Confirmed directly:
+running that exact command as the service account (`switchboard-svc`)
+fails with `sending serve config: Access denied: serve config denied` —
+`tailscale serve` requires either root or the tailnet's designated
+"operator" account to modify serve config, and nothing in `install.sh`
+(even under `--with-code-server` + `PUBLISH_MODE=tailscale`) ever runs
+`tailscale set --operator=$SVC_USER`. Fails on every fresh install that
+picks tailscale publishing, 100% of the time, completely silently.
+Confirmed the fix works live: running `tailscale set
+--operator=switchboard-svc` once, then the identical toggle correctly
+registers the serve route and the URL becomes genuinely reachable (`curl`
+→ `302`). Applied manually on CT110 so the user's box works now: **not
+yet fixed in the codebase**.
+
+Shape of the fix, matching the item 42/43 precedent (two parts):
+1. `install.sh`, when `PUBLISH_MODE=tailscale` is selected and
+   `tailscale` is present, should run `tailscale set
+   --operator=$SVC_USER` itself. If tailscale isn't installed/authed yet
+   at install time, print a clear one-time instruction in the summary
+   (same style as the Gitea/Taiga two-step bootstrap notes) to run that
+   command once `tailscale up` is done — install.sh can't force tailscale
+   auth itself.
+2. `_publish()`/`_unpublish()` in app.py should check the subprocess
+   returncode and surface a real error, same pattern as items 42/43,
+   instead of returning a URL that looks valid but silently doesn't work
+   — the more important half, since it's what let this go unnoticed
+   through every prior round. Whichever round picks this up should give
+   `PUBLISH_MODE=tailscale` its own real E2E pass, not just a code review
+   — nobody has hands-on-tested this mode this entire session.
+
+**Not yet pushed to a live tracker** — the reporting peer doesn't have
+Taiga credentials, and neither does this sandbox (checked: no
+`~/.config/ai-dev-switchboard/taiga-push.env` exists here, only test
+fixtures under `/tmp` from the test suite). Recorded here per this file's
+own established role as the source of truth for this session; orchestrator
+flagged the credential gap to the user rather than fabricating a push.
+**Update**: the same peer later set up push access against CT110's own
+live Taiga instance (using the credentials from the migration) and has
+been filing real tickets there — status of a ticket for this specific
+item not yet confirmed, see item 47 below.
+
+## 47. Taiga frontend under a tailscale-serve subpath renders as raw unstyled markup — pushed live as Taiga ticket #4
+
+Found and fixed by the same peer session, live-verified with a real
+Playwright browser session (not just curl/API) — page title correctly
+changes to route-specific text, zero console errors, zero failed
+requests, successfully created a real user story through the actual
+rendered UI. Two compounding causes: (a) the gateway's `location /`
+(frontend) has the exact same variable-`proxy_pass`-drops-URI-rewrite bug
+items 42/43's `/api/`/`/admin/` had — never caught because the first
+request under a subpath is always literally `/`, so it "worked" by
+coincidence while every other asset request silently got `index.html`
+back instead of the real asset; (b) taiga-front's own `.env` (`SUBPATH`,
+`TAIGA_SCHEME`, `WEBSOCKETS_SCHEME`) is never populated from
+`PUBLISH_MODE`/`BASE_URL` in `install.sh` — taiga-front's Docker image
+has first-class `TAIGA_SUBPATH` support, it's just never wired up. Both
+fixed and confirmed live on CT110. **Not yet reflected in this repo's
+own `install.sh`/nginx-conf generation** — fixed on the running container
+directly; the code fix (matching item 43's own `taiga.conf` bind-mount
+override pattern) still needs to land here. Full repro/fix detail in
+Taiga ticket #4 on CT110's live project.
+
+## 48. Gitea under a subpath generates every link/form-action without the subpath prefix — persisted-volume `app.ini` never re-reads env vars after first container start — pushed live as Taiga ticket #5
+
+Root cause: `GITEA__server__ROOT_URL`/`DOMAIN` are already correctly
+generated in `.env` by `install.sh`, but Gitea's official Docker image
+only applies those env vars to `app.ini` on a container's *first* ever
+start — once `app.ini` exists in the persisted data volume, a plain
+restart (or `docker compose up -d` without a forced recreate) keeps
+using stale values. Hits any install where Gitea gets toggled on before
+(or without) `PUBLISH_MODE=tailscale`+`BASE_URL` being configured, then
+that changes later — not specific to any one session's timeline, a
+structural gap. Fixed via `docker compose up -d --force-recreate server`
+(note for next time: the actual service name in Gitea's compose file is
+`server`, not `gitea` — a plain `... server` guess fails silently as "no
+such service" if you get it wrong). Confirmed with a real Playwright
+login flow landing on the correct dashboard, repo data intact after the
+recreate. **Not yet reflected in `install.sh`** — install.sh should
+probably force-recreate Gitea's `server` container itself whenever
+`ROOT_URL`/`DOMAIN` actually change value between runs, not just write
+the new `.env` and hope a restart picks it up. Full repro/fix detail in
+Taiga ticket #5.
+
+## 49. Dashboard's 4s `/status` poll force-closes any open `<select>` dropdown mid-interaction — hotfixed live on CT110, not yet ticketed
+
+User-reported as "the model selector always closes." The dashboard's poll
+loop does a full `innerHTML` replace of the whole rows container every
+cycle, which forces the browser to close any open native `<select>`
+popup (team-lead/add-member model pickers) the instant its DOM node gets
+replaced — even when the regenerated HTML is identical to what's already
+there. Minimal live patch applied directly to CT110's running `app.py`:
+skip the replace for one cycle if `document.activeElement` is a `<select>`
+inside `#rows`. Unblocks the user immediately; **not yet a permanent code
+fix, and not yet pushed as a Taiga ticket** — orchestrator asked the
+reporting peer to push it themselves as ticket #6 (they already have
+working push access, this session doesn't), pending confirmation.
+
 ---
 
 ## Items 39-43: found by E2E round 6 real test on fresh CT110 (2026-08-16)
