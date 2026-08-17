@@ -261,10 +261,12 @@ GITHUB_POLL_INTERVAL_SECONDS = int(os.environ.get("GITHUB_POLL_INTERVAL_SECONDS"
 
 # HTTP-level smoke check (backlog item 18, docs/spec.md) -- a manual,
 # per-project "Smoke check" button that makes a single in-process GET
-# against that project's own already-captured _session_urls entry. Bounded
-# by construction: a request timeout and a capped response-body read, same
-# "never trust an outbound call to behave" discipline AI_REVIEWER_MAX_DIFF_
-# BYTES already established for a different bounded read.
+# against that project's most-recently-started live session's own
+# already-captured URL (_latest_session_url_for_project(), docs/spec.md
+# "Smoke-check preserved via a resolver"). Bounded by construction: a
+# request timeout and a capped response-body read, same "never trust an
+# outbound call to behave" discipline AI_REVIEWER_MAX_DIFF_BYTES already
+# established for a different bounded read.
 SMOKE_CHECK_TIMEOUT_SECONDS = int(os.environ.get("SMOKE_CHECK_TIMEOUT_SECONDS", "10"))
 SMOKE_CHECK_MAX_BODY_BYTES = int(os.environ.get("SMOKE_CHECK_MAX_BODY_BYTES", "65536"))
 
@@ -461,11 +463,14 @@ def _parse_engine_file(path: str):
         return None
     name = os.path.splitext(os.path.basename(path))[0]
     # Reserved engine-name prefixes (docs/spec.md "Session naming", extended
-    # by backlog item 6d part 1 "Engine-name reservation"): headless tmux
-    # sessions are named f"switchboard-headless-{run_id}" (app/teams.py) via
-    # the *same* TMUX rule instance_start() uses, and active_engine() keys
-    # purely off f"{engine_name}-{project_name}" with no other cross-check.
-    # Reserving only the exact name "switchboard-headless" would still leave
+    # by backlog item 6d part 1 "Engine-name reservation", and by the
+    # per-session identity scheme, docs/spec.md "New session-identity
+    # scheme"): headless tmux sessions are named
+    # f"switchboard-headless-{run_id}" (app/teams.py) via the *same* TMUX
+    # rule instance_start() uses, and every session_id (_new_session_id())
+    # still starts with the exact f"{engine_name}-{project_name}" prefix,
+    # with no other cross-check. Reserving only the exact name
+    # "switchboard-headless" would still leave
     # a constructible collision open (engine "switchboard" + a project
     # directory literally named "headless-<run_id>"), so the *whole*
     # "switchboard" prefix is reserved. Same bug class, same fix shape for
@@ -1932,18 +1937,21 @@ def smoke_check_run(name: str, expect_contains: str) -> dict:
     """Synchronous, request-thread dispatch -- same "manually clicked
     one-shot action can and should just block the request" reasoning
     deploy_run()'s own docstring gives. HTTP-level only (backlog item 18,
-    docs/spec.md): a single GET against _session_urls[name], the
-    switchboard's own trusted, server-derived URL for that project (never
-    an arbitrary client-supplied URL, so no SSRF-style concern). Never
-    raises -- every branch below returns a dict; on/OSError-shaped failures
-    from urlopen()/resp.read() are caught and turned into a clean
+    docs/spec.md): a single GET against _latest_session_url_for_project
+    (name)'s resolved URL, the switchboard's own trusted, server-derived URL
+    for that project (never an arbitrary client-supplied URL, so no
+    SSRF-style concern). For a project with more than one live session
+    (docs/spec.md "part 1" -- session identity), this deterministically
+    targets the most-recently-started one, never an arbitrary/undefined
+    one. Never raises -- every branch below returns a dict; on/OSError-shaped
+    failures from urlopen()/resp.read() are caught and turned into a clean
     {"ok": False, ...} result instead.
 
     Returns one of:
     - {"ok": False, "error": "no captured URL for this project"} -- no
-      _session_urls entry for `name` (engine off, no url_regex, or hasn't
-      printed a matching URL yet). Returned immediately, before the lock is
-      even touched.
+      live session for `name` has a resolved URL yet (no live session at
+      all, engine off, no url_regex, or hasn't printed a matching URL yet).
+      Returned immediately, before the lock is even touched.
     - {"ok": False, "error": <msg>, "locked": True} -- a check for this
       project is already in flight. "locked" is an internal-only marker
       the route below reads (and strips) to answer with HTTP 409, mirroring
@@ -1958,7 +1966,13 @@ def smoke_check_run(name: str, expect_contains: str) -> dict:
       content_ok is None (never False) when `expect_contains` was empty --
       "not checked" must stay visibly distinct from "checked and failed".
     """
-    url = _session_urls.get(name)
+    # Loaded once here and threaded through to _latest_session_url_for_project
+    # -> _resolve_session_url (fix-up, docs/test-review.md finding #4) --
+    # this route only ever resolves a single session's URL, but the two
+    # helpers below would otherwise each reload load_engines() independently
+    # for that one lookup; one call here is the correct amount of work.
+    engines = load_engines()
+    url = _latest_session_url_for_project(name, engines)
     if url is None:
         return {"ok": False, "error": "no captured URL for this project"}
 
@@ -2400,20 +2414,93 @@ def tmux_has(session: str) -> bool:
     return r.returncode == 0
 
 
-def active_engine(name: str) -> str | None:
-    return next((e for e in load_engines() if tmux_has(f"{e}-{name}")), None)
+def _new_session_id(engine_name: str, project_name: str) -> str:
+    """Session-identity scheme (docs/spec.md "New session-identity scheme"):
+    this is used verbatim as BOTH the tmux session name AND the key into
+    _sessions/_ttyd_*/_session_urls below -- no separate id-vs-tmux-name
+    mapping needed. Starts with the exact f"{engine_name}-{project_name}"
+    prefix the old single-session naming already produced, preserving the
+    reserved-engine-name-prefix collision guard in _parse_engine_file()
+    above unchanged, with a timestamp+hex suffix in the same style as
+    app/teams.py's own _run_id() (f"{int(time.time())}-
+    {secrets.token_hex(6)}") -- shortened to 3 hex bytes here since this id
+    is in-memory-only, never persisted to disk, and only needs to
+    disambiguate concurrent spawns within one process's lifetime, not
+    survive a restart. Collision probability is accepted at the same
+    standard this codebase already uses for _run_id() and
+    _ai_reviewer_scratch's secrets.token_hex(8) (app/teams.py) -- not
+    literally proven impossible, consistent with this codebase's existing
+    risk tolerance for this exact class of identifier.
+    """
+    return f"{engine_name}-{project_name}-{int(time.time())}-{secrets.token_hex(3)}"
+
+
+# Per-session bookkeeping (docs/spec.md "New session registry, lock-guarded")
+# -- replaces active_engine()'s "at most one live session per project"
+# assumption with a real registry, keyed by session_id (== the tmux session
+# name), so N concurrent sessions for one project are each tracked
+# independently. Same "sanctioned access points only" discipline
+# _team_threads_set()/_get()/_pop_if_owned() already established below for
+# the identical hazard shape (concurrent spawn/stop/reap touching the same
+# in-memory dict -- that lock's own comment notes this exact defect class
+# has been found and fixed four separate times in this codebase's team
+# subsystem) -- every mutation and every liveness-deciding read of
+# _sessions goes through one of the four functions below, nothing else
+# touches _sessions directly.
+_sessions: dict[str, dict] = {}   # session_id -> {"project": str, "engine": str}
+_sessions_lock = threading.Lock()
+
+
+def _sessions_add(session_id: str, project: str, engine: str) -> None:
+    with _sessions_lock:
+        _sessions[session_id] = {"project": project, "engine": engine}
+
+
+def _sessions_pop(session_id: str) -> dict | None:
+    with _sessions_lock:
+        return _sessions.pop(session_id, None)
+
+
+def _sessions_ids() -> list[str]:
+    """Fix-up (docs/test-review.md finding #3): lock-guarded snapshot of
+    EVERY registered session_id across all projects, for _reap_dead_state()'s
+    global sweep below. A 4th sanctioned accessor alongside _sessions_add/
+    _sessions_pop/active_sessions() -- _reap_dead_state() previously did
+    `for session_id in list(_sessions):` directly, unguarded by
+    _sessions_lock, violating this module's own stated "nothing else
+    touches _sessions directly" invariant. Returns REGISTERED ids, not
+    necessarily live ones -- same as active_sessions(), the caller still
+    checks tmux_has() itself against each one."""
+    with _sessions_lock:
+        return list(_sessions)
+
+
+def active_sessions(project_name: str) -> list[dict]:
+    """Replaces active_engine() as the per-project liveness source of
+    truth. Self-healing like today's active_engine() was -- tmux_has() is
+    checked fresh here on every call, not just relied on via the periodic
+    _reap_dead_state() sweep. A plain dict preserves insertion order, so
+    the returned list is oldest-spawned first / most-recently-spawned last
+    -- relied on by /status's `sessions` array and
+    _latest_session_url_for_project() below to deterministically pick "the
+    newest session" for a project."""
+    with _sessions_lock:
+        snapshot = [(sid, info) for sid, info in _sessions.items()
+                    if info["project"] == project_name]
+    return [{"session_id": sid, "engine": info["engine"]}
+            for sid, info in snapshot if tmux_has(sid)]
 
 
 # Team session lifecycle, part 2a (backlog item 6d, docs/spec.md §1) -- the
 # reverse import direction (teams.py -> app) has existed since 6a; this is
 # the first time app.py itself imports teams. MUST sit here, after TMUX
-# (:191), load_engines() (:397), tmux_has()/active_engine() (above) are all
-# already defined -- teams.py does `from app import TMUX, tmux_has,
-# load_engines` at ITS OWN module level, so app.py must have already
-# defined all three by the time this import runs, or the circular import
-# breaks. Never move this earlier. No sys.path manipulation needed -- both
-# files live in the same directory, in a repo checkout and in a real
-# install alike (see install.sh's own new teams.py copy line below).
+# (:191), load_engines() (:397), tmux_has() (above) are all already defined
+# -- teams.py does `from app import TMUX, tmux_has, load_engines` at ITS OWN
+# module level, so app.py must have already defined all three by the time
+# this import runs, or the circular import breaks. Never move this earlier.
+# No sys.path manipulation needed -- both files live in the same directory,
+# in a repo checkout and in a real install alike (see install.sh's own new
+# teams.py copy line below).
 import teams  # noqa: E402
 
 # Background team-run threads (backlog item 6d part 2a). Keyed by PROJECT
@@ -2608,16 +2695,82 @@ def run_startup_watch(session: str, name: str, engine: "Engine", timeout: int = 
             break
 
 
-def instance_start(name: str, engine_name: str = "claude"):
-    engines = load_engines()
+def _resolve_session_url(session_id: str, engine_name: str,
+                          engines: dict | None = None) -> str | None:
+    """Single source of truth for "what URL represents this session" --
+    shared by /status's per-session `sessions` array, its back-compat `url`
+    field, and _latest_session_url_for_project() below (docs/spec.md
+    "Smoke-check preserved via a resolver, not touched otherwise": "ideally
+    sharing one implementation ... rather than two"). Same resolution rule
+    the old per-project /status line already used: the engine's own
+    captured hosted link (_session_urls) if it has one (url_regex), else
+    the ttyd-hosted terminal URL (_ttyd_urls) as the fallback.
+
+    `engines` (fix-up, docs/test-review.md finding #4): the caller's own
+    already-loaded load_engines() dict, when it has one -- /status loads it
+    once per poll and was otherwise paying for one full, uncached
+    os.listdir(ENGINES_DIR)-plus-parse PER LIVE SESSION by letting this
+    function reload it independently every time, scaling with total
+    concurrent session count. Falls back to loading it fresh only for a
+    standalone caller with no pre-loaded dict of its own.
+    """
+    if engines is None:
+        engines = load_engines()
     engine = engines.get(engine_name)
     if engine is None:
-        return
+        return None
+    return _session_urls.get(session_id) if engine.url_regex else _ttyd_urls.get(session_id)
+
+
+def _latest_session_for_project(name: str) -> dict | None:
+    """The most-recently-started LIVE session for a project ({"session_id",
+    "engine"}), or None if it has zero. "Most recent" = the last entry of
+    active_sessions()'s own insertion-order-preserving list (docs/spec.md
+    "/status JSON -- additive": a plain dict already preserves insertion
+    order -- deterministic, never "whichever dict iteration happens to
+    return first")."""
+    sessions = active_sessions(name)
+    return sessions[-1] if sessions else None
+
+
+def _latest_session_url_for_project(name: str, engines: dict | None = None) -> str | None:
+    """Preserves smoke_check_run()'s pre-spec single-URL contract
+    mechanically (docs/spec.md "Smoke-check preserved via a resolver, not
+    touched otherwise"): externally identical to today for the common
+    single-session case; for multi-session projects, deterministically
+    targets the newest session's resolved URL, never an
+    arbitrary/undefined one.
+
+    `engines`: threaded straight through to _resolve_session_url() below
+    (see its own docstring, fix-up docs/test-review.md finding #4) -- loaded
+    fresh here only when the caller (e.g. a direct test call) has none of
+    its own.
+    """
+    latest = _latest_session_for_project(name)
+    if latest is None:
+        return None
+    if engines is None:
+        engines = load_engines()
+    return _resolve_session_url(latest["session_id"], latest["engine"], engines)
+
+
+def instance_start(name: str, engine_name: str = "claude") -> str | None:
+    """Starts an ADDITIONAL session for `name` -- no "already running" guard
+    here (docs/spec.md "instance_start -> returns a session_id, no longer
+    guards on already running"): multiplicity is now the point, exercised
+    directly by the POST /instance/<name>/spawn route (part 1's legacy
+    /on/off shim -- which used to re-add an "already running" guard of its
+    own -- was removed in part 2, docs/spec.md "Routes" §6). Returns the
+    new session's session_id, or None if the engine name is unknown or the
+    project directory doesn't exist.
+    """
+    engines = load_engines()
+    engine = engines.get(engine_name)
     workdir = os.path.join(PROJECTS_DIR, name)
-    if active_engine(name) is not None or not os.path.isdir(workdir):
-        return
-    _session_urls.pop(name, None)
-    session = f"{engine_name}-{name}"
+    if engine is None or not os.path.isdir(workdir):
+        return None
+    session_id = _new_session_id(engine_name, name)
+    _session_urls.pop(session_id, None)
     cmd = engine.cmd.format(name=shlex.quote(name))
     # Run the engine command directly as the tmux session's own command (not
     # via send-keys into a persistent shell). That way the *session's*
@@ -2626,53 +2779,98 @@ def instance_start(name: str, engine_name: str = "claude"):
     # tears the session down with it, so `tmux has-session` (and thus "is
     # this running") self-heals instead of reporting true forever against a
     # bare leftover shell.
-    subprocess.run(TMUX + ["new-session", "-d", "-s", session, "-c", workdir,
+    subprocess.run(TMUX + ["new-session", "-d", "-s", session_id, "-c", workdir,
                            "bash", "-lc", cmd])
+    if not tmux_has(session_id):
+        # tmux failed to actually bring the session up (a fast-failing cmd,
+        # tmux itself erroring, ...) -- report failure the same clean way
+        # an unknown engine/project does above, rather than registering
+        # bookkeeping for a session_id that was never really live.
+        return None
+    # Fix-up (docs/test-review.md finding #1): registration is deliberately
+    # deferred to HERE, after tmux has confirmed the session exists, not
+    # before subprocess.run above. Registering earlier left a window where
+    # a concurrent /status poll's _reap_dead_state() (a separate thread --
+    # ThreadingHTTPServer) could see this session_id in _sessions while
+    # tmux_has() was still false (tmux hadn't finished creating it yet),
+    # call instance_stop_session() on it, and pop it back out of _sessions/
+    # _session_urls -- moments before this function's own subprocess.run
+    # above actually finished creating the real tmux session (and started
+    # ttyd below). The result was a live tmux+ttyd process registered in
+    # neither _sessions nor any of the ttyd bookkeeping dicts: invisible to
+    # /status, unstoppable via any route, leaked until a process restart.
+    # Deferring registration until the session is confirmed to exist closes
+    # that race at the source -- there is no longer any window where
+    # _sessions can name a session_id that tmux doesn't yet back.
+    _sessions_add(session_id, name, engine_name)
     if engine.startup or engine.url_regex:
-        run_startup_watch(session, name, engine)
+        run_startup_watch(session_id, session_id, engine)
     if not engine.url_regex:
-        _ttyd_start(name, session)
+        _ttyd_start(session_id, session_id)
+    return session_id
 
 
-def instance_stop(name: str):
-    # Deliberately does NOT touch VS Code (_code_stop) — code-server has its
-    # own independent on/off lifecycle, spawnable and usable whether or not
-    # an engine session is running.
-    _session_urls.pop(name, None)
-    _ttyd_stop(name)
-    for e in load_engines():
-        subprocess.run(TMUX + ["kill-session", "-t", f"{e}-{name}"], capture_output=True)
+def instance_stop_session(session_id: str) -> None:
+    """Tears down exactly one session, leaving any siblings for the same
+    project untouched (docs/spec.md "New per-session stop"). Idempotent --
+    stopping an already-gone session_id is a clean no-op, same tolerant
+    style this already had before the per-session split: killing a
+    nonexistent tmux session under capture_output=True just fails silently,
+    never raises. Deliberately does NOT touch VS Code (_code_stop) --
+    code-server has its own independent on/off lifecycle, spawnable and
+    usable whether or not any engine session is running.
+    """
+    _sessions_pop(session_id)
+    _session_urls.pop(session_id, None)
+    _ttyd_stop(session_id)
+    subprocess.run(TMUX + ["kill-session", "-t", session_id], capture_output=True)
 
 
 def _reap_dead_state():
     """
     tmux sessions die on their own the moment the engine process inside them
-    exits (see instance_start), so active_engine() is the source of truth
-    for whether a project is "running" — but leftover bookkeeping (a
-    captured hosted URL, a still-running ttyd/code-server proc, a
-    tailscale-serve mapping pointing at a now-dead port) doesn't clear
-    itself just because the tmux session went away between polls. Called on
-    every /status so the UI self-heals even when a session ends on its own
-    (crash, quit, `tmux kill-session` from inside) rather than only when the
-    user explicitly flips the switch off.
+    exits (see instance_start), so tmux_has(session_id) is the source of
+    truth for whether a given session is still "running" -- but leftover
+    bookkeeping (a captured hosted URL, a still-running ttyd/code-server
+    proc, a tailscale-serve mapping pointing at a now-dead port) doesn't
+    clear itself just because the tmux session went away between polls.
+    Called on every /status so the UI self-heals even when a session ends on
+    its own (crash, quit, `tmux kill-session` from inside) rather than only
+    when the user explicitly stops it.
+
+    Per-session sweep (docs/spec.md "New per-session stop, _reap_dead_state()
+    generalized") -- simpler than the old active_engine()-driven version (no
+    engines.get(active_engine(...)) indirection needed) since session_id
+    *is* the tmux session name, so the liveness check is a single direct
+    tmux_has() call. instance_stop_session() is idempotent and safe to race
+    against a concurrent explicit /session/<id>/stop -- both go through
+    _sessions_pop(), guarded by _sessions_lock, so the loser's pop returns
+    None and short-circuits with no double teardown. The session_id list
+    itself is read through _sessions_ids() (fix-up, docs/test-review.md
+    finding #3), not `list(_sessions)` directly, so this walk is guarded by
+    _sessions_lock like every other read of _sessions.
+
+    A second, INDEPENDENT sweep below walks the ttyd/_session_urls
+    bookkeeping dicts themselves, by their own keys -- restored (fix-up,
+    docs/test-review.md finding #2) from the pre-session-identity version of
+    this function, which independently cleaned up ttyd/URL bookkeeping even
+    when it had drifted out of sync with the primary liveness registry
+    (there, active_engine(); here, _sessions). Without this second sweep, a
+    bookkeeping entry that ends up outside _sessions for any reason (a race,
+    a future bug) is permanently unreachable by the sweep above, since that
+    one only ever walks _sessions' own keys.
 
     Also sweeps abandoned upload-wizard staging directories (docs/spec.md
     "Two-phase protocol" — TTL/idle cleanup for abandoned uploads), reusing
     this same "opportunistic cleanup on a request that already happens
     often" precedent rather than a dedicated background thread/timer.
     """
-    engines = load_engines()
-    for name in list(_session_urls):
-        e = engines.get(active_engine(name) or "")
-        if e is None or not e.url_regex:
-            _session_urls.pop(name, None)
-    for name in set(_ttyd_urls) | set(_ttyd_procs):
-        ae = active_engine(name)
-        e = engines.get(ae or "")
-        # ttyd fallback belongs to whichever engine is active AND lacks its
-        # own hosted link; anything else means it's stale.
-        if ae is None or (e is not None and e.url_regex):
-            _ttyd_stop(name)
+    for session_id in _sessions_ids():
+        if not tmux_has(session_id):
+            instance_stop_session(session_id)
+    for session_id in set(_ttyd_urls) | set(_ttyd_procs) | set(_session_urls):
+        if not tmux_has(session_id):
+            instance_stop_session(session_id)
     for name in list(_code_procs):
         proc = _code_procs.get(name)
         if proc is not None and proc.poll() is not None:
@@ -2843,6 +3041,24 @@ PAGE_TEMPLATE = """<!doctype html>
      "Resource badge: informational tone, not warning"). */
   .badge.gitea-resources { color: #66d9ff; }
   .sub { font-size: 12px; color: #888; margin-top: 4px; word-break: break-all; }
+  /* Per-session list (concurrent sessions per project, part 2 --
+     docs/design.md "New CSS classes"). .sessions-list reuses .team-picker's
+     own nested-container pattern (border + darker background) for subtle
+     visual separation without heavyweight card styling. */
+  .sessions-list { display: flex; flex-direction: column; gap: 8px; margin-top: 8px;
+                    padding: 8px 10px; border: 1px solid #333; border-radius: 8px;
+                    background: #181818; }
+  .session-item { display: flex; align-items: center; gap: 8px; }
+  .session-status { font-size: 12px; color: #888; }
+  .session-status a { color: #4da6ff; }
+  /* .session-stop-btn is its OWN class (not a literal reuse of
+     .deploy-btn/.team-btn), per this file's own established "one class per
+     distinct button role" precedent (see .team-btn's own doc comment
+     below) -- red (#ff6b6b) signals a destructive per-session action,
+     distinct from the green spawn button. */
+  .session-stop-btn { font-size: 14px; padding: 8px 14px; border-radius: 8px; border: none;
+                       background: #ff6b6b; color: #111; font-weight: 600; cursor: pointer;
+                       white-space: nowrap; }
   .taiga-err { color: #ff6b6b; }
   .gitea-err { color: #ff6b6b; }
   .taiga-starting-spinner { display: inline-block; width: 12px; height: 12px;
@@ -2875,7 +3091,11 @@ PAGE_TEMPLATE = """<!doctype html>
      deploy-map entry must never render anything class="deploy-btn" at all
      (tests/test_deploy_frontend.js's own existing, reviewer-approved
      assertion), and every project unconditionally renders a team control. */
-  .deploy-btn, .team-btn { font-size: 14px; padding: 10px 16px; border-radius: 10px; border: none;
+  /* .session-spawn-btn ("+ Start session", concurrent sessions per project
+     part 2 -- docs/design.md "Button styling (reused)") shares this exact
+     shape byte-for-byte too, same "own class, not a literal reuse" pattern
+     .team-btn's own comment above already established. */
+  .deploy-btn, .team-btn, .session-spawn-btn { font-size: 14px; padding: 10px 16px; border-radius: 10px; border: none;
                 background: #34c759; color: #111; font-weight: 600; cursor: pointer;
                 white-space: nowrap; }
   .deploy-msg { font-size: 12px; color: #888; margin: 4px 0 0; min-height: 14px; word-break: break-all; }
@@ -3406,8 +3626,18 @@ async function refresh() {
   for (const inst of s.instances) {
     if (inst.deploy) DEPLOY_TARGETS[inst.name] = inst.deploy;
     TEAM_BY_NAME[inst.name] = inst.team;
-    html += row(inst.name, inst.on, inst.url, 'inst', inst.name, inst.desc, inst.engine,
-               inst.code_on, inst.code_url, undefined, undefined, inst.gitea_sync, inst.deploy, inst.team);
+    // Session identity, part 2 (docs/spec.md "Proposed approach" §5): reads
+    // `inst.sessions` (part 1's real, non-back-compat array) instead of the
+    // now-removed singular `inst.on`/`inst.url`/`inst.engine` fields.
+    // `newestUrl` reuses row()'s existing `url` slot for smokeCheckRow's
+    // own "does this project have a captured URL to check" gate (spec's
+    // Non-goals: smoke-check stays project-level, targeting the newest
+    // session, exactly as part 1's own backend resolver already does).
+    const sessions = inst.sessions || [];
+    const newestUrl = sessions.length ? sessions[sessions.length - 1].url : null;
+    html += row(inst.name, false, newestUrl, 'inst', inst.name, inst.desc, sessions,
+               inst.code_on, inst.code_url, instSessionsSub(sessions), undefined,
+               inst.gitea_sync, inst.deploy, inst.team);
     // Live event feed polling (backlog item 6f part 2) used to fire from
     // this loop -- the dashboard row no longer renders the feed at all
     // (Taiga #10, docs/spec.md Goals: "no ... event feed ... left inline
@@ -3433,20 +3663,52 @@ function pickEngine(name, engine) {
   engineChoice[name] = engine;
   refresh();
 }
-function engineRow(name, on, engine) {
+// Always the picker now (concurrent sessions, docs/spec.md "Proposed
+// approach" §1) -- multiplicity means "what to spawn next" is relevant
+// regardless of what's already running, so the old `if (on) { Running
+// badge }` branch is gone; there is no longer a single "on" flag for this
+// row to branch on. The "+ Start session" button lives right here too
+// (spec §2, docs/design.md "Placement within the row"), sharing this same
+// empty-roster guard -- a spawn button with nothing to pick from would be
+// broken/empty (docs/spec.md acceptance criteria).
+function engineRow(name) {
   // Only real per-project instances get an engine choice — the host row (if
   // enabled) uses a single fixed engine, no picker needed there.
   const names = Object.keys(ENGINE_LABELS);
   if (names.length === 0) return '';
-  if (on) {
-    return '<div class="engine-label">Running</div>' +
-      '<div class="badge">' + esc(ENGINE_LABELS[engine] || engine) + '</div>';
-  }
   const chosen = engineChoice[name] || names[0];
   return '<div class="engine-label">Start with</div>' +
     '<div class="engine-picker">' + names.map(e =>
     '<span class="pill' + (e === chosen ? ' active' : '') + '" onclick="pickEngine(' +
-    "'" + name + "','" + e + "'" + ')">' + esc(ENGINE_LABELS[e]) + '</span>').join('') + '</div>';
+    "'" + name + "','" + e + "'" + ')">' + esc(ENGINE_LABELS[e]) + '</span>').join('') +
+    '<button class="session-spawn-btn" onclick="toggle(' +
+    "'session-spawn','" + name + "'" + ', true, null)">+ Start session</button></div>';
+}
+// New per-session list (docs/spec.md "Proposed approach" §3, docs/design.md
+// "sessionsRow(name, sessions)") -- one .session-item per entry in this
+// project's /status `sessions` array, each independently stoppable.
+// Omitted entirely (not an empty list with a header) when there are zero
+// sessions, matching docs/design.md State 1/2.
+function sessionsRow(name, sessions) {
+  if (!sessions || sessions.length === 0) return '';
+  return '<div class="sessions-list">' + sessions.map(s =>
+    '<div class="session-item">' +
+    '<span class="badge">' + esc(ENGINE_LABELS[s.engine] || s.engine) + '</span>' +
+    '<span class="session-status">' +
+    (s.url ? '<a href="' + s.url + '" target="_blank" rel="noopener">open</a>' : 'starting…') +
+    '</span>' +
+    '<button class="session-stop-btn" onclick="stopSession(' +
+    "'" + name + "','" + s.session_id + "'" + ')">Stop</button></div>').join('') + '</div>';
+}
+// The row's own "sub" text for a multi-session project (docs/design.md
+// "Sub text for multi-session rows") -- computed once per refresh(), same
+// "subOverride" plumbing singletonToggleSub() already supplies for Taiga/
+// Gitea (row()'s own generic on/url ternary would no longer make sense
+// here now that there's no single on/url pair for an 'inst' row).
+function instSessionsSub(sessions) {
+  if (!sessions || sessions.length === 0) return 'stopped';
+  const newest = sessions[sessions.length - 1];
+  return newest.url ? 'running — newest: <a href="' + newest.url + '" target="_blank">open</a>' : 'running';
 }
 function codeRow(name, codeOn, codeUrl) {
   // VS Code (code-server) is independent of the engine switch — spawnable
@@ -3488,8 +3750,10 @@ function deployRow(name, deploy) {
 // typing.
 let smokeCheckExpect = {};
 // HTTP-level smoke check (backlog item 18, docs/spec.md). Rendered only
-// when this project currently has a captured hosted URL (inst.url
-// non-null) -- mirrors deployRow()'s own "return '' if not present" shape
+// when this project currently has a captured hosted URL (the `url`
+// param -- refresh()'s newest-session resolver, part 2's replacement for
+// the removed `inst.url` back-compat field -- non-null) -- mirrors
+// deployRow()'s own "return '' if not present" shape
 // -- since a direct POST with no captured URL is still handled cleanly
 // server-side, but there is nothing useful to click otherwise. Reused-
 // message slot (.smoke-check-msg) is always rendered empty here;
@@ -4540,11 +4804,12 @@ function teamRow(name, team) {
     '<a href="/team/' + encodeURIComponent(name) + '" class="team-configure-btn">Open team chat →</a>' +
     '</div>';
 }
-function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverride, showBadge, gitSync, deploy, team, toggleDisabled) {
+function row(label, on, url, kind, name, desc, sessions, codeOn, codeUrl, subOverride, showBadge, gitSync, deploy, team, toggleDisabled) {
   // subOverride lets a singleton-toggle row (Taiga/Gitea — see refresh())
-  // supply its own starting/running/stopped/error text instead of this
-  // generic on/off computation — every other kind (inst/host/code) omits it
-  // and keeps the plain behavior unchanged. showBadge + SINGLETON_TOGGLE_CONFIG
+  // or a multi-session 'inst' row (docs/design.md "Sub text for
+  // multi-session rows") supply its own starting/running/stopped/error
+  // text instead of this generic on/off computation — 'host'/'code' omit
+  // it and keep the plain behavior unchanged. showBadge + SINGLETON_TOGGLE_CONFIG
   // (keyed by kind) supply that row's own resource-cost badge text/class.
   // toggleDisabled likewise only ever comes from a singleton-toggle row's own
   // singletonToggleSub() result (see its "disabled" doc comment) — every
@@ -4555,21 +4820,63 @@ function row(label, on, url, kind, name, desc, engine, codeOn, codeUrl, subOverr
   const cfg = SINGLETON_TOGGLE_CONFIG[kind];
   const arg = name ? "'" + kind + "','" + name + "'" : "'" + kind + "',null";
   return '<div class="row"><div><div class="label">' + esc(label) + '</div>' +
-    (kind === 'inst' ? engineRow(name, on, engine) : '') +
+    (kind === 'inst' ? engineRow(name) : '') +
     (showBadge && cfg ? '<div class="badge ' + cfg.badgeClass + '">' + cfg.badgeText + '</div>' : '') +
     (desc ? '<div class="desc">' + esc(desc) + '</div>' : '') +
     '<div class="sub">' + sub + '</div>' +
+    (kind === 'inst' ? sessionsRow(name, sessions) : '') +
     (kind === 'inst' ? codeRow(name, codeOn, codeUrl) : '') +
     (kind === 'inst' ? smokeCheckRow(name, url) : '') +
     (kind === 'inst' ? deployRow(name, deploy) : '') +
     (kind === 'inst' ? teamRow(name, team) : '') +
     '</div>' +
-    '<label class="switch"><input type="checkbox" ' + (on ? 'checked' : '') + (toggleDisabled ? ' disabled' : '') +
-    ' onchange="toggle(' + arg + ', this.checked, this)"><span class="slider"></span></label></div>';
+    // Concurrent sessions per project, part 2 (docs/spec.md "Proposed
+    // approach" §4): a single on/off checkbox no longer represents an
+    // 'inst' row's state (multiplicity) -- the engine picker + "+ Start
+    // session" button + per-session Stop controls above cover its role
+    // entirely. Host/Taiga/Gitea rows are unaffected, unchanged.
+    (kind !== 'inst' ? '<label class="switch"><input type="checkbox" ' + (on ? 'checked' : '') +
+    (toggleDisabled ? ' disabled' : '') +
+    ' onchange="toggle(' + arg + ', this.checked, this)"><span class="slider"></span></label>' : '') +
+    '</div>';
 }
-let pendingToggle = null;  // {kind, name, on, checkboxEl} — only set while the code overlay is up
+let pendingToggle = null;  // {kind, name, on, checkboxEl, sessionId} — only set while the code overlay is up
+// Per-session Stop side-channel (docs/spec.md "Proposed approach" §3,
+// docs/design.md "Side-channel state pattern") -- name -> ARRAY of
+// session_ids that currently have an in-flight or TOTP-pending stop request
+// for that project.
+//
+// Fix-up (hotfix/ad-9, review round 2): this used to be a single value
+// (name -> one session_id), following team-add-member's own precedent --
+// but unlike team-add-member (one outstanding "add" per project at a time,
+// by construction of the UI), Stop can legitimately be clicked on TWO
+// different sessions of the SAME project before the first click's 428/TOTP
+// code overlay is ever answered (there's nothing in the UI that disables
+// the other sessions' Stop buttons while the overlay is up). A single
+// shared value meant the second click's session_id silently clobbered the
+// first's, and since submitActionCode() only fires ONE retry per code
+// entry, the first session's stop request was dropped on the floor with no
+// error shown -- see docs/implementation.md for the full writeup. Each
+// stopSession() click now pushes onto this project's own queue instead of
+// overwriting a single slot, and the exact session_id each individual POST
+// targets is threaded explicitly through toggle()/performAction()/
+// actionPath() (see their own sessionId parameter below) rather than
+// re-read from this dict at fetch time -- so the dict's only remaining job
+// is letting submitActionCode() know how many sessions are still waiting on
+// the ONE code the operator is about to type, and retry every one of them,
+// not just the most recently clicked.
+let pendingSessionStop = {};
+// stopSession() is sessionsRow()'s own onclick target -- queues sessionId
+// for this project (deduped) BEFORE toggle() fires, same discipline
+// doTeamAddMember() already establishes for teamAddMemberChoice, extended
+// to a queue per the fix-up comment above.
+function stopSession(name, sessionId) {
+  if (!pendingSessionStop[name]) pendingSessionStop[name] = [];
+  if (pendingSessionStop[name].indexOf(sessionId) === -1) pendingSessionStop[name].push(sessionId);
+  toggle('session-stop', name, true, null, sessionId);
+}
 
-function actionPath(kind, name, on) {
+function actionPath(kind, name, on, sessionId) {
   if (kind === 'host') return '/host/' + (on ? 'on' : 'off');
   if (kind in singletonToggleState) return '/' + kind + '/' + (on ? 'on' : 'off');
   if (kind === 'code') return '/instance/' + encodeURIComponent(name) + '/code/' + (on ? 'on' : 'off');
@@ -4583,12 +4890,32 @@ function actionPath(kind, name, on) {
   if (kind === 'team-interject') return '/projects/' + encodeURIComponent(name) + '/team/interject';
   if (kind === 'team-add-member') return '/projects/' + encodeURIComponent(name) + '/team/add-member';
   if (kind === 'smoke-check') return '/projects/' + encodeURIComponent(name) + '/smoke-check';
-  return '/instance/' + encodeURIComponent(name) + '/' + (on ? 'on' : 'off');
+  // Concurrent sessions per project, part 2 (docs/spec.md "Proposed
+  // approach" §2/§3, docs/design.md "Implementation notes"): the legacy
+  // /instance/<name>/on|off shim this fallback used to build for kind ===
+  // 'inst' is gone -- nothing dispatches that kind anymore (the checkbox
+  // for 'inst' rows no longer exists), so 'session-spawn'/'session-stop'
+  // are the only per-project instance actions left.
+  if (kind === 'session-spawn') return '/instance/' + encodeURIComponent(name) + '/spawn';
+  // Fix-up (hotfix/ad-9): sessionId is now passed in explicitly by the
+  // caller (captured once, synchronously, at the moment this specific
+  // request was dispatched -- see toggle()/submitSessionStopRetries() below)
+  // rather than re-read from the shared pendingSessionStop[name] queue here,
+  // which is exactly what let a second Stop click on a different session
+  // silently steal the URL out from under the first's retry.
+  if (kind === 'session-stop') return '/instance/' + encodeURIComponent(name) + '/session/' +
+    encodeURIComponent(sessionId) + '/stop';
 }
 function actionBody(kind, name, on, code) {
   const body = {};
   if (code) body.code = code;
-  if (on && kind === 'inst') body.engine = engineChoice[name] || Object.keys(ENGINE_LABELS)[0];
+  // "+ Start session" (docs/spec.md "Proposed approach" §2) -- same
+  // {engine: ...} shape the removed 'inst' branch used to build, re-keyed
+  // to the new 'session-spawn' kind. 'session-stop' needs no body fields
+  // beyond the optional TOTP code above -- which session to stop is
+  // encoded in actionPath()'s own URL via its explicit sessionId parameter
+  // (see actionPath()'s own fix-up comment).
+  if (kind === 'session-spawn') body.engine = engineChoice[name] || Object.keys(ENGINE_LABELS)[0];
   if (kind === 'newproject') body.name = name;
   // Clone-from-URL (backlog item 16, docs/spec.md/docs/design.md) -- reads
   // straight from the still-live inputs, same "survives a TOTP retry"
@@ -4659,8 +4986,8 @@ function actionBody(kind, name, on, code) {
   }
   return body;
 }
-async function performAction(kind, name, on, code) {
-  return fetch(actionPath(kind, name, on), {method: 'POST', headers: {'Content-Type': 'application/json'},
+async function performAction(kind, name, on, code, sessionId) {
+  return fetch(actionPath(kind, name, on, sessionId), {method: 'POST', headers: {'Content-Type': 'application/json'},
                                             body: JSON.stringify(actionBody(kind, name, on, code))});
 }
 // TOTP is verified once per session server-side (see session_totp_ok in
@@ -4694,6 +5021,12 @@ async function handleActionResult(r, ctx) {
       kind === 'team-add-member' ? 'Adding teammate: ' + (name || 'this') :
       kind === 'smoke-check' ? 'Smoke checking: ' + (name || 'this') :
       kind === 'clone' ? 'Cloning from URL' :
+      // Both new per-session actions dispatch with on=true (docs/spec.md
+      // "Proposed approach" §2/§3) -- without their own label case here,
+      // Stop would misleadingly fall through to the generic "Turning on:"
+      // text below.
+      kind === 'session-spawn' ? 'Starting a session: ' + (name || 'this') :
+      kind === 'session-stop' ? 'Stopping session: ' + (name || 'this') :
       (on ? 'Turning on: ' : 'Turning off: ') + (name || 'this');
     document.getElementById('action-code').value = '';
     document.getElementById('err-code').textContent = '';
@@ -4902,10 +5235,26 @@ async function handleActionResult(r, ctx) {
     return;
   }
   if (kind === 'newproject') document.getElementById('new-project-name').value = '';
+  // Session Stop's own side-channel state (docs/design.md "Implementation
+  // notes" -- "delete pendingSessionStop[name]") -- cleared once the
+  // dispatch has actually resolved (this generic fallback path), same
+  // "delete after handleActionResult() completes" discipline
+  // teamAddMemberChoice's own cleanup already follows above.
+  //
+  // Fix-up (hotfix/ad-9): pendingSessionStop[name] is now a queue (see its
+  // own declaration comment) -- this generic fallback only ever runs for a
+  // stop that succeeded (or hard-failed) WITHOUT ever needing a TOTP retry,
+  // so it must remove just its OWN session_id, not the whole project's
+  // queue, in case a second Stop for a different session of the same
+  // project is still independently in flight.
+  if (kind === 'session-stop' && pendingSessionStop[name]) {
+    pendingSessionStop[name] = pendingSessionStop[name].filter((id) => id !== ctx.sessionId);
+    if (pendingSessionStop[name].length === 0) delete pendingSessionStop[name];
+  }
   hideCodeOverlay();
   setTimeout(refresh, 1500);
 }
-async function toggle(kind, name, on, checkboxEl) {
+async function toggle(kind, name, on, checkboxEl, sessionId) {
   if (kind in singletonToggleState) {
     const st = singletonToggleState[kind];
     // Optimistic, ahead of the POST resolving (docs/design.md "Starting
@@ -4922,9 +5271,14 @@ async function toggle(kind, name, on, checkboxEl) {
       st.offPendingCount++;
     }
   }
-  const ctx = {kind, name, on, checkboxEl};
+  // sessionId (only meaningful for kind === 'session-stop') is captured
+  // into ctx right here, synchronously, before any other click handler can
+  // run -- see pendingSessionStop's own declaration comment for why this
+  // (rather than re-reading a shared dict at fetch/retry time) is what
+  // actually fixes the two-concurrent-stops bug.
+  const ctx = {kind, name, on, checkboxEl, sessionId};
   try {
-    const r = await performAction(kind, name, on, null);
+    const r = await performAction(kind, name, on, null, sessionId);
     handleActionResult(r, ctx);
   } finally {
     // A network-level failure (performAction's fetch() rejects, not just a
@@ -5081,6 +5435,15 @@ function cancelActionCode() {
     errEl.textContent = '';
     errEl.className = 'clone-err';
   }
+  // Fix-up (hotfix/ad-9): nothing actually stopped server-side for ANY
+  // queued session either (same 428-before-touching-anything reasoning as
+  // every other kind above) -- abandon the whole per-project queue rather
+  // than leaving stale entries around that a later, unrelated Stop click
+  // (or a later, unrelated code retry for a different kind) could
+  // accidentally resurrect.
+  if (pendingToggle && pendingToggle.kind === 'session-stop') {
+    delete pendingSessionStop[pendingToggle.name];
+  }
   hideCodeOverlay();
 }
 async function submitActionCode() {
@@ -5103,6 +5466,17 @@ async function submitActionCode() {
   if (!pendingToggle) return;
   const {kind, name, on} = pendingToggle;
   const code = document.getElementById('action-code').value;
+  // Fix-up (hotfix/ad-9): pendingToggle only ever remembers ONE {kind, name}
+  // context, but two Stop clicks on different sessions of the SAME project
+  // can both be awaiting this SAME code overlay (see pendingSessionStop's
+  // own declaration comment) -- so a single performAction() call here, keyed
+  // off pendingToggle alone, would only ever retry whichever session_id was
+  // clicked last, silently dropping any earlier one(s). Retry every
+  // session_id still queued for this project instead of just one.
+  if (kind === 'session-stop') {
+    await submitSessionStopRetries(name, on, code);
+    return;
+  }
   if (kind in singletonToggleState && !on) {
     // This retry (after a 428 asked for a TOTP code) is the request that
     // actually triggers <kind>_run("down") server-side — the first attempt
@@ -5122,6 +5496,55 @@ async function submitActionCode() {
       singletonToggleState[kind].offPendingCount = Math.max(0, singletonToggleState[kind].offPendingCount - 1);
     }
   }
+}
+// Fix-up (hotfix/ad-9): the code-overlay retry for 'session-stop' has to
+// cover every session_id queued in pendingSessionStop[name], not just the
+// one that happens to be attached to pendingToggle -- see submitActionCode()
+// and pendingSessionStop's own declaration comment for the full context.
+// Sequential, not parallel/Promise.all: session_totp_ok is validated once
+// server-side per browser session, so if the FIRST retry reveals a wrong
+// code (403), every other queued id would fail identically -- no point
+// firing them, and stopping early keeps "Wrong code — try again." accurate
+// (nothing partially-applied gets silently treated as done).
+async function submitSessionStopRetries(name, on, code) {
+  const ids = (pendingSessionStop[name] || []).slice();
+  for (const sessionId of ids) {
+    let r;
+    try {
+      r = await performAction('session-stop', name, on, code, sessionId);
+    } catch (e) {
+      // Network-level failure -- leave this id queued (not removed below),
+      // move on to the next one rather than aborting the whole batch.
+      continue;
+    }
+    if (r.status === 401) {
+      // Full re-auth needed -- same as handleActionResult()'s own 401
+      // branch elsewhere; abort the batch, leave every remaining id queued
+      // for whenever the operator retries after logging back in.
+      hideCodeOverlay();
+      showOverlay();
+      return;
+    }
+    if (r.status === 403) {
+      // Wrong code -- every other queued id would fail the exact same way
+      // (one shared TOTP check per browser session), so stop here rather
+      // than firing the rest. Nothing in the queue is removed: the code
+      // overlay stays up (pendingToggle is still set) so the operator can
+      // just retype and resubmit, covering every still-queued id again.
+      document.getElementById('err-code').textContent = 'Wrong code — try again.';
+      return;
+    }
+    // Success, or a non-retryable error (400/404/etc, e.g. the session was
+    // already gone) -- either way this id is resolved, remove it from the
+    // queue so a later retry batch (for some OTHER still-queued id) doesn't
+    // resend it.
+    if (pendingSessionStop[name]) {
+      pendingSessionStop[name] = pendingSessionStop[name].filter((x) => x !== sessionId);
+    }
+  }
+  if (pendingSessionStop[name] && pendingSessionStop[name].length === 0) delete pendingSessionStop[name];
+  hideCodeOverlay();
+  setTimeout(refresh, 1500);
 }
 document.getElementById('action-code').addEventListener('keydown', e => { if (e.key === 'Enter') submitActionCode(); });
 
@@ -6082,19 +6505,28 @@ class Handler(BaseHTTPRequestHandler):
             deploy_map = _load_deploy_map()
             instances = []
             for n in instance_names():
-                engine = active_engine(n)
-                e = engines.get(engine) if engine else None
-                url = (_session_urls.get(n) if (e and e.url_regex) else
-                       _ttyd_urls.get(n) if engine else None)
-                inst = {"name": n, "on": engine is not None, "engine": engine,
-                       "url": url,
+                # Session identity (docs/spec.md "/status JSON -- additive"):
+                # `sessions` is the real data shape -- one entry per live
+                # session for this project, in insertion (oldest-first)
+                # order. Part 1's temporary back-compat `on`/`engine`/`url`
+                # singular fields (derived from the newest session, for the
+                # since-removed checkbox frontend) are gone as of part 2
+                # (docs/spec.md "Routes" §6) -- the frontend now reads
+                # `sessions` directly.
+                proj_sessions = active_sessions(n)
+                sessions_field = [
+                    {"session_id": s["session_id"], "engine": s["engine"],
+                     "url": _resolve_session_url(s["session_id"], s["engine"], engines)}
+                    for s in proj_sessions]
+                inst = {"name": n,
+                       "sessions": sessions_field,
                        "desc": get_description(n, os.path.join(PROJECTS_DIR, n)),
                        "code_on": code_running(n), "code_url": _code_urls.get(n)}
                 # Team session lifecycle, part 2a (backlog item 6d,
                 # docs/spec.md §5) -- always present (unlike deploy/
                 # gitea_sync, which are only attached when configured), same
-                # "always-present" treatment on/engine already get. A fresh
-                # read on every poll -- deliberately unthrottled, unlike
+                # "always-present" treatment `sessions` above already gets.
+                # A fresh read on every poll -- deliberately unthrottled, unlike
                 # sweep_dead_teams() below (see _team_reap_if_due()) --
                 # since a team started seconds ago must not still show
                 # "idle".
@@ -6542,17 +6974,44 @@ class Handler(BaseHTTPRequestHandler):
             status, payload = confirm_upload(
                 body.get("token", ""), body.get("mode", ""), body.get("selected") or [])
             self._json(payload, status)
-        elif parts[0] == "instance" and len(parts) == 3 and parts[2] in ("on", "off"):
+        elif parts[0] == "instance" and len(parts) == 3 and parts[2] == "spawn":
+            # New session-identity route (docs/spec.md "Routes" §6): starts
+            # an ADDITIONAL session regardless of whether others are
+            # already running for this project -- no "already on" guard,
+            # unlike the legacy /on shim above. Same fallback-to-default-
+            # engine behavior as /on, no new validation (an unknown engine
+            # name falls back silently, same as today).
             name = parts[1]
             if name not in instance_names():
                 return self._json({"error": "unknown instance"}, 404)
-            if parts[2] == "on":
-                engines = load_engines()
-                default_engine = next(iter(engines), "claude")
-                engine = body.get("engine") if body.get("engine") in engines else default_engine
-                instance_start(name, engine)
-            else:
-                instance_stop(name)
+            engines = load_engines()
+            default_engine = next(iter(engines), "claude")
+            engine = body.get("engine") if body.get("engine") in engines else default_engine
+            session_id = instance_start(name, engine)
+            self._json({"ok": session_id is not None, "session_id": session_id})
+        elif (parts[0] == "instance" and len(parts) == 5 and parts[2] == "session"
+              and parts[4] == "stop"):
+            # New per-session stop route (docs/spec.md "Routes" §6): tears
+            # down exactly the targeted session_id, leaving any siblings for
+            # the same project untouched. Idempotent -- an already-gone
+            # session_id (double-click, stale frontend cache, or a race
+            # with the reap sweep) is a normal race, never a 404/500 (see
+            # docs/spec.md "Edge cases"). Ownership check below is NOT in
+            # the original spec pseudocode but is required regardless: the
+            # URL shape (/instance/<name>/session/<id>/stop) implies id
+            # belongs to name, but nothing enforced that -- without this
+            # check, any caller could tear down another project's session,
+            # or even a real team-<project> tmux session, via a bare
+            # session-name string with zero cross-check against ownership.
+            # Stopping an id that isn't (or is no longer) one of this
+            # project's live sessions is treated the same as the existing
+            # "already gone" idempotent case above -- silently ignored,
+            # still {"ok": true}, never a 404/500.
+            name = parts[1]
+            if name not in instance_names():
+                return self._json({"error": "unknown instance"}, 404)
+            if any(s["session_id"] == parts[3] for s in active_sessions(name)):
+                instance_stop_session(parts[3])
             self._json({"ok": True})
         elif parts[0] == "instance" and len(parts) == 4 and parts[2] == "code" and parts[3] in ("on", "off"):
             name = parts[1]
