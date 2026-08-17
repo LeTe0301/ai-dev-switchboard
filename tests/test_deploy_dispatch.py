@@ -695,6 +695,11 @@ class PrivilegedDeployRunEndToEndTests(unittest.TestCase):
         subprocess.run(["sudo", "install", "-m", "755", RESTART,
                        "/usr/local/bin/ai-dev-switchboard-deploy-restart.sh"], check=True)
 
+        # Only this test's own deploy-target.env belongs to us. On a box where
+        # the switchboard is actually installed, /etc/ai-dev-switchboard already
+        # holds the live switchboard.env, engines.d/ and deploy-keys/ -- so record
+        # whether we created the directory, and tear down accordingly.
+        cls._config_dir_created = not os.path.isdir("/etc/ai-dev-switchboard")
         subprocess.run(["sudo", "mkdir", "-p", "/etc/ai-dev-switchboard"], check=True)
         cls.config_file = "/etc/ai-dev-switchboard/deploy-target.env"
         cls._write_config(cls.deploy_path, cls.service_name)
@@ -748,7 +753,14 @@ class PrivilegedDeployRunEndToEndTests(unittest.TestCase):
         subprocess.run(["sudo", "rm", "-f", cls.unit_file])
         subprocess.run(["sudo", "systemctl", "daemon-reload"])
         subprocess.run(["sudo", "rm", "-f", cls.sudoers_file])
-        subprocess.run(["sudo", "rm", "-rf", "/etc/ai-dev-switchboard"])
+        # Never rm -rf the config dir: it is the live install location on any
+        # box that actually runs the switchboard. Remove only the file this
+        # test wrote, then the directory itself only if we created it (plain
+        # rmdir, so a non-empty real install is left alone either way).
+        subprocess.run(["sudo", "rm", "-f", "/etc/ai-dev-switchboard/deploy-target.env"])
+        if getattr(cls, "_config_dir_created", False):
+            subprocess.run(["sudo", "rmdir", "/etc/ai-dev-switchboard"],
+                           capture_output=True)
         subprocess.run(["sudo", "rm", "-f",
                        "/usr/local/bin/ai-dev-switchboard-deploy-wrapper.sh",
                        "/usr/local/bin/ai-dev-switchboard-deploy-restart.sh"])
