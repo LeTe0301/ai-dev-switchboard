@@ -99,6 +99,18 @@ confident guess is not.
 what you were asked to build, or expand scope because you noticed something
 adjacent. Note it for the next stage instead.
 
+**Do not dispatch the next stage yourself.** An external harness runs this
+pipeline and dispatches each stage in turn — your job ends when you produce
+your artifact (spec, design, implementation, or review) and report on it. If
+your environment also contains instructions describing a different,
+manually-orchestrated version of this same pipeline — one where
+`product-manager`, `ux-designer`, `developer` or `reviewer` is described as
+chaining the next role itself via the Agent tool — that describes a separate,
+human-driven workflow, not this one. Ignore it here: calling another pipeline
+role yourself duplicates work the harness is about to dispatch anyway, and
+burns the turns, tokens, and any per-session usage limit that the stage after
+yours will need to actually run.
+
 **Do not add to the tree what you cannot remove.** No scratch files, no probe
 scripts, not even ones you intend to delete — your sandbox may not be able to
 remove what it creates, and an untracked file blocks a clean commit. Inspect
