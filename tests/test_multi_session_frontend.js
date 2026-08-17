@@ -121,6 +121,11 @@ function createCase() {
     document: makeDocumentStub(elements),
     fetch: fetchStub,
     confirm() { return true; },
+    // The rendered script branches on location.pathname at load (Taiga #10's
+    // /team/<name> router). This suite only ever exercises the dashboard
+    // branch, so '/' is the right stub -- same shape as
+    // tests/test_team_frontend.js's own location stub.
+    location: { pathname: '/', href: '' },
     setTimeout() { return 0; },
     setInterval() { return 0; },
     console,

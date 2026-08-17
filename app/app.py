@@ -768,6 +768,14 @@ def _code_stop(name: str):
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]{0,59}$")
 
+# Dedicated team chat page (Taiga #10, docs/spec.md "Proposed approach" §1) --
+# matches the same static shell "/" already serves. The project name segment
+# is never read/validated server-side here -- exactly like "/" itself, the
+# page carries no session data; everything (including "does this project even
+# exist") is resolved client-side against /status after login (see
+# renderTeamPage() in PAGE_TEMPLATE's own <script>).
+_TEAM_PAGE_PATH_RE = re.compile(r"^/team/[^/]+/?$")
+
 # Clone-from-URL allowlist (backlog item 16, docs/spec.md "URL validation --
 # allowlist, not denylist"). Only http(s)://, ssh://, or git's own scp-like
 # user@host:path shorthand are accepted -- file://, git://, ext::/fd::
@@ -3257,6 +3265,22 @@ PAGE_TEMPLATE = """<!doctype html>
                               border: 1px solid #333; background: #1c1c1c; color: #eee; font-family: inherit; }
   .team-add-member-reason { font-size: 12px; color: #888; }
   .team-feed-event.kind-member-joined { border-left: 3px solid currentColor; padding-left: 12px; }
+  /* Dedicated team chat page (Taiga #10, docs/design.md "Page Container
+     Styling" / "Header & Navigation") -- max-width matches the dashboard's
+     own body width so both views look consistent; #team-page defaults
+     hidden, toggled via .active by hideDashboardChromeForTeamPage() in the
+     script below. No new color tokens -- all colors reuse existing ones. */
+  #team-page { display: none; max-width: 480px; margin: 40px auto; padding: 0 16px; }
+  #team-page.active { display: block; }
+  #rows.hidden-for-team-page { display: none; }
+  .team-page-header { font-size: 12px; margin-bottom: 16px; padding: 12px 0; border-bottom: 1px solid #333; }
+  .team-page-back-link { color: #4da6ff; cursor: pointer; text-decoration: underline; background: none;
+                          border: none; padding: 6px 0; font-size: 12px; font-family: inherit;
+                          min-height: 44px; display: inline-block; vertical-align: middle; }
+  .team-page-back-link:hover { opacity: 0.8; }
+  .team-page-not-found { display: flex; flex-direction: column; gap: 16px; padding: 20px; text-align: center; }
+  .team-page-not-found-message { font-size: 14px; color: #eee; }
+  .team-page-not-found-detail { font-size: 12px; color: #888; }
   .new-project-row { display: flex; gap: 8px; padding: 4px 0 16px; }
   .new-project-row input { flex: 1; font-size: 14px; padding: 10px 12px; border-radius: 10px;
                             border: 1px solid #333; background: #1c1c1c; color: #eee; }
@@ -3352,13 +3376,13 @@ PAGE_TEMPLATE = """<!doctype html>
                  font-size: 11px; color: #aaa; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
 </style></head>
 <body>
-<h1>ai-dev-switchboard</h1>
-<div class="new-project-row">
+<h1 id="page-title">ai-dev-switchboard</h1>
+<div class="new-project-row" id="new-project-row">
   <input id="new-project-name" placeholder="new project name" maxlength="60">
   <button onclick="startNewProject()">+ New project</button>
 </div>
 <div class="new-project-err" id="new-project-err"></div>
-<button class="upload-wizard-btn" onclick="openUploadWizard()">Upload folder / .zip</button>
+<button class="upload-wizard-btn" id="upload-folder-btn" onclick="openUploadWizard()">Upload folder / .zip</button>
 <button class="upload-wizard-btn" id="clone-toggle-btn" onclick="openCloneForm()">Clone from URL</button>
 <div class="clone-form" id="clone-form" style="display: none;">
   <div class="clone-form-label">Clone from URL</div>
@@ -3370,6 +3394,7 @@ PAGE_TEMPLATE = """<!doctype html>
 </div>
 <div class="clone-err" id="clone-err"></div>
 <div id="rows"></div>
+<div id="team-page"></div>
 
 <div id="upload-overlay" class="overlay">
   <div class="card wizard-card">
@@ -3425,7 +3450,7 @@ async function login() {
   if (r.ok) {
     document.getElementById('login-pass').value = '';
     hideOverlay();
-    refresh();
+    refreshCurrentView();
   } else {
     document.getElementById('err-creds').textContent = 'Wrong username or password — try again.';
   }
@@ -3452,6 +3477,21 @@ let DEPLOY_TARGETS = {};
 // the picker's pre-selection the first time it's opened for a project.
 let ROSTER = [];
 let TEAM_BY_NAME = {};
+
+// Dedicated team chat page (Taiga #10, docs/spec.md / docs/design.md) --
+// set once at load time by the bottom-of-script router (null on the
+// dashboard). Every fire-and-forget action handler throughout this script
+// that used to just call refresh() to reflect its own state change
+// immediately (composition picker, escalation option, feed toggle/filter,
+// login, ...) calls refreshCurrentView() instead, so it re-renders whichever
+// view is actually on screen -- refresh() itself only ever touches the
+// hidden #rows and would leave the team page stale until the next 4s tick
+// otherwise.
+let TEAM_PAGE_PROJECT = null;
+function refreshCurrentView() {
+  if (TEAM_PAGE_PROJECT) { renderTeamPage(TEAM_PAGE_PROJECT); return; }
+  refresh();
+}
 
 // Singleton-toggle rows (Taiga, Gitea, ...future ones) need more visual
 // states than the generic on/off rows above (see docs/design.md "How
@@ -3598,16 +3638,11 @@ async function refresh() {
     html += row(inst.name, false, newestUrl, 'inst', inst.name, inst.desc, sessions,
                inst.code_on, inst.code_url, instSessionsSub(sessions), undefined,
                inst.gitea_sync, inst.deploy, inst.team);
-    // Live event feed polling (backlog item 6f part 2, docs/spec.md
-    // "Proposed approach" §3) -- folded into this existing 4s cycle, no new
-    // setInterval. teamFeedOpen[inst.name] is only ever set once row()'s
-    // own teamRow() call above has already run for this project (it seeds
-    // the default-open state the first time a row renders non-idle), so
-    // this check always sees the up-to-date value. Fire-and-forget: does
-    // not block this refresh() call's own render.
-    if (inst.team && inst.team.status !== 'idle' && teamFeedOpen[inst.name]) {
-      pollTeamFeed(inst.name);
-    }
+    // Live event feed polling (backlog item 6f part 2) used to fire from
+    // this loop -- the dashboard row no longer renders the feed at all
+    // (Taiga #10, docs/spec.md Goals: "no ... event feed ... left inline
+    // on the dashboard"), so the equivalent poll now lives in
+    // renderTeamPage() below, the feed's only remaining home.
   }
   if (s.instances.length === 0) html += '<div class="empty">No project folders under the configured PROJECTS_DIR yet.</div>';
   if (s.host_enabled) html += row(s.host_label, s.host, s.host_url, 'host', null, '', null, false, null);
@@ -3873,7 +3908,7 @@ async function fetchTeamGrounding(name) {
   } catch (e) {
     teamGroundingCache[name] = null;
   }
-  refresh();
+  refreshCurrentView();
 }
 // Past team branches panel (backlog item 13, docs/spec.md) -- fetched once
 // per project, the first time renderTeamBranches() below finds no cache
@@ -3939,10 +3974,10 @@ function toggleTeamPicker(name) {
     teamPickerInitialized[name] = true;
   }
   if (teamPickerOpen[name] && teamGroundingCache[name] === undefined) {
-    fetchTeamGrounding(name);  // its own refresh() covers this render
+    fetchTeamGrounding(name);  // its own refreshCurrentView() covers this render
     return;
   }
-  refresh();
+  refreshCurrentView();
 }
 function onTeamLeadChange(name) {
   const sel = document.getElementById('team-lead-' + name);
@@ -3956,12 +3991,12 @@ function onTeamLeadChange(name) {
   const lead = teamPickerLead[name];
   const members = teamPickerMembers[name];
   if (lead && members) members.delete(lead.name);
-  refresh();
+  refreshCurrentView();
 }
 function onTeamMateToggle(name, memberName, checked) {
   const set = teamPickerMembers[name] || (teamPickerMembers[name] = new Set());
   if (checked) set.add(memberName); else set.delete(memberName);
-  refresh();
+  refreshCurrentView();
 }
 // docs/design.md "Grounding Files" -- always the same four canonical slots,
 // in this fixed order, so an ABSENT file (e.g. no docs/ARCHITECTURE.md) is
@@ -4086,7 +4121,7 @@ async function fetchTeamInbox(name, runId) {
   } catch (e) {
     teamInboxCache[runId] = null;
   }
-  refresh();
+  refreshCurrentView();
 }
 // Options are addressed by INDEX into the cached inbox's own options[], not
 // by label text -- labels are LLM-authored free text that could contain
@@ -4103,7 +4138,7 @@ function onEscalationOptionChange(name, idx, multiSelect, checked) {
     set.clear();
     if (checked) set.add(idx);
   }
-  refresh();
+  refreshCurrentView();
 }
 // Shared by doTeamResolve()'s own client-side validation and
 // actionBody()'s 'team-resolve' body so they can never diverge (docs/
@@ -4449,13 +4484,13 @@ function toggleTeamFeed(name) {
     delete teamFeedCursor[name];
     delete teamFeedEvents[name];
   }
-  refresh();
+  refreshCurrentView();
 }
 // Client-side only -- filtering never refetches (docs/spec.md "Edge cases":
 // "Switching the per-agent filter does not reset or refetch").
 function setTeamFeedFilter(name, agent) {
   teamFeedFilter[name] = agent;
-  refresh();
+  refreshCurrentView();
 }
 // Folded into refresh()'s existing 4s poll cycle (docs/spec.md "Proposed
 // approach" §3), not a new setInterval -- called from refresh() itself for
@@ -4658,7 +4693,13 @@ function doTeamAddMember(name) {
   if (msgEl) { msgEl.textContent = ''; msgEl.className = 'team-msg'; }
   toggle('team-add-member', name, true, null);
 }
-function teamRow(name, team) {
+// Dedicated team chat page (Taiga #10, docs/spec.md "Proposed approach" §3)
+// -- the full team surface teamRow() itself used to render inline on the
+// dashboard, extracted verbatim so it can be mounted from renderTeamPage()
+// below without any duplicated copy of the sub-renderers it calls. teamRow()
+// (further down) is now just a compact dashboard summary; this is the only
+// place any of these sub-renderers are actually invoked from.
+function renderTeamPageBody(name, team) {
   const msgSlot = '<div class="team-msg" id="team-msg-' + esc(name) + '"></div>';
   if (!team || team.status === 'idle') {
     clearTeamFeedState(name);
@@ -4745,6 +4786,23 @@ function teamRow(name, team) {
     '<div class="team-actions"><button class="team-btn" onclick="doTeamStop(' +
     "'" + name + "'" + ')">Stop team</button></div>' +
     msgSlot + renderTeamBranches(name) + '</div>';
+}
+// Dashboard's own per-project team section (Taiga #10, docs/spec.md Goals /
+// docs/design.md "Dashboard's Simplified teamRow()") -- shrunk to a compact
+// status badge + a link into the dedicated /team/<name> page. Applies
+// uniformly regardless of status, including idle (starting a team now only
+// happens on the dedicated page) -- no task textarea, composition picker,
+// event feed, escalation panel, or interject box left inline here.
+const TEAM_STATUS_LABELS = {
+  idle: 'Idle', running: 'Running', blocked: 'Blocked', finished: 'Finished', error: 'Error',
+};
+function teamRow(name, team) {
+  const status = team ? team.status : 'idle';
+  const statusLabel = TEAM_STATUS_LABELS[status] || 'Unknown';
+  return '<div class="team-row"><div class="team-status status-' + esc(status) + '">' +
+    statusLabel + '</div>' +
+    '<a href="/team/' + encodeURIComponent(name) + '" class="team-configure-btn">Open team chat →</a>' +
+    '</div>';
 }
 function row(label, on, url, kind, name, desc, sessions, codeOn, codeUrl, subOverride, showBadge, gitSync, deploy, team, toggleDisabled) {
   // subOverride lets a singleton-toggle row (Taiga/Gitea — see refresh())
@@ -6183,7 +6241,77 @@ function renderWizard() {
 
 initWizardInputs();
 
-refresh(); setInterval(refresh, 4000);
+// Dedicated team chat page (Taiga #10, docs/spec.md / docs/design.md) --
+// full-page routing entry point. hideDashboardChromeForTeamPage() hides the
+// dashboard's own creation controls (only the login/TOTP overlays stay
+// shared between both contexts) and swaps #rows for #team-page -- there is
+// no in-page way back to the dashboard chrome within the same page load
+// (goToDashboard() is a full navigation, docs/spec.md non-goals: "no in-page
+// project switcher"), so this is one-directional.
+function hideDashboardChromeForTeamPage() {
+  document.getElementById('page-title').style.display = 'none';
+  document.getElementById('new-project-row').style.display = 'none';
+  document.getElementById('new-project-err').style.display = 'none';
+  document.getElementById('upload-folder-btn').style.display = 'none';
+  document.getElementById('clone-toggle-btn').style.display = 'none';
+  document.getElementById('clone-form').style.display = 'none';
+  document.getElementById('clone-err').style.display = 'none';
+  document.getElementById('rows').classList.add('hidden-for-team-page');
+  document.getElementById('team-page').classList.add('active');
+}
+function goToDashboard() { location.href = '/'; }
+function teamPageHeader(name) {
+  return '<div class="team-page-header"><button class="team-page-back-link" onclick="goToDashboard()">' +
+    '← ai-dev-switchboard › ' + esc(name) + '</button></div>';
+}
+// Unknown/nonexistent project name (docs/spec.md "Edge cases") -- a clear
+// message with a way back, never a JS exception or blank page.
+function renderTeamPageNotFound(projectName) {
+  hideDashboardChromeForTeamPage();
+  document.getElementById('team-page').innerHTML =
+    '<div class="team-page-header"><button class="team-page-back-link" onclick="goToDashboard()">' +
+    '← ai-dev-switchboard › team-chat</button></div>' +
+    '<div class="team-page-not-found">' +
+    '<div class="team-page-not-found-message">Unknown project ' + esc(projectName) + '</div>' +
+    '<div class="team-page-not-found-detail">This project may have been deleted, or the name was misspelled.</div>' +
+    '<button class="team-page-back-link" onclick="goToDashboard()">← Back to dashboard</button>' +
+    '</div>';
+}
+// Entry point for the /team/<project> route (docs/spec.md "Proposed
+// approach" §2) -- fetches /status (same unauthenticated/401 handling
+// refresh() already has, copied rather than reimplemented), finds the
+// matching project by name, and mounts the exact same full-page body
+// renderTeamPageBody() (extracted from the old inline teamRow()) produces --
+// no forked copy of any sub-renderer.
+async function renderTeamPage(projectName) {
+  const r = await fetch('/status');
+  if (r.status === 401) { hideDashboardChromeForTeamPage(); showOverlay(); return; }
+  const s = await r.json();
+  ENGINE_LABELS = s.engines || {};
+  ROSTER = s.roster || [];
+  if (s.team_max_members) TEAM_MAX_MEMBERS_CLIENT = s.team_max_members;
+  const project = (s.instances || []).find((inst) => inst.name === projectName);
+  if (!project) { renderTeamPageNotFound(projectName); return; }
+  TEAM_BY_NAME[project.name] = project.team;
+  hideDashboardChromeForTeamPage();
+  document.getElementById('team-page').innerHTML =
+    teamPageHeader(project.name) + renderTeamPageBody(project.name, project.team);
+  // Live event feed polling (backlog item 6f part 2) -- the dedicated page's
+  // own equivalent of refresh()'s old per-project poll, now that the feed
+  // only ever renders here (see the removed block in refresh() above).
+  if (project.team && project.team.status !== 'idle' && teamFeedOpen[project.name]) {
+    pollTeamFeed(project.name);
+  }
+}
+
+const teamPageMatch = location.pathname.match(/^\/team\/([^/]+)\/?$/);
+if (teamPageMatch) {
+  TEAM_PAGE_PROJECT = decodeURIComponent(teamPageMatch[1]);
+  renderTeamPage(TEAM_PAGE_PROJECT);
+  setInterval(() => renderTeamPage(TEAM_PAGE_PROJECT), 4000);
+} else {
+  refresh(); setInterval(refresh, 4000);
+}
 </script>
 </body></html>"""
 
@@ -6319,7 +6447,7 @@ class Handler(BaseHTTPRequestHandler):
         # overlay and the dashboard rows are both populated client-side, gated
         # on whether /status comes back 401. Nothing sensitive is served here
         # without a valid session.
-        if self.path == "/":
+        if self.path == "/" or _TEAM_PAGE_PATH_RE.match(self.path):
             return self._html(render_page())
         if not self._authed():
             return self._json({"error": "not authenticated"}, 401)

@@ -1,283 +1,318 @@
-# Spec: Concurrent sessions per project — part 2: "+" control and per-session list UI
+# Spec: Dedicated team chat page (`/team/<project>`)
 
 ## Routing note (read first)
-**Workflow: `workflows/feature.md`. Queued after `docs/spec.md` (part 1,
-backend).** This part **does** need ux-designer — it replaces a boolean
-checkbox with a new list-of-sessions layout, a real new visual pattern for
-the `kind === 'inst'` row. Do not build this before part 1 has landed
-(it depends on part 1's `POST /instance/<name>/spawn`, `POST /instance/
-<name>/session/<id>/stop`, and `/status`'s new `sessions` array all
-existing and working).
+**Workflow: `workflows/feature.md`.** Independent of the two-part
+"concurrent sessions" spec (`docs/spec.md` + `docs/spec-feature1-part2-
+multi-session-ui.md`) — no ordering dependency, can be built before,
+after, or interleaved with either part. **Does need ux-designer**: this
+introduces a genuinely new page layout (full-page chat-style surface),
+not a reuse of an existing visual pattern.
 
-This file is written now, alongside part 1 and the feature-2 spec, as a
-complete ready-to-execute plan — per the product-manager's own "don't stop
-at a pitch" convention — but is **not** the currently-active
-`docs/spec.md`. When part 1 is reviewer-approved, promote this file's
-content into `docs/spec.md` (copy over, refresh any line numbers that
-shifted, overwrite) for the next build cycle.
+This file is written now, alongside the two-part session spec, as a
+complete ready-to-execute plan. It is **not** the currently-active
+`docs/spec.md` (that slot currently holds part 1 of the session-identity
+work, queued to run first per this session's recommended ordering — see
+that file's own routing note). When this feature's turn comes, promote
+this file's content into `docs/spec.md` (copy over, refresh any line
+numbers that shifted in the interim, overwrite).
+
+Already approved by Leo — no sign-off gate applies.
 
 ## Summary
-Replace the single on/off checkbox on each project's dashboard row with a
-"+ Start session" control (engine picker, always available) and a list of
-that project's currently-running sessions, each independently stoppable —
-consuming part 1's new backend surface — and remove the now-unused
-back-compat shim (old `/on`/`/off` routes and `/status`'s singular `on`/
-`engine`/`url` fields).
+Move the AI-team interface (status strip, escalation/answer panel,
+interject box, live event feed, composition picker, start/stop controls)
+off the per-project dashboard row and onto its own dedicated page at
+`/team/<project>`, so it no longer shares screen space with the
+project's engine/session controls; the dashboard row keeps only a compact
+status indicator and a link into that page.
 
 ## Goals
-- The `kind === 'inst'` row (per-project dashboard row) no longer renders
-  a `<label class="switch"><input type="checkbox" ...>` toggle. Host/
-  Taiga/Gitea singleton-toggle rows (`kind` `host`/`taiga`/`gitea`) are
-  **unaffected** — they keep their existing checkbox unchanged.
-- An always-visible engine picker + "+ Start session" button (reusing the
-  existing pill-picker visual pattern from `engineRow()`,
-  `app/app.py:3401-3415`) that calls `POST /instance/<name>/spawn`.
-- A session list: one entry per item in that project's `/status` `sessions`
-  array, showing its engine label, an "open" link when a URL is captured
-  (else a "starting…" placeholder — mirroring the existing `sub` text
-  convention `'running — <a>open</a>'` / `'running'`), and a "Stop"
-  button that calls `POST /instance/<name>/session/<session_id>/stop` for
-  that specific session only.
-- All new mutating controls (spawn, stop) go through the exact same
-  TOTP-retry/code-overlay plumbing (`pendingToggle`, `submitActionCode()`,
-  `performAction()`/`handleActionResult()`) every other action on this
-  page already uses — no parallel/duplicate implementation.
-- Cleanup: remove the part-1 back-compat shim entirely once nothing in the
-  frontend calls it — old `/instance/<name>/on`/`/off` routes deleted from
-  `app/app.py`, `/status`'s singular `on`/`engine`/`url` fields removed
-  from the per-project JSON (keep `desc`/`code_on`/`code_url`/`deploy`/
-  `gitea_sync`/`team`, all still project-level and unaffected).
+- New route `GET /team/<project>` serving a real page — full team
+  interface for exactly one project, addressable/bookmarkable/linkable on
+  its own.
+- Dashboard row's team section shrinks to a compact status badge (idle /
+  running / blocked / finished / error — reusing the exact status
+  vocabulary `/status` already computes server-side) plus an "Open team
+  chat →" link to `/team/<name>`. No task textarea, composition picker,
+  event feed, escalation panel, or interject box left inline on the
+  dashboard, for **any** team status including idle (starting a team also
+  moves fully to the dedicated page).
+- The dedicated page supports the complete lifecycle: idle launcher
+  (task text + Lead/Teammates composition picker + Start), through
+  running/blocked (status strip, escalation panel when
+  `waiting_on_you`, interject compose box, add-member control, live event
+  feed), to finished/error (summary, Stop-adjacent state) — functionally
+  everything `teamRow()` renders today, just relocated.
+- Reuses the **existing** backend surface unchanged: `/status` (filtered
+  client-side to one project), `POST /projects/<name>/team/start|stop|
+  resolve|board-resolve|interject|add-member`, `GET /projects/<name>/
+  team/events|inbox|branches|grounding`. Confirmed via archaeology (see
+  "Background") that all of these are already project-scoped and
+  sufficient — **no new backend routes**.
 
 ## Non-goals
-- No per-session git worktree isolation (carried over from part 1's own
-  non-goal — this is a UI-layer spec, doesn't reopen that decision).
-- No configurable maximum session count / resource-limit UI.
-- No change to `codeRow()`/`deployRow()`/`smokeCheckRow()`/`teamRow()`'s
-  own project-level (not per-session) behavior, beyond `smokeCheckRow`
-  continuing to receive a single resolved `url` (part 1's "newest session"
-  resolver) — whether smoke-check becomes session-scoped is an explicit
-  open question below, not decided/built here either, unless the ux-
-  designer's pass concludes it's trivial to add and low-risk; default
-  assumption is **no** (keep smoke-check project-level, targeting the
-  newest session, exactly as part 1 left it).
-- No visual redesign of the row's other sections (description, deploy row,
-  team row) — only the on/off checkbox area changes shape.
+- No chat-bubble redesign of the event feed. Already explicitly decided
+  against in backlog item 19 (`docs/BACKLOG.md:1240-1247`): "~10
+  structurally different event kinds across more than two participants
+  doesn't fit a two-party bubble layout," and a redesign risked breaking
+  the existing `role="log"`/`aria-live="polite"` accessibility contract
+  for no functional gain. "Dedicated page" and "chat bubbles" are
+  orthogonal asks — Leo's request is about *location* (own page vs.
+  inline), not the feed's visual format — and this spec does not revisit
+  that prior decision.
+- No new backend routes, no change to `app/teams.py`, no change to the
+  event envelope shape (`{ts, agent, seq, kind, text, meta}`) or the
+  cursor-polling mechanism.
+- No multi-project view on the team page — one project per page load,
+  selected via the URL path segment. Switching projects means navigating
+  to a different URL (via the dashboard's own link, or a browser back/
+  forward), not an in-page project switcher.
+- Not fixing item 20 (`.team-btn` WCAG AA contrast) — separate, already-
+  backlogged, unrelated to this change even though the same button family
+  is relocated here.
+- No "last event preview" on the dashboard's compact badge (a chat-app-
+  style conversation-list preview) — not requested; flagged as a
+  possible future nice-to-have, not built speculatively here (see Open
+  questions).
+- Not building a genuinely separate frontend app/build pipeline. This
+  codebase has zero frontend build tooling today — one inline Python-
+  string HTML/CSS/JS template, one file (`app/app.py`). A separate SPA/
+  framework would be a real architectural deviation from that
+  established pattern for no stated benefit (Leo's own request text
+  leaves "same app, new route" as an explicit valid option and gives an
+  example URL, `dev.tailbe22cd.ts.net/team/<project>`, matching that
+  exact shape) — this spec deliberately stays inside the existing
+  single-file convention instead.
 
 ## Background / current state
-Assumes part 1 (`docs/spec.md` as currently written) has shipped:
-`POST /instance/<name>/spawn`, `POST /instance/<name>/session/<id>/stop`,
-and `/status`'s per-project `sessions: [{session_id, engine, url}, ...]`
-array all exist and work, alongside the temporary back-compat `on`/
-`engine`/`url` singular fields and the old `/on`/`/off` routes (all to be
-removed here).
 
-### Current frontend, precisely
-- `refresh()` (`app/app.py:3354-3392`): loops `s.instances`, calls
-  `row(inst.name, inst.on, inst.url, 'inst', inst.name, inst.desc,
-  inst.engine, inst.code_on, inst.code_url, ...)` — reads exactly the
-  singular fields part 1 marked as back-compat-only.
-- `row()` (`app/app.py:4485-4510`): for `kind === 'inst'`, renders
-  `engineRow(name, on, engine)` then, at the end, an unconditional
-  `<label class="switch"><input type="checkbox" ... onchange="toggle(arg,
-  this.checked, this)">` — this checkbox is shared code with `host`/
-  `taiga`/`gitea` rows (`arg` and the `toggle()` call are kind-agnostic);
-  only the `kind === 'inst'` case needs its own replacement block, the
-  shared checkbox markup for the other three kinds must stay exactly as-
-  is.
-- `engineRow(name, on, engine)` (`app/app.py:3401-3415`): today branches
-  on `on` — shows a "Running" badge when true, an engine picker (pills,
-  `engineChoice[name]` selection state) when false. This needs to become
-  **always** the engine-picker (no more "already running, hide the
-  picker" branch — multiplicity means the picker for "what to spawn
-  next" is relevant regardless of what's already running).
-- `actionPath()`/`actionBody()` (`app/app.py:4514-4529`/`4530+`): kind-
-  keyed dispatch table already handles kinds needing no extra state
-  (`'code'`, `'deploy'`, etc.) and kinds needing extra state threaded via
-  a side-channel module-level variable rather than `toggle()`'s own
-  `name`/`on`/`checkboxEl` params, which have no slot for it — see
-  `team-add-member`'s existing precedent (`app/app.py:4366-4396`,
-  `4538-4539`'s own comment: "rather than threading url/name through
-  toggle()'s own name/on/checkboxEl parameters (which don't have a slot
-  for a second [value])"). Per-session Stop needs exactly this pattern
-  (the extra value being *which* `session_id* to stop).
-- `toggle(kind, name, on, checkboxEl)` (`app/app.py:4850+`): the shared
-  entry point for every mutating action on the page, handling the TOTP
-  code-overlay retry flow generically over `kind`/`name`. Reused as-is.
-- No dedicated frontend test file exists yet for `kind === 'inst'` rows —
-  confirmed via `tests/test_deploy_frontend.js:190-193` and `tests/
-  test_smoke_check_frontend.js:195-198`'s own comments, both explicitly
-  noting there's no earlier canonical `kind='inst'`-row test file to
-  follow. This spec's own new test file becomes that canonical file.
+### Architecture note
+Same as the session-identity specs: no separate frontend framework — one
+big inline HTML/CSS/JS template (`PAGE_TEMPLATE`, defined at
+`app/app.py:2805`), served by a hand-rolled `http.server`-based Python
+app. `do_GET` (`app/app.py:5894` on) currently special-cases exactly one
+path, `"/"` (line 5899: `if self.path == "/": return
+self._html(render_page())`), and requires auth for every other GET.
+`render_page()` (`app/app.py:5768-5780`) just does template-variable
+substitution (login copy) on `PAGE_TEMPLATE` — the page itself carries no
+session data; the login overlay and dashboard rows are both populated
+client-side, gated on whether `/status` comes back 401 (per `do_GET`'s
+own comment at 5895-5898).
+
+### Current team UI, precisely (confirms "frontend-surface only")
+`teamRow(name, team)` (`app/app.py:4397-4484`) renders one of two shapes
+depending on `team.status`, both **inline inside the project's dashboard
+row** (`row()`, called from `refresh()`'s per-project loop,
+`app/app.py:3354-3392`):
+- `idle`/no team yet: task textarea, "Configure team..." link toggling
+  `renderTeamPicker()` (`app/app.py:3729`, Lead/Teammates pill+checkbox
+  picker), Start button.
+- Otherwise: `renderTeamStatusStrip()` (`app/app.py:3790`), an
+  escalation note or `renderEscalationPanel()` (`app/app.py:3913`) when
+  `waiting_on_you`, a finished-run summary, `renderTeamInterjectBox()`
+  (`app/app.py:4313`), `renderTeamAddMemberControl()` (`app/app.py:4366`),
+  `renderTeamFeedToggle()`/`renderTeamFeed()` (`app/app.py:3983`/`4137`,
+  the collapsible cursor-polled event log), a Stop button, and
+  `renderTeamBranches()` (`app/app.py:3638`).
+All of the above are called **from** `teamRow()`, which is itself called
+from `row()`'s `(kind === 'inst' ? teamRow(name, team) : '')` line
+(`app/app.py:4507`) — i.e. structurally nested inside the same row as the
+engine toggle, description, code-server row, smoke-check row, and deploy
+row, exactly matching Leo's complaint that it doesn't get its own space.
+
+### Backend routes already sufficient (confirmed, not assumed)
+Every route the dedicated page needs already exists and is already
+project-scoped by `<name>` in its own path segment:
+`POST /projects/<name>/team/start` (`app/app.py:6444`), `/stop` (`6496`),
+`/resolve` (`6522`), `/board-resolve` (`6578`), `/interject` (`6627`),
+`/add-member` (`6668`); `GET /projects/<name>/team/events` (`6132`,
+`_handle_team_events`), `/inbox` (`6134`), `/branches` (`6136`),
+`/grounding` (`6124`). `/status` itself (`app/app.py:5903` on) already
+returns a `team` object per project (`app/app.py:5973-5978` computes
+`team_status`; the full `team` dict assembled further down includes
+composition/roster data). This matches the task's own framing: this is a
+frontend-surface feature, not new backend plumbing — confirmed by reading
+every route this page would call, not assumed from the framing alone.
 
 ## Proposed approach
 
-### 1. `engineRow()` → always the picker
-Drop the `if (on) { ... Running badge ... }` branch entirely; always
-render the pill-picker (`engineChoice[name]` selection state, unchanged).
-Rename if it reads better once its purpose is "pick what to spawn next"
-rather than "pick what to start" (developer/ux-designer's call — not a
-functional change either way).
+### 1. Backend: one new `do_GET` route branch
+Add, alongside the existing `if self.path == "/":` check
+(`app/app.py:5899`), a match for `^/team/[^/]+/?$` that serves the exact
+same `self._html(render_page())` — same unauthenticated static shell,
+same "nothing sensitive served without a session" security model
+(`do_GET`'s own existing comment). The project name in the URL is never
+read/validated server-side at this layer — exactly like today's `/`,
+everything is resolved client-side against `/status` after login,
+including "does this project even exist" (see Edge cases). Use a
+precompiled `re` pattern (module already needs `re` available — check
+whether it's already imported near the top of `app/app.py`; if not, this
+is the one new import this whole feature requires).
 
-### 2. New "+ Start session" control
-A button next to/below the engine picker, calling `toggle('session-
-spawn', name, true, null)`. `actionPath('session-spawn', name, ...)` →
-`/instance/<name>/spawn`. `actionBody('session-spawn', name, ...)` → same
-`{engine: engineChoice[name] || Object.keys(ENGINE_LABELS)[0]}` shape
-`actionBody`'s existing `kind === 'inst'` branch already builds
-(`app/app.py:4533`) — just re-keyed to the new kind. Button always
-enabled when `Object.keys(ENGINE_LABELS).length > 0` (mirrors
-`engineRow()`'s own existing empty-roster guard,
-`app/app.py:3404-3405`); omitted entirely when no engines are configured
-at all, same as today.
-
-### 3. New session list
-New render function, e.g. `sessionsRow(name, sessions)`:
+### 2. Client-side routing (bottom of `<script>`)
+Today: `refresh(); setInterval(refresh, 4000);` (`app/app.py:5763`).
+Replace with a branch on `location.pathname`:
 ```js
-function sessionsRow(name, sessions) {
-  if (!sessions || sessions.length === 0) return '';
-  return '<div class="sessions-list">' + sessions.map(s =>
-    '<div class="session-item">' +
-      '<span class="badge">' + esc(ENGINE_LABELS[s.engine] || s.engine) + '</span>' +
-      (s.url ? ' <a href="' + s.url + '" target="_blank">open</a>' : ' starting…') +
-      ' <button onclick="stopSession(' + "'" + name + "','" + s.session_id + "'" + ')">Stop</button>' +
-    '</div>').join('') + '</div>';
-}
-function stopSession(name, sessionId) {
-  pendingSessionStop[name] = sessionId;
-  toggle('session-stop', name, true, null);
+const teamPageMatch = location.pathname.match(/^\/team\/([^/]+)\/?$/);
+if (teamPageMatch) {
+  const TEAM_PAGE_PROJECT = decodeURIComponent(teamPageMatch[1]);
+  renderTeamPage(TEAM_PAGE_PROJECT);
+  setInterval(() => renderTeamPage(TEAM_PAGE_PROJECT), 4000);
+} else {
+  refresh(); setInterval(refresh, 4000);
 }
 ```
-`pendingSessionStop` is a new module-level `{}` (same idiom as
-`teamAddMemberChoice`/other side-channel state already in the file).
-`actionPath('session-stop', name, ...)` → `/instance/<name>/session/' +
-encodeURIComponent(pendingSessionStop[name]) + '/stop'`. Exact CSS class
-names/visual treatment are ux-designer's call (`docs/design.md`) — the
-above is the functional shape, not the final styling.
+`renderTeamPage(projectName)` is new: fetches `/status` (unchanged
+endpoint — same auth/401→login-overlay handling `refresh()` already has,
+copy that exact handling rather than reimplementing it), finds the
+matching entry in `s.instances` by `name`, and either renders the full
+team surface (§3) or an "unknown project" message with a link back to
+`/` (see Edge cases) if no match is found.
 
-### 4. `row()`'s `kind === 'inst'` checkbox removed
-The trailing `<label class="switch">...</label>` block
-(`app/app.py:4509-4510`) becomes conditional: rendered as today for
-`host`/`taiga`/`gitea`, and for `kind === 'inst'` replaced by nothing (the
-engine-picker + spawn button + session list, inserted earlier in the row
-alongside `engineRow()`'s own existing call site, cover its role
-entirely). Concretely: gate the existing checkbox markup on `kind !==
-'inst'`, and add the new spawn/session-list block inside the existing
-`(kind === 'inst' ? ... : '')` conditional chain already present in
-`row()` right next to `engineRow()`'s own call.
+### 3. Reuse, don't fork, the existing sub-renderers
+`renderTeamPage`'s body should call the same functions `teamRow()`
+already calls (`renderTeamStatusStrip`, `renderEscalationPanel`,
+`renderTeamInterjectBox`, `renderTeamAddMemberControl`,
+`renderTeamFeedToggle`/`renderTeamFeed`, `renderTeamPicker`,
+`renderTeamBranches`, the idle-state task textarea + Start button, and
+`doTeamStart`/`doTeamStop` for the actions) — either by having
+`teamRow(name, team)` itself become a shared body-builder called from
+both contexts (dashboard's compact version wraps a *different*,
+much smaller function; the full version is what mounts on the page), or
+by extracting `teamRow()`'s existing non-idle/idle bodies into a new
+`renderTeamPageBody(name, team)` that both `teamRow()` (if it still needs
+any inline remnant — see §4, it shouldn't) and `renderTeamPage()` call.
+Developer's call on the exact extraction shape; the hard requirement is
+**no duplicated copy of any of the listed render functions** — one
+implementation, mounted in two different containers.
 
-### 5. `refresh()` updated
-Read `inst.sessions` (part 1's new array) instead of `inst.on`/`inst.url`/
-`inst.engine`; pass it through to `row()` in place of those three
-params (signature change — update every call site, including the `host`/
-`taiga`/`gitea` calls which pass `null`/fixed values for the now-removed
-positional params, or refactor `row()`'s signature to an options object if
-that's cleaner — developer's call, but keep the three non-`inst` call
-sites' behavior byte-for-byte unchanged).
+### 4. Dashboard's `teamRow()` shrinks to a compact summary
+For the dashboard context only: status badge (map `team.status` the same
+way `/status`'s own `team_status` computation already does —
+`idle`/`running`/`blocked`/`finished`/`error`, `app/app.py:5974-5978`) +
+`'<a href="/team/' + encodeURIComponent(name) + '">Open team chat →</a>'`.
+This applies uniformly regardless of status — including `idle`, since
+starting a team now only happens on the dedicated page (today's idle-
+state task textarea/picker/Start button move there entirely, per Goals).
+`row()`'s existing `(kind === 'inst' ? teamRow(name, team) : '')` call
+site (`app/app.py:4507`) is unchanged in *shape*, just now renders the
+much smaller compact block.
 
-### 6. Backend cleanup
-Delete `POST /instance/<name>/on` and `/off`'s route branches
-(`app/app.py:6417-6428`), `instance_stop()` (only ever existed to back
-that route — confirm nothing else calls it before deleting; if
-`instance_stop_session`/the `/off`-shim loop from part 1 already
-subsumed it, this may already be dead by the time this cycle starts).
-Delete `/status`'s three back-compat fields (`on`/`engine`/`url` on the
-per-project object) once `refresh()` no longer reads them.
+### 5. Full-page layout container
+New HTML container in `PAGE_TEMPLATE`'s `<body>` (alongside `#rows`,
+`#upload-overlay`, etc. — see `app/app.py:3134-3177`), e.g. `<div
+id="team-page" style="display:none;"></div>`, shown/hidden opposite `
+#rows` and the new-project/upload/clone controls based on which branch
+§2's routing takes (the plain dashboard chrome — "+ New project", upload
+wizard button, clone form — should not render on the team page; only the
+login/TOTP overlays are shared between both contexts). Exact header/back-
+link/spacing treatment is ux-designer's call (`docs/design.md`).
 
 ## Affected areas
-- `app/app.py`: `engineRow()`, `row()`, `refresh()`, `actionPath()`/
-  `actionBody()` (new `session-spawn`/`session-stop` kinds), new
-  `sessionsRow()`/`stopSession()` functions, new `pendingSessionStop`
-  state, `<style>` additions for `.sessions-list`/`.session-item` (per
-  ux-designer's `docs/design.md`), backend route cleanup (§6 above).
-- New `tests/test_multi_session_frontend.js` — Node `vm`-based extraction
-  of the real rendered `<script>` from `app.render_page()`, same technique
-  as `tests/test_singleton_toggle_frontend.js`/`tests/
-  test_team_frontend.js`. This becomes the canonical `kind='inst'`-row
-  frontend test file (see "Background" — none exists yet).
-- `tests/test_deploy_frontend.js`/`tests/test_smoke_check_frontend.js`:
-  both explicitly note (per their own comments cited above) that they
-  render a `kind='inst'` row as a side effect — re-run after this change
-  to confirm they still pass against the new row shape (no checkbox
-  assumed in either file today, per a quick read, but must be confirmed,
-  not assumed).
+- `app/app.py`: `do_GET` (new route branch, `re` import if not already
+  present), bottom-of-script routing branch, new `renderTeamPage()`, the
+  `teamRow()`/`renderTeamPageBody()` extraction (§3), dashboard's
+  compact-summary block, new `#team-page` container + its show/hide
+  wiring, new `<style>` rules for the full-page layout (ux-designer).
+- `tests/test_team_frontend.js`: existing coverage of the extracted sub-
+  renderers must keep passing unmodified (they're being *called from* a
+  new place, not changed); add new coverage for (a) the dashboard's
+  compact-summary+link rendering across all five statuses, and (b)
+  `renderTeamPage()`'s own behavior — found-project renders the full
+  surface via the shared sub-renderers (assert it's the *same* functions,
+  not a forked duplicate — e.g. by spying/monkeypatching one of them in
+  the test harness and confirming both contexts call it), unknown-project
+  renders the fallback message.
+- `tests/test_team_routes.py`: add a smoke assertion that `GET /team/
+  <any-name>` returns the same static shell as `GET /`, unauthenticated,
+  200 — mirrors whatever existing assertion already covers `/`.
+- No `app/teams.py` changes.
 - `docs/implementation.md` — developer's usual write-up.
 
 ## Edge cases
-- **Zero sessions running, zero engines configured** — no spawn control,
-  no session list, row shows only the description/other project-level
-  rows (deploy/team/etc.) — matches `engineRow()`'s existing empty-roster
-  guard behavior.
-- **Zero sessions running, ≥1 engine configured** — spawn control shown,
-  session list area empty/omitted (not an empty list with a header and no
-  rows).
-- **Many sessions (e.g. 5+) for one project** — list simply grows; no
-  pagination/collapse required by this spec (not requested, not a
-  correctness issue, revisit only if it becomes a real problem later).
-- **A session with no captured URL yet** (still starting, or a `url_regex`
-  engine that hasn't printed its link) — "starting…" placeholder, not a
-  broken/empty link.
-- **Stopping session A while session B (different engine) keeps running**
-  — B's row must not flicker/re-render incorrectly; `refresh()`'s full
-  `#rows`-innerHTML replace already handles this correctly today for
-  other rows, no new risk introduced, but worth an explicit test (see
-  Acceptance criteria).
-- **Rapid double-click Stop on the same session** — idempotent per part
-  1's backend contract; frontend does not need its own dedup logic beyond
-  what `toggle()`'s existing in-flight-request handling already provides.
-- **TOTP required mid-spawn or mid-stop** — identical code-overlay/retry
-  flow as every other action; `pendingSessionStop[name]` must survive the
-  retry round-trip (set *before* `toggle()`'s first optimistic POST fires,
-  same discipline `team-interject`'s own doc comment already establishes
-  at `app/app.py:4336-4349` — read/copy that exact pattern, don't
-  reinvent it).
+- **Unauthenticated access to `/team/<project>`** — identical behavior to
+  `/`: shell loads, `/status` 401s, login overlay shows, no team data
+  visible before login. No new auth code path.
+- **Unknown/nonexistent project name in the URL** (typo, deleted project)
+  — `renderTeamPage()` finds no match in `s.instances`; render a clear
+  "Unknown project" message with a link back to `/`, not a JS
+  exception/blank page.
+- **Project with an active team `blocked_ask_user`/`waiting_on_you`** —
+  dashboard badge reflects "blocked" distinctly; no answer-capability
+  inline on the dashboard anymore (must click through to the page) — this
+  is an intentional behavior change per Goals, not an oversight.
+- **Long/URL-unsafe project names** — reuse the existing
+  `encodeURIComponent`/`unquote` handling already used by the team API
+  routes and the ttyd/code-server path builders (`/term/<name>`, `/code/
+  <name>`) — no new escaping logic invented.
+- **Multiple browser tabs open on the same project's `/team/<name>`
+  simultaneously** — already safe: the event feed's cursor-based polling
+  (`GET .../team/events?cursor=...`) already supports concurrent viewers
+  today (used from the dashboard's own polling); nothing about moving it
+  to a different container changes that guarantee.
+- **Losing not-yet-submitted interject/task text on navigation** — a real
+  but pre-existing-equivalent behavior: today's SPA never fully reloads
+  so in-progress textarea state (`teamTaskText[name]`) survives across
+  `refresh()`'s polling re-renders; navigating *to* `/team/<name>` for the
+  first time is unaffected (fresh state), but navigating away and back
+  (or reloading the tab) loses in-progress text — exactly as reloading
+  today's dashboard already would. Not a new regression; one line in
+  `docs/implementation.md` acknowledging it is enough, not a blocker.
+- **Empty roster / `composition === null`** on the dedicated page's idle
+  launcher — reuse the exact existing "No roster members available"
+  branch/messaging (`app/app.py:4412-4421`), unchanged.
 
 ## Acceptance criteria
-- [ ] Given a project with 0 sessions, when the row renders, then an
-      engine picker and "+ Start session" control are shown, no checkbox,
-      no session list.
-- [ ] Given a project with 2 running sessions of different engines, when
-      the row renders, then both are listed, each with its own engine
-      label and its own Stop control — no checkbox present anywhere in
-      this row.
-- [ ] Given 2 sessions are running, when Stop is clicked on session B's
-      row, then only session B's entry disappears after the next refresh;
-      session A's entry (including its own open-link) is unchanged.
-- [ ] Given the TOTP overlay is required, when "+ Start session" or a
-      session's Stop is clicked, then the same `pendingToggle`/code-
-      overlay/retry flow as every other mutating control runs, with no
-      duplicated implementation.
-- [ ] Given zero engines are configured, when the row renders, then the
-      spawn control is omitted entirely (no broken/empty picker).
-- [ ] Given `host`/`taiga`/`gitea` rows, when rendered, then they are
-      pixel-for-pixel/behaviorally unchanged (still a checkbox) — this
-      spec's changes are scoped to `kind === 'inst'` only.
-- [ ] `tests/test_multi_session_frontend.js` passes; `tests/
-      test_singleton_toggle_frontend.js`, `tests/test_team_frontend.js`,
-      `tests/test_deploy_frontend.js`, `tests/test_smoke_check_frontend.js`
-      all continue to pass unmodified (or with only the confirmed-necessary
-      adjustments noted in "Affected areas").
-- [ ] `POST /instance/<name>/on` and `/off` no longer exist (return 404,
-      or are simply absent from the route table) and nothing in the
-      frontend references them; `/status`'s per-project JSON no longer
-      includes `on`/`engine`/`url` (only `sessions`, `desc`, `code_on`,
-      `code_url`, `deploy`, `gitea_sync`, `team`).
+- [ ] Given a project with a running team, when navigating to `/team/
+      <project-name>`, then the status strip, escalation panel (if
+      `waiting_on_you`), interject box, add-member control, and event feed
+      for that project render on the dedicated page — same data/behavior
+      as previously rendered inline.
+- [ ] Given any project row on `/`, when it renders, then it shows only a
+      compact team-status badge and an "Open team chat" link — no task
+      textarea, composition picker, event feed, escalation panel, or
+      interject box inline, for every team status (idle/running/blocked/
+      finished/error).
+- [ ] Given a project with no team ever started (`status === 'idle'`),
+      when its "Open team chat" link is clicked, then `/team/<project-
+      name>` renders the full idle launcher (task textarea + composition
+      picker + Start button) — not a blank or read-only page.
+- [ ] Given `/team/<a-real-project-name>` loaded unauthenticated, then the
+      same login-overlay behavior as `/` occurs, no team data visible
+      before authentication.
+- [ ] Given `/team/<a-nonexistent-project-name>` loaded while
+      authenticated, then a clear "unknown project" message with a link
+      back to `/` is shown, no JS error.
+- [ ] Given the interject box, escalation panel, and add-member control on
+      the dedicated page, when used, then they call the exact same
+      existing routes (`/team/interject`, `/team/resolve`/`/team/board-
+      resolve`, `/team/add-member`) — verified via network-call
+      assertions in the frontend test, not just visual inspection.
+- [ ] `tests/test_team_frontend.js` (existing + new coverage) and `tests/
+      test_team_routes.py` (existing + the new `/team/<name>` shell
+      assertion) all pass.
 
 ## Open questions
-- **Smoke-check's per-session scoping**: default assumption (stated in
-  Non-goals) is to leave it project-level, targeting whatever part 1's
-  "newest session" resolver picks. If ux-designer's pass surfaces an easy,
-  low-risk way to let the user pick which session to smoke-check instead,
-  that's a reasonable addition to fold in here — but not a requirement,
-  and not to be added speculatively if it complicates the row layout.
-- **Visual treatment of the session list** (badges vs. plain text, compact
-  vs. card-style, whether "Stop" needs a confirm step) — left entirely to
-  `docs/design.md`.
+- **Visual treatment** of the full-page layout (header, back-link
+  placement, overall spacing, degree to which it echoes the dashboard's
+  existing dark theme) — explicitly left to ux-designer's `docs/design.md`
+  pass, not decided here.
+- **Dashboard badge "last event" preview** (chat-app-style conversation
+  preview text) — not requested by Leo; assumption is **not building this
+  now**, flagged so it can be explicitly requested later rather than
+  silently added as scope creep.
+- **Exact route shape**: assuming `/team/<project>` verbatim (matches
+  Leo's own example URL in the request, `dev.tailbe22cd.ts.net/team/
+  <project>`) — no query params, one path segment. Low-stakes assumption;
+  a one-line change if a different shape (e.g. `/team/<project>/chat`) is
+  actually wanted.
 
 ## Risk / rollback notes
-Frontend-only changes plus deletion of already-superseded back-compat
-backend code from part 1 — no data model changes beyond what part 1
-already made permanent (in-memory, lost-on-restart, unchanged). Rollback
-is a plain revert of the commit; part 1's backend remains intact and
-correct on its own even if this part is rolled back (the back-compat
-shim simply keeps serving the old checkbox UI, exactly as it did the
-moment part 1 shipped).
+Additive route + extraction/reuse of existing render functions into a
+shared body callable from two containers — no backend route/data changes,
+no `app/teams.py` changes. The main regression risk is accidentally
+breaking `teamRow()`'s dashboard-embedded behavior while extracting the
+shared body; mitigated by running the existing `tests/
+test_team_frontend.js` suite (should pass unmodified if the extraction
+preserves each sub-renderer's own contract) plus the new page-specific
+coverage above. Rollback is a plain revert of the commit.

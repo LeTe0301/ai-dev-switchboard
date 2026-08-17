@@ -3027,5 +3027,67 @@ CONFIG_DIR={config_dir}
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ─── GET /team/<project> -- dedicated team chat page (Taiga #10) ───────────
+class TeamPageRouteTests(_RealHTTPTeamTestCase):
+    """docs/spec.md "Proposed approach" §1 -- one new do_GET route branch
+    serving the exact same unauthenticated static shell as "/". No project-
+    name validation server-side (everything is resolved client-side against
+    /status after login, same as "/" itself) -- this only asserts the HTTP-
+    level contract, not any client-side rendering (covered by tests/
+    test_team_frontend.js instead)."""
+
+    def _raw_get(self, path):
+        req = urllib.request.Request(f"{self.base}{path}")
+        try:
+            resp = urllib.request.urlopen(req)
+            return resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def test_team_page_returns_the_same_static_shell_as_root_unauthenticated(self):
+        root_status, root_body = self._raw_get("/")
+        team_status, team_body = self._raw_get("/team/" + self._project_name())
+        self.assertEqual(root_status, 200)
+        self.assertEqual(team_status, 200)
+        self.assertEqual(root_body, team_body,
+            "GET /team/<project> must serve byte-identical output to GET / -- "
+            "same static, session-free shell (docs/spec.md \"no new auth code path\")")
+
+    def test_team_page_shell_matches_render_page_directly(self):
+        status, body = self._raw_get("/team/" + self._project_name())
+        self.assertEqual(status, 200)
+        self.assertEqual(body.decode(), appmod.render_page())
+
+    def test_team_page_works_for_a_nonexistent_project_name_too(self):
+        # No server-side existence check at this layer at all -- "unknown
+        # project" is resolved client-side against /status (docs/spec.md
+        # "Edge cases"). A typo'd/deleted project name still gets the shell.
+        status, _ = self._raw_get("/team/this-project-does-not-exist")
+        self.assertEqual(status, 200)
+
+    def test_team_page_accepts_an_optional_trailing_slash(self):
+        status, _ = self._raw_get("/team/" + self._project_name() + "/")
+        self.assertEqual(status, 200)
+
+    def test_team_page_handles_a_url_encoded_project_name(self):
+        status, _ = self._raw_get("/team/" + urllib.parse.quote("a project/weird name", safe=""))
+        self.assertEqual(status, 200)
+
+    def test_paths_that_merely_resemble_the_team_route_do_not_match(self):
+        # No trailing name segment at all -- must fall through to the
+        # normal authenticated-route handling (401 unauthenticated), not be
+        # mistaken for the static shell.
+        for path in ("/team", "/team/", "/teamfoo"):
+            status, body = self._raw_get(path)
+            self.assertEqual(status, 401, f"{path} must not match the /team/<name> shell route")
+            self.assertEqual(json.loads(body), {"error": "not authenticated"})
+
+    def _project_name(self):
+        # No real project directory needed -- the route never touches the
+        # filesystem or validates the name server-side (docs/spec.md
+        # "Proposed approach" §1); a plain name string is enough.
+        return _PROJ
+
+
 if __name__ == "__main__":
     unittest.main()

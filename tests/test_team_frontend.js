@@ -53,11 +53,20 @@ const SCRIPT_SRC = extractRenderedScript();
 // extraction, not a hand-copied snapshot) ──────────────────────────────────
 
 function makeElementStub(id) {
+  // classList (Taiga #10) -- a real, stateful Set-backed stub, not the
+  // no-op every sibling test file's own makeElementStub() still uses (this
+  // file is the first to actually assert .contains() -- #team-page/#rows'
+  // own show/hide toggling via .active/.hidden-for-team-page). Scoped to
+  // this file only, per docs/spec.md's own minimal-diff instinct -- the
+  // other four test files' identical no-op stub is untouched.
+  const classes = new Set();
   return {
     id,
     className: '',
     classList: {
-      add() {}, remove() {}, contains() { return false; },
+      add(...cls) { cls.forEach((c) => classes.add(c)); },
+      remove(...cls) { cls.forEach((c) => classes.delete(c)); },
+      contains(c) { return classes.has(c); },
     },
     style: {},
     value: '',
@@ -95,7 +104,13 @@ function makeDocumentStub(elements) {
   };
 }
 
-function createCase() {
+// locationPathname (Taiga #10, docs/spec.md "Proposed approach" §2) --
+// defaults to '/' so every pre-existing caller (which never passes this)
+// keeps triggering the script's own unawaited bootstrap refresh() call at
+// load time, unchanged. Passing e.g. '/team/proj' instead makes the script's
+// own top-level router branch fire renderTeamPage('proj') at load time
+// instead -- used by the router-dispatch tests further down.
+function createCase(locationPathname) {
   const elements = new Map();
   const pendingFetches = []; // {url, opts, resolve, reject}
   const confirmCalls = [];
@@ -123,6 +138,10 @@ function createCase() {
     document: makeDocumentStub(elements),
     fetch: fetchStub,
     confirm(msg) { confirmCalls.push(msg); return confirmReturn; },
+    // Dedicated team chat page (Taiga #10) -- a plain mutable stub, not a
+    // real browser Location: goToDashboard()'s onclick sets .href directly,
+    // assertable the same way c.sandbox.location.href is read below.
+    location: { pathname: locationPathname || '/', href: '' },
     setTimeout() { return 0; },
     setInterval() { return 0; },
     console,
@@ -164,8 +183,11 @@ function createCase() {
   // Scopes assertions to exactly one project's own <div class="row">...
   // </div> slice, anchored on its <div class="label">NAME</div> — same
   // slicing technique tests/test_deploy_frontend.js's own instanceRowHtml()
-  // uses.
-  function instanceRowHtml(name) {
+  // uses. Post-Taiga #10, this is the *dashboard's* own compact team
+  // summary (status badge + "Open team chat" link) -- used by the new
+  // dashboard-summary tests further down, NOT by the pre-existing full-body
+  // team tests (see instanceRowHtml() below).
+  function dashboardRowHtml(name) {
     const html = rowsHtml();
     const marker = '<div class="label">' + name + '</div>';
     const markerIdx = html.indexOf(marker);
@@ -175,9 +197,50 @@ function createCase() {
     return html.slice(rowStart === -1 ? 0 : rowStart, rowEnd === -1 ? html.length : rowEnd);
   }
 
+  // Taiga #10 (docs/spec.md "Proposed approach" §3): the full team surface
+  // this file's own pre-existing tests exercise no longer lives in the
+  // dashboard's #rows at all -- it moved to renderTeamPageBody(), mounted
+  // from the dedicated /team/<project> page. Rather than touch every one of
+  // those pre-existing test bodies, this helper is retargeted to call
+  // renderTeamPageBody() directly (the same function renderTeamPage() itself
+  // calls, so this is still exercising the real, shared implementation, not
+  // a parallel one) -- every existing `c.instanceRowHtml('proj')` call site
+  // keeps working, and keeps proving the same thing it always did, just
+  // against the sub-renderers' new home. TEAM_BY_NAME is populated by every
+  // refresh()/toggleTeamPicker() cycle these tests already drive, so it's
+  // always up to date here (same vm-lexical-scope reasoning setTeamTaskText
+  // above already documents).
+  function instanceRowHtml(name) {
+    return vm.runInContext(
+      `renderTeamPageBody(${JSON.stringify(name)}, TEAM_BY_NAME[${JSON.stringify(name)}])`, sandbox);
+  }
+  // Old teamRow(), called from refresh()'s per-project loop, rendered EVERY
+  // project's full body on every poll -- which is what fired renderTeamBranches()'s
+  // own one-time fetchTeamBranches() side effect (idle or not) and, for a
+  // non-idle project, seeded teamFeedOpen[name] and let refresh() immediately
+  // fire pollTeamFeed() for it on the same tick. Both of those now live in
+  // renderTeamPage() instead (refresh() itself no longer renders any of this
+  // -- the dashboard doesn't show it anymore, Taiga #10). simulateTeamPageRender()
+  // replicates that same adjacency in the test harness -- called once per
+  // simulated "poll tick" (i.e. once per c.call('refresh') this file's own
+  // helpers already perform) -- so every pre-existing feed/escalation/
+  // branches test keeps observing the same behavior it always did, without
+  // needing its own body touched.
+  function simulateTeamPageRender(instances) {
+    for (const inst of (instances || [])) {
+      vm.runInContext(
+        `renderTeamPageBody(${JSON.stringify(inst.name)}, TEAM_BY_NAME[${JSON.stringify(inst.name)}])`, sandbox);
+      const team = inst.team;
+      if (team && team.status !== 'idle' &&
+          vm.runInContext(`!!teamFeedOpen[${JSON.stringify(inst.name)}]`, sandbox)) {
+        vm.runInContext(`pollTeamFeed(${JSON.stringify(inst.name)})`, sandbox);
+      }
+    }
+  }
+
   return {
-    sandbox, elements, resolveFetch, call, rowsHtml, instanceRowHtml, setTeamTaskText,
-    setTeamInterjectText,
+    sandbox, elements, resolveFetch, call, rowsHtml, instanceRowHtml, dashboardRowHtml, simulateTeamPageRender,
+    setTeamTaskText, setTeamInterjectText,
     pendingFetches,
     confirmCalls,
     setConfirmReturn(v) { confirmReturn = v; },
@@ -228,6 +291,13 @@ async function bootstrapCase(instances, roster) {
   const p = c.call('refresh');
   c.resolveFetch((f) => f.url === '/status', 200, statusWith(instances, roster));
   await p;
+  // Taiga #10: refresh() itself no longer renders any per-project team
+  // detail (see simulateTeamPageRender()'s own doc comment above) -- fire
+  // its replacement here so bootstrapCase()'s own callers (including the
+  // "Past team branches panel" tests that call this directly, expecting a
+  // pending /team/branches fetch afterward) see the same side effects a
+  // real dashboard-then-team-page load would have produced.
+  c.simulateTeamPageRender(instances);
   return c;
 }
 
@@ -973,6 +1043,7 @@ async function rerenderRow(c, instances, roster) {
   await waitForFetch(c, (f) => f.url === '/status');
   c.resolveFetch((f) => f.url === '/status', 200, statusWith(instances, roster));
   await p;
+  c.simulateTeamPageRender(instances);  // see its own doc comment -- Taiga #10
   await tick();
 }
 // Several action helpers (setTeamFeedFilter()/onEscalationOptionChange()/
@@ -988,6 +1059,7 @@ async function drainTriggeredRefresh(c, instances, roster) {
   await waitForFetch(c, (f) => f.url === '/status');
   c.resolveFetch((f) => f.url === '/status', 200, statusWith(instances, roster));
   await tick();
+  c.simulateTeamPageRender(instances);  // see its own doc comment -- Taiga #10
   await tick();
 }
 
@@ -2337,6 +2409,297 @@ test('a running team row also renders the past branches panel', async () => {
   const html = c.instanceRowHtml('proj');
   assert.ok(html.includes('class="team-branches"'),
     'expected the branches panel to render for a running team too, got: ' + html);
+});
+
+// ─── Dedicated team chat page (Taiga #10, docs/spec.md / docs/design.md) ───
+// Dashboard's compact teamRow() summary -- status badge + "Open team chat"
+// link, no task textarea/picker/feed/escalation/interject inline, for every
+// team status.
+
+test('dashboard row: idle (no team yet) shows an Idle badge and an "Open team chat" link, no launcher', async () => {
+  const c = await setupCase([inst('proj', null)]);
+  const html = c.dashboardRowHtml('proj');
+  assert.ok(html.includes('class="team-status status-idle"'), 'expected an idle status badge, got: ' + html);
+  assert.ok(/>Idle</.test(html));
+  assert.ok(html.includes('href="/team/proj"'), 'expected a link to the dedicated page, got: ' + html);
+  assert.ok(/Open team chat/.test(html));
+  assert.ok(!html.includes('team-textarea'), 'no inline task textarea on the dashboard anymore');
+  assert.ok(!html.includes('doTeamStart'), 'no inline Start button on the dashboard anymore');
+});
+
+test('dashboard row: idle (team.status === "idle") renders the same compact badge, not the old launcher', async () => {
+  const c = await setupCase([inst('proj', { status: 'idle', run_id: null })]);
+  const html = c.dashboardRowHtml('proj');
+  assert.ok(html.includes('class="team-status status-idle"'));
+  assert.ok(!html.includes('team-textarea'));
+  assert.ok(!html.includes('team-configure-row'), 'no inline composition picker toggle on the dashboard anymore');
+});
+
+test('dashboard row: running shows a Running badge and the link, no status strip/feed/interject inline', async () => {
+  const c = await setupCase([inst('proj', { status: 'running', run_id: 'run-1' })]);
+  const html = c.dashboardRowHtml('proj');
+  assert.ok(html.includes('class="team-status status-running"'));
+  assert.ok(/>Running</.test(html));
+  assert.ok(html.includes('href="/team/proj"'));
+  assert.ok(!html.includes('team-status-strip'), 'the full status strip must not render on the dashboard anymore');
+  assert.ok(!html.includes('team-feed'), 'no inline event feed on the dashboard anymore');
+  assert.ok(!html.includes('team-interject'), 'no inline interject compose box on the dashboard anymore');
+  assert.ok(!html.includes('doTeamStop'), 'no inline Stop button on the dashboard anymore');
+});
+
+test('dashboard row: blocked (waiting_on_you) shows a Blocked badge, no escalation panel inline', async () => {
+  const c = await setupCase([inst('proj', { status: 'blocked', run_id: 'run-1', waiting_on_you: true })]);
+  const html = c.dashboardRowHtml('proj');
+  assert.ok(html.includes('class="team-status status-blocked"'));
+  assert.ok(/>Blocked</.test(html));
+  assert.ok(!html.includes('team-escalation'), 'no inline escalation panel on the dashboard anymore -- must click through');
+});
+
+test('dashboard row: finished shows a Finished badge, no summary inline', async () => {
+  const c = await setupCase([inst('proj', { status: 'finished', run_id: 'run-1', summary: 'All done.' })]);
+  const html = c.dashboardRowHtml('proj');
+  assert.ok(html.includes('class="team-status status-finished"'));
+  assert.ok(/>Finished</.test(html));
+  assert.ok(!html.includes('All done.'), 'the finished-run summary text must not render on the dashboard anymore');
+});
+
+test('dashboard row: error shows an Error badge', async () => {
+  const c = await setupCase([inst('proj', { status: 'error', run_id: 'run-1' })]);
+  const html = c.dashboardRowHtml('proj');
+  assert.ok(html.includes('class="team-status status-error"'));
+  assert.ok(/>Error</.test(html));
+});
+
+test('dashboard row: the "Open team chat" link URL-encodes the project name', async () => {
+  const c = await setupCase([inst('a project/weird name', { status: 'running', run_id: 'run-1' })]);
+  const html = c.dashboardRowHtml('a project/weird name');
+  assert.ok(html.includes('href="/team/' + encodeURIComponent('a project/weird name') + '"'),
+    'expected the href to reuse encodeURIComponent, got: ' + html);
+});
+
+// ─── renderTeamPage() -- the dedicated page's own entry point ─────────────
+
+// renderTeamPage() always issues its OWN fresh fetch('/status') (it never
+// reuses whatever setupCase()'s own bootstrap already resolved) -- every
+// test below must resolve that second, independent fetch itself, exactly
+// like doTeamStart()/doTeamAddMember()/etc.'s own single-POST tests already
+// resolve their own dispatched fetch.
+async function callRenderTeamPage(c, projectName, instances, roster) {
+  const p = c.call('renderTeamPage', projectName);
+  c.resolveFetch((f) => f.url === '/status', 200, statusWith(instances, roster));
+  await p;
+}
+
+test('renderTeamPage(): a found project renders the full surface via the SAME shared sub-renderer functions ' +
+  'the dashboard used to call directly (no forked duplicate)', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-1' })];
+  const c = await setupCase(instances);
+  // Spy on renderTeamStatusStrip by replacing it inside the sandbox's own
+  // lexical scope (same vm.runInContext technique setTeamTaskText() already
+  // establishes above) -- if renderTeamPage() still produces the strip's
+  // real output, it can only be because it called through this same
+  // (now-wrapped) function, not a parallel hand-copied implementation.
+  vm.runInContext(
+    'var __origStrip = renderTeamStatusStrip; var __stripCalls = 0; ' +
+    'renderTeamStatusStrip = function(t) { __stripCalls++; return __origStrip(t); };',
+    c.sandbox);
+  await callRenderTeamPage(c, 'proj', instances);
+  const calls = vm.runInContext('__stripCalls', c.sandbox);
+  assert.strictEqual(calls, 1, 'expected renderTeamPage() to call the real, shared renderTeamStatusStrip()');
+  const pageHtml = c.sandbox.document.getElementById('team-page').innerHTML;
+  assert.ok(pageHtml.includes('team-status-strip'), 'expected the status strip to actually be mounted, got: ' + pageHtml);
+  assert.ok(pageHtml.includes('status-running'));
+});
+
+test('renderTeamPage(): mounts the header, hides dashboard chrome, and shows #team-page', async () => {
+  const instances = [inst('proj', { status: 'running', run_id: 'run-1' })];
+  const c = await setupCase(instances);
+  await callRenderTeamPage(c, 'proj', instances);
+  const pageHtml = c.sandbox.document.getElementById('team-page').innerHTML;
+  assert.ok(pageHtml.includes('team-page-header'), 'expected the header, got: ' + pageHtml);
+  assert.ok(/ai-dev-switchboard/.test(pageHtml) && /proj/.test(pageHtml));
+  assert.ok(c.sandbox.document.getElementById('rows').classList.contains('hidden-for-team-page'));
+  assert.ok(c.sandbox.document.getElementById('team-page').classList.contains('active'));
+  assert.strictEqual(c.sandbox.document.getElementById('page-title').style.display, 'none');
+  assert.strictEqual(c.sandbox.document.getElementById('new-project-row').style.display, 'none');
+});
+
+test('renderTeamPage(): idle project renders the full idle launcher (textarea + Start), not blank/read-only', async () => {
+  const instances = [inst('proj', null)];
+  const c = await setupCase(instances);
+  await callRenderTeamPage(c, 'proj', instances);
+  const pageHtml = c.sandbox.document.getElementById('team-page').innerHTML;
+  assert.ok(pageHtml.includes('class="team-textarea"'), 'expected the task textarea, got: ' + pageHtml);
+  assert.ok(pageHtml.includes("doTeamStart('proj')"));
+  assert.ok(pageHtml.includes('>Start team<'));
+});
+
+test('renderTeamPage(): blocked + waiting_on_you renders the escalation panel', async () => {
+  const instances = [inst('proj', { status: 'blocked', run_id: 'run-1', waiting_on_you: true })];
+  const c = await setupCase(instances);
+  await callRenderTeamPage(c, 'proj', instances);
+  const pageHtml = c.sandbox.document.getElementById('team-page').innerHTML;
+  assert.ok(pageHtml.includes('team-escalation'), 'expected the escalation panel to render, got: ' + pageHtml);
+});
+
+test('renderTeamPage(): unknown project renders a clear "Unknown project" message with a link back, no exception', async () => {
+  const instances = [inst('other-proj', { status: 'running', run_id: 'run-1' })];
+  const c = await setupCase(instances);
+  await callRenderTeamPage(c, 'nonexistent-proj', instances);
+  const pageHtml = c.sandbox.document.getElementById('team-page').innerHTML;
+  assert.ok(pageHtml.includes('team-page-not-found'), 'expected the not-found panel, got: ' + pageHtml);
+  assert.ok(/Unknown project/.test(pageHtml) && /nonexistent-proj/.test(pageHtml));
+  assert.ok(pageHtml.includes('goToDashboard()'), 'expected a way back to the dashboard, got: ' + pageHtml);
+  assert.ok(c.sandbox.document.getElementById('rows').classList.contains('hidden-for-team-page'));
+});
+
+test('renderTeamPage(): a 401 from /status shows the login overlay, same as refresh()', async () => {
+  const c = createCase();
+  // Drain the auto-bootstrap refresh() call this default ('/') location
+  // triggers at load, same as bootstrapCase() does for every other test.
+  c.resolveFetch((f) => f.url === '/status', 200, statusWith([]));
+  await tick();
+  await tick();
+  const p = c.call('renderTeamPage', 'proj');
+  c.resolveFetch((f) => f.url === '/status', 401, { error: 'not authenticated' });
+  await p;
+  assert.ok(c.sandbox.document.getElementById('overlay').classList.contains('show'),
+    'expected the login overlay to be shown on a 401, same as unauthenticated access to "/"');
+});
+
+// Regression test for the /code-review finding on PR #4 (Taiga #10): the
+// 401 branch above only called showOverlay() and returned, so a bookmarked
+// /team/<project> URL loaded with no valid session left the dashboard's
+// project-creation chrome (page title, "+ New project" row, upload/clone
+// buttons) visible behind the translucent overlay -- docs/spec.md §5 says
+// only the login/TOTP overlays are shared between the two contexts, so the
+// dashboard chrome must be hidden regardless of auth state.
+test('renderTeamPage(): a 401 from /status also hides the dashboard chrome, not just the overlay', async () => {
+  const c = createCase();
+  // Drain the auto-bootstrap refresh() call this default ('/') location
+  // triggers at load, same as the previous 401 test does.
+  c.resolveFetch((f) => f.url === '/status', 200, statusWith([]));
+  await tick();
+  await tick();
+  const p = c.call('renderTeamPage', 'proj');
+  c.resolveFetch((f) => f.url === '/status', 401, { error: 'not authenticated' });
+  await p;
+  assert.ok(c.sandbox.document.getElementById('overlay').classList.contains('show'),
+    'expected the login overlay to be shown on a 401');
+  assert.ok(c.sandbox.document.getElementById('rows').classList.contains('hidden-for-team-page'),
+    'expected #rows to be hidden on a 401, same as the found-project and not-found paths');
+  assert.strictEqual(c.sandbox.document.getElementById('page-title').style.display, 'none',
+    'expected the dashboard page title to be hidden on a 401');
+  assert.strictEqual(c.sandbox.document.getElementById('new-project-row').style.display, 'none',
+    'expected the "+ New project" row to be hidden on a 401');
+  assert.strictEqual(c.sandbox.document.getElementById('upload-folder-btn').style.display, 'none',
+    'expected the "Upload folder/.zip" button to be hidden on a 401');
+  assert.strictEqual(c.sandbox.document.getElementById('clone-toggle-btn').style.display, 'none',
+    'expected the "Clone from URL" button to be hidden on a 401');
+});
+
+test('the back-link navigates to the dashboard via a real navigation, not an in-page switch', async () => {
+  const c = await setupCase([inst('proj', { status: 'running', run_id: 'run-1' })]);
+  c.call('goToDashboard');
+  assert.strictEqual(c.sandbox.location.href, '/');
+});
+
+// ─── Client-side router: dispatches /team/<project> to renderTeamPage() ───
+
+test('router: location.pathname matching /team/<name> calls renderTeamPage(), not refresh(), at load', async () => {
+  const c = createCase('/team/proj');
+  // Whichever function the router picked, it hits the same /status endpoint
+  // either way -- draining it and inspecting which container got populated
+  // is what actually distinguishes renderTeamPage() from refresh() here.
+  c.resolveFetch((f) => f.url === '/status', 200, statusWith([inst('proj', { status: 'running', run_id: 'run-1' })]));
+  await tick();
+  await tick();
+  const pageHtml = c.sandbox.document.getElementById('team-page').innerHTML;
+  assert.ok(pageHtml.includes('team-status-strip'), 'expected renderTeamPage() to have populated #team-page, got: ' + pageHtml);
+  assert.strictEqual(c.sandbox.document.getElementById('rows').innerHTML, '',
+    'refresh() must not also have run and populated #rows');
+});
+
+test('router: a URL-encoded project name in the path is decoded before matching /status instances', async () => {
+  const c = createCase('/team/' + encodeURIComponent('a project/weird name'));
+  c.resolveFetch((f) => f.url === '/status', 200,
+    statusWith([inst('a project/weird name', { status: 'running', run_id: 'run-1' })]));
+  await tick();
+  await tick();
+  const pageHtml = c.sandbox.document.getElementById('team-page').innerHTML;
+  assert.ok(!pageHtml.includes('team-page-not-found'), 'expected the decoded name to match the found instance, got: ' + pageHtml);
+  assert.ok(pageHtml.includes('team-status-strip'));
+});
+
+test('router: location.pathname not matching /team/... falls back to the normal dashboard refresh() poll', async () => {
+  const c = createCase('/');
+  c.resolveFetch((f) => f.url === '/status', 200, statusWith([inst('proj', { status: 'running', run_id: 'run-1' })]));
+  await tick();
+  await tick();
+  assert.ok(c.sandbox.document.getElementById('rows').innerHTML.length > 0,
+    'expected refresh() to have populated #rows');
+  assert.strictEqual(c.sandbox.document.getElementById('team-page').innerHTML, '',
+    'renderTeamPage() must not also have run and populated #team-page');
+});
+
+// refreshCurrentView() (Taiga #10) -- action handlers that used to just call
+// refresh() to reflect their own state change immediately (composition
+// picker, escalation option, feed toggle/filter, ...) must re-render
+// whichever view is actually on screen. On the team page, refresh() alone
+// would leave #team-page stale until the next 4s tick (it only ever
+// touches the hidden #rows) -- these two regression tests lock in the fix.
+test('refreshCurrentView(): toggling the composition picker on the team page re-renders #team-page, not #rows', async () => {
+  const roster = [rosterEntry({ name: 'lead2', tier: 2 }), rosterEntry({ name: 'helper', tier: 2 })];
+  const comp = { lead: { kind: 'engine', name: 'lead2' }, members: ['helper'] };
+  const instances = [inst('proj', { status: 'idle', run_id: null, composition: comp })];
+  const c = createCase('/team/proj');
+  c.resolveFetch((f) => f.url === '/status', 200, statusWith(instances, roster));
+  await tick();
+  await tick();
+  assert.ok(!c.sandbox.document.getElementById('team-page').innerHTML.includes('id="team-lead-proj"'),
+    'picker should not be open yet');
+
+  c.call('toggleTeamPicker', 'proj');
+  await waitForFetch(c, (f) => f.url === '/projects/proj/team/grounding');
+  c.resolveFetch((f) => f.url === '/projects/proj/team/grounding', 200, { files: [], skipped: [] });
+  // refreshCurrentView() -> renderTeamPage() issues its OWN fresh /status
+  // fetch (same as every other renderTeamPage() test in this file).
+  await waitForFetch(c, (f) => f.url === '/status');
+  c.resolveFetch((f) => f.url === '/status', 200, statusWith(instances, roster));
+  await tick();
+  await tick();
+  await tick();
+
+  const pageHtml = c.sandbox.document.getElementById('team-page').innerHTML;
+  assert.ok(pageHtml.includes('id="team-lead-proj"'),
+    'expected the picker to now be rendered into #team-page, got: ' + pageHtml);
+  assert.strictEqual(c.sandbox.document.getElementById('rows').innerHTML, '',
+    'refresh() must never have run -- #rows should stay untouched on the team page');
+});
+
+test('refreshCurrentView(): logging in from the team page\'s shared overlay lands on the team page, not the dashboard', async () => {
+  const c = createCase('/team/proj');
+  // Drain the router's own initial (unauthenticated) renderTeamPage() call.
+  c.resolveFetch((f) => f.url === '/status', 401, { error: 'not authenticated' });
+  await tick();
+  await tick();
+  assert.ok(c.sandbox.document.getElementById('overlay').classList.contains('show'));
+
+  c.sandbox.document.getElementById('login-user').value = 'testuser';
+  c.sandbox.document.getElementById('login-pass').value = 'testpass';
+  const p = c.call('login');
+  await waitForFetch(c, (f) => f.url === '/login');
+  c.resolveFetch((f) => f.url === '/login', 200, {});
+  await p;
+  await waitForFetch(c, (f) => f.url === '/status');
+  c.resolveFetch((f) => f.url === '/status', 200,
+    statusWith([inst('proj', { status: 'running', run_id: 'run-1' })]));
+  await tick();
+  await tick();
+
+  assert.ok(c.sandbox.document.getElementById('team-page').innerHTML.includes('team-status-strip'),
+    'expected login() to land back on the team page via refreshCurrentView(), not the dashboard');
+  assert.strictEqual(c.sandbox.document.getElementById('rows').innerHTML, '');
 });
 
 // ─── run ────────────────────────────────────────────────────────────────

@@ -167,6 +167,12 @@ function createCase() {
     // to keep the tests deterministic and instant.
     setTimeout() { return 0; },
     setInterval() { return 0; },
+    // Dedicated team chat page (Taiga #10) added an unconditional top-level
+    // `location.pathname.match(...)` router branch at the bottom of the
+    // rendered <script> — every file that extracts and runs that script
+    // (this one included) needs a location stub or script load itself
+    // throws. Shape matches tests/test_team_frontend.js's own stub.
+    location: { pathname: '/', href: '' },
     console,
   };
   vm.createContext(sandbox);
