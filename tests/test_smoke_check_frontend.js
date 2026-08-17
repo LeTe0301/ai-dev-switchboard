@@ -214,7 +214,7 @@ function test(name, fn) { tests.push({ name, fn }); }
 
 test('project with a captured url renders a Smoke check button + input + empty message slot', async () => {
   const c = await setupCase([
-    { name: 'proj', on: true, url: 'http://127.0.0.1:3000/', engine: 'claude', desc: '',
+    { name: 'proj', sessions: [{ session_id: 'sess1', engine: 'claude', url: 'http://127.0.0.1:3000/' }], desc: '',
       code_on: false, code_url: null },
   ]);
   const html = c.instanceRowHtml('proj');
@@ -228,7 +228,7 @@ test('project with a captured url renders a Smoke check button + input + empty m
 // what "Smoke check" does, since the reported context is touch/mobile.
 test('the Smoke check row includes a static, always-visible helper line explaining what it does', async () => {
   const c = await setupCase([
-    { name: 'proj', on: true, url: 'http://127.0.0.1:3000/', engine: 'claude', desc: '',
+    { name: 'proj', sessions: [{ session_id: 'sess1', engine: 'claude', url: 'http://127.0.0.1:3000/' }], desc: '',
       code_on: false, code_url: null },
   ]);
   const html = c.instanceRowHtml('proj');
@@ -239,7 +239,7 @@ test('the Smoke check row includes a static, always-visible helper line explaini
 
 test('project without a captured url renders no Smoke check button at all', async () => {
   const c = await setupCase([
-    { name: 'plain', on: false, url: null, engine: null, desc: '', code_on: false, code_url: null },
+    { name: 'plain', sessions: [], desc: '', code_on: false, code_url: null },
   ]);
   const html = c.instanceRowHtml('plain');
   assert.ok(!html.includes('smoke-btn'), 'must not render a Smoke check button, got: ' + html);
@@ -251,7 +251,7 @@ test('project without a captured url renders no Smoke check button at all', asyn
 
 test('clicking Smoke check dispatches immediately with no confirm() dialog', async () => {
   const c = await setupCase([
-    { name: 'proj', on: true, url: 'http://127.0.0.1:3000/', engine: 'claude', desc: '',
+    { name: 'proj', sessions: [{ session_id: 'sess1', engine: 'claude', url: 'http://127.0.0.1:3000/' }], desc: '',
       code_on: false, code_url: null },
   ]);
   const p = c.call('doSmokeCheck', 'proj');
@@ -269,13 +269,13 @@ test('clicking Smoke check dispatches immediately with no confirm() dialog', asy
 
 test('typed expect_contains text survives a refresh() re-render', async () => {
   const c = await setupCase([
-    { name: 'proj', on: true, url: 'http://127.0.0.1:3000/', engine: 'claude', desc: '',
+    { name: 'proj', sessions: [{ session_id: 'sess1', engine: 'claude', url: 'http://127.0.0.1:3000/' }], desc: '',
       code_on: false, code_url: null },
   ]);
   c.setSmokeCheckExpect('proj', 'Welcome');
   const p = c.call('refresh');
   c.resolveFetch((f) => f.url === '/status', 200, statusWith([
-    { name: 'proj', on: true, url: 'http://127.0.0.1:3000/', engine: 'claude', desc: '',
+    { name: 'proj', sessions: [{ session_id: 'sess1', engine: 'claude', url: 'http://127.0.0.1:3000/' }], desc: '',
       code_on: false, code_url: null },
   ]));
   await p;
@@ -287,7 +287,7 @@ test('typed expect_contains text survives a refresh() re-render', async () => {
 
 test('a successful check with no expect_contains shows status + timing, no content verdict', async () => {
   const c = await setupCase([
-    { name: 'proj', on: true, url: 'http://127.0.0.1:3000/', engine: 'claude', desc: '',
+    { name: 'proj', sessions: [{ session_id: 'sess1', engine: 'claude', url: 'http://127.0.0.1:3000/' }], desc: '',
       code_on: false, code_url: null },
   ]);
   const p = c.call('doSmokeCheck', 'proj');
@@ -304,7 +304,7 @@ test('a successful check with no expect_contains shows status + timing, no conte
 
 test('a successful check where the expected substring IS present shows a positive content match', async () => {
   const c = await setupCase([
-    { name: 'proj', on: true, url: 'http://127.0.0.1:3000/', engine: 'claude', desc: '',
+    { name: 'proj', sessions: [{ session_id: 'sess1', engine: 'claude', url: 'http://127.0.0.1:3000/' }], desc: '',
       code_on: false, code_url: null },
   ]);
   const p = c.call('doSmokeCheck', 'proj');
@@ -320,7 +320,7 @@ test('a successful check where the expected substring IS present shows a positiv
 
 test('a successful check where the expected substring is NOT present still shows the real status/timing', async () => {
   const c = await setupCase([
-    { name: 'proj', on: true, url: 'http://127.0.0.1:3000/', engine: 'claude', desc: '',
+    { name: 'proj', sessions: [{ session_id: 'sess1', engine: 'claude', url: 'http://127.0.0.1:3000/' }], desc: '',
       code_on: false, code_url: null },
   ]);
   const p = c.call('doSmokeCheck', 'proj');
@@ -339,7 +339,7 @@ test('a successful check where the expected substring is NOT present still shows
 
 test('an unreachable target (connection refused) shows the error message, never an unhandled failure', async () => {
   const c = await setupCase([
-    { name: 'proj', on: true, url: 'http://127.0.0.1:3000/', engine: 'claude', desc: '',
+    { name: 'proj', sessions: [{ session_id: 'sess1', engine: 'claude', url: 'http://127.0.0.1:3000/' }], desc: '',
       code_on: false, code_url: null },
   ]);
   const p = c.call('doSmokeCheck', 'proj');
@@ -355,7 +355,7 @@ test('an unreachable target (connection refused) shows the error message, never 
 
 test('a second dispatch already in flight (409) shows the in-progress error message', async () => {
   const c = await setupCase([
-    { name: 'proj', on: true, url: 'http://127.0.0.1:3000/', engine: 'claude', desc: '',
+    { name: 'proj', sessions: [{ session_id: 'sess1', engine: 'claude', url: 'http://127.0.0.1:3000/' }], desc: '',
       code_on: false, code_url: null },
   ]);
   const p = c.call('doSmokeCheck', 'proj');
@@ -373,7 +373,7 @@ test('a second dispatch already in flight (409) shows the in-progress error mess
 
 test('a 428 mid-dispatch shows the code overlay labeled for this smoke check, and a correct retry succeeds', async () => {
   const c = await setupCase([
-    { name: 'proj', on: true, url: 'http://127.0.0.1:3000/', engine: 'claude', desc: '',
+    { name: 'proj', sessions: [{ session_id: 'sess1', engine: 'claude', url: 'http://127.0.0.1:3000/' }], desc: '',
       code_on: false, code_url: null },
   ]);
   const p = c.call('doSmokeCheck', 'proj');

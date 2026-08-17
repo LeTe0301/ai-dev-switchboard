@@ -3820,8 +3820,9 @@ def _kill_team_session_if_owned(session: str, run_id: str) -> bool:
 def _create_team_session(project_name: str, run_id: str, members: list) -> dict:
     """
     {"ok": True, "session": ...} or {"ok": False, "error": ...}. Refuses up
-    front (tmux_has() check, same precondition style instance_start() already
-    uses for active_engine()) if a session with this name already exists --
+    front (tmux_has() check, same precondition style app.py's legacy /on
+    route already uses via active_sessions()) if a session with this name
+    already exists --
     never lets a raw `tmux new-session` "duplicate session" error be the
     thing that surfaces. Window 0 named "lead" (transcript.jsonl), one window
     per member in --members order, named after the member's own engine name
