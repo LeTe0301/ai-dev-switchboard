@@ -447,13 +447,28 @@ if [ "$WITH_TAIGA" -eq 1 ]; then
         set_env "$TAIGA_ENV" RABBITMQ_PASS "$(random_token 24)"
         set_env "$TAIGA_ENV" RABBITMQ_ERLANG_COOKIE "$(random_token 32)"
     fi
-    set_env "$TAIGA_ENV" TAIGA_SCHEME "http"
+    # TAIGA_SCHEME has to be the scheme the BROWSER speaks, not the one
+    # taiga-gateway itself listens on (which is always plain http on :80
+    # behind the published port). taiga-front bakes this value straight into
+    # conf.json's `api` URL, so hardcoding "http" while the UI is actually
+    # served over https (PUBLISH_MODE=tailscale -> `tailscale serve`) makes
+    # the SPA issue http:// XHRs from an https:// page. Browsers block that
+    # as mixed content, so the page still renders fully styled while every
+    # API call — login, navigation, project load — silently fails. Derived
+    # from BASE_URL rather than assumed, and mirrors the ws/wss choice
+    # WEBSOCKETS_SCHEME already makes for the very same reason.
     if [ "$PUBLISH_MODE" = "tailscale" ] && [ -n "$BASE_URL" ]; then
+        case "$BASE_URL" in
+            https://*) TAIGA_SCHEME_VALUE="https" ;;
+            *)         TAIGA_SCHEME_VALUE="http" ;;
+        esac
         TAIGA_DOMAIN_VALUE="${BASE_URL#https://}"
         TAIGA_DOMAIN_VALUE="${TAIGA_DOMAIN_VALUE#http://}"
     else
+        TAIGA_SCHEME_VALUE="http"
         TAIGA_DOMAIN_VALUE="localhost:$TAIGA_PORT"
     fi
+    set_env "$TAIGA_ENV" TAIGA_SCHEME "$TAIGA_SCHEME_VALUE"
     set_env "$TAIGA_ENV" TAIGA_DOMAIN "$TAIGA_DOMAIN_VALUE"
 
     # 4b. taiga-front's own SUBPATH/WEBSOCKETS_SCHEME (backlog item 47b).
@@ -613,7 +628,13 @@ server {
     # API
     location /api/ {
         set $upstream_back taiga-back;
-        proxy_pass http://$upstream_back:8000/api/;
+        # $request_uri, NOT a literal "/api/". When proxy_pass contains
+        # BOTH a variable and a URI part, nginx passes that URI as-is,
+        # *replacing* the original request URI -- so /api/v1/stats/discover
+        # arrived at taiga-back as bare /api/ and 404'd. Every API call
+        # failed: the SPA loaded fully styled but could not navigate or log
+        # in. The `location /` block above already had the correct shape.
+        proxy_pass http://$upstream_back:8000$request_uri;
         proxy_pass_header Server;
         proxy_set_header Host $http_host;
         proxy_redirect off;
@@ -624,7 +645,10 @@ server {
     # Admin
     location /admin/ {
         set $upstream_back taiga-back;
-        proxy_pass http://$upstream_back:8000/admin/;
+        # Same variable-plus-URI nginx trap as /api/ above: a literal
+        # "/admin/" here would replace the whole request URI, collapsing
+        # every /admin/... path to bare /admin/.
+        proxy_pass http://$upstream_back:8000$request_uri;
         proxy_pass_header Server;
         proxy_set_header Host $http_host;
         proxy_redirect off;
