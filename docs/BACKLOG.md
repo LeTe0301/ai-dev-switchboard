@@ -3358,6 +3358,22 @@ failure.
 
 ## 52. `install.sh --update` never applies the logic it just pulled — a single run is always one version behind
 
+**Status: fixed (2026-08-18).** `--update` now re-execs at the pulled
+revision, via `${BASH_SOURCE[0]}` rather than a hardcoded
+`$REPO_DIR/install.sh` (the update block is also exercised standalone
+through `bash -c`, where no script file exists — hardcoding the name
+aborted that path with exit 127), warning and continuing instead of
+failing when there is nothing re-executable. Covered by
+`tests/test_install_update_reexec.py`, which runs the real extracted
+block against a scratch git repo.
+
+One inherent caveat, worth knowing rather than being surprised by: the
+update that *introduces* the fix still cannot use it. That run is
+executed by the pre-fix script, so it pulls the new revision and
+applies the old logic, exactly as described below. Observed live —
+the run that landed this printed `Pulled 78a18bb` with no re-exec.
+From the next update onward it applies in a single invocation.
+
 Found live on CT110 (2026-08-18) while landing the item 47/48 follow-up
 fixes.
 
