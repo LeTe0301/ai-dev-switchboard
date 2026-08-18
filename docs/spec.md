@@ -1,318 +1,161 @@
-# Spec: Dedicated team chat page (`/team/<project>`)
+# Spec: Land backlog items 47 and 48 in code (Taiga subpath rendering, Gitea stale ROOT_URL)
 
-## Routing note (read first)
-**Workflow: `workflows/feature.md`.** Independent of the two-part
-"concurrent sessions" spec (`docs/spec.md` + `docs/spec-feature1-part2-
-multi-session-ui.md`) — no ordering dependency, can be built before,
-after, or interleaved with either part. **Does need ux-designer**: this
-introduces a genuinely new page layout (full-page chat-style surface),
-not a reuse of an existing visual pattern.
+**Workflow: bugfix (two independent, already root-caused bugs bundled into
+one cycle since both touch `install.sh`'s optional-service provisioning and
+neither needs a design pass — no new UI, no new page).** Written directly by
+the orchestrator rather than dispatched to `product-manager`, per the global
+workflow's "right-sizing dispatches" rule 1: both root causes were already
+found and fixed *live* on a real CT110 deployment (see `docs/BACKLOG.md`
+items 47 and 48) — the only remaining work is landing the equivalent fix in
+this repo's own `install.sh`, a mechanical port rather than a fresh
+triage/scoping call.
 
-This file is written now, alongside the two-part session spec, as a
-complete ready-to-execute plan. It is **not** the currently-active
-`docs/spec.md` (that slot currently holds part 1 of the session-identity
-work, queued to run first per this session's recommended ordering — see
-that file's own routing note). When this feature's turn comes, promote
-this file's content into `docs/spec.md` (copy over, refresh any line
-numbers that shifted in the interim, overwrite).
+**User-reported context (2026-08-18):** "gitea doesnt start signed in" and
+"taiga which doesnt even [load] the webui" — both match items 48 and 47
+below closely enough to be the same underlying bugs, not new ones. Confirm
+that during the reviewer's live test pass.
 
-Already approved by Leo — no sign-off gate applies.
+---
 
-## Summary
-Move the AI-team interface (status strip, escalation/answer panel,
-interject box, live event feed, composition picker, start/stop controls)
-off the per-project dashboard row and onto its own dedicated page at
-`/team/<project>`, so it no longer shares screen space with the
-project's engine/session controls; the dashboard row keeps only a compact
-status indicator and a link into that page.
+## Part A — Item 48: Gitea under a subpath keeps stale links after `ROOT_URL`/`DOMAIN` change
 
-## Goals
-- New route `GET /team/<project>` serving a real page — full team
-  interface for exactly one project, addressable/bookmarkable/linkable on
-  its own.
-- Dashboard row's team section shrinks to a compact status badge (idle /
-  running / blocked / finished / error — reusing the exact status
-  vocabulary `/status` already computes server-side) plus an "Open team
-  chat →" link to `/team/<name>`. No task textarea, composition picker,
-  event feed, escalation panel, or interject box left inline on the
-  dashboard, for **any** team status including idle (starting a team also
-  moves fully to the dedicated page).
-- The dedicated page supports the complete lifecycle: idle launcher
-  (task text + Lead/Teammates composition picker + Start), through
-  running/blocked (status strip, escalation panel when
-  `waiting_on_you`, interject compose box, add-member control, live event
-  feed), to finished/error (summary, Stop-adjacent state) — functionally
-  everything `teamRow()` renders today, just relocated.
-- Reuses the **existing** backend surface unchanged: `/status` (filtered
-  client-side to one project), `POST /projects/<name>/team/start|stop|
-  resolve|board-resolve|interject|add-member`, `GET /projects/<name>/
-  team/events|inbox|branches|grounding`. Confirmed via archaeology (see
-  "Background") that all of these are already project-scoped and
-  sufficient — **no new backend routes**.
+**Root cause (already confirmed live on CT110, see `docs/BACKLOG.md` item
+48):** Gitea's official Docker image only applies `GITEA__server__ROOT_URL`
+/ `GITEA__server__DOMAIN` env vars to the persisted `app.ini` on a
+container's *first ever* start. `install.sh` (`install.sh:864-872`)
+correctly recomputes and re-writes these into `$GITEA_DIR/.env` on every
+run via `set_env`, but nothing forces Gitea's `server` container (the
+service name in `config/gitea-docker-compose.yml:26` — **not** `gitea`) to
+actually pick up a changed value once `app.ini` already exists in the
+persisted `gitea` volume. A plain `docker compose up -d` (what
+`scripts/gitea-up.sh` runs on every toggle-on) is a no-op against an
+already-running/created container — it does not re-apply changed env vars.
+Confirmed fix on CT110: `docker compose up -d --force-recreate server`.
+
+**Trigger scenario:** any install where Gitea is toggled on before (or
+without) `PUBLISH_MODE=tailscale`+`BASE_URL` being configured, and that
+changes on a later `install.sh` re-run — `ROOT_URL`/`DOMAIN` get written to
+`.env` correctly but the running container keeps serving stale values,
+generating every link/form-action without the correct subpath prefix. This
+plausibly explains "gitea doesn't start signed in": if login POSTs back to
+a `ROOT_URL` that doesn't match what the browser is actually on (e.g. still
+pointing at `http://127.0.0.1:3000` instead of the real
+`https://<tailnet-host>/gitea`), the session cookie / redirect can fail to
+land the browser back in an authenticated state even though the credential
+check itself succeeded.
+
+**Fix to implement**, in `install.sh`'s Gitea block (around
+`install.sh:860-872`):
+
+1. Before calling `set_env "$GITEA_ENV" GITEA__server__ROOT_URL ...` /
+   `GITEA__server__DOMAIN ...`, capture the **previous** persisted values
+   via `get_env "$GITEA_ENV" GITEA__server__ROOT_URL` /
+   `GITEA__server__DOMAIN` (same idiom `GITEA_SECRET_KEY`/
+   `GITEA_INTERNAL_TOKEN` already use a few lines above for their own
+   "only set if empty" checks).
+2. After computing the new `GITEA_ROOT_URL_VALUE`/`GITEA_DOMAIN_VALUE` and
+   writing them, compare old vs. new. If either changed **and** the
+   `server` container currently exists (e.g. `docker compose ps -q server`
+   returns non-empty, guarded the same "warn, don't fail the install" way
+   the pre-pull step at `install.sh` already does for network failures),
+   force-recreate it: `(cd "$GITEA_DIR" && docker compose up -d
+   --force-recreate server)`. Skip cleanly (no error) when the container
+   doesn't exist yet — nothing to recreate on a fresh install, first start
+   will already pick up the correct values.
+3. Keep this scoped to the `server` service only (`--force-recreate
+   server`, not a bare `--force-recreate` for the whole stack) — no reason
+   to touch `db`.
+
+No changes needed to `config/gitea-docker-compose.yml` or `app.py` for this
+part.
+
+---
+
+## Part B — Item 47: Taiga frontend under a tailscale-serve subpath
+
+**Two compounding causes were found live on CT110 (`docs/BACKLOG.md` item
+47) — verify both against this repo's *current* code before touching
+anything, since one of them may already be fixed:**
+
+**(b) Confirmed still missing — fix this one.** `taiga-front`'s own `.env`
+supports `SUBPATH`, `TAIGA_SCHEME`, and `WEBSOCKETS_SCHEME` (first-class in
+its Docker image) but `install.sh`'s Taiga block only ever sets
+`TAIGA_SCHEME` on the **gateway's** `.env` (`install.sh:438`,
+`$TAIGA_ENV`, i.e. `$TAIGA_DIR/.env` — this is `taiga-back`/
+`taiga-gateway`'s shared env file, not `taiga-front`'s own). `taiga-front`
+gets no `.env` file written at all today — confirmed by grep, no
+`SUBPATH`/`WEBSOCKETS_SCHEME` reference anywhere in `install.sh`. Since
+`TAIGA_URL_PATH` is a fixed `"/taiga"` (`app/app.py:2978`, singleton, same
+shape as Gitea's `GITEA_URL_PATH`), the subpath value to populate is known
+statically, not derived per-request.
+
+Add, alongside the existing `TAIGA_SCHEME`/`TAIGA_DOMAIN` block
+(`install.sh:438-451`): write `SUBPATH`, `TAIGA_SCHEME`,
+`WEBSOCKETS_SCHEME` into a `taiga-front`-specific env source. Check
+`taiga-docker`'s actual compose file (`$TAIGA_DIR/docker-compose.yml`,
+cloned at `install.sh:392-396`) for how `taiga-front`'s service picks up
+its own `.env` — it's likely a *separate* env file (upstream
+`taiga-docker` convention: `taiga-front/.env` alongside the root `.env`
+used by back/gateway) or the same root `.env` with different variable
+names (`taiga-front`'s image reads `TAIGA_URL`/`SUBPATH`/etc. — confirm the
+exact var names upstream expects by reading that image's own docs/entrypoint
+in the cloned checkout, don't guess). Mirror the existing "only set the
+non-secret values every run, tracking whatever PUBLISH_MODE/BASE_URL
+currently resolve to" behavior the gateway's own `TAIGA_SCHEME`/
+`TAIGA_DOMAIN` already follow — same conditional (`PUBLISH_MODE=tailscale`
++ `BASE_URL` set → derive from `BASE_URL`; else → local/plain values), same
+`set_env` idiom.
+
+**(a) Possibly already fixed — verify live, don't blind-patch.** The
+backlog item's other stated cause was `location /`'s (frontend) variable
+`proxy_pass` dropping URI rewriting the same way items 42/43 originally
+found for `/api/`/`/admin/`. The *current* `docker-compose.override.taiga-
+gateway.conf` heredoc (`install.sh:538-611`) already uses the identical
+`set $upstream_front taiga-front; proxy_pass http://$upstream_front/;`
+variable pattern, with a `resolver 127.0.0.11 valid=10s;` directive, for
+**every** location including `location /` — this may already be the
+item-43-style fix the backlog note says is still missing, in which case
+that half of item 47 is stale and needs no further change. Note also that
+`app/app.py:703-706`'s own comment on `_ttyd_start()` confirms `tailscale
+serve --set-path` **strips** the subpath prefix before forwarding to the
+backend — so `taiga-gateway` itself receives plain, unprefixed paths, not
+`/taiga/...`-prefixed ones. This means the actual failure mode is more
+likely entirely explained by (b) (taiga-front generating wrong absolute
+asset/API/WebSocket URLs because it doesn't know it's mounted under
+`/taiga`), not by nginx's proxy_pass behavior at all.
+
+**Verification the reviewer must do for both (a) and (b):** bring up a
+real `--with-taiga` stack with `PUBLISH_MODE=tailscale` (or simulate the
+subpath by hitting the gateway through a path prefix, if no real tailnet is
+available in the sandbox) and confirm the frontend renders styled, with
+working asset/API/WebSocket requests — not just that the root page returns
+200. A raw `curl` of `/` alone will not catch this class of bug (that's
+exactly how it went unnoticed the first time — "the first request under a
+subpath is always literally `/`, so it worked by coincidence").
+
+---
 
 ## Non-goals
-- No chat-bubble redesign of the event feed. Already explicitly decided
-  against in backlog item 19 (`docs/BACKLOG.md:1240-1247`): "~10
-  structurally different event kinds across more than two participants
-  doesn't fit a two-party bubble layout," and a redesign risked breaking
-  the existing `role="log"`/`aria-live="polite"` accessibility contract
-  for no functional gain. "Dedicated page" and "chat bubbles" are
-  orthogonal asks — Leo's request is about *location* (own page vs.
-  inline), not the feed's visual format — and this spec does not revisit
-  that prior decision.
-- No new backend routes, no change to `app/teams.py`, no change to the
-  event envelope shape (`{ts, agent, seq, kind, text, meta}`) or the
-  cursor-polling mechanism.
-- No multi-project view on the team page — one project per page load,
-  selected via the URL path segment. Switching projects means navigating
-  to a different URL (via the dashboard's own link, or a browser back/
-  forward), not an in-page project switcher.
-- Not fixing item 20 (`.team-btn` WCAG AA contrast) — separate, already-
-  backlogged, unrelated to this change even though the same button family
-  is relocated here.
-- No "last event preview" on the dashboard's compact badge (a chat-app-
-  style conversation-list preview) — not requested; flagged as a
-  possible future nice-to-have, not built speculatively here (see Open
-  questions).
-- Not building a genuinely separate frontend app/build pipeline. This
-  codebase has zero frontend build tooling today — one inline Python-
-  string HTML/CSS/JS template, one file (`app/app.py`). A separate SPA/
-  framework would be a real architectural deviation from that
-  established pattern for no stated benefit (Leo's own request text
-  leaves "same app, new route" as an explicit valid option and gives an
-  example URL, `dev.tailbe22cd.ts.net/team/<project>`, matching that
-  exact shape) — this spec deliberately stays inside the existing
-  single-file convention instead.
 
-## Background / current state
-
-### Architecture note
-Same as the session-identity specs: no separate frontend framework — one
-big inline HTML/CSS/JS template (`PAGE_TEMPLATE`, defined at
-`app/app.py:2805`), served by a hand-rolled `http.server`-based Python
-app. `do_GET` (`app/app.py:5894` on) currently special-cases exactly one
-path, `"/"` (line 5899: `if self.path == "/": return
-self._html(render_page())`), and requires auth for every other GET.
-`render_page()` (`app/app.py:5768-5780`) just does template-variable
-substitution (login copy) on `PAGE_TEMPLATE` — the page itself carries no
-session data; the login overlay and dashboard rows are both populated
-client-side, gated on whether `/status` comes back 401 (per `do_GET`'s
-own comment at 5895-5898).
-
-### Current team UI, precisely (confirms "frontend-surface only")
-`teamRow(name, team)` (`app/app.py:4397-4484`) renders one of two shapes
-depending on `team.status`, both **inline inside the project's dashboard
-row** (`row()`, called from `refresh()`'s per-project loop,
-`app/app.py:3354-3392`):
-- `idle`/no team yet: task textarea, "Configure team..." link toggling
-  `renderTeamPicker()` (`app/app.py:3729`, Lead/Teammates pill+checkbox
-  picker), Start button.
-- Otherwise: `renderTeamStatusStrip()` (`app/app.py:3790`), an
-  escalation note or `renderEscalationPanel()` (`app/app.py:3913`) when
-  `waiting_on_you`, a finished-run summary, `renderTeamInterjectBox()`
-  (`app/app.py:4313`), `renderTeamAddMemberControl()` (`app/app.py:4366`),
-  `renderTeamFeedToggle()`/`renderTeamFeed()` (`app/app.py:3983`/`4137`,
-  the collapsible cursor-polled event log), a Stop button, and
-  `renderTeamBranches()` (`app/app.py:3638`).
-All of the above are called **from** `teamRow()`, which is itself called
-from `row()`'s `(kind === 'inst' ? teamRow(name, team) : '')` line
-(`app/app.py:4507`) — i.e. structurally nested inside the same row as the
-engine toggle, description, code-server row, smoke-check row, and deploy
-row, exactly matching Leo's complaint that it doesn't get its own space.
-
-### Backend routes already sufficient (confirmed, not assumed)
-Every route the dedicated page needs already exists and is already
-project-scoped by `<name>` in its own path segment:
-`POST /projects/<name>/team/start` (`app/app.py:6444`), `/stop` (`6496`),
-`/resolve` (`6522`), `/board-resolve` (`6578`), `/interject` (`6627`),
-`/add-member` (`6668`); `GET /projects/<name>/team/events` (`6132`,
-`_handle_team_events`), `/inbox` (`6134`), `/branches` (`6136`),
-`/grounding` (`6124`). `/status` itself (`app/app.py:5903` on) already
-returns a `team` object per project (`app/app.py:5973-5978` computes
-`team_status`; the full `team` dict assembled further down includes
-composition/roster data). This matches the task's own framing: this is a
-frontend-surface feature, not new backend plumbing — confirmed by reading
-every route this page would call, not assumed from the framing alone.
-
-## Proposed approach
-
-### 1. Backend: one new `do_GET` route branch
-Add, alongside the existing `if self.path == "/":` check
-(`app/app.py:5899`), a match for `^/team/[^/]+/?$` that serves the exact
-same `self._html(render_page())` — same unauthenticated static shell,
-same "nothing sensitive served without a session" security model
-(`do_GET`'s own existing comment). The project name in the URL is never
-read/validated server-side at this layer — exactly like today's `/`,
-everything is resolved client-side against `/status` after login,
-including "does this project even exist" (see Edge cases). Use a
-precompiled `re` pattern (module already needs `re` available — check
-whether it's already imported near the top of `app/app.py`; if not, this
-is the one new import this whole feature requires).
-
-### 2. Client-side routing (bottom of `<script>`)
-Today: `refresh(); setInterval(refresh, 4000);` (`app/app.py:5763`).
-Replace with a branch on `location.pathname`:
-```js
-const teamPageMatch = location.pathname.match(/^\/team\/([^/]+)\/?$/);
-if (teamPageMatch) {
-  const TEAM_PAGE_PROJECT = decodeURIComponent(teamPageMatch[1]);
-  renderTeamPage(TEAM_PAGE_PROJECT);
-  setInterval(() => renderTeamPage(TEAM_PAGE_PROJECT), 4000);
-} else {
-  refresh(); setInterval(refresh, 4000);
-}
-```
-`renderTeamPage(projectName)` is new: fetches `/status` (unchanged
-endpoint — same auth/401→login-overlay handling `refresh()` already has,
-copy that exact handling rather than reimplementing it), finds the
-matching entry in `s.instances` by `name`, and either renders the full
-team surface (§3) or an "unknown project" message with a link back to
-`/` (see Edge cases) if no match is found.
-
-### 3. Reuse, don't fork, the existing sub-renderers
-`renderTeamPage`'s body should call the same functions `teamRow()`
-already calls (`renderTeamStatusStrip`, `renderEscalationPanel`,
-`renderTeamInterjectBox`, `renderTeamAddMemberControl`,
-`renderTeamFeedToggle`/`renderTeamFeed`, `renderTeamPicker`,
-`renderTeamBranches`, the idle-state task textarea + Start button, and
-`doTeamStart`/`doTeamStop` for the actions) — either by having
-`teamRow(name, team)` itself become a shared body-builder called from
-both contexts (dashboard's compact version wraps a *different*,
-much smaller function; the full version is what mounts on the page), or
-by extracting `teamRow()`'s existing non-idle/idle bodies into a new
-`renderTeamPageBody(name, team)` that both `teamRow()` (if it still needs
-any inline remnant — see §4, it shouldn't) and `renderTeamPage()` call.
-Developer's call on the exact extraction shape; the hard requirement is
-**no duplicated copy of any of the listed render functions** — one
-implementation, mounted in two different containers.
-
-### 4. Dashboard's `teamRow()` shrinks to a compact summary
-For the dashboard context only: status badge (map `team.status` the same
-way `/status`'s own `team_status` computation already does —
-`idle`/`running`/`blocked`/`finished`/`error`, `app/app.py:5974-5978`) +
-`'<a href="/team/' + encodeURIComponent(name) + '">Open team chat →</a>'`.
-This applies uniformly regardless of status — including `idle`, since
-starting a team now only happens on the dedicated page (today's idle-
-state task textarea/picker/Start button move there entirely, per Goals).
-`row()`'s existing `(kind === 'inst' ? teamRow(name, team) : '')` call
-site (`app/app.py:4507`) is unchanged in *shape*, just now renders the
-much smaller compact block.
-
-### 5. Full-page layout container
-New HTML container in `PAGE_TEMPLATE`'s `<body>` (alongside `#rows`,
-`#upload-overlay`, etc. — see `app/app.py:3134-3177`), e.g. `<div
-id="team-page" style="display:none;"></div>`, shown/hidden opposite `
-#rows` and the new-project/upload/clone controls based on which branch
-§2's routing takes (the plain dashboard chrome — "+ New project", upload
-wizard button, clone form — should not render on the team page; only the
-login/TOTP overlays are shared between both contexts). Exact header/back-
-link/spacing treatment is ux-designer's call (`docs/design.md`).
-
-## Affected areas
-- `app/app.py`: `do_GET` (new route branch, `re` import if not already
-  present), bottom-of-script routing branch, new `renderTeamPage()`, the
-  `teamRow()`/`renderTeamPageBody()` extraction (§3), dashboard's
-  compact-summary block, new `#team-page` container + its show/hide
-  wiring, new `<style>` rules for the full-page layout (ux-designer).
-- `tests/test_team_frontend.js`: existing coverage of the extracted sub-
-  renderers must keep passing unmodified (they're being *called from* a
-  new place, not changed); add new coverage for (a) the dashboard's
-  compact-summary+link rendering across all five statuses, and (b)
-  `renderTeamPage()`'s own behavior — found-project renders the full
-  surface via the shared sub-renderers (assert it's the *same* functions,
-  not a forked duplicate — e.g. by spying/monkeypatching one of them in
-  the test harness and confirming both contexts call it), unknown-project
-  renders the fallback message.
-- `tests/test_team_routes.py`: add a smoke assertion that `GET /team/
-  <any-name>` returns the same static shell as `GET /`, unauthenticated,
-  200 — mirrors whatever existing assertion already covers `/`.
-- No `app/teams.py` changes.
-- `docs/implementation.md` — developer's usual write-up.
-
-## Edge cases
-- **Unauthenticated access to `/team/<project>`** — identical behavior to
-  `/`: shell loads, `/status` 401s, login overlay shows, no team data
-  visible before login. No new auth code path.
-- **Unknown/nonexistent project name in the URL** (typo, deleted project)
-  — `renderTeamPage()` finds no match in `s.instances`; render a clear
-  "Unknown project" message with a link back to `/`, not a JS
-  exception/blank page.
-- **Project with an active team `blocked_ask_user`/`waiting_on_you`** —
-  dashboard badge reflects "blocked" distinctly; no answer-capability
-  inline on the dashboard anymore (must click through to the page) — this
-  is an intentional behavior change per Goals, not an oversight.
-- **Long/URL-unsafe project names** — reuse the existing
-  `encodeURIComponent`/`unquote` handling already used by the team API
-  routes and the ttyd/code-server path builders (`/term/<name>`, `/code/
-  <name>`) — no new escaping logic invented.
-- **Multiple browser tabs open on the same project's `/team/<name>`
-  simultaneously** — already safe: the event feed's cursor-based polling
-  (`GET .../team/events?cursor=...`) already supports concurrent viewers
-  today (used from the dashboard's own polling); nothing about moving it
-  to a different container changes that guarantee.
-- **Losing not-yet-submitted interject/task text on navigation** — a real
-  but pre-existing-equivalent behavior: today's SPA never fully reloads
-  so in-progress textarea state (`teamTaskText[name]`) survives across
-  `refresh()`'s polling re-renders; navigating *to* `/team/<name>` for the
-  first time is unaffected (fresh state), but navigating away and back
-  (or reloading the tab) loses in-progress text — exactly as reloading
-  today's dashboard already would. Not a new regression; one line in
-  `docs/implementation.md` acknowledging it is enough, not a blocker.
-- **Empty roster / `composition === null`** on the dedicated page's idle
-  launcher — reuse the exact existing "No roster members available"
-  branch/messaging (`app/app.py:4412-4421`), unchanged.
+- Item 41 (VS Code / code-server hardcoded path) — already fixed in this
+  repo's code (`app/app.py:117-127`, `install.sh:231-250` both resolve
+  `code-server` dynamically via `command -v`/`shutil.which`). Not part of
+  this cycle. If the user's live "VS Code sessions don't start" report
+  persists, it's a separate investigation (most likely the deployed box
+  predates this fix and needs `install.sh --update`) — out of scope here.
+- Item 50 (backup-before-upgrade) — unrelated, separate backlog item, not
+  touched by this cycle.
+- No new UI, no `docs/design.md` needed.
 
 ## Acceptance criteria
-- [ ] Given a project with a running team, when navigating to `/team/
-      <project-name>`, then the status strip, escalation panel (if
-      `waiting_on_you`), interject box, add-member control, and event feed
-      for that project render on the dedicated page — same data/behavior
-      as previously rendered inline.
-- [ ] Given any project row on `/`, when it renders, then it shows only a
-      compact team-status badge and an "Open team chat" link — no task
-      textarea, composition picker, event feed, escalation panel, or
-      interject box inline, for every team status (idle/running/blocked/
-      finished/error).
-- [ ] Given a project with no team ever started (`status === 'idle'`),
-      when its "Open team chat" link is clicked, then `/team/<project-
-      name>` renders the full idle launcher (task textarea + composition
-      picker + Start button) — not a blank or read-only page.
-- [ ] Given `/team/<a-real-project-name>` loaded unauthenticated, then the
-      same login-overlay behavior as `/` occurs, no team data visible
-      before authentication.
-- [ ] Given `/team/<a-nonexistent-project-name>` loaded while
-      authenticated, then a clear "unknown project" message with a link
-      back to `/` is shown, no JS error.
-- [ ] Given the interject box, escalation panel, and add-member control on
-      the dedicated page, when used, then they call the exact same
-      existing routes (`/team/interject`, `/team/resolve`/`/team/board-
-      resolve`, `/team/add-member`) — verified via network-call
-      assertions in the frontend test, not just visual inspection.
-- [ ] `tests/test_team_frontend.js` (existing + new coverage) and `tests/
-      test_team_routes.py` (existing + the new `/team/<name>` shell
-      assertion) all pass.
 
-## Open questions
-- **Visual treatment** of the full-page layout (header, back-link
-  placement, overall spacing, degree to which it echoes the dashboard's
-  existing dark theme) — explicitly left to ux-designer's `docs/design.md`
-  pass, not decided here.
-- **Dashboard badge "last event" preview** (chat-app-style conversation
-  preview text) — not requested by Leo; assumption is **not building this
-  now**, flagged so it can be explicitly requested later rather than
-  silently added as scope creep.
-- **Exact route shape**: assuming `/team/<project>` verbatim (matches
-  Leo's own example URL in the request, `dev.tailbe22cd.ts.net/team/
-  <project>`) — no query params, one path segment. Low-stakes assumption;
-  a one-line change if a different shape (e.g. `/team/<project>/chat`) is
-  actually wanted.
-
-## Risk / rollback notes
-Additive route + extraction/reuse of existing render functions into a
-shared body callable from two containers — no backend route/data changes,
-no `app/teams.py` changes. The main regression risk is accidentally
-breaking `teamRow()`'s dashboard-embedded behavior while extracting the
-shared body; mitigated by running the existing `tests/
-test_team_frontend.js` suite (should pass unmodified if the extraction
-preserves each sub-renderer's own contract) plus the new page-specific
-coverage above. Rollback is a plain revert of the commit.
+1. A fresh `--with-git-hosting` install, followed by a second `install.sh`
+   run where `BASE_URL`/`PUBLISH_MODE` changed, force-recreates Gitea's
+   `server` container and the new `ROOT_URL`/`DOMAIN` are reflected in
+   generated links without a manual restart.
+2. A fresh `--with-taiga` install under `PUBLISH_MODE=tailscale` renders a
+   fully styled Taiga frontend at `$BASE_URL/taiga`, with working
+   asset/API/WebSocket requests through the subpath — verified with an
+   actual browser-level check (Playwright), not just an HTTP status code.
+3. Existing test suite stays green; no regression in the non-tailscale
+   (`PUBLISH_MODE=none`) path for either service.
