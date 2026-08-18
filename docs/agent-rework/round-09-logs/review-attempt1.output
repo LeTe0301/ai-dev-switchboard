@@ -1,0 +1,17 @@
+## Review summary
+
+**Will block**
+
+- **`frontend/src/App.jsx:125` (Alan Heitkotter — failure paths) / `frontend/src/components/UndoToast.jsx:6`** — `pendingDeleteIds` is never reconciled against `tasks`, so when a pending-delete task disappears from `tasks` via some *other* refresh, the toast crashes. Concrete repro: delete a completed task (leaves it pending-undo, still in `tasks`), then click "Clear completed" before the 5s window elapses. That bulk-deletes the (done) task server-side and refreshes `tasks`, which no longer contains it — but `pendingDeleteIds` still does. `tasks.find(...)` returns `undefined`, and `UndoToast.jsx:6`'s `key={task.id}` throws on it. No error boundary exists, so this is a full UI crash, not a cosmetic glitch. This is exactly the race the spec's own AC6 anticipates (Clear Completed vs. a pending delete) — the code handles the async 404 from that race but not this synchronous state-desync from it.
+
+**Will comment**
+
+- **`frontend/src/App.jsx:19` (Christopher Zipp — reuse/data modelling)** — `pendingDeleteIds` (state) and `pendingDeleteTimers.current` (ref Map) track the identical key set in two places, always mutated together. Not a bug today, but it's the kind of duplicate source of truth that produced the blocker above; collapsing to one `Map<id, timerHandle>` (deriving the id list from its keys) removes a spot a future edit has to remember to touch twice.
+
+**Worth considering**
+
+- None.
+
+Everything else checks out: the frontend-only design decision is sound and well-justified, all six acceptance criteria are otherwise met (immediate hide, exact-state restore since nothing is mutated, 5s auto-delete, done-state preserved, independent multi-undo via array+Map, 404 swallowed on the *timer* path), `TaskList.jsx`/`api.js`/backend correctly left untouched, and the CSS/a11y choices match the design doc and existing `.error`/`TaskCounts` conventions.
+
+VERDICT: changes-requested

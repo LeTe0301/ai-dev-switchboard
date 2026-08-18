@@ -1,0 +1,19 @@
+## Verification report — Taiga #9: Clear all completed tasks
+
+The findings I was handed claim the backend half of this feature is "entirely missing." That does not match the current working tree — `git diff --stat` shows all the backend files already modified, and every piece described as missing is present and working:
+
+**Backend — verified by running the actual suite**
+- `backend/app/models.py` — `ClearResult(BaseModel)` with `count: int`, present.
+- `backend/app/store.py:94-100` — `TaskStore.clear_completed()` present, mirrors `delete()`'s save-only-on-change discipline.
+- `backend/app/main.py:56-58` — `DELETE /api/tasks/completed` route present, declared **above** `@app.delete("/api/tasks/{task_id}")` (line 61+), so the route-ordering hazard the spec flagged is genuinely avoided — confirmed by running the route through `TestClient`, not just reading it (`test_clear_completed_removes_only_done_tasks` asserts `status_code == 200`, which a 422 mis-route would fail).
+- `python3 -m pytest -q` in `backend/`: **35 passed**, including all 4 new tests (`test_clear_completed_on_empty_store_returns_zero` AC6, `test_clear_completed_with_no_completed_tasks_removes_nothing` AC1, `test_clear_completed_removes_only_done_tasks` AC2, `test_clear_completed_leaves_no_done_tasks_in_list` AC3) and the pre-existing `test_cleared_completed_tasks_do_not_reappear_after_restart` (AC5).
+
+**Frontend — verified by reading the wiring and building**
+- `frontend/src/api.js:26` `clearCompleted()` calls `DELETE /api/tasks/completed`, matching the backend contract exactly.
+- `frontend/src/components/ClearCompleted.jsx` — button disabled at `count === 0` (AC1, structurally prevents any click from firing).
+- `frontend/src/App.jsx:38,58` — `completedCount` is derived from the full `tasks` array, not `visibleTasks`, so it's correctly filter-independent (AC4). Wired through the existing `run()` helper so errors surface via the same `error` banner as every other mutation.
+- `npm run build` — clean, no errors.
+
+All six spec ACs trace to passing, real test runs or directly-inspected code, not inference. The review that produced the "changes-requested" verdict appears to have been evaluating a stale or different state of the tree — nothing here supports "clicking the button does nothing but show a 422." I'm not making any code changes since there's nothing broken to fix; flagging the discrepancy instead of silently redoing already-correct work.
+
+VERDICT: pass

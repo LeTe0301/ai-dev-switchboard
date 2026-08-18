@@ -1,0 +1,20 @@
+## Review: Taiga #3 — Edit a task title
+
+**Verified, not just read:**
+- `cd backend && python3 -m pytest -q` → 12/12 passed
+- `cd frontend && npm run build` → succeeds
+- `python3 -m pytest e2e/ -q` → 28/28 passed (including all 9 new edit-title scenarios: prefill, save, save-closes-edit, cancel-reverts-no-backend-call, disabled-Save-on-empty, Enter-rejects-empty, Enter-rejects-whitespace, done-state-preserved)
+
+Note: the handoff text claimed the developer "stayed strictly in backend/... frontend is out of my scope — not touched," but the actual diff includes substantial frontend changes (`TaskList.jsx`, `api.js`, `App.jsx`, `App.css`, e2e tests). I disregarded that claim and reviewed/tested the code as it actually stands rather than as reported — flagging this only so the orchestrator is aware the stage report doesn't match the diff, though the code itself is sound.
+
+**Will block:** none.
+
+**Will comment:** none.
+
+**Worth considering:**
+- `frontend/src/components/TaskList.jsx`'s `onKeyDown` Enter handler is a deliberate, commented deviation from `docs/design.md`'s sketch (which only wired Escape). It's correct — a disabled Save button blocks native implicit form-submission-on-Enter, so this is required to make AC5 (whitespace-only via Enter) actually surface the inline error — and it's proven by the passing e2e tests. Flagging only as a documented deviation, not a defect.
+- The server-side whitespace-only quirk (`TaskIn`'s `min_length=1` counts raw characters, so `"   "` would pass Pydantic on a direct API call) is *not* fixed by this PR — but that's an explicit, spec-documented non-goal (`docs/spec.md:63-68`), consistent with the same pre-existing quirk on `create`, and the UI-facing path is fully guarded client-side (trimmed before submit) and tested server-side for the true-empty case. Not a gap in this feature's actual acceptance criteria.
+
+All 9 acceptance criteria in `docs/spec.md` are covered by tests and pass. Backend mirrors `set_done`'s exact pattern; frontend reuses `.add-task`'s existing styles and `AddTask`'s trim-guard idiom. No scope creep, no unjustified surface added.
+
+VERDICT: approve

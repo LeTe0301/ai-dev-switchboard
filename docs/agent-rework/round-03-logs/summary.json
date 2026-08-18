@@ -1,0 +1,52 @@
+{
+  "status": "finished",
+  "reason": "",
+  "dispatches": 7,
+  "attempts": {
+    "story": 1,
+    "design": 1,
+    "build": 1,
+    "review": 1,
+    "test": 2
+  },
+  "stages": [
+    {
+      "stage": "story",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "design",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "build/frontend",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "build/backend",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "review",
+      "ok": true,
+      "verdict": "approve-with-followups"
+    },
+    {
+      "stage": "test",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "test",
+      "ok": true,
+      "verdict": "pass"
+    }
+  ],
+  "seconds": 1050.2,
+  "task": "Taiga #4: Give tasks a priority.\n\nEverything in my list looks equally urgent. Let me mark a task low, normal or high priority, see that at a glance, and have high-priority tasks sort to the top without disturbing the order of everything else.",
+  "workdir": "/home/dev/projects/test-project"
+}

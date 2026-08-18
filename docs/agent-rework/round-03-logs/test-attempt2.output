@@ -1,0 +1,20 @@
+## Test verification — Taiga #4: Give tasks a priority
+
+**Commands actually run this session:**
+- `cd backend && python3 -m pytest -q` → **22 passed** (14 pre-existing + 8 new: `test_create_defaults_to_normal_priority`, `test_create_with_explicit_priority`, `test_create_with_invalid_priority_is_rejected`, `test_updating_priority_changes_it`, `test_updating_priority_does_not_change_title_id_or_done`, `test_updating_priority_of_a_missing_task_is_404`, `test_updating_priority_with_invalid_value_is_rejected`, `test_updating_title_leaves_priority_untouched`). Full suite, not just new tests.
+- `cd frontend && npm run build` → succeeds (vite build, 20 modules, no errors).
+- `npm test` → `npm error Missing script: "test"` — confirms this project has **no frontend test framework configured**, despite `CLAUDE.md` documenting `npm test` as the frontend test command. Pre-existing gap, not introduced by this feature.
+
+**Not run, and why:** `npm run lint`, starting the backend/frontend dev servers, and even a standalone `node` check — all required interactive approval this non-interactive session has no channel to grant (same limitation the prior review stage hit). No live-browser exercise of the feature was possible.
+
+**Verified by reading code + hand-tracing logic (not execution), since no frontend harness exists to automate it:**
+- AC5/6/9 (stable high-first sort): `App.jsx:33-35` — `[...visibleTasks].sort((a,b) => (a.priority==='high'?0:1) - (b.priority==='high'?0:1))`. Traced by hand against the spec's literal example `[A:normal, B:high, C:low, D:high, E:normal]`: comparator keys are `[1,0,1,0,1]`; a stable sort (guaranteed by ECMA-262 since ES2019, universal in evergreen engines) on those keys yields `[B, D, A, C, E]` — matches the spec exactly.
+- AC7 (sort scoped to filtered subset): `visibleTasks` (filter) computed first, `sortedTasks` derived from it — a filtered-out Done task can't reappear via the sort.
+- AC8 (priority visible without edit mode): `TaskList.jsx:93-103`, view-mode branch always renders the `priority-select`.
+- AC1-4, AC10: covered directly by the passing backend tests above.
+
+**Findings:** none new. I confirm the three items the prior review already surfaced (`TaskIn` still accepting an ignored `priority` on `PATCH /api/tasks/{id}`; `PRIORITIES` duplicated across `AddTask.jsx`/`TaskList.jsx`; `docs/spec.md` stale) — all are quality/documentation issues, not violations of any acceptance criterion, and none reproduce as a test failure.
+
+**Unverified, disclosed rather than assumed:** actual browser rendering/interaction (badge colors, select-triggers-immediate-update, filter+sort together in a live DOM) — blocked by sandbox approval limits, not by any defect found. Given no failures surfaced anywhere I could run or reason through, and the gap is an environment limitation rather than a code problem:
+
+VERDICT: pass

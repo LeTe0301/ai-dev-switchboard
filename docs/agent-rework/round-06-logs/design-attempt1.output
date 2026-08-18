@@ -1,0 +1,9 @@
+Wrote `docs/design.md`. Summary for the next stage:
+
+- **New component:** `frontend/src/components/TaskCounts.jsx` — takes `open`/`done` props, renders `"{n} task(s) open · {n} task(s) done"` with independent singular/plural per bucket, `role="status"` for live-region announcements.
+- **Placement:** directly under `<h1>Tasks</h1>`, gated on `!loading`, rather than inside `.list-toolbar` (kept that layout untouched).
+- **Wiring:** add `openCount = tasks.filter((t) => !t.done).length` next to the existing `completedCount` in `App.jsx:38`.
+- **CSS:** new `.task-counts` rule using `#5a646c` (a darkened, contrast-verified version of the existing muted grey — the obvious reuse, `#6b7780`, actually fails AA at 4.28:1 on the page background, so I computed a passing alternative at 5.63:1) plus a small `h1` margin tweak.
+- All 9 acceptance criteria traced to specific design elements, including loading/error/zero/singular edge cases with ASCII wireframes.
+
+Next stage (developer) should read `docs/design.md` for exact code and CSS to implement.

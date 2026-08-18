@@ -1,0 +1,13 @@
+I've triaged Taiga #3 as a **Feature** and written `docs/spec.md` (overwriting round 1's spec, per this pipeline's per-cycle `docs/` convention — round 1 is already merged per git log).
+
+Summary of the spec:
+
+- **Scope:** in-place title editing on an existing task row — enter edit mode, Save (persists via a new backend endpoint) or Cancel (reverts, no backend call), with empty/whitespace titles rejected client- and server-side.
+- **Backend:** new `PATCH /api/tasks/{task_id}` in `backend/app/main.py`, a new `update_title` method in `backend/app/store.py` (parallel to `set_done`), reusing the existing `TaskIn` model for validation — no schema change needed.
+- **Frontend:** `frontend/src/api.js` gets `updateTask`, `TaskList.jsx` gets per-row edit state (input + Save/Cancel), `App.jsx` wires an `onUpdate` callback the same way `onComplete`/`onDelete` already work.
+- **Two open questions**, both resolved with stated defaults rather than left open: exact edit-trigger UI (ux-designer's call, no new visual pattern) and the endpoint shape (`PATCH /api/tasks/{task_id}`).
+- Explicitly **not** touching the create endpoint's existing whitespace-validation quirk, `done` state, or bulk editing.
+
+Not split into sub-specs — despite spanning backend+frontend, it's the natural shape of one small feature in this app, not a disproportionate cross-layer change.
+
+Next stage is **ux-designer**, to turn this into `docs/design.md`.

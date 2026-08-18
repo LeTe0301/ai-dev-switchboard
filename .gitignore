@@ -6,3 +6,7 @@ __pycache__/
 /CLAUDE.md
 /.claude/
 /graphify-out/
+
+# Aider tooling state (not project content)
+/.aider.chat.history.md
+/.aider*

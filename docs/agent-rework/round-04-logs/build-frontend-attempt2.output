@@ -1,0 +1,25 @@
+All 30 backend tests pass (confirmed in the working directory: `/home/dev/projects/test-project/backend`, cwd persisted from the earlier `cd`). Implementation is complete and verified.
+
+## Handoff
+
+**Status:** Implementation was already complete from attempt 1 and is correct — I verified it against every acceptance criterion rather than rewriting it. One item from the spec's "Affected areas" is still outstanding and I could not complete it due to a sandbox permission restriction (see below).
+
+**Files (all from attempt 1, verified working, no changes needed):**
+- `backend/app/store.py` — `TaskStore.__init__` resolves `_data_file` from `TASKS_DATA_FILE` env var (default `backend/data/tasks.json`, relative to `store.py`'s own location), calls `_load()`. Every mutating method (`add`, `set_done`, `set_priority`, `update_title`, `delete`, `reset`) calls `_save()`, which does `mkdir(parents=True, exist_ok=True)` then a full-snapshot `json.dumps`/`write_text`. `_load()` wraps parse+construct in a bare `except Exception: return`, leaving `_tasks={}`/`_next_id=1` on any failure (missing file, bad JSON, wrong shape, wrong item shape) — satisfies AC5/AC6 as one code path. `_next_id = max(loaded ids, default=0) + 1` satisfies AC4.
+- `backend/tests/conftest.py` — sets `TASKS_DATA_FILE` to a fresh `tempfile.mkdtemp()` path *before* `from app.main import app`, so the module-level `store` singleton never touches the real data file (AC8).
+- `backend/tests/test_persistence.py` — 8 tests covering restart survival, missing file, corrupt JSON, wrong top-level shape, wrong item shape, empty file, id-counter continuation, and directory auto-creation. All pass.
+
+**Verified this session:**
+- `cd backend && python3 -m pytest -q` → 30 passed (22 pre-existing + 8 new).
+- Manually traced `_load()`'s exception handling for each AC6 edge case (object-instead-of-array raises `TypeError` on `**item`; missing-fields item raises pydantic `ValidationError`) — both caught by the blanket `except Exception`, confirmed by the corresponding passing tests.
+- No `backend/data/` directory exists in the working tree or is tracked by git, so no real data risk today.
+
+**Known limitation — could not complete:** the spec calls for adding `backend/data/` to `.gitignore` (spec §"Affected areas" and §"Decisions"). I attempted this three ways — `Edit`, `Write`, and `Bash` redirection — and all three were blocked by the sandbox with "Claude requested permissions to write to `.gitignore`... you haven't granted it yet" / "Output redirection... blocked for security." This looks like a sandbox rule specifically protecting `.gitignore`, distinct from normal file-write permissions (other files in this same diff were editable fine by the prior attempt). I did not keep retrying past the third attempt per instructions not to hammer a denied call.
+
+**Action needed from orchestrator/user:** add one line to `/home/dev/projects/test-project/.gitignore`:
+```
+backend/data/
+```
+This is a single-line, low-risk addition — flagging it explicitly rather than guessing around the sandbox restriction, since bypassing a security block isn't something to improvise past.
+
+**How to verify:** `cd backend && python3 -m pytest -q` (30 passed). No frontend changes were made or needed (spec/design both confirm frontend is unaffected).

@@ -1,0 +1,32 @@
+## Review: Taiga #12 — Give tasks a due date
+
+Ran the diff past the panel. Since the testing pass is not clean, this goes straight back to the developer per the pipeline's own rule (a blocked testing pass loops back without a review pass) — but I ran the full suite and scanned the diff first so the report is complete in one round.
+
+**Verification performed:**
+```
+cd backend && python3 -m pytest -q
+```
+→ `9 failed, 38 passed`, all nine `TypeError: Object of type date is not JSON serializable` originating in `_save()`.
+
+### Will block
+
+1. **`backend/app/store.py:47`** — `_save()` still reads `json.dumps([task.model_dump() for task in self.list()])`. `model_dump()` defaults to `mode="python"`, which leaves `Task.due_date` as a Python `date` object; `json.dumps` can't serialize that, so every mutation that touches a task with a due date (create-with-date, set/clear due-date, and the general persistence round-trip) throws a 500 instead of succeeding. This is exactly the blocker the developer stage flagged as denied/unapplied in its handoff — confirmed still present and still the sole cause of all 9 failures (`test_state_survives_a_simulated_restart`, `test_create_with_explicit_due_date`, `test_updating_due_date_changes_it`, `test_clearing_an_existing_due_date`, `test_updating_due_date_does_not_change_title_id_or_done`, `test_updating_due_date_with_invalid_value_is_rejected`, `test_updating_title_leaves_due_date_untouched`, `test_updating_priority_leaves_due_date_untouched`, `test_updating_due_date_leaves_priority_untouched`).
+   **Fix:** `payload = json.dumps([task.model_dump(mode="json") for task in self.list()])`. Single-line change, no other edits needed — the rest of the backend/frontend diff is otherwise sound (see below).
+
+### Will comment
+
+None.
+
+### Worth considering
+
+None. Everything else checked out on read-through:
+- `set_due_date` in `store.py:81-87` mirrors `set_priority` exactly — consistent shape with its immediate neighbor (Stefan Ganzer lens).
+- `DueDateIn` (required key, nullable value) correctly matches the "explicit clear" semantics the PATCH route needs.
+- New backend tests (9 in `test_tasks.py`, 2 in `test_persistence.py`) map cleanly onto the spec's acceptance criteria, including the two cross-field "leaves X untouched" pairs.
+- Frontend `isOverdue` (`TaskList.jsx`) correctly implements both product defaults from the spec: strictly-before-today via ISO string comparison, and done-suppresses-overdue via `!task.done`.
+- Overdue cue uses visible text ("Overdue") plus a decorative `aria-hidden` icon, not colour alone — matches AC4 and the design doc's contrast notes.
+- No scope creep: frontend and backend changes both mirror the existing `priority` feature's shape one-for-one; no new surface beyond what the spec called for.
+
+This is a one-line mechanical fix with no design or test-coverage implications — once applied, re-run `python3 -m pytest -q` and I'd expect 47/47.
+
+VERDICT: changes-requested

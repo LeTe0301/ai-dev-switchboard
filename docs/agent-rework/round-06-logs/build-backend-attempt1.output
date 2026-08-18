@@ -1,0 +1,11 @@
+Both `docs/spec.md` and `docs/design.md` explicitly scope Taiga #10 as frontend-only — there is no backend work to do here.
+
+**Findings:**
+- `docs/spec.md` Non-goals (line 52-54): "No backend/API change... No new endpoint, no change to `backend/app/main.py`, `models.py`, or `store.py`."
+- `docs/design.md` Non-goals honored (line 205): "no backend/API touch."
+- `git status` shows only `docs/design.md` and `docs/spec.md` modified — no backend source changed by an earlier stage either.
+- Ran the existing backend suite as a sanity check: `python3 -m pytest -q backend/tests` → **35 passed**, unrelated to this change, confirming backend is untouched and healthy.
+
+Per my role's instructions ("Faithful scope" / stay inside the given scope, don't improvise beyond it), I'm not implementing the frontend work myself even though that's where the actual feature lives — that's outside the "backend" scope I was dispatched with, and per the "Your scope" instructions in this dispatch, I should not reach across into it.
+
+**Handoff:** There is no backend deliverable for Taiga #10. If a separate developer dispatch is/was assigned the frontend scope, it owns the entire implementation described in `docs/design.md` (new `frontend/src/components/TaskCounts.jsx`, edits to `frontend/src/App.jsx` and `frontend/src/App.css`). If no frontend-scope dispatch exists yet, the orchestrator should issue one — splitting this particular story into a "backend" scope was a no-op, since the spec and design both explicitly rule out backend changes.

@@ -1,0 +1,47 @@
+{
+  "status": "finished",
+  "reason": "",
+  "dispatches": 6,
+  "attempts": {
+    "story": 1,
+    "design": 1,
+    "build": 1,
+    "review": 1,
+    "test": 1
+  },
+  "stages": [
+    {
+      "stage": "story",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "design",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "build/frontend",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "build/backend",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "review",
+      "ok": true,
+      "verdict": "approve"
+    },
+    {
+      "stage": "test",
+      "ok": true,
+      "verdict": "pass"
+    }
+  ],
+  "seconds": 810.0,
+  "task": "Taiga #3: Edit a task title.\n\nI mistype task titles and there is no way to correct one without deleting it and typing it again. Let me edit a task's title in place, cancel out of an edit without saving, and have an empty title rejected rather than silently wiping the task.",
+  "workdir": "/home/dev/projects/test-project"
+}

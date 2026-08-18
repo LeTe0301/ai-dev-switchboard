@@ -1,0 +1,9 @@
+Both the spec and design explicitly call out this feature as frontend-only — no changes to `backend/`, `store.py`, or `api.js`, since the deferred-delete approach never mutates the task's local state, so nothing needs reconstructing server-side.
+
+My assigned scope is backend, and the spec's "Affected areas" section (`docs/spec.md:76-95`) confirms there is nothing in `backend/` for this ticket. I verified this rather than assuming — the existing `DELETE /api/tasks/{id}` route and its 404 behavior (`backend/app/main.py:69`) are reused unmodified.
+
+**Handoff:**
+
+No backend changes are required for Taiga #13. The spec/design's core design decision is to implement the undo window entirely in `App.jsx` by deferring the `DELETE` API call for 5 seconds rather than firing it immediately — since the task is only hidden from view (not mutated or removed from state) during that window, undo is a pure frontend state operation. `backend/app/main.py`, `backend/app/store.py`, and `frontend/src/api.js` are all reused unmodified.
+
+I ran no commands and made no edits, since there is nothing in this scope to implement. The frontend-scope developer instance (working on `App.jsx`, `TaskList.jsx`, new `UndoToast.jsx`, `App.css`) owns the entire feature. No backend tests need updating either, since the existing `DELETE /api/tasks/{id}` route's behavior (including its 404-on-missing semantics, which AC6 relies on) is unchanged.

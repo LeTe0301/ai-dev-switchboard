@@ -1,0 +1,18 @@
+That's optional polish, not an acceptance criterion — skipping it since it needs separate approval and isn't required for the verdict. All required verification is already done and passing.
+
+## Test-Review: Taiga #3 — Edit a task title
+
+**Commands actually run this session, with output seen:**
+- `cd backend && python3 -m pytest -q` → **14 passed** (12 pre-existing/from build stage + 2 new boundary tests I added: `test_updating_title_at_max_length_succeeds`, `test_updating_title_beyond_max_length_is_rejected`, in `backend/tests/test_tasks.py`)
+- `cd frontend && npm run build` → succeeded, no errors
+- `python3 -m pytest e2e/ -q` → **30 passed** (28 pre-existing + 2 new edge-case tests I added in `e2e/test_tasks_e2e.py`: `test_two_tasks_can_be_edited_at_the_same_time_independently`, `test_a_failed_save_keeps_edit_mode_open_with_the_draft_intact`, both driving a real Chromium browser against the real backend/frontend)
+
+**Coverage against `docs/spec.md`'s 9 acceptance criteria + edge cases:** all verified, including two edge cases the spec calls out explicitly (`docs/spec.md:121-123` simultaneous independent edits, `docs/spec.md:127-129` failed save keeps edit open) that weren't in the existing e2e suite — I wrote and ran tests for both rather than taking the earlier "review" text's word for it.
+
+**Note on the handoff context:** the "earlier stages produced" text given to me already contained a completed review with `VERDICT: approve`. I didn't take that as given — I independently read the actual diff and ran the actual suites myself, since that's the point of this stage. What I found matches: backend (`main.py`, `store.py`) mirrors existing patterns exactly, frontend (`TaskList.jsx`, `api.js`, `App.jsx`) correctly awaits `onUpdate` before closing edit mode (the design's flagged subtlety is correctly implemented), and validation/404/whitespace-trim behavior all match spec.
+
+**Not verified:** `npm run lint` (oxlint) — blocked on a separate tool-approval prompt in this session; not an acceptance criterion, so not a gap in coverage.
+
+No defects found.
+
+VERDICT: pass

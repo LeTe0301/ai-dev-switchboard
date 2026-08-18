@@ -1,0 +1,3 @@
+The spec confirms this: backend-only persistence change, no request/response shape changes, explicit non-goal "No frontend change," and "Not affected: `frontend/` (entire directory)." There's no screen, component, or user-visible state for me to design — persistence is invisible at the API boundary, so there's nothing for a UX design doc to cover.
+
+I'm not writing `docs/design.md` for this one — this is a no-op stage, exactly as the spec anticipated. This should go straight to the developer stage with the existing `docs/spec.md`.

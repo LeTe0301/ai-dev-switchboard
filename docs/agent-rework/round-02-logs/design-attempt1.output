@@ -1,0 +1,10 @@
+`docs/design.md` is written for Taiga #3 (edit a task title), overwriting round 1's filter-feature design per this pipeline's per-cycle `docs/` convention.
+
+**Key decisions:**
+- No new component — edit mode is per-row local state inside `TaskList.jsx` (a small `TaskRow` helper), reusing `App.css`'s existing button/input styles exactly.
+- Empty-title rejection uses **both** a disabled Save (mirroring `AddTask`) and an inline `.field-error` message on submit attempt, since a disabled button alone won't catch the Enter-key path.
+- Failed saves keep edit mode open with the draft intact for retry, using the existing global error banner — no new UI pattern.
+- Reused the app's existing error red (`#a3271d`) for the field error text; computed contrast on white is **7.33:1**, clearing both the 4.5:1 AA and 7:1 AAA text thresholds.
+- Flagged one implementation subtlety for the developer: the sketch closes edit mode optimistically on submit, but the "stays open on failure" decision requires awaiting `onUpdate` before closing — noted explicitly so it's not lost in translation.
+
+Next stage is **developer**, to implement against `docs/spec.md` + `docs/design.md`.

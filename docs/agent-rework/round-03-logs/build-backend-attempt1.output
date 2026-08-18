@@ -1,0 +1,17 @@
+This matches the design (`PATCH /api/tasks/{id}/priority` per `docs/design.md:176-178`). Backend implementation is complete and verified.
+
+## Backend handoff summary
+
+**Files changed:**
+- `backend/app/models.py` — added `Priority = Literal["low", "normal", "high"]`; `TaskIn` and `Task` gained `priority: Priority = "normal"`; added `PriorityIn` (single-field model for the priority-update endpoint). Invalid values are rejected with `422` automatically via Pydantic's `Literal` validation — no manual check needed.
+- `backend/app/store.py` — `TaskStore.add()` takes an optional `priority` (default `"normal"`); added `set_priority()` mirroring the existing `set_done()` shape.
+- `backend/app/main.py` — `create_task` passes `payload.priority` through; added `PATCH /api/tasks/{task_id}/priority` (matches `docs/design.md`'s `api.js` contract — note this uses `PATCH`, not `POST` like `/done`, since that's what the design doc's frontend call already specifies).
+- `backend/tests/test_tasks.py` — 8 new tests: default priority on create, explicit priority on create, invalid priority rejected on create (no mutation), priority update, priority update leaves title/id/done untouched, 404 on missing task, invalid priority rejected on update (no mutation), title update leaves priority untouched.
+
+**Verification:** `cd backend && python3 -m pytest -q` → 22 passed (14 pre-existing + 8 new). Two pre-existing, unrelated warnings (httpx2 deprecation notice, pytest cache write permission).
+
+**Deviation from spec draft:** the inline spec said "mirrors the existing `/done` action-scoped route" (implying `POST`), but `docs/design.md`'s frontend `api.js` snippet explicitly calls `PATCH .../priority`. I followed the design doc since it's the more concrete, later-stage artifact — flagging in case that was an unintentional mismatch between stages.
+
+**Known gap:** `docs/spec.md` on disk still holds the prior cycle's content (per both earlier stages' notes) — I did not touch it, since resolving that overwrite was called out as needing user confirmation first.
+
+Frontend scope (api.js, AddTask.jsx, TaskList.jsx, App.jsx, App.css) is out of my scope and untouched.

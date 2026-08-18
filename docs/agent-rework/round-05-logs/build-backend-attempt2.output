@@ -1,0 +1,15 @@
+The frontend `clearCompleted()` at `frontend/src/api.js:26` matches the new `DELETE /api/tasks/completed` route and expects a JSON body (`{count: int}`), which the new `ClearResult` response provides correctly.
+
+## Summary
+
+The backend half of Taiga #9 was genuinely missing (confirmed by the review), and an earlier partial attempt had left some inconsistent/duplicated state across files, which I found and cleaned up during implementation. Final state:
+
+- **`backend/app/models.py`** — added `ClearResult(BaseModel)` with a single `count: int` field.
+- **`backend/app/store.py:94-100`** — added `TaskStore.clear_completed() -> int`, matching the shape of `delete()`: removes all done tasks, calls `self._save()` once only if anything changed, returns the count removed.
+- **`backend/app/main.py:56-58`** — added `DELETE /api/tasks/completed` → `ClearResult`, declared **above** `@app.delete("/api/tasks/{task_id}")` at what's now line 61, avoiding the route-ordering hazard the spec flagged.
+- **`backend/tests/test_tasks.py`** — 4 new tests: empty store (AC6), no-completed-tasks no-op (AC1), mixed removal with open tasks preserved (AC2), no `done: true` tasks remain afterward (AC3).
+- **`backend/tests/test_persistence.py:87-101`** — `test_cleared_completed_tasks_do_not_reappear_after_restart` already existed from the earlier attempt and correctly covers AC5; left as-is.
+
+AC4 (filter-independence) has no backend dimension — the store has no concept of a filter, so `clear_completed()` is inherently store-wide.
+
+Verified: full backend suite passes (35/35, `python3 -m pytest -q`), including the 4 new tests run in isolation. Frontend `clearCompleted()` in `api.js:26` already matches this contract exactly, so no frontend changes were needed.

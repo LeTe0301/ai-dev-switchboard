@@ -92,15 +92,39 @@ class ProxyPassLineTests(unittest.TestCase):
             "Defect 1 found live.")
         self.assertNotIn("proxy_pass http://$upstream_front/;", self.conf)
 
-    def test_other_locations_left_untouched(self):
-        # docs/test-review.md confirmed /api/, /admin/, /media/ already
-        # forward correctly today -- this is a narrow, targeted fix for
-        # location / only, not a blanket rewrite.
-        self.assertIn("proxy_pass http://$upstream_back:8000/api/;",
-                       self.conf)
-        self.assertIn("proxy_pass http://$upstream_back:8000/admin/;",
-                       self.conf)
+    def test_api_and_admin_forward_the_real_request_uri(self):
+        # Supersedes the earlier `test_other_locations_left_untouched`,
+        # which asserted /api/ and /admin/ kept their literal-URI form on
+        # the strength of docs/test-review.md's claim that they "already
+        # forward correctly today". Live testing on CT110 (2026-08-18)
+        # disproved that claim outright: GET /api/v1/stats/discover through
+        # the gateway returned 404, while the same path straight at
+        # taiga-back returned 200 application/json. Cause is the same nginx
+        # rule the `location /` fix above is about -- proxy_pass carrying
+        # BOTH a variable and a URI part passes that URI as-is, replacing
+        # the request URI -- so /api/v1/... reached taiga-back as bare
+        # /api/. Switching both blocks to $request_uri turned that 404 into
+        # 200 with no other change.
+        self.assertIn("proxy_pass http://$upstream_back:8000$request_uri;",
+                      self.conf)
+        self.assertNotIn("proxy_pass http://$upstream_back:8000/api/;",
+                         self.conf)
+        self.assertNotIn("proxy_pass http://$upstream_back:8000/admin/;",
+                         self.conf)
+        # Both back-facing blocks must have been converted, not just one.
+        self.assertEqual(
+            2, self.conf.count(
+                "proxy_pass http://$upstream_back:8000$request_uri;"),
+            "expected both /api/ and /admin/ to forward $request_uri")
+
+    def test_locations_without_a_variable_plus_uri_are_left_alone(self):
+        # /media/ and /events keep their literal URI parts: those are
+        # genuinely correct. /media/ maps onto taiga-protected's own root
+        # and /events onto taiga-events' /events, so the replacement
+        # behaviour is the intended one there, not a bug.
         self.assertIn("proxy_pass http://$upstream_protected:8003/;",
+                       self.conf)
+        self.assertIn("proxy_pass http://$upstream_events:8888/events;",
                        self.conf)
 
 

@@ -1,0 +1,43 @@
+## Developer handoff — Taiga #14, frontend scope
+
+**Status:** The keyboard-accessibility implementation is complete and already matches `docs/implementation.md` exactly — I verified it file-by-file rather than trusting the doc:
+
+- `frontend/src/components/AddTask.jsx` — `autoFocus` on the title input (AC1); `forwardRef`/`useImperativeHandle` exposing `.focus()` for App-level restoration.
+- `frontend/src/components/TaskList.jsx` — `registerRowButtonRef(id, kind, el)` threaded through `TaskList`/`TaskRow`; `editButtonRef` + mount-guarded `useEffect` restoring focus to Edit on Escape/Cancel/Save (AC6/AC7).
+- `frontend/src/App.jsx` — `rowButtonRefs` registry, `computeFocusFallback`, `handleDelete`/`handleComplete` fallback logic, and the `focusRequest` resolution effect (AC4/AC5).
+- `frontend/src/App.css:153-173` — global `*:focus-visible` rule plus the inset-outline override for `.filter-option.active`/`.priority-select.priority-high`.
+
+`npm run build` passes clean (ran it this session, 23 modules, no errors).
+
+**Issue found and NOT yet fixed (blocked, needs your action):** `frontend/package.json` and `frontend/package-lock.json` carry unused changes unrelated to this feature — `vitest`, `jsdom`, `@testing-library/jest-dom`, `@testing-library/react`, `@testing-library/user-event` were added to `devDependencies`, but there's no `test` script, no test files anywhere (`find src -iname '*.test.*'` returns nothing), and none of this is mentioned in `docs/implementation.md`. `docs/spec.md:187-197` explicitly says standing up test infra is the **reviewer's** call, not the developer's — so this looks like leftover/abandoned work from an earlier attempt in this same uncommitted tree, not something in scope here. I tried to revert it (both `git checkout -- package.json package-lock.json` and a direct `Edit` restoring the original `devDependencies` block) but **every write/checkout call in this session was denied** ("you haven't granted it yet") — this appears to be a session-level permission gate, not something retrying fixes.
+
+**Exact fix for the next attempt to apply**, in `frontend/package.json`, replace:
+```json
+  "devDependencies": {
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.4",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.4",
+    "jsdom": "^30.0.1",
+    "oxlint": "^1.75.0",
+    "vite": "^8.2.0",
+    "vitest": "^4.1.10"
+  }
+```
+with:
+```json
+  "devDependencies": {
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.4",
+    "oxlint": "^1.75.0",
+    "vite": "^8.2.0"
+  }
+```
+Then regenerate `package-lock.json` by running `npm install` (simpler and safer than hand-editing 1300+ diff lines) — or `git checkout -- frontend/package.json frontend/package-lock.json` if write/checkout permission is available in that session.
+
+**Also blocked, not a regression:** `npm run lint` (oxlint) — every invocation in this session returned "This command requires approval" with no prompt resolving it. Same finding as the prior attempt's `docs/implementation.md` "Known limitations" section; still needs to be run in an environment where it's permitted.
+
+**No other frontend changes needed for Taiga #14.** Once the `package.json`/`package-lock.json` revert lands and lint has been run somewhere unblocked, this scope is ready for the reviewer stage — per the story-stage product-manager's recommendation to proceed straight to `reviewer` next.

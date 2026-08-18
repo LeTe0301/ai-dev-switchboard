@@ -1,0 +1,11 @@
+`docs/design.md` is written for Taiga #12.
+
+**Summary:**
+- Mirrors the priority control pattern throughout: `<input type="date">` styled to match `.priority-select`, editable directly per-row, no edit-mode needed.
+- Adds a `.due-date-clear` button (shown only when a date is set) since native date-input clear support is inconsistent across browsers — needed to satisfy AC3's "clearing must be possible."
+- Overdue badge (AC4) reuses the app's existing error red (`#a3271d` / `#fbe9e7`) rather than inventing a new colour, with the accessible cue being the visible text "Overdue" (icon is decorative/`aria-hidden`). Computed contrast: badge text-on-badge-bg 6.25:1, badge text-on-card 7.33:1, clear-button text 6.04:1 — all pass 4.5:1 for text.
+- Full wireframes for populated/overdue/done/unset states, plus explicit notes on why empty/loading/error states need no changes (non-goals exclude filtering/sorting by due date).
+- Exact prop wiring (`onDueDateChange` mirroring `onPriorityChange`) and file/line references for the developer stage.
+- Flagged one pre-existing gap (border contrast ~1.53:1, app-wide, not introduced by this feature) as explicitly out of scope rather than silently ignoring it.
+
+Ready to hand off to the developer stage.

@@ -1,0 +1,43 @@
+## Handoff
+
+**Fixed in `backend/app/store.py`:**
+
+- **#2 (non-atomic write)** — `_save()` now writes to a `.tmp` sibling file and `os.replace()`s it into place (store.py:44-49). A kill mid-write leaves the temp file torn, never the real `tasks.json`, so a restart after an interrupted save still loads the last good snapshot.
+- **#3 (silent corruption)** — `_load()` now catches `FileNotFoundError` separately (silent, as before — that's the benign "no file yet" case) and logs `logger.warning(...)` for every other exception (parse errors, shape mismatches) before starting empty (store.py:29-40), so a wiped/corrupted data file is now discoverable in the server logs instead of indistinguishable from first-run.
+- **#4 (concurrent-thread races)** — left as-is per the review's own verdict: explicitly not blocking, filed as a follow-up rather than in scope here.
+
+`cd backend && python3 -m pytest -q` — **30 passed**, confirmed in this session.
+
+**Blocked, not applied — needs your attention:**
+
+- **`.gitignore`** (must-fix #1): every attempt to add `backend/data/` — via Edit, Write, and a Bash shell redirect — was rejected by this session's permission system with "you haven't granted it yet," repeated across five separate tries. This is the one **blocking** finding and it's still open in the working tree.
+- **`backend/tests/test_persistence.py`**: I tried to add one small test (`test_save_does_not_leave_a_temp_file_behind`, asserting no stray `.tmp` file survives a save) to cover the atomic-write fix directly — same permission rejection, twice.
+
+Both are one paragraph/one function, ready to apply — I just can't get either file write approved in this session. Someone with interactive approval needs to either grant the edit or apply these two small diffs by hand:
+
+```diff
+--- a/.gitignore
++++ b/.gitignore
+@@
+ .pytest_cache/
++backend/data/
+```
+
+```diff
+--- a/backend/tests/test_persistence.py
++++ b/backend/tests/test_persistence.py
+@@
++def test_save_does_not_leave_a_temp_file_behind(tmp_path, monkeypatch):
++    data_file = tmp_path / "tasks.json"
++    monkeypatch.setenv("TASKS_DATA_FILE", str(data_file))
++
++    store = TaskStore()
++    store.add("write atomically")
++
++    assert list(tmp_path.iterdir()) == [data_file]
++
++
+ def test_data_directory_is_created_on_first_write(tmp_path, monkeypatch):
+```
+
+Not marking this complete: must-fix #1 is still unresolved in the actual repo, even though the fix content is fully specified above.

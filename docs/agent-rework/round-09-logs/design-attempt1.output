@@ -1,0 +1,10 @@
+`docs/design.md` is written. Summary of key decisions:
+
+- **New component:** `frontend/src/components/UndoToast.jsx`, fixed-position bottom-center toast, stacked (oldest on top) for multiple pending deletes.
+- **Reuses existing dark surface color** `#16191c`/white already in `App.css` — computed contrast ≈17.6:1 for text, ≈6.1:1 for the button border, both pass.
+- **Decorative CSS-only progress bar** (`aria-hidden`) sharing the same 5000ms constant as the JS timer, so there's one source of truth for the duration.
+- **No focus-stealing** on toast appearance (matches existing app behavior and standard snackbar a11y guidance); flagged that keyboard users reach Undo last in tab order as an accepted limitation given the spec's "no keyboard shortcut" non-goal.
+- **`role="status"`** container (matches `TaskCounts`'s existing pattern) rather than `role="alert"`.
+- Every acceptance criterion mapped to a specific state/element; non-404 delete failures explicitly routed to the existing `.error` banner rather than inventing new error UI.
+
+Ready for the developer stage.

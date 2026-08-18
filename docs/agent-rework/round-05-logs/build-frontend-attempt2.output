@@ -1,0 +1,22 @@
+## Handoff
+
+Both must-fix items from the review are addressed — the backend half of Taiga #9 was missing entirely; it's now built to spec.
+
+**Files changed:**
+
+- **`backend/app/models.py`** — added `ClearResult(BaseModel)` with a single `count: int` field, next to `Task`.
+- **`backend/app/store.py`** — added `TaskStore.clear_completed() -> int`, following the exact shape of `delete()`: collects done task ids, removes them, calls `self._save()` once only if anything was removed, returns the count.
+- **`backend/app/main.py`** — added `DELETE /api/tasks/completed` (`response_model=ClearResult`) at line 56, **above** `DELETE /api/tasks/{task_id}` at line 61, avoiding the route-ordering hazard the spec flagged (Starlette would otherwise match `"completed"` against `task_id: int` and 422).
+- **`backend/tests/test_tasks.py`** — 4 new tests: empty-store no-op, mixed completed/open removal (open tasks untouched), full-clear leaves no `done: true` behind, empty-store direct-call returns `200`/`count: 0`.
+- **`backend/tests/test_persistence.py`** — 1 new test: `clear_completed()` then a fresh `TaskStore()` reload confirms the removal survives a restart (AC5), same pattern as the existing restart test.
+
+**Note on the process:** while editing, the tool surfaced spurious "modified since read" duplication in `store.py` and `test_tasks.py` (the same method/tests appearing twice). I caught and cleaned both — verified with `grep ... | sort | uniq -d` that no duplicate `def` names remain anywhere in the touched files, and that `pytest --collect-only` reports exactly 35 tests (26 in `test_tasks.py` + 9 in `test_persistence.py`), matching the real test count.
+
+**Verification actually run this session:**
+- `cd backend && python3 -m pytest -q` → **35 passed**, no failures, no skips.
+- `cd frontend && npm run build` → succeeds (project's documented type/build check; no test runner is configured in this repo — pre-existing, out of scope here).
+- Confirmed route order in `main.py` via `grep -n "^@app\."` — `/api/tasks/completed` before `/api/tasks/{task_id}`.
+
+**Frontend** (`ClearCompleted.jsx`, `App.jsx`, `App.css`, `api.js`) was already correct per the prior review pass — untouched here, confirmed its `clearCompleted()` call in `api.js` now hits a real, working endpoint.
+
+All 6 acceptance criteria in `docs/spec.md` are now implemented and covered by tests. Ready for re-review.

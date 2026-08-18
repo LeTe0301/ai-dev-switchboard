@@ -1,0 +1,11 @@
+`docs/design.md` is written for Taiga #9.
+
+**Key decisions:**
+- New sibling component `ClearCompleted.jsx` next to `TaskFilter`, both wrapped in a new `.list-toolbar` flex row (`justify-content: space-between`, wraps on narrow widths) in `App.jsx` — deliberately *not* nested inside `TaskFilter`, so it visually reads as store-wide (AC4), not filter-scoped.
+- Button text doubles as the count display: `Clear completed (N)`, disabled when N=0 — satisfies AC1/AC2 with no new component state, no aria-label needed (text is already the accessible name).
+- Reuses the app's plain, un-colored button styling — confirmed there's no "destructive = red" convention anywhere (even the per-task `Delete` button is styled identically to `Edit`/`Done`), so no new visual language introduced.
+- No loading state, spinner, or focus-ring override — none exist elsewhere in this app, so none are added here either.
+- Computed contrast ratios: text ~17.5:1 (passes), existing border color ~1.37:1 (fails 3:1 but is an app-wide pre-existing choice, not a new pairing this feature introduces — flagged rather than silently fixed, since correcting it is out of this ticket's scope).
+- Full AC traceability table included; 3 of 6 ACs are backend-only with no visual dimension, noted as such.
+
+Ready for the developer stage.

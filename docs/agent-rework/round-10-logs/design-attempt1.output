@@ -1,0 +1,9 @@
+Design review complete. Summary:
+
+**What I found:** `docs/design.md`'s contrast math had real errors — most notably `#16191c`'s luminance was off by ~10x (0.096 stated vs. 0.0095 actual), and `#0066cc`/`#a8480a` were overstated by ~2.6x. That caused the doc to wrongly conclude the dark-orange background failed the 3:1 minimum and to rationalize shipping that shortfall anyway ("established pattern in accessible design systems") rather than fixing it — which is exactly backwards from what a design review should do. With correct math, every combination actually clears 3:1 with real margin; no CSS values needed to change.
+
+Separately, `docs/implementation.md` documents a deviation the developer made (inset white outline instead of outset box-shadow for `.filter-option.active`/`.priority-select.priority-high`, to avoid the ring being clipped/occluded on flush-adjacent filter buttons) that was never folded back into `docs/design.md` — the design doc still only described the single global rule while the shipped `frontend/src/App.css:153-173` has two rules. The developer's geometric reasoning was sound, so I adopted it into the design record and computed contrast for it (17.65:1 and 5.84:1 — both pass comfortably).
+
+**What changed:** Only `docs/design.md` — corrected contrast tables, added the "Override for flush/dark-fill controls" section, updated the CSS snippets and traceability table to match what's actually implemented. No code changes; `frontend/src/App.css` already matches the (now-accurate) design.
+
+**Handoff:** Design is now internally consistent with the implementation and accessibility-verified. Ready for the reviewer stage (test pass + review against `docs/spec.md`'s 7 ACs) — no further design or development work needed for this cycle.

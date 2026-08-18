@@ -1,0 +1,19 @@
+No new commits yet (all work is uncommitted), so there's no commit-message convention to check at this stage.
+
+## Review: Taiga #5 — Keep tasks when the server restarts (attempt 2)
+
+**Will block**
+
+- **`.gitignore` still missing `backend/data/`** (`/home/dev/projects/test-project/.gitignore`, 4 lines, unchanged by this diff). `docs/spec.md`'s own "Affected areas" section requires this line specifically so persisted task data is never committed. It's still absent — confirmed by reading the file directly. The moment someone runs the real server locally (`uvicorn app.main:app --reload`) and later does a broad `git add`, `backend/data/tasks.json` — containing real user-entered task titles — becomes trackable. The build handoff says this was blocked by session write permissions on that specific filename and needs a human to add it by hand; that's understood, but from a spec-coverage standpoint the deliverable isn't done, so this stays a blocker until the line actually lands, not a note for later.
+
+**Will comment**
+
+- `backend/app/store.py:35-40` — `_load`'s `except Exception:` catch logs only the file path, never the exception itself (`logger.warning("Could not parse %s; ...", self._data_file)` — no `%s` for `str(exc)`, no `exc_info=True`). Alan's lens: a failure path should log enough to diagnose *what* went wrong, not just *that* something did. As written, a permission error, a `JSONDecodeError`, and a Pydantic validation error are all indistinguishable in the log, which will slow down whoever has to debug a real corrupt-file incident later. Cheap fix whenever this file is next touched: `logger.warning("Could not parse %s (%s); starting with an empty task list.", self._data_file, exc)`.
+
+**Worth considering**
+
+- Same-process concurrent writers: FastAPI's sync `def` routes run in Starlette's threadpool, so two in-flight requests can call `_save()` concurrently and race on the shared `.tmp` file / `os.replace`. This was already raised and explicitly deferred as a follow-up in the prior round (noted in this round's build handoff as "#4, not addressed"), and the spec's non-goal ("no multi-process/multi-worker locking... this app runs as a single process") only strictly rules out multi-*process* races, not multi-*thread* ones — worth a sentence in a follow-up ticket rather than blocking this cycle on it.
+
+**Verified:** `python3 -m pytest -q` → 30 passed (same run I did in this review). Load/save round-trip, missing/corrupt/wrong-shape/empty-file handling, id-continuation after reload, and directory auto-creation are all covered by `backend/tests/test_persistence.py` and match spec ACs 1–8. Reviewed disk state before/after — nothing left in the tree by this review pass.
+
+VERDICT: changes-requested

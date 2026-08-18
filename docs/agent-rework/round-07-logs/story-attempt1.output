@@ -1,0 +1,11 @@
+The spec is written to `docs/spec.md`. Summary:
+
+**Triage:** Feature, single-layer (frontend only) — no split needed.
+
+**Key decisions:**
+- Search is client-side, following the exact pattern the existing state filter already uses (`App.jsx` narrows the fetched task array in memory; no backend query param, no new endpoint).
+- Search and the Open/Done state filter combine with AND, chained onto the same `visibleTasks` filter at `App.jsx:29`.
+- Case-insensitive substring match against the title only, literal (not regex).
+- A new "no matches" empty-state message, distinct from the existing per-filter empty copy in `TaskList.jsx:3-7`.
+
+No open questions requiring sign-off — defaults are stated and reasonable. Next stage is ux-designer, working from `docs/spec.md`.

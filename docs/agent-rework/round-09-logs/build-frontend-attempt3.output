@@ -1,0 +1,17 @@
+That's sufficient confirmation — the spec's race-handling criteria are unaffected by this fix (the 404-swallow logic in the `catch` block is untouched, just now paired with a `finally`).
+
+## Handoff
+
+**Fixed:** `frontend/src/App.jsx` (all three review findings, same file, all in scope).
+
+1. **Blocking fix (flicker on natural expiry)** — `deferDelete` (lines 74–97): moved the `setPendingDeletes` removal out of the front of the `setTimeout` callback and into a `finally` block that runs after the `try`/`catch` around `api.deleteTask`/`refresh()`. The task now stays excluded from `activeTasks` for the entire duration of the delete request, not just until the timer fires — no more reappear-then-vanish flash on the default (no-undo) path. The existing "no such task" 404-swallow behavior in `catch` is untouched.
+
+2. **Toast stacking order** — `App.jsx:137–143`: `UndoToast`'s `pending` prop now derives from `[...pendingDeletes.keys()]` (a `Map` preserves insertion order) mapped to their `tasks` objects, `.filter(Boolean)`-guarded against a task that's vanished from `tasks` some other way (e.g., a `Clear completed` race). This restores the "oldest deleted on top" guarantee from `docs/design.md` while keeping the round-2 crash fix (no `undefined` reaches `UndoToast`).
+
+3. **Optional purity cleanup** — `cancelPendingDelete` (lines 99–107): reads the timer handle from `pendingDeletes` in render scope before calling `clearTimeout`, instead of doing it as a side effect inside the `setPendingDeletes` updater function. Removes the (harmless but StrictMode-flaggable) impurity the review noted.
+
+Also updated the stale comment above the `pendingDeletes` state declaration (line 20–23) since it described the old tasks-filter derivation, which no longer matches the code.
+
+**Verified:** `npm run build` passes clean. `npm run lint` is blocked on approval in this headless session (same gap the prior developer and reviewer stages already hit — not something I can resolve from here). No frontend test runner exists in this repo (`package.json` has no `test` script, no `*.test.*` files present), so `npm test` per `CLAUDE.md` isn't currently runnable — that's a pre-existing gap, not something introduced by this change, and out of scope for this fix cycle.
+
+**Not touched:** backend is unaffected (spec calls for frontend-only implementation); no other files needed changes for these three findings.

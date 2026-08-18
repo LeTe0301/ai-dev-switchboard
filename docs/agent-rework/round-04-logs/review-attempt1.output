@@ -1,0 +1,27 @@
+## Review: Taiga #5 — Keep tasks when server restarts
+
+Scope: `backend/app/store.py`, `backend/tests/conftest.py`, `backend/tests/test_persistence.py` (new). Ran `cd backend && python3 -m pytest -q` — 30 passed, matching the developer's report. Verified against `docs/spec.md`'s 8 acceptance criteria directly.
+
+### Will block
+
+**1. `backend/data/` was never added to `.gitignore`** (Christopher Zipp / scope discipline)
+`docs/spec.md`'s own "Affected areas" (spec.md:102-103) requires this, and it's called out explicitly in the developer's handoff as an incomplete item — but checking the actual repo state, `.gitignore` is untouched (still just `node_modules/`, `dist/`, `__pycache__/`, `.pytest_cache/`). Nothing currently stops `backend/data/tasks.json` from being committed the first time someone runs the server locally and later does `git add -A`. This is a one-line fix (`backend/data/` appended to `.gitignore`) and blocks merge since it's a spec-mandated deliverable, not a nice-to-have.
+
+### Will comment
+
+**2. Non-atomic write can turn a normal restart into total data loss** — `backend/app/store.py:38`, in `_save()` (Alan Heitkotter)
+`self._data_file.write_text(payload)` is not atomic. If the process is killed mid-write (SIGKILL, OOM, host reboot, `--reload` racing a save) the file is left truncated. On the next start, `_load()` (store.py:26-31) hits a parse error and — per AC6 — starts empty, discarding *every* previously-saved task. That directly undercuts the feature's own goal ("nothing is lost just because the process stopped"). Fix: write to a temp file in the same directory and `os.replace()` it into place — cheap, standard, and closes the gap.
+
+**3. Corruption is swallowed with zero logging** — `backend/app/store.py:26-31`, in `_load()` (Alan Heitkotter)
+The bare `except Exception: return` is correct per spec decision 4 (one path for missing-or-corrupt), but it gives an operator no way to tell "first run, no file yet" apart from "the data file just got silently wiped." Combined with finding #2, a torn write becomes an invisible data-loss event — nothing in the logs, nothing in the response. Recommend at minimum a `logger.warning` when the file exists but fails to parse (distinct from the benign `FileNotFoundError` case), so a lost `tasks.json` is discoverable rather than silently masked.
+
+### Worth considering
+
+**4. `_save()` isn't safe against concurrent request threads** — `backend/app/store.py:35`, called from every mutator (Alan Heitkotter)
+`backend/app/main.py`'s route handlers are plain `def`, so Starlette runs each in a threadpool — two mutating requests arriving close together run `_save()` concurrently with nothing serializing the writes, which can interleave and produce invalid JSON (same failure mode as #2). The spec's non-goal (`docs/spec.md:64-66`) only rules out *multi-process/multi-worker* locking; it doesn't address this in-process, multi-thread case, which FastAPI's own sync-handler behavior actually creates today. Given this project's realistic usage (one developer clicking a UI, not concurrent clients), I'm not blocking on it, but it's worth a follow-up ticket — likely the same temp-file+replace fix from #2 plus a simple `threading.Lock` around `_save()` would close both at once.
+
+---
+
+Everything else checks out: all 8 ACs are demonstrably met by `test_persistence.py`'s 7 new tests plus the existing suite staying green; the env-var override ordering in `conftest.py` is correctly sequenced before `app.main` import with a comment explaining why; id-counter-from-max-loaded-id, empty-file/wrong-shape/wrong-item-shape handling, and directory auto-creation all match spec decisions exactly; no route, model, or frontend changes, consistent with the spec's stated scope.
+
+VERDICT: changes-requested

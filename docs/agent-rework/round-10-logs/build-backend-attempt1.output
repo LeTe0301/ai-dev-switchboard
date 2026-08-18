@@ -1,0 +1,13 @@
+Confirmed: no backend work exists for this ticket, and nothing to do in this scope.
+
+**Backend scope — no changes made.**
+
+`docs/spec.md`'s non-goals explicitly state "No backend changes — this is entirely a frontend concern" (line 112), and the "Affected areas" section (lines 114-136) lists only `frontend/src/components/AddTask.jsx`, `frontend/src/components/TaskList.jsx`, `frontend/src/App.jsx`, and `frontend/src/App.css`. Taiga #14 is a keyboard-accessibility feature entirely about focus management and CSS `:focus-visible` styling in the React frontend — there is no backend surface (routes, schemas, store) that keyboard operability touches.
+
+Verified before handing off:
+- `git status --porcelain backend/` and `git diff --stat backend/` are both empty — no pending or uncommitted backend changes exist in this cycle.
+- `cd backend && python3 -m pytest -q` — 47 passed, 0 failed. Backend is green and untouched.
+
+`docs/implementation.md` (written earlier this cycle by the developer instance that had the frontend scope) already documents the complete frontend implementation — `autoFocus`, `forwardRef`/`useImperativeHandle` on `AddTask`, the row-button-ref registry and focus-fallback computation in `App.jsx`, the edit-mode focus-restore effect in `TaskList.jsx`, and the `:focus-visible` CSS rules. Nothing in that diff touches `backend/`.
+
+**Handoff:** Backend scope for Taiga #14 is complete by virtue of being empty — correctly so, per the spec's own non-goal. No files changed, no risk of collision with the frontend scope's work. The story is ready to proceed to the reviewer stage as the product-manager's report already recommended; there is nothing further for a backend developer pass to do on this ticket.

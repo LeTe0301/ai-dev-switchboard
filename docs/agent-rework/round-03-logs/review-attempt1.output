@@ -1,0 +1,25 @@
+## Review — Taiga #4: Give tasks a priority
+
+**Verification performed:** `cd backend && python3 -m pytest -q` → 22 passed (14 pre-existing + 8 new, all covering the stated acceptance criteria: default priority, explicit priority, invalid-value 422 with no mutation on both create and update, priority update leaves id/title/done untouched, title update leaves priority untouched, 404 on missing task). `cd frontend && npm run build` → succeeds. Read every changed file in full and cross-checked the implementation against `docs/design.md`'s code snippets line-by-line — they match verbatim (sort expression, CSS class names/colors, aria-labels, endpoint shape). Could not start a live server or run `npm run lint`/`python3 -c` in this sandbox (both require approval this session provides no channel for); relied on the test suite, build, and direct code reading instead.
+
+### Will block
+
+None.
+
+### Will comment
+
+1. **`TaskIn` now advertises a `priority` field on an endpoint that ignores it.** `backend/app/models.py:9-11` added `priority: Priority = "normal"` to `TaskIn`, which is still the request model for `update_task` (`backend/app/main.py:48-49`, `PATCH /api/tasks/{id}`). That route only ever calls `store.update_title(task_id, payload.title)` — `payload.priority` is silently dropped. The generated OpenAPI schema and any client reading it will see `priority` as an accepted field on the title-update endpoint with no effect. (Stefan Ganzer lens — an interface that admits a value the route doesn't honor.) Fix: give `update_task` its own single-field model (e.g. `TitleIn`), leaving `TaskIn` scoped to creation.
+
+2. **`PRIORITIES` literal array duplicated verbatim** in `frontend/src/components/AddTask.jsx:3-7` and `frontend/src/components/TaskList.jsx:9-13`. Unlike `TaskFilter.jsx`'s `OPTIONS` (single owner, single use), this same three-item array now lives in two files that must be kept in sync by hand. (Christopher Zipp lens.) Fix: extract to one shared module (e.g. a `frontend/src/priorities.js`) and import it in both.
+
+3. **`docs/spec.md` on disk was never updated for this feature** — it still holds the prior cycle's "Edit a task title" (Taiga #3) content. All three earlier stages (story, design, build) flagged this and said it needed confirmation before overwriting, but it was never resolved; `docs/design.md` *was* correctly overwritten with the Taiga #4 design, so the two docs are now inconsistent with each other and the spec doesn't reflect what was actually shipped. Doesn't affect runtime correctness (I verified behavior against the acceptance criteria given inline in this dispatch), but it's a real gap in the deliverable's source-of-truth record.
+
+### Worth considering
+
+- `docs/design.md:140-143` states priority "stays visible and editable independently while a title edit is in progress," but the implementation (`frontend/src/components/TaskList.jsx:63-91`, the edit-mode branch) doesn't render `priority-select` there — it only appears in the view-mode branch (lines 93-103). The code matches the design doc's own code snippet exactly; only the doc's prose overstates it. Not a spec violation (AC8 only requires visibility without opening the edit form, which holds), just a minor UX gap worth a note for whoever revisits this design.
+
+### Scope discipline check
+
+No renames or re-scoping of pre-existing code. The new `PATCH /api/tasks/{id}/priority` endpoint is new surface, but it's justified by the design's single-field-touch precedent already established by `/done` and the title `PATCH`, not gratuitous. Commit messages n/a — nothing committed yet.
+
+VERDICT: approve-with-followups

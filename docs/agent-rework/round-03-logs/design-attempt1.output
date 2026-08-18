@@ -1,0 +1,10 @@
+`docs/design.md` is written. Summary for the next stage:
+
+**Key decisions:**
+- One `<select className="priority-select priority-{level}">` per row (and in `AddTask`) does double duty as both the at-a-glance indicator and the change control — no separate badge, no new dropdown component.
+- `normal` = baseline styling (blends in), `high` = solid orange fill `#a8480a`/white text (5.84:1 contrast, computed — deliberately not reusing `.error`'s red to keep "red = error" unambiguous), `low` = light gray `#e8eaec`/`#4a545c` text (6.42:1), with a border since the fill alone is only 1.21:1 against the white card.
+- Priority change applies immediately on select (no Save step), same precedent as `Done` and `TaskFilter`.
+- Sort is a stable partition (`high` first) applied to `App.jsx`'s already-filtered `visibleTasks`, not the raw list — satisfies the filter-then-sort ordering the spec requires.
+- No optimistic UI — reuses the existing `run()`/`refresh()` pattern verbatim, so a failed change just snaps the select back to server state via the existing controlled-component wiring.
+
+**Flag for you:** `docs/spec.md` on disk still holds the prior cycle's "Edit a task title" content — the Taiga #4 spec I designed against was only given inline in this dispatch, pending your confirmation to overwrite it and to resolve the interleaved-vs-3-tier sort question. Worth confirming both and persisting `docs/spec.md` before the developer stage starts, so it isn't building from a stale file.

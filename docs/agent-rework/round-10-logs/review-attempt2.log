@@ -1,0 +1,10 @@
+{"ts": "2026-08-17T13:57:34Z", "agent": "claude", "seq": 1, "kind": "status", "text": "", "meta": {"native_type": "system", "subtype": "hook_started", "session_id": "a1054dd7-3e8e-427f-be9a-7d21a12503ce"}}
+{"ts": "2026-08-17T13:57:34Z", "agent": "claude", "seq": 2, "kind": "status", "text": "", "meta": {"native_type": "system", "subtype": "hook_started", "session_id": "a1054dd7-3e8e-427f-be9a-7d21a12503ce"}}
+{"ts": "2026-08-17T13:57:34Z", "agent": "claude", "seq": 3, "kind": "status", "text": "", "meta": {"native_type": "system", "subtype": "hook_started", "session_id": "a1054dd7-3e8e-427f-be9a-7d21a12503ce"}}
+{"ts": "2026-08-17T13:57:34Z", "agent": "claude", "seq": 4, "kind": "status", "text": "", "meta": {"native_type": "system", "subtype": "hook_response", "session_id": "a1054dd7-3e8e-427f-be9a-7d21a12503ce"}}
+{"ts": "2026-08-17T13:57:34Z", "agent": "claude", "seq": 5, "kind": "status", "text": "", "meta": {"native_type": "system", "subtype": "hook_response", "session_id": "a1054dd7-3e8e-427f-be9a-7d21a12503ce"}}
+{"ts": "2026-08-17T13:57:34Z", "agent": "claude", "seq": 6, "kind": "status", "text": "", "meta": {"native_type": "system", "subtype": "hook_response", "session_id": "a1054dd7-3e8e-427f-be9a-7d21a12503ce"}}
+{"ts": "2026-08-17T13:57:35Z", "agent": "claude", "seq": 7, "kind": "status", "text": "", "meta": {"native_type": "system", "subtype": "init", "session_id": "a1054dd7-3e8e-427f-be9a-7d21a12503ce"}}
+{"ts": "2026-08-17T13:57:36Z", "agent": "claude", "seq": 8, "kind": "status", "text": "", "meta": {"native_type": "rate_limit_event"}}
+{"ts": "2026-08-17T13:57:36Z", "agent": "claude", "seq": 9, "kind": "message", "text": "You've hit your session limit \u00b7 resets 4pm (UTC)", "meta": {"native_type": "assistant", "block_type": "text", "session_id": "a1054dd7-3e8e-427f-be9a-7d21a12503ce"}}
+{"ts": "2026-08-17T13:57:36Z", "agent": "claude", "seq": 10, "kind": "status", "text": "You've hit your session limit \u00b7 resets 4pm (UTC)", "meta": {"native_type": "result", "subtype": "success", "session_id": "a1054dd7-3e8e-427f-be9a-7d21a12503ce", "is_error": true, "total_cost_usd": 0}}

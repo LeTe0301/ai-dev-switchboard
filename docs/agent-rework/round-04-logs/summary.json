@@ -1,0 +1,71 @@
+{
+  "status": "blocked",
+  "reason": "stage 'build' reached 3 attempts without passing",
+  "dispatches": 11,
+  "attempts": {
+    "story": 1,
+    "design": 2,
+    "build": 3,
+    "review": 2
+  },
+  "stages": [
+    {
+      "stage": "story",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "design",
+      "ok": false,
+      "verdict": null
+    },
+    {
+      "stage": "design",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "build/frontend",
+      "ok": false,
+      "verdict": null
+    },
+    {
+      "stage": "build/backend",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "build/frontend",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "build/backend",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "review",
+      "ok": true,
+      "verdict": "changes-requested"
+    },
+    {
+      "stage": "build/frontend",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "build/backend",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "review",
+      "ok": true,
+      "verdict": "changes-requested"
+    }
+  ],
+  "seconds": 766.0,
+  "task": "Taiga #5: Keep my tasks when the server restarts.\n\nEvery restart loses everything, which makes the app useless for anything real. Persist tasks to disk and reload them at startup. A corrupt or missing file should start empty rather than crash the server.",
+  "workdir": "/home/dev/projects/test-project"
+}
