@@ -3353,3 +3353,56 @@ failure.
 - `AUTH_MODE=pve` itself never actually exercised end-to-end, precisely
   because of item 39 — tested via the auto-generated simple-mode
   credentials instead.
+
+---
+
+## 52. `install.sh --update` never applies the logic it just pulled — a single run is always one version behind
+
+Found live on CT110 (2026-08-18) while landing the item 47/48 follow-up
+fixes.
+
+`--update` fast-forwards `$REPO_DIR` to `origin/$REPO_BRANCH` as its
+*first* step, then continues into the install steps below "against that
+fresh checkout" — but the thing it just replaced **is the script that is
+currently executing**. `git merge --ff-only` swaps `install.sh` for a new
+inode; the running `bash` still holds an open descriptor on the *old*
+one, so the entire remainder of the run executes pre-update logic.
+
+Observed exactly this: `install.sh --update` reported
+`Pulled a5c84df (main).`, and `$REPO_DIR/install.sh` genuinely contained
+the new config-writing logic afterwards — yet the files it wrote during
+that same run (`$TAIGA_DIR/.env`, the taiga-gateway nginx conf) were
+still the pre-fix versions. Running `install.sh` a second time, with no
+`--update`, produced the corrected output.
+
+So today the real update procedure is **two invocations**: `--update` to
+fetch, then a plain run to apply. Nothing says that, and the first run
+looks fully successful (exit 0, "== Done ==").
+
+Options for whoever picks this up:
+
+1. **Re-exec after the pull.** Once the ff-merge changes `install.sh`,
+   `exec "$0" "$@"` minus the `--update` flag (guard with an env var so
+   it can only happen once). Single invocation, correct logic, no
+   surprise.
+2. **Refuse to continue**, printing "updated to <sha> — re-run
+   `install.sh` (without `--update`) to apply". Honest and trivial, but
+   keeps the two-step dance.
+3. **Split the concerns**: make `--update` *only* pull (and say so), with
+   applying always being a separate plain run.
+
+Option 1 is the least surprising and matches what `--update`'s own
+documentation already promises. Whichever is chosen, the docs at the top
+of `install.sh` need to stop claiming a single `--update` run "re-runs
+the steps below against that fresh checkout" — it does not.
+
+**Related trap, same root cause, worth documenting alongside:** the
+taiga-gateway nginx conf is bind-mounted into the container **as a single
+file**, so Docker binds it by inode. Any rewrite of that file (install.sh
+regenerating it, or a `sed -i`) leaves the running container looking at
+the old inode — `nginx -s reload` inside the container re-reads the
+*stale* file and appears to do nothing. The container must be recreated
+(`docker compose up -d --force-recreate taiga-gateway`, or the Taiga
+off/on toggle) for a conf change to take effect. Editing in place with
+`cat > file` preserves the inode for *future* containers but still does
+not help one already running against a replaced inode.
