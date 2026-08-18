@@ -22,6 +22,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -631,8 +632,29 @@ class ConfigureScriptTests(unittest.TestCase):
             env=env, timeout=30)
         config_path = os.path.join(self.tmp, ".config", "ai-dev-switchboard", "taiga-push.env")
         self.assertTrue(os.path.isfile(config_path))
+        # NB: assert what actually matters -- that nobody but the owner and
+        # the explicitly-ACL'd service user can read this file (it holds a
+        # live Taiga password) -- rather than a literal 0o600.
+        #
+        # The script deliberately follows its `chmod 600` with
+        # `setfacl -m u:<svc>:r`, and a named-user ACL entry makes stat()
+        # report the ACL *mask* in the group triad. So on any filesystem
+        # where that setfacl succeeds the mode reads 0o640 even though
+        # getfacl still shows `group::---` and `other::---`. Asserting
+        # 0o600 therefore failed on exactly the systems where the ACL was
+        # working as intended.
         mode = stat.S_IMODE(os.stat(config_path).st_mode)
-        self.assertEqual(mode, 0o600)
+        self.assertEqual(0o600, mode & 0o606,
+                         "owner must keep rw and 'other' must have no access "
+                         "at all (got %o)" % mode)
+        acl = shutil.which("getfacl")
+        if acl:
+            facl = subprocess.run([acl, "-cE", config_path], capture_output=True,
+                                  text=True).stdout
+            self.assertIn("group::---", facl,
+                          "real group access must stay empty; the group bits "
+                          "in stat() are the ACL mask, not group permission")
+            self.assertIn("other::---", facl)
         with open(config_path) as f:
             content = f.read()
         self.assertIn("TAIGA_URL=http://127.0.0.1:1", content)

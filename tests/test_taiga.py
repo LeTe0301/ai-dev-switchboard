@@ -38,6 +38,14 @@ os.environ.setdefault("SIMPLE_USERNAME", "testuser")
 os.environ.setdefault("SIMPLE_PASSWORD", "testpass")
 os.environ.setdefault("PROJECTS_DIR", os.path.join(_TMP_ROOT, "projects"))
 os.environ.setdefault("UPLOAD_STAGING_DIR", os.path.join(_TMP_ROOT, "uploads"))
+# Every request through the real Handler runs _reap_dead_state(), which
+# reaches teams.sweep_dead_teams() -> _persist(). teams.py resolves
+# TEAM_STATE_DIR once at import time, so it has to be redirected here,
+# before `import app` pulls teams in -- otherwise these tests write into
+# the machine's LIVE /var/lib/ai-dev-switchboard/teams. That failed with
+# PermissionError as an unprivileged user, and as root would instead have
+# silently rewritten real run.json state.
+os.environ.setdefault("TEAM_STATE_DIR", os.path.join(_TMP_ROOT, "teams"))
 # TAIGA_ENABLED must be "1" the first time app.py is ever imported in this
 # process (module-level globals are computed once, at import time — same
 # constraint tests/test_upload.py's own os.environ.setdefault calls already
