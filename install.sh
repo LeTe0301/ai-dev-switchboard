@@ -45,8 +45,13 @@
 #                         this checkout to origin/$REPO_BRANCH (never a
 #                         destructive reset — refuses on local changes, a
 #                         branch mismatch, or real divergence from origin),
-#                         re-runs the steps below against that fresh
-#                         checkout, then restarts ai-dev-switchboard — but
+#                         then RE-EXECS itself at the newly-pulled revision
+#                         (otherwise bash would keep running the pre-merge
+#                         file it already has open, and the run that pulled
+#                         an update would still apply the old logic — see
+#                         docs/BACKLOG.md item 52), re-runs the steps below
+#                         against that fresh checkout, then restarts
+#                         ai-dev-switchboard — but
 #                         ONLY if RUN_USER has no live tmux session; if one
 #                         is live, the restart is deferred (code is still
 #                         updated) and the script prints how to finish by
@@ -143,8 +148,40 @@ if [ "$UPDATE" -eq 1 ]; then
         echo "ERROR: $REPO_DIR's local $REPO_BRANCH has diverged from origin/$REPO_BRANCH -- refusing to merge. Resolve by hand, then re-run --update." >&2
         exit 1
     fi
+    UPDATE_OLD_HEAD="$(git -C "$REPO_DIR" rev-parse HEAD)"
     git -C "$REPO_DIR" merge --ff-only "origin/$REPO_BRANCH"
+    UPDATE_NEW_HEAD="$(git -C "$REPO_DIR" rev-parse HEAD)"
     echo "Pulled $(git -C "$REPO_DIR" rev-parse --short HEAD) ($REPO_BRANCH)."
+
+    # The file that merge just replaced IS this script (docs/BACKLOG.md item
+    # 52). bash still holds an open descriptor on the PRE-merge inode, so
+    # without this every step below would run the OLD logic against the NEW
+    # checkout -- the pull lands on disk, the run that pulled it writes
+    # pre-update output, and it all exits 0 looking successful. Observed for
+    # real on 2026-08-18: a --update run reported "Pulled a5c84df" while the
+    # taiga .env and gateway nginx conf it wrote that same run were still the
+    # pre-fix versions; a second plain run produced the corrected output.
+    #
+    # So hand the rest of the run over to the version just pulled. Guarded
+    # two ways against looping: only when the merge actually moved HEAD, and
+    # only when we have not already re-exec'd once.
+    if [ "$UPDATE_OLD_HEAD" != "$UPDATE_NEW_HEAD" ] \
+       && [ -z "${AI_DEV_SWITCHBOARD_UPDATE_REEXEC:-}" ]; then
+        # Re-exec the file actually being run, via BASH_SOURCE rather than a
+        # hardcoded "$REPO_DIR/install.sh": the update block is also sourced
+        # standalone by tests through `bash -c`, where no script file exists
+        # and BASH_SOURCE is empty. Hardcoding a filename made that abort the
+        # whole run with 127 (exec: no such file). If there is nothing to
+        # re-exec, say so and carry on rather than failing the update.
+        UPDATE_SELF="${BASH_SOURCE[0]:-}"
+        if [ -n "$UPDATE_SELF" ] && [ -r "$UPDATE_SELF" ]; then
+            echo "Re-executing install.sh at $(git -C "$REPO_DIR" rev-parse --short HEAD) so the pulled version is what actually applies it."
+            AI_DEV_SWITCHBOARD_UPDATE_REEXEC=1
+            export AI_DEV_SWITCHBOARD_UPDATE_REEXEC
+            exec bash "$UPDATE_SELF" "$@"
+        fi
+        echo "WARNING: pulled $(git -C "$REPO_DIR" rev-parse --short HEAD) but could not re-exec (no readable script file) -- the rest of THIS run uses the pre-update logic. Re-run install.sh to apply it." >&2
+    fi
 fi
 
 interactive() { [ "$YES" -eq 0 ] && [ -t 0 ]; }
