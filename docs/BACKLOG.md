@@ -3024,11 +3024,25 @@ back instead of the real asset; (b) taiga-front's own `.env` (`SUBPATH`,
 `TAIGA_SCHEME`, `WEBSOCKETS_SCHEME`) is never populated from
 `PUBLISH_MODE`/`BASE_URL` in `install.sh` — taiga-front's Docker image
 has first-class `TAIGA_SUBPATH` support, it's just never wired up. Both
-fixed and confirmed live on CT110. **Not yet reflected in this repo's
-own `install.sh`/nginx-conf generation** — fixed on the running container
-directly; the code fix (matching item 43's own `taiga.conf` bind-mount
-override pattern) still needs to land here. Full repro/fix detail in
-Taiga ticket #4 on CT110's live project.
+fixed and confirmed live on CT110.
+
+**Status: shipped in this repo (2026-08-18).** (a) fixed in
+`install.sh`'s `docker-compose.override.taiga-gateway.conf` heredoc:
+`location /`'s `proxy_pass http://$upstream_front/;` changed to
+`proxy_pass http://$upstream_front$request_uri;` — the earlier assumption
+that this half was already fixed (matching items 42/43's pattern) was
+wrong and caught live by the reviewer's testing pass before landing; see
+`docs/test-review.md`. (b) fixed by writing `SUBPATH`/`WEBSOCKETS_SCHEME`
+into the same `$TAIGA_ENV` file `TAIGA_SCHEME`/`TAIGA_DOMAIN` already use,
+conditional on `PUBLISH_MODE=tailscale`+`BASE_URL` exactly like
+`TAIGA_DOMAIN`'s own existing conditional. Both verified live against real
+Docker (a real headless Playwright session through a subpath-stripping
+proxy against a gateway container running the fixed config, joined to a
+live Taiga stack's own network) by both the developer and, independently,
+the reviewer. Full spec/implementation/test-review in the current
+`docs/spec.md` / `docs/implementation.md` / `docs/test-review.md` (bundled
+with item 48, below, in the same cycle). Full original repro/fix detail
+still in Taiga ticket #4 on CT110's live project.
 
 ## 48. Gitea under a subpath generates every link/form-action without the subpath prefix — persisted-volume `app.ini` never re-reads env vars after first container start — pushed live as Taiga ticket #5
 
@@ -3045,11 +3059,20 @@ structural gap. Fixed via `docker compose up -d --force-recreate server`
 `server`, not `gitea` — a plain `... server` guess fails silently as "no
 such service" if you get it wrong). Confirmed with a real Playwright
 login flow landing on the correct dashboard, repo data intact after the
-recreate. **Not yet reflected in `install.sh`** — install.sh should
-probably force-recreate Gitea's `server` container itself whenever
-`ROOT_URL`/`DOMAIN` actually change value between runs, not just write
-the new `.env` and hope a restart picks it up. Full repro/fix detail in
-Taiga ticket #5.
+recreate.
+
+**Status: shipped in this repo (2026-08-18).** `install.sh`'s Gitea block
+now captures the previous `ROOT_URL`/`DOMAIN` values before overwriting
+them and, when either actually changed and the `server` container already
+exists, runs `docker compose up -d --force-recreate --no-deps server`.
+The `--no-deps` flag was a fix-up-round addition: the reviewer's testing
+pass caught that `server` and `db` share `env_file`, so a bare
+`--force-recreate server` was also recreating `db` as an unwanted side
+effect — reproduced and fixed live against real Compose, see
+`docs/test-review.md`. Bundled with item 47 in the same cycle; full spec/
+implementation/test-review in the current `docs/spec.md` /
+`docs/implementation.md` / `docs/test-review.md`. Full original repro/fix
+detail still in Taiga ticket #5.
 
 ## 49. Dashboard's 4s `/status` poll force-closes any open `<select>` dropdown mid-interaction — hotfixed live on CT110, not yet ticketed
 

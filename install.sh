@@ -455,6 +455,35 @@ if [ "$WITH_TAIGA" -eq 1 ]; then
         TAIGA_DOMAIN_VALUE="localhost:$TAIGA_PORT"
     fi
     set_env "$TAIGA_ENV" TAIGA_DOMAIN "$TAIGA_DOMAIN_VALUE"
+
+    # 4b. taiga-front's own SUBPATH/WEBSOCKETS_SCHEME (backlog item 47b).
+    # Confirmed against the cloned checkout's own $TAIGA_DIR/docker-
+    # compose.yml: taiga-front's `environment:` block reads TAIGA_URL/
+    # TAIGA_WEBSOCKETS_URL/TAIGA_SUBPATH from ${TAIGA_SCHEME}/${TAIGA_DOMAIN}/
+    # ${WEBSOCKETS_SCHEME}/${SUBPATH} — there's no separate taiga-front/.env
+    # file the way upstream's own docs initially suggest; it's the exact
+    # same root $TAIGA_ENV Compose already auto-loads for taiga-back/
+    # taiga-gateway. TAIGA_SCHEME/TAIGA_DOMAIN above already reach
+    # taiga-front for free through this same file; only SUBPATH/
+    # WEBSOCKETS_SCHEME were never written anywhere. TAIGA_URL_PATH mirrors
+    # app.py's own fixed TAIGA_URL_PATH constant (app/app.py:2978, singleton,
+    # same shape as Gitea's GITEA_URL_PATH above) — and, per app.py's own
+    # _taiga_display_url(), that subpath only applies under
+    # PUBLISH_MODE=tailscale; PUBLISH_MODE=none access is direct
+    # (http://127.0.0.1:$TAIGA_PORT, no subpath prefix at all), so SUBPATH/
+    # WEBSOCKETS_SCHEME follow the same PUBLISH_MODE/BASE_URL conditional as
+    # TAIGA_DOMAIN above rather than being unconditional constants.
+    TAIGA_URL_PATH="/taiga"  # mirrors app.py's TAIGA_URL_PATH constant
+    if [ "$PUBLISH_MODE" = "tailscale" ] && [ -n "$BASE_URL" ]; then
+        TAIGA_SUBPATH_VALUE="$TAIGA_URL_PATH"
+        TAIGA_WEBSOCKETS_SCHEME_VALUE="wss"
+    else
+        TAIGA_SUBPATH_VALUE=""
+        TAIGA_WEBSOCKETS_SCHEME_VALUE="ws"
+    fi
+    set_env "$TAIGA_ENV" SUBPATH "$TAIGA_SUBPATH_VALUE"
+    set_env "$TAIGA_ENV" WEBSOCKETS_SCHEME "$TAIGA_WEBSOCKETS_SCHEME_VALUE"
+
     # TAIGA_PORT also lives in taiga-docker's own .env (not just
     # switchboard.env below) — Compose auto-loads .env from the project
     # directory for variable substitution, which is what lets
@@ -535,6 +564,32 @@ if [ "$WITH_TAIGA" -eq 1 ]; then
     # never opened for writing. Item 30's healthcheck/service_healthy gate
     # is kept in place as defense-in-depth alongside this fix, not replaced
     # by it.
+    #
+    # Item 47(a) (backlog item 47, reviewer-found post-approval regression
+    # -- docs/test-review.md Defect 1): `location /`'s `proxy_pass
+    # http://$upstream_front/;` looked like the same variable-indirection
+    # fix items 42/43 already applied successfully to /api/, /admin/,
+    # /media/ below -- but live-tested with a real nginx+backend pair, it
+    # collapses every request path to a bare `/`, so taiga-front's
+    # index.html is served for every asset/API/conf.json request instead of
+    # the real file (confirmed live against both the real running gateway
+    # container and an isolated scratch nginx+fake-backend reproduction
+    # this session). Root cause: unlike /api/, /admin/, /media/ (whose
+    # proxy_pass target has a real trailing path segment after the
+    # variable, e.g. ".../api/"), `location /`'s target ends in a bare "/"
+    # with nothing else -- for that specific bare-URI + variable-upstream
+    # combination, nginx does not append the client's actual request path
+    # to the forwarded request the way it does for the other locations.
+    # Fixed by explicitly appending $request_uri (nginx's own raw,
+    # unmodified request URI including any query string) to the proxy_pass
+    # target, forwarding the exact path the client requested instead of a
+    # constant "/" -- verified live (isolated nginx+fake-backend
+    # reproduction): distinct real content for /, /conf.json, and
+    # /js/app-loader.js, and a genuine 404 (not index.html) for a
+    # nonexistent path, both with and without a query string. Left
+    # /api/, /admin/, /media/ untouched -- reviewer confirmed those already
+    # forward correctly today; this is a narrow, targeted fix for the one
+    # broken location, not a blanket rewrite of the whole file.
     cat > "$TAIGA_DIR/docker-compose.override.taiga-gateway.conf" <<'NGINX'
 server {
     listen 80 default_server;
@@ -547,7 +602,7 @@ server {
     # Frontend
     location / {
         set $upstream_front taiga-front;
-        proxy_pass http://$upstream_front/;
+        proxy_pass http://$upstream_front$request_uri;
         proxy_pass_header Server;
         proxy_set_header Host $http_host;
         proxy_redirect off;
@@ -860,6 +915,15 @@ if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
     # but off is safe even before an admin account exists.
     set_env "$GITEA_ENV" GITEA__security__INSTALL_LOCK "true"
 
+    # Captured *before* being overwritten below (backlog item 48) — Gitea's
+    # official image only applies GITEA__server__ROOT_URL/DOMAIN to the
+    # persisted app.ini on a container's first-ever start, so a value change
+    # here needs to force-recreate the already-running `server` container
+    # once the new values are written (see step 3b below), or the container
+    # keeps serving stale links/form-actions indefinitely.
+    GITEA_DOMAIN_PREV="$(get_env "$GITEA_ENV" GITEA__server__DOMAIN)"
+    GITEA_ROOT_URL_PREV="$(get_env "$GITEA_ENV" GITEA__server__ROOT_URL)"
+
     if [ "$PUBLISH_MODE" = "tailscale" ] && [ -n "$BASE_URL" ]; then
         GITEA_DOMAIN_VALUE="${BASE_URL#https://}"
         GITEA_DOMAIN_VALUE="${GITEA_DOMAIN_VALUE#http://}"
@@ -870,6 +934,38 @@ if [ "$WITH_GIT_HOSTING" -eq 1 ]; then
     fi
     set_env "$GITEA_ENV" GITEA__server__DOMAIN "$GITEA_DOMAIN_VALUE"
     set_env "$GITEA_ENV" GITEA__server__ROOT_URL "$GITEA_ROOT_URL_VALUE"
+
+    # 3b. Force-recreate `server` (the service name in
+    # config/gitea-docker-compose.yml — NOT `gitea`) if ROOT_URL/DOMAIN
+    # actually changed and the container already exists (backlog item 48).
+    # A plain `docker compose up -d` (what scripts/gitea-up.sh runs on every
+    # toggle-on) is a no-op against an already-created container — it does
+    # not re-apply changed env vars into the persisted app.ini. Skipped
+    # cleanly on a fresh install: nothing to recreate yet, and the first-ever
+    # start will already pick up the correct values. Warn-and-continue (not
+    # fatal) on failure, same idiom as the pre-pull step below.
+    #
+    # `--no-deps` (docs/test-review.md Defect 2, reviewer-found post-approval
+    # regression): `server` and `db` both load the same `env_file: - .env`
+    # (config/gitea-docker-compose.yml), so a changed `.env` also changes
+    # Compose's own computed config hash for `db`, not just `server` — and
+    # because `server` has `depends_on: - db`, naming only `server` on the
+    # command line still pulls `db` into scope (to satisfy the dependency),
+    # so Compose recreated `db` too even though `--force-recreate` was only
+    # given for `server` (reproduced live: `db`'s container `Created`
+    # timestamp changed on a real, isolated Gitea+Postgres compose stack).
+    # `--no-deps` keeps `db` out of scope entirely, so only `server` itself
+    # gets processed — confirmed live on the same isolated stack: `server`
+    # recreates (new `Created` timestamp, new `ROOT_URL`/`DOMAIN` correctly
+    # in `app.ini`) while `db`'s `Created` timestamp is provably unchanged.
+    if [ "$GITEA_DOMAIN_VALUE" != "$GITEA_DOMAIN_PREV" ] || [ "$GITEA_ROOT_URL_VALUE" != "$GITEA_ROOT_URL_PREV" ]; then
+        if [ -n "$(cd "$GITEA_DIR" && docker compose ps -q server 2>/dev/null)" ]; then
+            echo "Gitea's ROOT_URL/DOMAIN changed — force-recreating the server container so it picks up the new values..."
+            if ! ( cd "$GITEA_DIR" && docker compose up -d --force-recreate --no-deps server ); then
+                echo "WARNING: force-recreating Gitea's server container failed — it may keep serving stale ROOT_URL/DOMAIN values until it's restarted manually (e.g. 'docker compose up -d --force-recreate --no-deps server' in $GITEA_DIR)." >&2
+            fi
+        fi
+    fi
     # GITEA_PORT/GITEA_SSH_PORT also live in this same .env (not just
     # switchboard.env below) — Compose auto-loads .env from the project
     # directory for variable substitution, which is what lets
