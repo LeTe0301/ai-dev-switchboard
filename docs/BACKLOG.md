@@ -3090,6 +3090,99 @@ working push access, this session doesn't), pending confirmation.
 
 ---
 
+## 50. `install.sh --update/--upgrade` performs an in-place upgrade with no backup of its own, and the installer never asks where backups should go
+
+Upgrading an installed box today (`install.sh --update`) fast-forwards
+`$REPO_DIR` and overwrites `$INSTALL_DIR`'s `app.py`/`teams.py`/
+`taiga_board.py` in place, then restarts the service. It is careful about
+*source* safety (refuses on a dirty checkout, a branch mismatch, or real
+divergence; `merge --ff-only`, never `reset --hard`) — but there is no
+rollback point for the *installed* state. If the new revision is broken,
+recovery means finding the previous commit by hand and re-deploying it,
+and anything the upgrade touched outside git (generated units, sudoers,
+`engines.d`) has no saved prior copy at all.
+
+**Asked for by the user (2026-08-18): the upgrade must always be bound to
+a backup — taken automatically, before anything is modified — and the
+setup flow must include a backup-storage setting so there is somewhere
+defined for that backup to go.**
+
+Scope decisions already settled:
+
+1. **A backup-storage setting belongs in `install.sh`'s config step**,
+   alongside the existing prompts, persisted to `switchboard.env` (e.g.
+   `BACKUP_DIR`, plus whatever is needed to name a Proxmox storage when
+   the box is an LXC on PVE). It should be asked for at *install* time,
+   not first discovered at upgrade time — an upgrade that stops to ask
+   where to put its safety net is an upgrade that gets run with the
+   prompt skipped.
+2. **`--update`/`--upgrade` should refuse to proceed when no backup
+   target is configured or the configured one is unwritable**, rather
+   than upgrading unprotected. Same posture as the existing dirty-checkout
+   refusal: the upgrade path already prefers to stop rather than do
+   something it cannot undo.
+3. **The backup must cover the installed state, not just the checkout** —
+   at minimum `$INSTALL_DIR`, `$CONFIG_DIR` (including `engines.d` and
+   any local-only engines that are not in the repo), and the generated
+   systemd unit. The checkout itself is already recoverable from git;
+   these are not.
+4. **Record what was backed up and to where in the upgrade's own output**,
+   so the operator has the restore path in front of them at the moment
+   they might need it.
+
+Note for whoever picks this up: on this deployment the platform-level
+equivalent already exists and was used manually for exactly this purpose —
+a Proxmox `vzdump` of the whole CT to a dedicated `backups` storage, taken
+immediately before the 2026-08-18 upgrade. That is the shape the built-in
+behaviour should automate, not replace: a whole-container snapshot is a
+stronger rollback than a file copy, but it is only available when the box
+happens to be a PVE guest, so the in-installer version needs a
+filesystem-level fallback for the standalone-Debian install path.
+
+---
+
+## 51. Multiple concurrent sessions of the same AI engine need enumerated names — first is the bare repo name, second is `repo-name-1`, etc.
+
+**Added 2026-08-18, user-requested:** when a project runs more than one
+session of the *same* underlying AI (e.g. two Claude Code sessions against
+the same repo), the sessions need distinguishable names instead of
+colliding with (or being indistinguishable from) each other in the UI.
+Requested shape: the first session keeps the bare repo name; the second is
+named `<repo-name>-1`, the third `<repo-name>-2`, and so on.
+
+**Relates directly to item 21** ("Spawn an arbitrary number of AI instances
+per project via a `+` button") — that item is about *how* multiple
+same-project instances get spawned (still unscoped, per its own two
+candidate shapes); this item is about what each one is *called* once it
+exists, which is needed under either of item 21's candidate shapes. Item
+21's own context note already flags that today a project runs at most one
+engine session at a time (`app/app.py`'s `_session_urls` keyed by project
+name alone) — so today there is no naming collision to resolve yet; this
+item only becomes actionable once item 21 lands.
+
+**Shape of the work (once item 21 is scoped):** find every place a
+session/instance is currently named from the bare project name alone —
+the tmux session name, the row/label shown in the web UI, and any per-
+session hosted URL — and thread an enumeration suffix through all of them
+consistently once a second same-project session exists.
+
+**Open for whoever picks this up:**
+- Whether numbering is scoped **per engine** (two Claude sessions on one
+  project → `repo`, `repo-1`; a separately-started Codex session on the
+  same project starts its own `repo`/`repo-1` sequence) or **per project
+  across all engines combined** (first session of any engine gets the
+  bare name, every session after that — regardless of engine — takes the
+  next number).
+- What happens to numbering when a lower-numbered session stops: renumber
+  the survivors downward (no gaps, but an instance's name can change out
+  from under whoever's watching it) or leave the number attached to that
+  instance for its lifetime (gaps can appear, but a name never moves).
+  Leaving a name stable for the life of the instance is the safer default
+  absent further input, since a mid-session name change is more likely to
+  confuse an operator than a gap in the sequence.
+
+---
+
 ## Items 39-43: found by E2E round 6 real test on fresh CT110 (2026-08-16)
 
 Found by `pve-sparkling-meadow` (Remote Control peer session on the pve
