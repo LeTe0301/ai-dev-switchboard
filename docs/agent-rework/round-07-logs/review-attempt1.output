@@ -1,0 +1,18 @@
+## Review: Taiga #11 — Search tasks by title
+
+**Scope reviewed:** `frontend/src/components/SearchTasks.jsx` (new), `frontend/src/App.jsx`, `frontend/src/components/TaskList.jsx`, `frontend/src/App.css`.
+
+**Verification performed:**
+- `npm run build` — passes, no errors.
+- Traced the two-pass filter (`stateFiltered` → search `.includes()`) in `App.jsx:29-37` against the AND-combine and case-insensitive-substring-on-displayed-title requirements — both hold: `t.title.toLowerCase().includes(searchTerm)` matches exactly what `TaskRow` renders (`TaskList.jsx:99`, no separate trim/transform on display).
+- Traced the empty-state precedence in `TaskList.jsx:16-21` against the design doc's stated table (empty store → per-filter copy; empty state-filter → per-filter copy; state-filter narrowed to zero by search → new "no match" copy) — matches, including the whitespace-only-search edge case (`trimmedSearch` falsy → falls through to `EMPTY_COPY`, avoiding a `No tasks match "".` bug).
+- Checked CSS layout (`App.css:33-49`) against the design's stated reason for the `.toolbar-filters` wrapper (keep `space-between` spacing exactly two groups) — matches.
+- Checked for existing frontend test conventions to see if this diff should include tests — the repo currently has zero frontend test files and no `test` script in `package.json`, so no convention is being skipped here; that gap predates this change.
+
+**Will block:** none.
+
+**Will comment:** none.
+
+**Worth considering:** none — the implementation is a faithful, minimal realization of the spec/design with no scope creep, no swallowed errors, no dead code, and no interface smells.
+
+VERDICT: approve

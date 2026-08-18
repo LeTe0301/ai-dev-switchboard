@@ -1,0 +1,12 @@
+All three review findings (the must-fix, the comment, and the worth-considering item) are in `frontend/src/App.jsx:76-134`. There is no backend diff at all — `docs/spec.md` explicitly calls for this feature to be implemented entirely in the frontend with no backend changes, and that's borne out in the current diff (`git diff --stat -- backend/` is empty).
+
+Per my scope (backend) and the "filter the list by your own scope first" rule: none of these items are mine to fix. I'm leaving all three untouched.
+
+**Handoff:**
+
+- **Scope:** backend. No backend changes were required by `docs/spec.md` for Taiga #13, and there is none in the current diff — nothing to verify or fix on my end.
+- **Must-fix (`frontend/src/App.jsx:76-93`), comment (`frontend/src/App.jsx:134`), and worth-considering (`frontend/src/App.jsx:96-103`)** are all in frontend scope, not mine. Leaving them for the developer instance handling frontend to apply the review's suggested fixes:
+  - Move `setPendingDeletes` removal into a `finally` block after the `try`/`catch` in `deferDelete`'s timer callback, so the task doesn't flash back into the list before the DELETE settles.
+  - Change the `UndoToast` `pending` prop to iterate `pendingDeletes.keys()` (insertion order) mapped to tasks, filtering out any that vanished, to preserve "oldest deleted on top" stacking order.
+  - Optionally move the `clearTimeout` side effect in `cancelPendingDelete` out of the `setPendingDeletes` updater for StrictMode purity (non-blocking, "worth considering" only).
+- No backend tests were run since no backend files are touched by this ticket; `backend/` is clean per `git diff --stat`.

@@ -1,0 +1,47 @@
+{
+  "status": "finished",
+  "reason": "",
+  "dispatches": 6,
+  "attempts": {
+    "story": 1,
+    "design": 1,
+    "build": 1,
+    "review": 1,
+    "test": 1
+  },
+  "stages": [
+    {
+      "stage": "story",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "design",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "build/frontend",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "build/backend",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "review",
+      "ok": true,
+      "verdict": "approve"
+    },
+    {
+      "stage": "test",
+      "ok": true,
+      "verdict": "pass"
+    }
+  ],
+  "seconds": 670.6,
+  "task": "Taiga #11: Search tasks by title.\n\nOnce the list is long, the filter by state is not enough. Let me type to narrow the list by title. Matching should be case-insensitive against what is actually displayed, work together with the done-state filter rather than fighting it, and say so when nothing matches.",
+  "workdir": "/home/dev/projects/test-project"
+}

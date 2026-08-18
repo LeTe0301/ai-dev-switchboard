@@ -1,0 +1,14 @@
+`docs/spec.md` is written for Taiga #12 (branch `feature/tp-12/give-tasks-due-date`, workspace already clean and on the correct branch — no hygiene issue to resolve).
+
+**Summary of the spec:**
+- **Feature**, sized like the existing priority feature (#4) — same shape, one cycle, no story split needed.
+- Optional `due_date` (date-only, no time) on create and per-row edit, mirroring how `priority` already works: new `DueDateIn` model, `PATCH /api/tasks/{id}/due-date`, `store.set_due_date()`.
+- 9 falsifiable acceptance criteria, including the two real product calls I made a default decision on rather than leaving open:
+  1. "Overdue" = strictly before today, not including today.
+  2. Marking a task done suppresses its overdue indicator, regardless of stored date.
+  Both are flagged as small, reversible defaults in Open Questions if the human wants them flipped.
+- Explicit non-goals: no sort/filter by due date, no time-of-day, no reminders/recurrence, no timezone handling.
+- AC4 calls out the accessibility constraint from the request directly: overdue must be marked by something other than colour alone (text/icon), with exact visual treatment left to ux-designer.
+- Affected areas listed with exact file/line references on both backend and frontend, following the priority feature as the concrete precedent throughout.
+
+I overwrote the previous cycle's `docs/spec.md` (Taiga #11, search by title) — that ticket is already merged (`7c1276f`/`5e852f6`), so this is normal per-cycle scratch turnover, not clobbering unmerged work.

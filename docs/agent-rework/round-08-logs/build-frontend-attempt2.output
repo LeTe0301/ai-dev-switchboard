@@ -1,0 +1,12 @@
+Frontend build passes cleanly (there's no `npm test` script configured in this repo, pre-existing, not part of this feature's scope).
+
+## Handoff
+
+**Root cause fixed:** `backend/app/store.py:47` — `_save()` was calling `task.model_dump()` (defaults to `mode="python"`), which left `Task.due_date` as a Python `date` object that `json.dumps` can't serialize. Changed to `task.model_dump(mode="json")`, which serializes `date` to an ISO string, matching how the rest of the store already round-trips through JSON. One-line change, exactly as the reviewer specified — no other edits needed since the rest of the diff was already sound per the review's read-through.
+
+**Verified:**
+- `cd backend && python3 -m pytest -q` → **47 passed**, 0 failed (previously 9 failed / 38 passed, all with `TypeError: Object of type date is not JSON serializable`).
+- `cd frontend && npm run build` → builds cleanly, no errors.
+- No `npm test` script exists in `frontend/package.json` (only `dev`, `build`, `lint`, `preview`) — pre-existing gap in this repo, unrelated to this fix, not touched.
+
+No other changes made — scope was strictly this single-line fix per the review's must-fix item.

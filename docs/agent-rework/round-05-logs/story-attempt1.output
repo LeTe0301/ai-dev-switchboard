@@ -1,0 +1,11 @@
+`docs/spec.md` is written for Taiga #9. Summary:
+
+**Triage:** Feature, kept as one spec (not split) — each of the three touched layers (store/route/frontend) is a thin, additive slice of a pattern already established by every other task mutation.
+
+**Contract decided:** `DELETE /api/tasks/completed` → `ClearResult{count: int}`, backed by `TaskStore.clear_completed()`. Flagged a real gotcha in `backend/app/main.py`: the new route must be declared *above* the existing `@app.delete("/api/tasks/{task_id}")` at line 56, or Starlette/FastAPI will try to coerce `"completed"` into `task_id: int` and return 422 instead of ever reaching it.
+
+**Key call, flagged as an open question rather than decided silently:** "tells me how many it will remove" is satisfied by an always-visible count on the control itself, not a confirmation dialog — because nothing else in this app (including the existing per-task Delete button) interrupts with a popup. Proceeding on that assumption; it's easy to override before the ux-designer builds it if wrong.
+
+Also noted and fixed in-place: `docs/spec.md`/`docs/design.md` were stale leftovers from the already-merged Taiga #5 cycle — overwrote `spec.md`, left `design.md` for the ux-designer stage to replace.
+
+Six falsifiable acceptance criteria are in the spec, covering the zero-completed inert case, mixed completed/open removal, persistence across restart, filter-independence, and the empty-store API edge case.

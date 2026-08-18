@@ -1,0 +1,14 @@
+Good — confirms exactly the expected files changed within my scope (`api.js`, `App.jsx`, `App.css`, `TaskList.jsx`, `e2e/test_tasks_e2e.py`), plus backend files already modified by the other agent.
+
+Implementation complete. Summary of the frontend work:
+
+**Files changed:**
+- `frontend/src/api.js` — added `updateTask(id, title)` calling `PATCH /api/tasks/:id`, alongside `completeTask`/`deleteTask`.
+- `frontend/src/components/TaskList.jsx` — added a `TaskRow` subcomponent with per-row `isEditing`/`draft`/`showError` state: Edit button, inline edit form (input + Save/Cancel), disabled-Save + inline `.field-error` for empty/whitespace titles, Escape-to-cancel, autofocus+select on entering edit mode.
+- `frontend/src/App.jsx` — wired `onUpdate` to `TaskList`; changed `run()` to return `true`/`false` on success/failure (previously returned nothing) so `TaskRow` can tell whether to close edit mode.
+- `frontend/src/App.css` — added `.task-edit`, `.task-title-input`, `.field-error` styles per the design doc, reusing existing colors/spacing.
+- `e2e/test_tasks_e2e.py` — 8 new tests covering prefill, save, cancel (no backend call), disabled Save on empty, Enter-key rejection of empty/whitespace titles, and `done` state independence.
+
+**One deviation from the design doc, found during testing:** the design assumed pressing Enter always fires the form's `onSubmit` even with a disabled Save button. That's false in Chromium — a disabled single submit button blocks native implicit-submit-on-Enter, so the empty-title error never appeared. Fixed by handling Enter explicitly in `TaskRow`'s `onKeyDown` (`e2e/test_tasks_e2e.py:203`/`212` initially failed, now pass — see `frontend/src/components/TaskList.jsx`).
+
+**Verification run this session:** `npm run build` (passes), full e2e suite `python3 -m pytest e2e/test_tasks_e2e.py -q` (28 passed). `npm run lint` (oxlint) could not be run — the sandbox blocked it pending approval I couldn't obtain non-interactively; flagging this gap rather than claiming it passed.

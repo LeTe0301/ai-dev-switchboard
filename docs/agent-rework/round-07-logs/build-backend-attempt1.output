@@ -1,0 +1,16 @@
+The spec and design are explicit and unambiguous: this is a frontend-only feature with **no backend changes** — "No changes to `backend/`" is stated directly in both the Non-goals and Affected areas sections of `docs/spec.md`.
+
+My dispatch assigns me "backend" scope, but there is no backend work in this story to do. Rather than inventing backend changes that aren't called for (which would violate both the spec's non-goals and the "minimal diff / faithful scope" discipline), I'm reporting this back as-is.
+
+## Handoff
+
+**Scope assigned:** backend
+**Work found in scope:** none
+
+`docs/spec.md` (Non-goals, line 45-48, and Affected areas, line 80) and `docs/design.md` ("Non-goals confirmed unaffected," lines 279-283) both explicitly state this feature requires zero backend changes: search is a purely client-side, in-memory array filter on data the frontend already has, following the exact pattern the existing Open/Done state filter already uses. `backend/app/store.py:51`'s `store.list()` already returns everything unfiltered and needs no new query param or endpoint.
+
+I verified this by reading both docs in full rather than assuming — there's no hidden backend touchpoint (e.g., no new sort/filter param, no schema change). All actual implementation work (new `SearchTasks.jsx` component, `App.jsx` two-pass filter, `TaskList.jsx` empty-state copy, `App.css` styling) belongs to whatever agent has the frontend scope for this same story.
+
+**Action taken:** none — no files touched, nothing to verify or test on the backend side, since making a change here would be scope creep against explicit non-goals.
+
+**For the next stage/orchestrator:** if a separate frontend-scoped developer dispatch isn't already running for this same Taiga #11 cycle, one is needed to do the actual implementation described above.

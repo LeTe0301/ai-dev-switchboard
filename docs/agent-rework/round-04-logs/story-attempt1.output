@@ -1,0 +1,15 @@
+The spec is written to `docs/spec.md`. Summary of the triage and scope:
+
+**Triage:** Feature, backend-only, single layer (the store) — no split needed.
+
+**Scope:** `TaskStore` gains disk-backed persistence — a synchronous full-snapshot write to `backend/data/tasks.json` on every mutation, and a load-on-construct step that starts empty on any failure (missing file, invalid JSON, or wrong shape), matching the request's "corrupt or missing → start empty, never crash" requirement.
+
+**Key decisions made (not left open), since each had a clear default:**
+- Data file path resolved relative to `store.py`'s own location, not cwd
+- An env var (`TASKS_DATA_FILE`) overrides the path — this is what lets `conftest.py` redirect tests to a tmp path *before* `app.main` is imported, so the existing test suite never touches the real data file
+- Next-id counter derived as `max(loaded ids) + 1` rather than persisted separately
+- `backend/data/` added to `.gitignore`
+
+**Non-goals called out explicitly:** no database, no file locking (single-process app), no partial recovery of corrupt files, no export/import endpoint, no frontend changes.
+
+This is ready to hand to the ux-designer stage — though since there's no UI surface here, that stage should be a no-op and this can likely go straight to the developer. Let me know if you want me to continue the pipeline (ux-designer → developer → reviewer) or if you'd like to review the spec first.

@@ -1,0 +1,28 @@
+I hit permission denials on further tool calls (an edit to add a 9th test, then several `git status`/`bash` checks) — per the tester protocol, I won't retry identically. Here's my verdict based on what I actually ran and observed this session.
+
+## Test report — Taiga #10: Show how many tasks are left
+
+**What I verified, and how:**
+
+1. Read `docs/spec.md`, `docs/design.md`, `frontend/src/components/TaskCounts.jsx`, `frontend/src/App.jsx` — implementation matches the design doc verbatim (props, JSX, `role="status"`, middle-dot separator, `!loading` gate, `tasks`-derived counts).
+2. Found the project's real test framework for this: `e2e/test_tasks_e2e.py` + `e2e/conftest.py` — a pytest + Playwright (Python, real Chromium) suite with a per-test empty-store fixture. This is the appropriate tool per "use the project's own framework, don't introduce a new one."
+3. Ran the pre-existing suite first as a baseline: `python3 -m pytest e2e -q` → **30 passed**.
+4. Added 8 new tests to `e2e/test_tasks_e2e.py`, following the file's own helper/style conventions, covering acceptance criteria 1–8:
+   - zero tasks → `"0 tasks open · 0 tasks done"`
+   - add → open count +1, done unchanged (also proves singular "1 task open")
+   - complete → open −1, done +1 (proves singular "1 task done")
+   - delete an open task → open −1 only
+   - delete a done task → done −1 only
+   - "Clear completed" removing N=2 → done −2, open unchanged
+   - counts stay at true totals while the "Done" filter is active (not the filtered subset)
+   - counts hidden during the initial loading window, then appear once load resolves
+5. Ran the full suite with the new tests: `python3 -m pytest e2e -q` → **38 passed**.
+6. **Regression-proofed the new tests**: temporarily neutralized the render line in `App.jsx` (`{!loading && <TaskCounts .../>}` → `{false && ...}`), reran just the count-related tests → **all 8 failed** with real assertion diffs (proving they exercise real behavior, not vacuous). Restored the line, reran full suite → **38 passed** again.
+7. Ran the backend suite as a regression check even though this is frontend-only: `cd backend && python3 -m pytest -q` → **35 passed**, confirming backend is untouched and healthy, matching both docs' "no backend change" non-goal.
+8. Ran `npm run build` → succeeded, no type/build errors.
+
+**Not independently verified live:** criterion 9 (fetch error on initial load shouldn't crash or blank the count). I drafted a 9th e2e test for this but the edit was denied by the permission system, and follow-up `git`/bash checks were also denied — I stopped retrying rather than loop on refusals. Verified instead by code trace: `App.jsx`'s `refresh()` only clears `tasks` on success (`setTasks(await api.listTasks())`), never on the `catch` branch, and `loading` is cleared in `finally` regardless of outcome — so `TaskCounts` (gated only on `!loading`) keeps rendering the last-known `tasks` state (`0/0` on a first-load failure) with no crash path. This is a straightforward read of the code, not a live-browser observation, so I'm flagging it as an explicit gap rather than a pass.
+
+No defects found. All 8 criteria with live browser coverage pass; the 9th is sound by code inspection but unverified live in this session.
+
+VERDICT: pass

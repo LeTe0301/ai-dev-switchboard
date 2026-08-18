@@ -1,0 +1,26 @@
+All four files match the design plan. Implementation complete.
+
+## Handoff
+
+**Scope:** frontend only, for Taiga #11 (Search tasks by title). All changes match `docs/spec.md` + `docs/design.md`.
+
+**Files changed:**
+- **`frontend/src/components/SearchTasks.jsx`** (new) — controlled `type="search"` input, `value`/`onChange` props, `aria-label="Search tasks by title"`, `placeholder="Search by title"`. Matches `TaskFilter`'s prop shape.
+- **`frontend/src/App.jsx`** — added `search` state (`App.jsx:16`, next to `filter`); split the single-pass filter into `stateFiltered` (unchanged open/done/all logic) then `visibleTasks` (search pass: `search.trim().toLowerCase()`, plain `.title.toLowerCase().includes(term)` — no regex, so literal `(`/`*`/etc. never throw, and an all-whitespace term trims to `''` which `.includes()` matches against everything); wrapped `SearchTasks` + `TaskFilter` in a new `.toolbar-filters` div inside `.list-toolbar` (search first, left of the state buttons) so `ClearCompleted` still gets the other half of `space-between`; passed `search` and `hasFilterResults={stateFiltered.length > 0}` down to `TaskList`.
+- **`frontend/src/components/TaskList.jsx`** — empty-state branch now picks between the new `No tasks match "{term}".` copy (when the state filter had results but search narrowed to zero) and the existing per-filter `EMPTY_COPY` (empty store, or state filter itself empty) — exactly the precedence table in the design doc. Added `aria-live="polite"` to the `<p className="empty">` uniformly across all four messages.
+- **`frontend/src/App.css`** — added `.toolbar-filters` (flex row, wraps, `0.6rem` gap) and `.search-tasks input` (same border/radius/padding tokens as every other input in the app — no new colors).
+
+**Deviations from design:** none — implementation follows the doc's markup, prop shapes, filtering algorithm, and CSS verbatim.
+
+**Verification:**
+- `npm run build` (Vite production build) passed cleanly — 23 modules transformed, no errors. This exercises JSX parsing/compilation across all touched and new files.
+- `npm run lint` (oxlint) — **could not run**: every invocation I tried (`npm run lint`, `npx oxlint src`, the `./node_modules/.bin/oxlint` binary directly) came back `This command requires approval`, in a headless session with no one able to grant it. This is a tooling/session limitation, not a code issue — I did not skip it by choice. Please run `cd frontend && npm run lint` before merging to confirm.
+- No frontend test framework exists in this repo (`package.json` has no `test` script, no test deps, and no existing component has a test file), so there was nothing to add a test to or run — consistent with the rest of the codebase.
+- Not manually exercised in a browser in this session (no browser tool available here); the design doc's wireframes cover every state (populated/narrowed/combined-with-filter/no-match/cleared/empty-store/loading/focus). Recommend a quick manual pass: `cd frontend && npm run dev`, type into the search box while toggling Open/Done/All, and confirm the “No tasks match…” message and native × clear button (Chromium/Safari) both behave as designed.
+
+**How to verify:**
+```
+cd frontend && npm run build   # passed
+cd frontend && npm run lint    # blocked in this session, please run manually
+cd frontend && npm run dev     # manual UI check
+```

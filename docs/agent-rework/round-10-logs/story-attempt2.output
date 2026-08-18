@@ -1,0 +1,13 @@
+## Product-manager report — Taiga #14 (attempt 2)
+
+**Triage:** Feature. Same conclusion as attempt 1 — no change to the request text warrants re-triage.
+
+**Workspace check:** `git status` shows uncommitted changes only in files belonging to this ticket (`docs/spec.md`, `docs/design.md`, `docs/implementation.md`, and the four frontend files the spec names as affected areas). No foreign/other-ticket work in the tree — the other Taiga tickets (`#13` undo-delete, etc.) live on their own separate branches, untouched here. Nothing to stash or move.
+
+**Finding:** This cycle already has a complete `docs/spec.md` (11.4KB, written 13:23), `docs/design.md` (13:27), and `docs/implementation.md` (13:36) — product-manager → ux-designer → developer have all run and produced coherent, mutually-consistent output. I spot-checked the developer's claims against the actual code (`AddTask.jsx`'s `forwardRef`/`useImperativeHandle`/`autoFocus`, `TaskList.jsx`'s `registerRowButtonRef`/`editButtonRef`, `App.jsx`'s `focusRequest`/`computeFocusFallback`, and the `App.css` `:focus-visible` rules) — all present as described. `docs/test-review.md` does not exist yet.
+
+**Spec verdict:** `docs/spec.md` stands as-is. It already covers what a good story needs — 7 falsifiable acceptance criteria, explicit non-goals (no new ARIA, no shortcuts, no skip-link, no visual redesign, no backend changes), exact affected paths, enumerated edge cases, and two open questions each resolved with a reasoned default. No new information from this dispatch changes any of that.
+
+**Handoff:** The only stage that hasn't run this cycle is **reviewer** (test pass + review pass against `docs/spec.md`'s 7 ACs, producing `docs/test-review.md`). The developer's implementation notes already flag two things worth the reviewer's attention: no frontend test runner exists yet (pre-existing gap, not caused by this feature — reviewer will need to stand one up or verify by driving the running app), and the `:focus-visible` inset-outline deviation for `.filter-option.active`/`.priority-select.priority-high` was reasoned through geometrically but never visually confirmed (no browser tooling in the developer's session — the reviewer has Playwright MCP tools available and should visually check it).
+
+Recommend proceeding straight to `reviewer` next rather than re-running ux-designer/developer.

@@ -1,0 +1,7 @@
+Confirmed: only `docs/spec.md` and `docs/design.md` are modified so far; no backend code changes exist yet from a parallel developer, and my scope is explicitly frontend.
+
+Both the spec and design docs are unambiguous and consistent: this feature (Taiga #5, backend disk persistence for `TaskStore`) is entirely internal to `backend/app/store.py`. The spec's "Affected areas" states plainly *"Not affected: `frontend/` (entire directory)"*, and the design doc confirms zero frontend surface — no new routes, no response-shape changes, no new UI states. There is no work in my assigned frontend scope for this story.
+
+Per my role's discipline (minimal diff, faithful scope, don't invent work), I'm not going to touch `frontend/` since there's nothing the spec asks for there — adding anything would be scope creep on a well-specified backend-only feature.
+
+**Handoff:** No frontend changes required for Taiga #5. `frontend/src/api.js` and all components already call the existing `GET/POST/PATCH/DELETE /api/tasks*` endpoints and render whatever comes back — since the backend's response shapes are unchanged (per spec non-goals: `backend/app/models.py` untouched), no frontend file needs modification, and none was modified. This mirrors the ux-designer stage's own no-op finding. The reviewer stage can verify this by diffing `frontend/` (empty) and confirming `frontend/src/api.js` needs no changes to work correctly against the persisted-tasks backend.

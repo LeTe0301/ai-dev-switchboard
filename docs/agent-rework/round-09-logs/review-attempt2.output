@@ -1,0 +1,48 @@
+## Review: Taiga #13 — Let me undo deleting a task (attempt 2)
+
+Verified against `docs/spec.md`'s 6 ACs and `docs/design.md`. Confirmed the round-1 crash (`UndoToast.jsx:6` on `Clear completed` racing a pending delete) is genuinely fixed — `pending={tasks.filter((t) => pendingDeletes.has(t.id))}` naturally excludes a task once it drops out of `tasks`, so no `undefined` reaches the map. `npm run build` passes. I could not spin up a live browser repro (dev server launch needs approval this headless session doesn't have — same gap noted in the developer's handoff for `npm run lint`), so the flicker finding below is a traced-through-code finding, not a live repro; the trace is based on standard JS/React execution order and I'm confident in it, but flagging the verification gap per the "report honestly" convention.
+
+## Will block
+
+**`frontend/src/App.jsx:76-93`** (Alan Heitkotter — failure paths / ordering of effects). `deferDelete`'s timer callback removes the id from `pendingDeletes` **before** awaiting `api.deleteTask(id)`:
+
+```js
+const timer = setTimeout(async () => {
+  setPendingDeletes((prev) => { ... next.delete(id); return next })  // ← commits first
+  try {
+    await api.deleteTask(id)   // ← network round trip happens after
+    await refresh()
+  } ...
+```
+
+Since `activeTasks` is computed as `tasks.filter((t) => !pendingDeletes.has(t.id))` (App.jsx:39), the moment this state update commits, the task is back in `activeTasks` — it reappears in the list, counts, and filters — because `tasks` itself hasn't been touched yet. Only once `refresh()` resolves (a real network round trip later) does the task disappear again. This isn't a rare race: it's the **default path**, every time a delete is left to expire naturally (the common case — no undo clicked). The user sees: toast disappears → task flashes back into the list, fully interactive (Edit/Done/Delete all live again) → task vanishes a moment later with no toast, no warning. That directly undermines AC3 ("the DELETE request is sent... and the notice disappears on its own") and the feature's whole premise of a clean, predictable deletion.
+
+**Fix:** don't release the `pendingDeletes` entry until the delete attempt (success or the swallowed 404) is settled — move the `setPendingDeletes` removal into a `finally` after the `try`/`catch`, not before it:
+
+```js
+const timer = setTimeout(async () => {
+  try {
+    await api.deleteTask(id)
+    await refresh()
+  } catch (e) {
+    if (e.message !== 'no such task') setError(e.message)
+  } finally {
+    setPendingDeletes((prev) => { const next = new Map(prev); next.delete(id); return next })
+  }
+}, UNDO_WINDOW_MS)
+```
+
+## Will comment
+
+**`frontend/src/App.jsx:134`** (Eric Goto — list/collection ordering). `docs/design.md:41` and `:80` explicitly specify "oldest pending-delete first" stacking, and the original design's data shape (`pendingDeleteIds.map(...)`) preserved deletion order. The round-2 fix switched to `tasks.filter((t) => pendingDeletes.has(t.id))`, which orders by `tasks`' own order (task creation/list order), not deletion order. Delete two tasks out of list order and the toast stack no longer matches "oldest deleted on top" as documented. Not a crash, but a documented design commitment that's silently not met.
+
+**Fix:** iterate `pendingDeletes`' own key order (a `Map` preserves insertion order) and guard against a since-vanished task, keeping both the crash fix and the deletion-order guarantee:
+```js
+pending={[...pendingDeletes.keys()].map((id) => tasks.find((t) => t.id === id)).filter(Boolean)}
+```
+
+## Worth considering
+
+**`frontend/src/App.jsx:96-103`** (Alan Heitkotter — purity of state updaters). `cancelPendingDelete`'s `setPendingDeletes` updater calls `clearTimeout(prev.get(id))` as a side effect inside the updater function. React (especially under `StrictMode`, which `main.jsx:6` enables) may invoke updaters more than once to surface impurities; here it's harmless since `clearTimeout` on an already-cleared/`undefined` handle is a no-op, but it's worth moving the `clearTimeout` call outside the updater (read `pendingDeletes.get(id)` from render scope, or use a ref) if this pattern gets reused elsewhere.
+
+VERDICT: changes-requested

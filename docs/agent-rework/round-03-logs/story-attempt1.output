@@ -1,0 +1,60 @@
+I've mapped the codebase — this is a small in-memory task tracker with a FastAPI backend (`backend/app/{models,store,main}.py`) and a React frontend (`frontend/src/{App.jsx,api.js,components/*}`). Two prior features (filter-by-done, edit-title) were each shipped in a single cycle touching the same full stack, so I'm triaging this as a **Feature** — comparable in size — not a multi-feature story, despite the "story" stage label on the dispatch.
+
+One thing before I write: `docs/spec.md` and `docs/design.md` currently hold the previous cycle's content (edit-a-task-title, already merged per `git log`). I'd overwrite both. Confirm that's fine, or say if you want them preserved elsewhere first.
+
+Here's the finished spec I'd write to `docs/spec.md`:
+
+---
+
+## Goal
+Let a task carry a low/normal/high priority, show that priority at a glance in the list, and have high-priority tasks float to the top of whatever's currently displayed — without reordering anything else.
+
+## Acceptance criteria
+1. Creating a task without a priority defaults it to `normal`.
+2. Creating a task with an explicit priority (`low`/`normal`/`high`) persists that value.
+3. Changing an existing task's priority updates only priority — id, title, done stay unchanged.
+4. A priority outside `{low, normal, high}` is rejected with `422` on both create and update; no task is mutated.
+5. Given list order `[A:normal, B:high, C:low, D:high, E:normal]`, the displayed order is `[B, D, A, C, E]` — all `high` tasks first, in their original relative order, then everyone else (normal and low, interleaved) in their original relative order.
+6. If no task is `high`, display order is unchanged from today (id order).
+7. The Open/Done filter still works exactly as now; priority sort applies **within** the filtered subset — a high-priority Done task doesn't jump into the Open view.
+8. A task's priority is visible without opening its edit form (e.g. a badge on the row).
+9. Moving a task's priority away from `high` moves it out of the top group on the next render.
+10. Editing a task's title via the existing `PATCH /api/tasks/{id}` flow leaves its priority untouched (same precedent as it already leaving `done` untouched).
+
+## Non-goals
+- No new filter/sort control for priority — the sort is automatic, not a UI toggle.
+- No priority levels beyond low/normal/high.
+- No bulk priority editing.
+- No change to `done` filtering/sorting behavior.
+- No priority history/audit trail.
+
+## Affected areas
+**Backend**
+- `backend/app/models.py` — add a `priority` field to `Task` (default `"normal"`); extend `TaskIn` or add a dedicated input model for priority changes.
+- `backend/app/store.py` — `TaskStore.add()` takes priority; add `TaskStore.set_priority()` alongside the existing `set_done()`.
+- `backend/app/main.py` — `create_task` passes priority through; add `PATCH /api/tasks/{id}/priority` (mirrors the existing `/done` action-scoped route rather than overloading the title-only `PATCH /{id}`).
+- `backend/tests/test_tasks.py` — tests for default priority, explicit priority on create, priority update, 422 on invalid value, and title-update leaving priority untouched.
+
+**Frontend**
+- `frontend/src/api.js` — add `updatePriority(id, priority)`; extend `createTask` to send priority.
+- `frontend/src/components/AddTask.jsx` — priority selector at creation, default `normal`.
+- `frontend/src/components/TaskList.jsx` — priority badge per row, plus a control to change priority without entering title-edit mode.
+- `frontend/src/App.jsx` — add a stable sort step (high-priority first) after the existing `visibleTasks` filter (`App.jsx:27-31`).
+- `frontend/src/App.css` — styling for the priority badge/control.
+
+## Edge cases
+- Multiple `high` tasks keep their relative order among themselves.
+- All-normal/no-`high` list renders identically to today.
+- Priority is independent of `done` in both directions.
+- Invalid priority string on create or update → `422`, no partial mutation.
+- Missing priority on create → defaults to `normal`.
+- `404` on priority-update of a nonexistent task id (mirrors `/done` and title-`PATCH` 404s).
+
+## Open questions (proceeding under these assumptions)
+1. **Does `low` sort below `normal`, or stay interleaved?** Assuming interleaved — only `high` moves, per the literal ask ("without disturbing the order of everything else"). A full 3-tier sort is a plausible alternate reading; flagging since it's cheap to change now, costly after ux/dev build against the wrong one.
+2. **Settable at creation, or only after?** Assuming both — `AddTask` gets a selector (default `normal`), and existing rows get a way to change it that doesn't require opening the title-edit form.
+3. **HTTP contract for changing priority.** Assuming a new `PATCH /api/tasks/{id}/priority` endpoint, matching the existing `/done` precedent.
+
+---
+
+Let me know if you want me to adjust anything (especially open question #1 — interleaved vs. full 3-tier sort), and confirm the docs overwrite, and I'll write `docs/spec.md` and hand off to the ux-designer stage.

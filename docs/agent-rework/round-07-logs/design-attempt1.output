@@ -1,0 +1,10 @@
+Design written to `docs/design.md`. Summary of the key decisions the developer will implement against:
+
+- **New component** `frontend/src/components/SearchTasks.jsx` — a controlled `type="search"` input (gets a native × clear button for free in Chromium/Safari), `aria-label="Search tasks by title"`, placeholder `"Search by title"`.
+- **Layout**: wrap `SearchTasks` + `TaskFilter` in a new `.toolbar-filters` div inside `.list-toolbar`, search first, so `space-between` still spaces exactly two groups (filters | ClearCompleted) instead of drifting search away from the filter buttons.
+- **Filtering**: two-pass filter in `App.jsx` — `stateFiltered` (today's logic, unchanged) then a search pass (trimmed, lower-cased, plain `.includes()`, never a regex). Pass `stateFiltered.length > 0` down to `TaskList` so it can tell "state filter is empty" apart from "search found nothing."
+- **Empty-state copy**: new `No tasks match "{term}".` string, added to `TaskList.jsx`'s empty-state logic with a defined precedence (empty store → existing per-filter copy; empty state-filter → existing copy; non-empty state-filter narrowed to zero by search → new copy). Also flagged adding `aria-live="polite"` to the empty `<p>` since results now change live as the user types.
+- **Styling**: reuses existing tokens only (`#ccd2d6` border, `#16191c` text, `#6b7780` placeholder/muted text) — computed contrast ratios (17.65:1 and 4.59:1) confirm no regressions, no new colors introduced.
+- Full ASCII wireframes for every state (populated, narrowed, combined-with-filter, no-match, cleared, empty-store, loading, focus/native-clear) and a traceability table mapping every AC and edge case to a specific design element are in the doc.
+
+Next stage is `developer`, working from `docs/spec.md` + `docs/design.md`.

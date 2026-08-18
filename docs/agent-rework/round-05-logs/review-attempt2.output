@@ -1,0 +1,21 @@
+Clean tree, no stray artifacts. Review complete.
+
+## Review: Taiga #9 — Clear all completed tasks at once
+
+**Verified:** full backend suite (35/35 passing, including 4 new tests), frontend `npm run build` clean, route-ordering hazard from the spec correctly avoided (`/api/tasks/completed` declared above `/api/tasks/{task_id}`), all 6 spec ACs traced to passing test coverage or working code, `git status` clean (no stray artifacts).
+
+### Will block
+
+None.
+
+### Will comment
+
+None.
+
+### Worth considering
+
+- `backend/app/store.py:94-97` (Leonard Teichmann — functional style) — `clear_completed()` builds a list of `done_ids` then deletes them in a loop. A single dict-comprehension rewrite (`self._tasks = {k: v for k, v in self._tasks.items() if not v.done}`) reads more directly as "keep the non-done tasks" and avoids the intermediate list, though the current two-step version is correct and no less readable than the existing imperative `delete()` it deliberately mirrors. Not worth a round-trip on its own.
+
+Everything else checks out: `ClearResult` is a minimal, honest response model; `TaskStore.clear_completed()` matches the shape and save-only-on-change discipline of its siblings; the route sits above the ordering hazard the spec flagged; the frontend button is disabled at count 0 (satisfying AC1's "no API call" requirement structurally, not just by convention), computes its count from the full `tasks` list rather than the filtered view (AC4), and is wired through the existing `run()` helper so errors surface the same way every other mutation's do; CSS reuses the existing plain-button styling with no new visual language, as the design doc specified. No frontend test scaffolding exists anywhere in this project (no `test` script, no test files, no testing library in `package.json`) — that's a pre-existing gap, not something this diff should be asked to fix.
+
+VERDICT: approve

@@ -1,0 +1,33 @@
+## Review — Taiga #13: Let me undo deleting a task (attempt 3)
+
+**Scope reviewed:** `frontend/src/App.jsx`, `frontend/src/components/UndoToast.jsx`, `frontend/src/App.css` (all uncommitted working-tree changes on `feature/tp-13/let-undo-deleting-task`; no commits yet, no `backend/` diff, matching the spec's frontend-only design).
+
+**Testing note (honesty disclosure):** This sandbox declined approval for starting `uvicorn`/`curl`/background dev servers, so I could not click through the feature in a live browser this round. I ran `npm run build` (passes, no syntax/type errors) and hand-traced all six acceptance criteria against the actual code paths in `App.jsx:74-107` and `UndoToast.jsx` instead. Flagging this gap explicitly rather than claiming a manual UI pass I didn't do.
+
+### Verification of prior round's findings
+
+All three items from the previous review pass are confirmed fixed in the current diff:
+- **Must-fix** (flash-back risk): `setPendingDeletes` removal now lives in the `finally` block at `App.jsx:85-94`, after `await api.deleteTask(id)` / `await refresh()` — the task can no longer flash back into the list before the delete settles.
+- **Comment** (stacking order): `App.jsx:138-140` now builds `pending` from `[...pendingDeletes.keys()]` (Map insertion order) mapped to tasks, filtering missing ones — oldest-first stacking preserved.
+- **Worth-considering** (StrictMode purity): `cancelPendingDelete` (`App.jsx:99-107`) now does `clearTimeout` outside the `setPendingDeletes` updater.
+
+### Trace against the six acceptance criteria
+
+Walked all six against `App.jsx:39,56-57,74-107,137-143` and `UndoToast.jsx` — all hold up, including the `activeTasks` filter feeding both the rendered list and the `completedCount`/`openCount` derivations, and the `Clear completed` race (a task pending its own undo timer that gets bulk-deleted server-side: the toast entry vanishes once `refresh()` drops it from `tasks` via `.filter(Boolean)`, and the orphaned timer's later 404 is swallowed by the `'no such task'` message check, matching AC6).
+
+### Will block
+
+None.
+
+### Will comment
+
+None.
+
+### Worth considering
+
+1. **`App.jsx:84`** — the swallowed-404 check matches on the literal string `'no such task'`, which couples the frontend to the exact wording of `backend/app/main.py:72`'s `HTTPException` detail. If that string ever changes, this silently stops matching and a benign race starts showing a spurious error banner instead of nothing. This was effectively forced by the spec's own non-goal of not touching `api.js` (no status-code passthrough available), so it's not something to fix here — just worth a one-line note for whoever next touches that error string.
+2. **`App.jsx:79-84`** — the caught 404 is swallowed with no `console.*` call. The codebase has zero existing logging precedent anywhere in `frontend/src/`, and the spec explicitly requires this exact case to be silent to the user, so I'm not treating "log at minimum" as violated here — just flagging it as a future debuggability nit if this pattern gets reused elsewhere.
+
+Neither item is a spec gap, a correctness bug, or a deviation from `docs/design.md`.
+
+VERDICT: approve-with-followups

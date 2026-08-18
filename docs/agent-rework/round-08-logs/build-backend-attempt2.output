@@ -1,0 +1,19 @@
+47/47 passing as the reviewer predicted. This is a backend-only fix, so I won't touch the frontend scope.
+
+## Handoff
+
+**Fix applied:** `backend/app/store.py:47` — `_save()` now serializes with `task.model_dump(mode="json")` instead of `task.model_dump()`, so `date` fields (`due_date`) round-trip to JSON-safe ISO strings instead of raising `TypeError: Object of type date is not JSON serializable`.
+
+**Status when I picked this up:** the fix was already present in the working tree (line 47 already read `mode="json")` when I first read the file — likely applied by a prior process/edit before this dispatch). I verified it's the correct, complete fix and re-ran the full verification the review asked for.
+
+**Verification run this session:**
+```
+cd backend && python3 -m pytest -q
+```
+→ `47 passed, 2 warnings in 0.20s` (0 failures, up from the reviewer's `9 failed, 38 passed`).
+
+**Diff confirmed minimal:** `git diff -- app/store.py` shows only the pre-existing due-date feature code (import of `date`, `add()`/`set_due_date()` signatures) plus the one-line `mode="json"` fix on line 47 — no other changes were needed or made, matching the reviewer's assessment that this was a single-line mechanical fix.
+
+**Not touched:** frontend files (`App.jsx`, `AddTask.jsx`, `TaskList.jsx`, `App.css`, `api.js`) — out of backend scope, review raised no findings against them, and they were already reported as correct in the review's "Worth considering" section.
+
+Ready for the reviewer to re-run its testing + review pass.

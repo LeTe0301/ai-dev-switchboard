@@ -1,0 +1,9 @@
+Spec written to `docs/spec.md` for Taiga #10. Summary:
+
+**Triage:** Feature, frontend-only — no backend change needed since the full task list is already in `App.jsx` state; counts are a pure client-side derivation, same pattern as the existing `completedCount` at `App.jsx:38`.
+
+**Key acceptance criteria:** open/done counts always visible (even at 0), correct singular/plural grammar at exactly 1, stay correct across add/complete/delete/clear-completed with no reload, hidden during initial load, and counts reflect true totals rather than whatever the current filter has scrolled into view.
+
+**Flagged assumption (proceeding on it, not blocking):** the count should show true totals independent of the `TaskFilter` selection, not the filtered subset — since "how many are left" is about actual task state, not the current view.
+
+Next stage is ux-designer, which should read `docs/spec.md` to produce `docs/design.md` (exact copy/wording and placement of the new count element).

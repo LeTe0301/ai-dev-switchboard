@@ -1,0 +1,20 @@
+## Verification report — Taiga #13: undo deleting a task
+
+**What I checked:** the review's must-fix, comment, and worth-considering findings against the actual current code in `frontend/src/App.jsx` and `frontend/src/components/UndoToast.jsx` — not from the report text, from reading the files directly.
+
+**Result: all three are already fixed in the working tree.** No further code changes needed.
+
+1. **Must-fix (flash-back)** — `App.jsx:85-94`: `setPendingDeletes` removal now sits in a `finally` block, after `await api.deleteTask(id)` / `await refresh()` settle. The task can't reappear in the list before the delete actually completes.
+2. **Comment (stacking order)** — `App.jsx:138-140`: toast `pending` prop is built from `[...pendingDeletes.keys()]` (Map insertion order) mapped to tasks with `.filter(Boolean)`, preserving oldest-deleted-on-top order and tolerating a task that vanished some other way (e.g. Clear completed racing the window).
+3. **Worth-considering (StrictMode purity)** — `App.jsx:99-107`: `cancelPendingDelete` reads the timer handle from `pendingDeletes.get(id)` in render scope and calls `clearTimeout` outside the `setPendingDeletes` updater.
+
+**Commands actually run this session:**
+- `npm run build` → passed clean (`✓ built in 157ms`), confirms no syntax/type errors across the changed files.
+- `find ... -iname "*.test.*"` → no test files exist anywhere in `frontend/`; there's no automated frontend test framework configured (`package.json` has only `dev`/`build`/`lint`/`preview`, no `test` script), so there's nothing to run beyond build + trace.
+- `npm run lint` and `git status`/`git diff` were denied approval in this sandbox — consistent with the same gap earlier stages already flagged. Not retried per the "don't retry identically" rule; falling back to the initial git status snapshot from session start, which already shows only `docs/design.md`, `docs/spec.md`, `frontend/src/App.css`, `frontend/src/App.jsx` modified and `frontend/src/components/UndoToast.jsx` untracked — no `backend/` changes, matching the frontend-only design.
+
+**Traced all 6 acceptance criteria against the current code** (`App.jsx:39,74-107,137-143`, `UndoToast.jsx`): all hold, including AC3 (notice now only disappears once the delete has actually settled — this is exactly what the finally-block fix restores) and AC6 (the Clear-completed race: orphaned timer's 404 is swallowed by the `'no such task'` check, and the toast entry vanishes on its own via the `.filter(Boolean)` lookup).
+
+Nothing failed. The only gaps are the lint/git approval denials and the absence of a frontend test framework in this repo — neither blocks the acceptance criteria, and both are pre-existing conditions of this sandbox/project, not something introduced by this change.
+
+VERDICT: pass

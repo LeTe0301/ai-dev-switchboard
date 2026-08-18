@@ -1,0 +1,98 @@
+The frontend implementation is complete and verified, but I hit a blocker on the final documentation step.
+
+**Implementation (done, verified):**
+- `frontend/src/components/TaskCounts.jsx` (new) — renders open/done counts with independent singular/plural grammar, `role="status"` live region.
+- `frontend/src/App.jsx` — imports `TaskCounts`, adds `openCount`, renders `{!loading && <TaskCounts open={openCount} done={completedCount} />}` under `<h1>`.
+- `frontend/src/App.css` — tightened `h1` bottom margin, added `.task-counts` rule (AA-passing `#5a646c`).
+
+All three match `docs/design.md` verbatim — no deviations. `npm run build` succeeds (verified this session). `npm test` fails with "Missing script: test" — a pre-existing gap (no test framework installed anywhere in the repo), not something this change introduced. `npm run lint` (oxlint) isn't in this session's Bash allowlist, so it wasn't run — the reviewer stage should run it.
+
+**Blocked:** The `Write` call for `docs/implementation.md` was denied twice (`.claude/settings.json` lists `Write(./docs/**)` as allowed, so this is likely a session-specific denial rather than a policy mismatch). I could not write the handoff file myself. Here is its complete, ready-to-apply content — the next attempt should write this verbatim to `/home/dev/projects/test-project/docs/implementation.md`:
+
+```markdown
+# Implementation: Show how many tasks are left
+
+Taiga #10 · reads `docs/spec.md`, `docs/design.md`
+
+## Scope
+
+Frontend-only, exactly as designed. No backend changes.
+
+## Files changed
+
+- **New:** `frontend/src/components/TaskCounts.jsx` — presentational component,
+  takes `open`/`done` integer props, renders one `<p className="task-counts"
+  role="status">` with independent singular/plural grammar per bucket, per
+  `docs/design.md`'s spec verbatim.
+- **`frontend/src/App.jsx`:**
+  - Import `TaskCounts` (line 3, alphabetical with the other component
+    imports).
+  - `openCount = tasks.filter((t) => !t.done).length` added next to the
+    existing `completedCount` (line 39-40) — both derive from `tasks`, never
+    `visibleTasks`/`sortedTasks`.
+  - `{!loading && <TaskCounts open={openCount} done={completedCount} />}`
+    rendered directly under `<h1>Tasks</h1>` (line 56), above `AddTask`.
+- **`frontend/src/App.css`:**
+  - `h1` bottom margin tightened from `1.2rem` to `0.3rem` so the counts line
+    sits snug under the title.
+  - New `.task-counts` rule added next to `.empty, .loading` (same "muted
+    secondary text" category): `margin: 0 0 1.2rem; font-size: 0.95rem;
+    color: #5a646c;` — the AA-contrast-passing color computed in
+    `docs/design.md` (5.63:1 on the page background), not a reuse of the
+    existing `#6b7780` (which the design doc found fails at 4.28:1).
+
+No other files touched. `frontend/src/api.js` untouched — no new request.
+
+## Deviations from design
+
+None. Component shape, wiring, CSS, and placement all match `docs/design.md`
+verbatim.
+
+## Verification
+
+- **Build:** `cd frontend && npm run build` — succeeds, no errors:
+  ```
+  ✓ 22 modules transformed.
+  ✓ built in 109ms
+  ```
+- **Tests:** `cd frontend && npm test` — fails with `npm error Missing
+  script: "test"`. This is a **pre-existing gap**, not introduced by this
+  change: `frontend/package.json` has no `test` script and no testing
+  library (`@testing-library/react`, `vitest`, etc.) is installed anywhere in
+  the repo (`node_modules/.bin/` only has `oxlint`, `vite`, `rolldown`,
+  `nanoid`). There is no existing frontend test to use as a precedent for
+  this component, and installing a test framework is out of scope for a
+  single-component feature diff per the "minimal diff" discipline — flagging
+  for reviewer/product-manager rather than silently skipping.
+- **Lint:** not run — `oxlint` is not in this session's Bash allowlist
+  (`.claude/settings.json` permits `npm run build*`/`npm run dev*`/`npm
+  test*` but not `npm run lint*`, and direct `node_modules/.bin/oxlint`
+  invocation is likewise outside the allowlist). Reviewer has broader Bash
+  access and should run `npm run lint` to confirm.
+- **Manual/visual check:** not run (no browser tool in this dispatch's
+  toolset). Reviewer's pass should exercise: zero tasks, exactly one task in
+  each bucket, add/complete/delete/clear-completed transitions, loading
+  state (count absent), and error state (count keeps last-known values) —
+  matching the states enumerated in `docs/design.md`.
+
+## How to run and verify
+
+```bash
+cd backend  && python3 -m uvicorn app.main:app --reload   # terminal 1
+cd frontend && npm run dev                                 # terminal 2
+```
+Open the app: the counts line reads e.g. "3 tasks open · 2 tasks done"
+under the "Tasks" heading, updates immediately on add/complete/delete/clear
+completed with no reload, and disappears only during the initial load.
+
+## Known limitations
+
+- No automated test coverage for `TaskCounts` or the new `openCount`
+  derivation — see "Tests" above. The logic is a one-line pure filter
+  (`tasks.filter((t) => !t.done).length`), directly parallel to the
+  already-untested `completedCount` on the line above it, so this follows
+  existing project precedent rather than introducing a new gap in test
+  discipline.
+```
+
+Everything else (the actual code diff) is applied and verified in this session.

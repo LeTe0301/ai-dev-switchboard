@@ -1,0 +1,34 @@
+## Review: Taiga #12 — Give tasks a due date (attempt 2)
+
+**Context confirmed:** the reviewer's attempt-1 blocker (`TypeError: Object of type date is not JSON serializable` in `store.py:47`) is fixed via `task.model_dump(mode="json")`. I re-ran the full suite myself rather than trusting the developer's report.
+
+**Verification run this session:**
+- `cd backend && python3 -m pytest -q` → **47 passed**, 0 failures.
+- `cd frontend && npm run build` → clean build, no errors.
+- `git status --porcelain` → only the 12 expected modified files, no stray untracked files.
+
+**Diff reviewed in full:** `backend/app/{main,models,store}.py`, `backend/tests/{test_tasks,test_persistence}.py`, `frontend/src/{App.jsx,api.js}`, `frontend/src/components/{AddTask,TaskList}.jsx`, `frontend/src/App.css`, plus `docs/{spec,design}.md`.
+
+**Spec/design fidelity check (all 9 ACs):**
+- AC1/2 (optional on create) — `AddTask.jsx` defaults `dueDate=''`, maps `'' → null`, covered by `test_create_defaults_to_no_due_date`.
+- AC3 (set/change/clear from row) — `TaskList.jsx` `.due-date-input` + `.due-date-clear` button, covered by `test_clearing_an_existing_due_date`.
+- AC4 (overdue marked by more than colour) — `.overdue-badge` renders visible text "Overdue" plus `aria-hidden` icon; matches `docs/design.md`'s contrast computations.
+- AC5/AC6 (today and future not overdue) — `isOverdue` uses strict `<` against `todayISO()`; ISO `YYYY-MM-DD` strings compare lexicographically identically to chronological order, so this is correct without needing `Date` parsing.
+- AC7 (done suppresses badge) — `isOverdue` is gated on `!task.done`.
+- AC8 (malformed date → 422) — `DueDateIn.due_date: date | None` (required key, nullable value) rejects garbage via Pydantic; covered by two dedicated tests, both passing.
+- AC9 (survives restart) — `test_due_date_absent_survives_a_simulated_restart` plus the updated existing persistence test, both passing.
+
+**Route ordering** (`main.py:48` `/due-date` before `main.py:56` generic `/{task_id}` PATCH) correctly avoids shadowing, following the same pattern as the pre-existing `/priority` route.
+
+**Store mutation pattern** (`store.py:81-87` `set_due_date`) is byte-for-byte the same shape as `set_priority`/`set_done`/`update_title` — no new idiom introduced.
+
+## Will block
+None.
+
+## Will comment
+None.
+
+## Worth considering
+- Frontend has no test infrastructure at all (`frontend/package.json` has no `test` script, no test files anywhere in the repo) despite `CLAUDE.md` documenting `npm test`. This is a pre-existing, project-wide gap — not introduced or worsened by this diff — and was already noted as out-of-scope in the design stage's precedent (the priority feature shipped the same way). Not this cycle's responsibility to fix.
+
+VERDICT: approve

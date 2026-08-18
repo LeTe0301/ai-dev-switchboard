@@ -1,0 +1,1 @@
+Write access to `e2e/test_tasks_e2e.py` isn't being approved automatically — I don't want to keep retrying the identical call. Could you approve the Edit tool for that file, or let me know if you'd rather I take a different approach (e.g., write the new e2e tests to a separate file)?

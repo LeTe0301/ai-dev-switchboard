@@ -1,0 +1,26 @@
+No lint/type-check config exists for the backend — `pytest` is the only verification command, and it passes. Implementation is complete.
+
+## Handoff
+
+**Files changed:**
+
+- `backend/app/store.py` — `TaskStore.__init__` now resolves a data-file path from `TASKS_DATA_FILE` env var (default `backend/data/tasks.json`, relative to `store.py`'s own location) and calls a new `_load()` on construction. `_load()` reads+parses the file and validates each entry against `Task`; any exception (missing file, bad JSON, wrong shape) is caught and the store starts empty — matches AC5/AC6, one code path for both. `_next_id` becomes `max(loaded ids, default=0) + 1`. Added `_save()` — creates the parent dir (`mkdir(parents=True, exist_ok=True)`, AC7) and writes the full task list as JSON. Called at the end of every mutating method: `add`, `set_done`, `set_priority`, `update_title`, `delete` (only on actual removal), `reset`.
+- `backend/tests/conftest.py` — sets `TASKS_DATA_FILE` to a fresh `tempfile.mkdtemp()` path before `app.main` is imported, so the module-level `store` singleton never touches the real data file (AC8). Verified: no `backend/data/` directory exists after running the suite.
+- `backend/tests/test_persistence.py` (new) — 8 tests: restart survival (two `TaskStore` instances, same path), missing file, corrupt JSON, wrong top-level shape (object not array), wrong item shape, empty file, id-counter continuation after non-contiguous deletes, and directory auto-creation.
+
+**Not changed:** `backend/app/main.py`, `backend/app/models.py`, `frontend/` — as the spec/design predicted, persistence is fully transparent to routes.
+
+**One thing I could not do:** the spec's "Affected areas" calls for adding `backend/data/` to `.gitignore`. I don't have write permission to `.gitignore` in this sandbox (the `Edit` call was denied twice). Someone with permission needs to add:
+```
+backend/data/
+```
+Without it, a real run's `backend/data/tasks.json` risks being `git add`-ed accidentally.
+
+**Verification run this session:**
+```
+cd backend && python3 -m pytest -q
+# 30 passed (22 pre-existing + 8 new), 0.11s
+```
+I could not start `uvicorn` to do a live curl-based restart check (background Bash execution was denied in this sandbox), so the restart behavior is verified via `test_persistence.py`'s two-`TaskStore`-instances-same-path tests rather than an actual process restart — this is the same technique used to test the store in isolation elsewhere in this suite (constructing `TaskStore()` directly rather than going through `app`).
+
+**Deviations from spec:** none. All 8 acceptance criteria are covered by the new tests; non-goals (no DB, no file locking, no partial recovery, no export endpoint, no frontend change) were respected.

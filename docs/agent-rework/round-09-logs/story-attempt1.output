@@ -1,0 +1,9 @@
+I've triaged Taiga #13 as a single-cycle **feature** and written `docs/spec.md` (overwriting the prior, already-merged #12 spec — expected per the workflow's scratch-doc convention).
+
+**Key design call:** implement this entirely in the frontend, with no backend changes. Delete already hides the row and starts a 5-second timer; the actual `DELETE /api/tasks/{id}` call is deferred until the timer lapses. Clicking Undo just cancels the timer and un-hides the row — since the task's data was never mutated in the first place, "get it back exactly as it was, including done state" is automatic rather than something to reconstruct. This avoids a backend soft-delete/trash+restore endpoint, which would've spanned the data and interface layers for no real benefit.
+
+Six falsifiable acceptance criteria, five non-goals (no bulk-undo for "Clear completed", no cross-reload undo, no keyboard shortcut, fixed 5s window, unchanged backend semantics), and exact affected files are in the spec (`App.jsx`, `TaskList.jsx`, a new `UndoToast.jsx`, `App.css`).
+
+One open question, resolved with a stated default: the ticket says "a brief chance" without a duration — I proceeded with **5 seconds** (documented as overridable before build).
+
+Next: ux-designer stage to turn this into `docs/design.md`, then developer.

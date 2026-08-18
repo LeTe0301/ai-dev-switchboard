@@ -1,0 +1,77 @@
+{
+  "status": "finished",
+  "reason": "",
+  "dispatches": 12,
+  "attempts": {
+    "story": 1,
+    "design": 1,
+    "build": 3,
+    "review": 3,
+    "test": 1
+  },
+  "stages": [
+    {
+      "stage": "story",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "design",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "build/frontend",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "build/backend",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "review",
+      "ok": true,
+      "verdict": "changes-requested"
+    },
+    {
+      "stage": "build/frontend",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "build/backend",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "review",
+      "ok": true,
+      "verdict": "changes-requested"
+    },
+    {
+      "stage": "build/frontend",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "build/backend",
+      "ok": true,
+      "verdict": null
+    },
+    {
+      "stage": "review",
+      "ok": true,
+      "verdict": "approve-with-followups"
+    },
+    {
+      "stage": "test",
+      "ok": true,
+      "verdict": "pass"
+    }
+  ],
+  "seconds": 1438.5,
+  "task": "Taiga #13: Let me undo deleting a task.\n\nDeleting is immediate and there is no way back, which makes me hesitant to use it. After deleting a task, give me a brief chance to undo it and get the task back exactly as it was, including whether it was completed.",
+  "workdir": "/home/dev/projects/test-project"
+}

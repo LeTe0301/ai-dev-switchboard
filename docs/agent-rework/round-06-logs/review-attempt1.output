@@ -1,0 +1,13 @@
+## Review: Taiga #10 — Show how many tasks are left
+
+**Will block:** none.
+
+**Will comment:**
+- `frontend/src/App.css:11` — `h1`'s `margin-bottom` was tightened from `1.2rem` to `0.3rem` to make room for the new counts line, but `TaskCounts` only renders `!loading`. During the initial loading flash, `AddTask` sits right under `<h1>` with the reduced margin, so the heading-to-input gap briefly shrinks before popping back open once the counts line mounts. It's implemented exactly as `docs/design.md`'s wireframes show, so it's a documented tradeoff rather than a bug — worth a follow-up if the loading flash turns out to be visually noticeable in practice, not a blocker.
+
+**Worth considering:**
+- No frontend test exists anywhere in this repo (`npm test` isn't even wired up in `package.json`), so `TaskCounts.jsx` ships without one. This is a pre-existing, repo-wide gap this diff didn't introduce or worsen — not something to hold this change for.
+
+Everything else checks out: `TaskCounts.jsx` matches `docs/design.md` verbatim (props, JSX, `role="status"`, separator), `openCount`/`completedCount` are both derived from `tasks` (not the filtered/sorted view), satisfying the spec's explicit "true totals, not the current filter" requirement. Singular/plural logic is correct at 0/1/N independently per bucket. The `#5a646c` contrast claim in the design doc checks out (5.63:1, computed independently). `npm run build` passes. No backend touched, matching both docs' non-goals. No scope creep, no dead code, no stray files left on disk.
+
+**VERDICT: approve-with-followups**

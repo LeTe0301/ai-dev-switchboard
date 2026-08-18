@@ -1,0 +1,18 @@
+That's fine — no test-review.md yet since this is mid-cycle.
+
+## Handoff — attempt 2 fix for changes-requested
+
+**Fixed the blocking crash** (`frontend/src/App.jsx`), root cause not symptom:
+
+- **Root cause of the crash:** `pendingDeleteIds.map((id) => tasks.find((t) => t.id === id))` looked deleted-task-ids up in `tasks` after the fact. When "Clear completed" (or any other refresh) removes a task from `tasks` while it's still mid-undo-window, the lookup returns `undefined`, and `UndoToast.jsx:6`'s `key={task.id}` throws.
+- **Fix:** the toast's `pending` prop is now derived the other way around — `tasks.filter((t) => pendingDeletes.has(t.id))` (`App.jsx:134`). A `filter` over `tasks` can structurally never produce `undefined` entries, so a task that vanished from `tasks` via any other path is silently excluded from the toast instead of crashing it. Its still-running delete timer fires normally later, hits the existing "no such task" 404 handling (`App.jsx:85-91`, unchanged), and is silently cleaned up — no new code path needed there.
+- **Also addressed the will-comment item:** collapsed the two always-mutated-together stores (`pendingDeleteIds` state array + `pendingDeleteTimers` ref `Map`) into one `pendingDeletes` state `Map<id, timerHandle>` (`App.jsx:20-25, 40, 75-103`). This was the duplicate-source-of-truth pattern the reviewer flagged as the kind of thing that produces desync bugs like the one above — collapsing it removes the spot a future edit would need to remember to touch twice. `useRef` import dropped since it's no longer used.
+
+**Files changed:** only `frontend/src/App.jsx`. `UndoToast.jsx`, `TaskList.jsx`, `api.js`, backend — untouched, as before.
+
+**Verified:**
+- `npm run build` (Vite/esbuild) — passes clean, no errors.
+- Manually traced the reviewer's exact repro (delete a completed task, then Clear Completed before the 5s window lapses) against the new code: `tasks` loses the task on the Clear Completed refresh → `pendingDeletes` still has its id → `tasks.filter(...)` on the next render simply yields one fewer element → no crash, toast just drops that entry.
+- Could not run `npm test` — no test script/framework is configured in `frontend/package.json` (only `dev`/`build`/`lint`/`preview`), and this was true before my change too; not something in this scope to add. Could not run `npm run lint` (oxlint) — the sandbox declined to approve that command in this session with no prompt to retry; build output shows no syntax/type issues in the meantime.
+
+All six acceptance criteria from `docs/spec.md` remain satisfied — this fix only changes *how* the pending list is derived, not the delete/undo/timer/multi-undo behavior itself.

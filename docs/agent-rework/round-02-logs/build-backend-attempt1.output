@@ -1,0 +1,14 @@
+All 12 tests pass (8 existing + 4 new). The warnings are pre-existing environment issues unrelated to this change.
+
+## Backend implementation complete — Taiga #3
+
+**Files changed:**
+- `backend/app/store.py` — added `update_title(task_id, title) -> Optional[Task]`, mirroring `set_done`'s found-or-`None` pattern.
+- `backend/app/main.py` — added `PATCH /api/tasks/{task_id}` route, reusing `TaskIn` for body validation, 404 on missing id, mirroring `complete_task`.
+- `backend/tests/test_tasks.py` — added 4 tests: title update succeeds, `done`/`id` are untouched by a title update, missing task is 404, empty title is 422 and doesn't mutate the stored title.
+
+**Verified:** `python3 -m pytest -q` in `backend/` → 12 passed (8 existing + 4 new).
+
+**Scope note:** stayed strictly in `backend/` per the spec's split. Frontend (`api.js`, `TaskList.jsx`, `App.jsx`, `App.css`, e2e tests) is out of my scope — not touched.
+
+No deviations from `docs/spec.md`/`docs/design.md`: endpoint shape (`PATCH /api/tasks/{task_id}`), validation reuse (`TaskIn`), and 404 pattern all match what was specified.
